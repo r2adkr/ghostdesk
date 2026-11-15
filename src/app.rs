@@ -104,8 +104,10 @@ fn spawn_input_queue(rt: &Handle, shared: Arc<AgentShared>) -> mpsc::UnboundedSe
     tx
 }
 
-#[derive(PartialEq)]
+#[derive(Default, PartialEq)]
 enum View {
+    #[default]
+    Home,
     Grid,
     Detail,
     /// 화면 모아보기: 모든 에이전트의 화면만 창 가득 크게 (목록·패널 없음)
@@ -331,7 +333,7 @@ impl GhostApp {
             },
             agents: Vec::new(),
             selected: None,
-            view: View::Grid,
+            view: View::default(),
             next_id: 1,
             show_cursor: true,
             pending_demo: std::env::var("GHOSTDESK_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -576,7 +578,7 @@ impl GhostApp {
             Some(s) if s > idx => Some(s - 1),
             s => s,
         };
-        if self.selected.is_none() {
+        if self.view == View::Detail && self.selected.is_none() {
             self.view = View::Grid;
         }
     }
@@ -618,6 +620,9 @@ impl GhostApp {
             .clicked()
         {
             self.open_wizard();
+        }
+        if theme::nav_item(ui, self.view == View::Home, icon::GHOST, "홈", None).clicked() {
+            self.view = View::Home;
         }
         if theme::nav_item(ui, self.view == View::Grid, icon::LAYOUT_GRID, "모든 에이전트", None).clicked() {
             self.view = View::Grid;
@@ -1491,10 +1496,10 @@ impl GhostApp {
         ui.vertical_centered(|ui| {
             let w = ui.available_width().min(680.0);
             ui.add_space((ui.available_height() * 0.28).max(24.0));
-            ui.label(RichText::new(greeting(ui)).size(28.0).color(theme::TEXT));
+            ui.label(RichText::new("오늘은 어떤 일을 대신 맡아 드릴까요?").size(28.0).color(theme::TEXT));
             ui.add_space(28.0);
             // 맡길 일 입력 상자: Enter(또는 ↵ 버튼)로 새 에이전트 창을 열고, 적은 일을 그대로 넘긴다
-            let id = egui::Id::new("welcome_composer");
+            let id = egui::Id::unique("welcome_composer");
             let focused = ui.memory(|m| m.has_focus(id));
             let mut submit = false;
             ui.allocate_ui(Vec2::new(w, 0.0), |ui| {
@@ -1527,117 +1532,25 @@ impl GhostApp {
     // ───────────────────────── 그리드 ─────────────────────────
 
     fn grid(&mut self, ui: &mut egui::Ui) {
-        if self.agents.is_empty() {
-            self.welcome(ui);
-            return;
-        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("모든 에이전트").size(20.0).strong().color(theme::TEXT));
             ui.label(RichText::new(self.agents.len().to_string()).size(14.0).color(theme::MUTED));
         });
         ui.add_space(16.0);
-        let n = self.agents.len();
-        let gap = 16.0;
-        // 카드 안쪽(그림) 폭을, 스크롤 없이 창에 다 들어가는 가장 큰 크기로 (너무 작아지면 스크롤)
-        let aspect = self
-            .agents
-            .iter()
-            .filter_map(|a| a.shared.workspace())
-            .map(|w| {
-                let (sw, sh) = w.size();
-                sh as f32 / sw.max(1) as f32
-            })
-            .fold(0.0f32, f32::max);
-        let aspect = if aspect > 0.0 { aspect } else { 0.625 };
-        let avail = ui.available_size();
-        let (cols, inner_w) = grid_layout(n, avail, aspect, gap, GRID_CARD_CHROME, 240.0);
-        let total_w = cols as f32 * (inner_w + GRID_CARD_CHROME.x) + gap * (cols as f32 - 1.0);
-        let pad = ((avail.x - total_w) / 2.0).max(0.0);
-        let mut open = None;
-        let show_cursor = self.show_cursor;
-        let mut repaint = false;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-            ui.add_space(pad);
-            egui::Grid::new("tiles").spacing([gap, gap]).show(ui, |ui| {
-                for (i, a) in self.agents.iter_mut().enumerate() {
-                    let card = theme::card().inner_margin(Margin::same(12)).show(ui, |ui| ui.vertical(|ui| {
-                        ui.set_width(inner_w);
-                        let st = a.shared.status();
-                        ui.horizontal(|ui| {
-                            theme::dot(ui, crate::cursor::agent_color(a.shared.id), 4.5);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                theme::chip(ui, status_color(&st), &crate::llm::short(&status_text(&st), 24)).on_hover_text(status_text(&st));
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.add(egui::Label::new(RichText::new(&a.shared.name).strong().color(theme::TEXT)).truncate().selectable(false));
-                                });
-                            });
-                        });
-                        let ws = a.shared.workspace();
-                        let aspect = ws.as_ref().map(|w| { let (sw, sh) = w.size(); sh as f32 / sw.max(1) as f32 }).unwrap_or(0.625);
-                        let size = Vec2::new(inner_w, inner_w * aspect);
-                        let resp = match &a.texture {
-                            Some(t) => ui.add(egui::Image::new((t.id(), size)).corner_radius(theme::CARD_RADIUS).sense(egui::Sense::click())),
-                            None => {
-                                let (r, p) = ui.allocate_painter(size, egui::Sense::click());
-                                p.rect_filled(r.rect, theme::CARD_RADIUS, theme::BG);
-                                p.text(r.rect.center(), egui::Align2::CENTER_CENTER, "준비 중…", egui::FontId::proportional(14.0), theme::MUTED);
-                                r
-                            }
-                        };
-                        if ws.is_none() && a.texture.is_some() && !matches!(st, AgentStatus::Preparing(_)) {
-                            ui.painter().rect_filled(resp.rect, theme::CARD_RADIUS, Color32::from_black_alpha(160));
-                            ui.painter().text(resp.rect.center(), egui::Align2::CENTER_CENTER, "닫힘", egui::FontId::proportional(18.0), Color32::from_gray(200));
-                        }
-                        if let (true, Some(w), Some(_)) = (show_cursor, ws.as_ref(), a.texture.as_ref()) {
-                            let (sw, _) = w.size();
-                            let scale = resp.rect.width() / sw.max(1) as f32;
-                            let mut st = a.shared.cursor.lock();
-                            repaint |= crate::cursor::paint(
-                                ui.painter(), resp.rect, scale, &mut st, &mut a.tile_cursor_view,
-                                w.mouse_pos(), crate::cursor::agent_color(a.shared.id), None, true,
-                            );
-                        }
-                        // 마지막 기록 한 줄 (오류는 알아보기 쉬운 말로 빨갛게, 전체는 마우스를 올리면)
-                        let last = a.shared.log.lock().iter().rev().find(|l| l.kind != LogKind::Thinking).map(|l| (l.kind, l.text.clone()));
-                        match last {
-                            Some((LogKind::Error, t)) => {
-                                ui.add(egui::Label::new(RichText::new(humanize_error(&t)).size(12.0).color(theme::DANGER)).truncate().selectable(false))
-                                    .on_hover_text(t);
-                            }
-                            Some((_, t)) => {
-                                ui.add(egui::Label::new(theme::hint(t)).truncate().selectable(false));
-                            }
-                            None => {
-                                ui.add(egui::Label::new(theme::hint("")).selectable(false));
-                            }
-                        }
-                        resp.clicked()
-                    }).inner);
-                    let whole = card.response.interact(egui::Sense::click());
-                    whole.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} 크게 보기", a.shared.name)));
-                    if let Some(c) = attention(&a.shared.status(), a.takeover) {
-                        ui.painter().rect_stroke(whole.rect, theme::CARD_RADIUS, Stroke::new(2.0, c), StrokeKind::Inside);
-                    } else if whole.hovered() {
-                        ui.painter().rect_stroke(whole.rect, theme::CARD_RADIUS, Stroke::new(1.0, theme::BORDER_HOVER), StrokeKind::Inside);
-                    }
-                    if card.inner || whole.clicked() {
-                        open = Some(i);
-                    }
-                    if (i + 1) % cols == 0 {
-                        ui.end_row();
-                    }
+        if self.agents.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.3).max(24.0));
+                ui.label(RichText::new("아직 에이전트가 없습니다").size(20.0).color(theme::TEXT));
+                ui.add_space(8.0);
+                ui.label(theme::hint("홈에서 할 일을 맡기거나 새 에이전트를 추가하세요."));
+                ui.add_space(20.0);
+                if theme::primary(ui, "새 에이전트").clicked() {
+                    self.open_wizard();
                 }
             });
-            });
-        });
-        if repaint {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+            return;
         }
-        if let Some(i) = open {
-            self.selected = Some(i);
-            self.view = View::Detail;
-        }
+        self.screens(ui, false);
     }
 
     // ───────────────────────── 화면 모아보기 ─────────────────────────
@@ -1653,20 +1566,20 @@ impl GhostApp {
     }
 
     /// 모든 에이전트의 화면만 창 가득 배치한다. 화면을 누르면 그 에이전트의 상세 보기로.
-    fn wall(&mut self, ui: &mut egui::Ui) {
+    fn screens(&mut self, ui: &mut egui::Ui, immersive: bool) {
         let ctx = ui.ctx().clone();
         // 창 관리자가 전체 화면을 바꿨을 수도 있으니 실제 상태를 따른다
-        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
+        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen).filter(|_| immersive) {
             self.wall_fullscreen = fs;
         }
         let mut exit = false;
         // 전체 화면: F11 (macOS 는 ⌃⌘F)
-        let mut toggle_fs = ctx.input(|i| {
+        let mut toggle_fs = immersive && ctx.input(|i| {
             i.key_pressed(egui::Key::F11) || (cfg!(target_os = "macos") && i.modifiers.mac_cmd && i.modifiers.ctrl && i.key_pressed(egui::Key::F))
         });
 
         // 화면만: 창 전체를 화면 배치에 쓰고, 단추는 오른쪽 위에 겹쳐 둔다
-        let area = ui.max_rect();
+        let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
         let n = self.agents.len();
         let aspect_of = |a: &AgentHandle| {
@@ -1733,7 +1646,9 @@ impl GhostApp {
             let mut job = egui::text::LayoutJob::default();
             let fmt = |color: Color32| egui::TextFormat { font_id: egui::FontId::proportional(12.0), color, ..Default::default() };
             job.append(&a.shared.name, 0.0, fmt(Color32::WHITE));
-            job.append(&format!("  ·  {}", crate::llm::short(&status_text(&st), 28)), 0.0, fmt(attn.unwrap_or(Color32::from_gray(205))));
+            let status = status_text(&st);
+            let status = if is_error(&st) { humanize_error(&status) } else { status };
+            job.append(&format!("  ·  {}", crate::llm::short(&status, 28)), 0.0, fmt(attn.unwrap_or(Color32::from_gray(205))));
             let g = p.layout_job(job);
             let at = rect.left_top() + Vec2::new(10.0, 9.0);
             let pill = egui::Rect::from_min_size(at, Vec2::new(g.size().x + 16.0, g.size().y)).expand2(Vec2::new(8.0, 4.0));
@@ -1751,7 +1666,7 @@ impl GhostApp {
         }
         // 오른쪽 위 단추 (전체 화면에서는 마우스를 위쪽 가장자리로 가져갈 때만)
         let near_top = ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < area.top() + 90.0));
-        if !self.wall_fullscreen || near_top {
+        if immersive && (!self.wall_fullscreen || near_top) {
             egui::Area::new(egui::Id::unique("wall_bar"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::RIGHT_TOP, [-18.0, 18.0])
@@ -1782,7 +1697,11 @@ impl GhostApp {
         }
         if let Some(i) = open {
             self.selected = Some(i);
-            self.leave_wall(&ctx, View::Detail);
+            if immersive {
+                self.leave_wall(&ctx, View::Detail);
+            } else {
+                self.view = View::Detail;
+            }
         } else if exit {
             self.leave_wall(&ctx, View::Grid);
         }
@@ -2209,28 +2128,6 @@ impl GhostApp {
     }
 }
 
-/// 처음 화면 인사말: 앱을 켤 때마다 하나를 골라, 켜져 있는 동안은 그대로 둔다
-const GREETINGS: [&str; 8] = [
-    "오늘은 어떤 일을 대신 맡아 드릴까요?",
-    "마우스는 쉬게 두세요. 일은 제가 할게요.",
-    "유령 직원 출근 완료. 무엇부터 할까요?",
-    "커피 한 잔 하고 오세요. 그동안 해 둘게요.",
-    "귀찮은 클릭은 저한테 넘기세요.",
-    "화면 뒤에서 조용히 일할 준비가 됐어요.",
-    "오늘의 반복 작업, 제가 가져갈게요.",
-    "보이진 않아도, 일은 확실하게.",
-];
-
-fn greeting(ui: &egui::Ui) -> &'static str {
-    let id = egui::Id::new("welcome_greeting");
-    let i = ui.data_mut(|d| {
-        *d.get_temp_mut_or_insert_with(id, || {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.subsec_nanos() as usize).unwrap_or(0) % GREETINGS.len()
-        })
-    });
-    GREETINGS[i]
-}
-
 /// 오류로 멈춘 상태인가 (Claude API 오류 뒤에는 '오류 — …' 로 대기 상태가 된다)
 fn is_error(st: &AgentStatus) -> bool {
     match st {
@@ -2289,30 +2186,6 @@ fn humanize_error(s: &str) -> String {
     } else {
         crate::llm::short(s, 60)
     }
-}
-
-/// 그리드 카드에서 그림 밖 부분의 크기 (좌우: 여백 12×2 + 테두리, 위아래: 여백 + 머리줄 + 마지막 기록 줄 + 간격)
-const GRID_CARD_CHROME: Vec2 = Vec2::new(27.0, 92.0);
-
-/// 그리드 배치: n 개 카드를 area 에 스크롤 없이 가장 크게 놓는 (열 수, 그림 폭). 그림 폭이 min_w 보다 작아져야만
-/// 다 들어가면, min_w 로 들어가는 만큼 열을 두고 세로로 스크롤한다. aspect = 그림 높이/너비.
-fn grid_layout(n: usize, area: Vec2, aspect: f32, gap: f32, chrome: Vec2, min_w: f32) -> (usize, f32) {
-    let n = n.max(1);
-    let mut best: Option<(usize, f32)> = None;
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-        let by_w = (area.x - gap * (cols as f32 - 1.0)) / cols as f32 - chrome.x;
-        let by_h = ((area.y - gap * (rows as f32 - 1.0)) / rows as f32 - chrome.y) / aspect;
-        let w = by_w.min(by_h);
-        if w >= min_w && best.is_none_or(|b| w > b.1 + 0.01) {
-            best = Some((cols, w));
-        }
-    }
-    best.unwrap_or_else(|| {
-        let cols = (((area.x + gap) / (min_w + chrome.x + gap)).floor() as usize).clamp(1, n);
-        let w = (area.x - gap * (cols as f32 - 1.0)) / cols as f32 - chrome.x;
-        (cols, w.max(120.0))
-    })
 }
 
 /// 생각 깊이 표시 (API 값은 그대로 괄호 안에)
@@ -2473,7 +2346,7 @@ impl eframe::App for GhostApp {
         if self.view == View::Wall {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Color32::from_rgb(10, 9, 8)).inner_margin(Margin::same(12)))
-                .show(ui, |ui| self.wall(ui));
+                .show(ui, |ui| self.screens(ui, true));
         } else {
             self.main_layout(ui, &ctx);
         }
@@ -2512,8 +2385,9 @@ impl GhostApp {
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(24)))
-            .show(ui, |ui| match (self.view == View::Detail, self.selected.filter(|&i| i < self.agents.len())) {
-                (true, Some(idx)) => self.detail_view(ui, idx),
+            .show(ui, |ui| match self.view {
+                View::Home => self.welcome(ui),
+                View::Detail => self.detail_view(ui, self.selected.unwrap()),
                 _ => self.grid(ui),
             });
 
@@ -3060,26 +2934,6 @@ mod tests {
                 assert!(rows as f32 * cell.y + (rows - 1) as f32 * 10.0 <= area.y + 0.5, "n={n} {area:?}");
             }
         }
-    }
-
-    #[test]
-    fn grid_layout_fits_without_scroll_when_possible() {
-        let chrome = GRID_CARD_CHROME;
-        let area = Vec2::new(1700.0, 1000.0);
-        for n in 1..=6 {
-            let (c, w) = grid_layout(n, area, 0.625, 14.0, chrome, 240.0);
-            let rows = n.div_ceil(c);
-            assert!(w >= 240.0, "n={n} w={w}");
-            assert!(c as f32 * (w + chrome.x) + (c - 1) as f32 * 14.0 <= area.x + 0.5, "n={n}");
-            assert!(rows as f32 * (w * 0.625 + chrome.y) + (rows - 1) as f32 * 14.0 <= area.y + 0.5, "n={n}");
-        }
-        // 셋: 보통 창에서는 2x2 가 한 줄 세 칸보다 크고 스크롤도 없다
-        assert_eq!(grid_layout(3, area, 0.625, 14.0, chrome, 240.0).0, 2);
-        // 가로로 긴 창에서는 한 줄 세 칸이 더 크다
-        assert_eq!(grid_layout(3, Vec2::new(2400.0, 700.0), 0.625, 14.0, chrome, 240.0).0, 3);
-        // 아주 많으면 최소 폭으로 들어가는 만큼 열을 두고 스크롤
-        let (c, w) = grid_layout(40, Vec2::new(1200.0, 700.0), 0.625, 14.0, chrome, 240.0);
-        assert!(c >= 3 && w >= 240.0, "{c} {w}");
     }
 
     #[test]

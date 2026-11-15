@@ -19,7 +19,7 @@ Agents never touch the visible screen: hidden browsers with cloned logins, hidde
 
 ## Operating Context
 - Window often sits beside other work while several agents run at once; the user glances at status (working / waiting for a question / error) and steps in when needed.
-- Main surfaces: agent grid, agent detail (live screen, log, next tasks, takeover), new-agent wizard (mode tiles + task), settings, external-connection window, approval dialogs, full-screen "화면 모아보기" overview.
+- Main surfaces: Home (task composer, the initial screen), All agents (live screen overview), agent detail (live screen, log, next tasks, takeover), new-agent wizard (mode tiles + task), settings, external-connection window, approval dialogs, full-screen "화면 모아보기" overview.
 - UI language is Korean.
 
 ## Capabilities and Constraints

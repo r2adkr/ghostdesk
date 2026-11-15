@@ -6,6 +6,14 @@ Rust + egui 데스크톱 앱입니다 (**macOS · Windows 10/11**). 마우스·�
 
 > Windows 에서의 차이(지원하는 화면 종류, 설치·설정 파일 위치, 빌드 방법)는 아래 **[Windows](#-windows)** 절에 모아 두었습니다.
 
+## Download and run (Windows)
+
+1. Download [GhostDesk v0.1.1 for Windows x64](https://github.com/r2adkr/ghostdesk/releases/download/v0.1.1/GhostDesk-0.1.1-windows-x64.exe) and double-click it. No installer, Rust, or separate runtime installation is required.
+2. **Home (홈)** opens first. Enter a task to configure a new agent. **All agents (모든 에이전트)** shows the agents' actual live screens; click a screen to open its details.
+3. Use your own Anthropic API key for the built-in agent, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
+
+The UI is currently in Korean. Windows 10/11 x64 is supported; a supported Chromium browser such as Edge is required for web workspaces. The executable is unsigned, so Windows may show a security warning. Windows child sessions remain experimental, require an administrator account, and have not been verified with real capture/input.
+
 ## 두 가지 사용법
 
 | | 여기서 바로 실행 | 다른 앱의 에이전트가 사용 (MCP) |
