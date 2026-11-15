@@ -1,0 +1,71 @@
+[package]
+name = "ghostdesk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "사용자 화면을 건드리지 않는 격리 브라우저 위에서 동작하는 다중 Claude computer-use 에이전트"
+
+[dependencies]
+eframe = "0.37"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml_edit = "0.25"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+anyhow = "1"
+dirs = "6"
+parking_lot = "0.12"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = { version = "0.3.2", features = ["libc"] }
+objc2-screen-capture-kit = "0.3.2"
+objc2-application-services = { version = "0.3.2", features = ["libc"] }
+block2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_RestartManager",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# COM 이 필요한 부분(UI Automation)만 windows 크레이트를 쓴다
+# OS 난수 (rfb.rs 의 ARD 인증 키·패딩). macOS 는 기존대로 /dev/urandom
+getrandom = "0.3"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }
+
+[profile.release]
+opt-level = 3

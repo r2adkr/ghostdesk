@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  GhostDesk 실행 파일 매니페스트 (Windows, build.rs 가 링크할 때 넣는다).
+
+  consoleAllocationPolicy=detached (Windows 11 24H2 이상):
+  ghostdesk.exe 는 MCP(stdio)·명령줄 모드 때문에 콘솔 서브시스템 실행 파일이지만, 탐색기에서 더블클릭하는 등
+  콘솔이 없는 곳에서 실행하면 콘솔(기본 터미널 창)을 새로 만들지 않는다. 터미널에서 실행하면 그 콘솔을 그대로 물려받는다.
+  이 설정을 모르는 이전 Windows 는 무시하며, 그때는 main.rs 가 콘솔 없이 자신을 다시 띄운다.
+
+  DPI 설정은 넣지 않는다: GUI(winit)는 실행 중에 모니터별 DPI 인식을 켜고, 앱 셀프테스트의 시험 창은
+  DPI 를 모르는 창이어야 한다.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <consoleAllocationPolicy xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">detached</consoleAllocationPolicy>
+    </windowsSettings>
+  </application>
+</assembly>

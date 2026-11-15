@@ -1,0 +1,7 @@
+# Windows(MSVC) 빌드는 C 런타임을 정적으로 링크한다: VC++ 재배포 패키지(VCRUNTIME140.dll)가 없는
+# 깨끗한 Windows 에서도 ghostdesk.exe 하나로 실행되게 (MCP 호스트가 서버를 띄우다 DLL 오류로 실패하지 않게).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
