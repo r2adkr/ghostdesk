@@ -709,7 +709,6 @@ mod tests {
                 minimized: false,
                 cloaked: false,
                 alpha: None,
-                tool_window: false,
             };
             if c != "WorkerW" || shell_pid != 0 {
                 assert!(!is_view_window(&w), "{c}");

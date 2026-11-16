@@ -3,7 +3,7 @@
 //! - GhostDesk 를 고정 위치에 설치한다 (관리자 권한 불필요).
 //!   - macOS: ~/Applications/GhostDesk.app (앱 번들)
 //!   - Windows: %LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe (실행 파일 하나)
-//! - Claude Code · Claude 앱 · Codex 에 GhostDesk MCP 서버를 자동으로 등록한다.
+//! - Claude Code · Claude 앱 · Codex · Kimi Code · OpenCode · pi 에 GhostDesk MCP 서버를 자동으로 등록한다.
 //!   클라이언트의 자체 CLI(`claude mcp add`)가 있으면 그것을 먼저 쓰고,
 //!   없거나 실패하면 설정 파일을 서식·키 순서를 보존하며 직접 고친다 (처음 고치기 전의 원본을 백업).
 //!   `ghostdesk` 항목 외의 설정은 건드리지 않는다.
@@ -39,6 +39,8 @@ const BUNDLE_ID: &str = "dev.ghostdesk.app";
 const CODEX_TOOL_TIMEOUT_SEC: i64 = 600;
 /// Codex 의 MCP 서버 시작(initialize) 시간 제한(초).
 const CODEX_STARTUP_TIMEOUT_SEC: i64 = 30;
+/// OpenCode 의 도구 목록 가져오기 시간 제한(밀리초). 기본 5초로는 `--mcp` 가 GUI 를 띄우는 동안 끊길 수 있다.
+const OPENCODE_TIMEOUT_MS: i64 = CODEX_STARTUP_TIMEOUT_SEC * 1000;
 
 // ───────────────────────── 사용자 폴더 ─────────────────────────
 
@@ -90,7 +92,6 @@ impl Bases {
     }
 
     /// 비어 있지 않은 환경변수를 경로로
-    #[cfg(windows)]
     fn var_path(&self, name: &str) -> Option<PathBuf> {
         self.var(name).filter(|v| !v.is_empty()).map(PathBuf::from)
     }
@@ -802,6 +803,7 @@ fn find_cli(name: &str) -> Option<PathBuf> {
     let mut cands = vec![
         h.join(".local/bin").join(name),
         h.join(format!(".{name}/local/{name}")),
+        h.join(format!(".{name}/bin/{name}")), // opencode 설치 스크립트 (~/.opencode/bin)
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
     ];
@@ -840,6 +842,7 @@ fn find_cli(name: &str) -> Option<PathBuf> {
         b.home.join(".bun").join("bin"),                         // bun
         b.local.join("Volta").join("bin"),                       // volta
         b.home.join(format!(".{name}")).join("local"),           // claude 의 예전 로컬 설치
+        b.home.join(format!(".{name}")).join("bin"),             // opencode 설치 스크립트 (~/.opencode/bin)
     ];
     if let Some(cur) = b.var("PATH") {
         dirs.extend(std::env::split_paths(&cur).filter(|d| d.is_absolute()));
@@ -1049,26 +1052,27 @@ fn read_json(p: &Path) -> Result<Value> {
     parse_json(p, s)
 }
 
-/// JSON 설정의 mcpServers.ghostdesk 를 `entry` 로 바꾼다 (None 이면 지움). 다른 키·순서는 그대로.
-fn json_set_server(p: &Path, entry: Option<Value>) -> Result<()> {
+/// JSON 설정의 `<key>.ghostdesk` 를 `entry` 로 바꾼다 (None 이면 지움). 다른 키·순서는 그대로.
+/// `key` 는 서버 목록 객체의 이름 (대부분 "mcpServers", OpenCode 는 "mcp").
+fn json_set_server(p: &Path, key: &str, entry: Option<Value>) -> Result<()> {
     update_file(p, &|text| {
         let mut v = parse_json(p, text)?;
         let obj = v.as_object_mut().ok_or_else(|| anyhow!("{} 형식 오류", p.display()))?;
         match &entry {
             Some(e) => {
-                let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
+                let servers = obj.entry(key).or_insert_with(|| json!({}));
                 if servers.is_null() {
                     *servers = json!({});
                 }
                 let m = servers
                     .as_object_mut()
-                    .ok_or_else(|| anyhow!("{} 의 mcpServers 형식이 예상과 다릅니다 (고치지 않음)", p.display()))?;
+                    .ok_or_else(|| anyhow!("{} 의 {key} 형식이 예상과 다릅니다 (고치지 않음)", p.display()))?;
                 if m.get(SERVER_NAME) == Some(e) {
                     return Ok(None);
                 }
                 m.insert(SERVER_NAME.to_string(), e.clone());
             }
-            None => match obj.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+            None => match obj.get_mut(key).and_then(|s| s.as_object_mut()) {
                 Some(m) if m.contains_key(SERVER_NAME) => {
                     m.shift_remove(SERVER_NAME);
                 }
@@ -1150,15 +1154,38 @@ pub enum Client {
     ClaudeCode,
     ClaudeApp,
     Codex,
+    KimiCode,
+    OpenCode,
+    /// pi 는 MCP 를 기본 지원하지 않는다. MCP 확장(pi-mcp-adapter 등)이 읽는 ~/.pi/agent/mcp.json 에 등록한다.
+    Pi,
 }
 
 impl Client {
-    pub const ALL: [Client; 3] = [Client::ClaudeCode, Client::ClaudeApp, Client::Codex];
+    pub const ALL: [Client; 6] = [Client::ClaudeCode, Client::ClaudeApp, Client::Codex, Client::KimiCode, Client::OpenCode, Client::Pi];
     pub fn name(self) -> &'static str {
         match self {
             Client::ClaudeCode => "Claude Code",
             Client::ClaudeApp => "Claude 앱",
             Client::Codex => "Codex",
+            Client::KimiCode => "Kimi Code",
+            Client::OpenCode => "OpenCode",
+            Client::Pi => "pi",
+        }
+    }
+    /// 운영체제와 상관없이 홈 기준인 클라이언트의 설정 파일 (나머지는 None)
+    /// - Kimi Code: %KIMI_CODE_HOME% 또는 ~/.kimi-code 의 mcp.json
+    /// - OpenCode: %XDG_CONFIG_HOME% 또는 ~/.config 의 opencode/opencode.json (없고 opencode.jsonc 만 있으면 그것)
+    /// - pi: %PI_CODING_AGENT_DIR% 또는 ~/.pi/agent 의 mcp.json
+    fn home_config(self, b: &Bases) -> Option<PathBuf> {
+        match self {
+            Client::KimiCode => Some(kimi_home(b).join("mcp.json")),
+            Client::OpenCode => {
+                let d = opencode_dir(b);
+                let (json, jsonc) = (d.join("opencode.json"), d.join("opencode.jsonc"));
+                Some(if !json.exists() && jsonc.is_file() { jsonc } else { json })
+            }
+            Client::Pi => Some(pi_agent_dir(b).join("mcp.json")),
+            _ => None,
         }
     }
     /// 이 클라이언트가 읽는 설정 파일 (등록할 때 실제로 고치는 경로).
@@ -1167,12 +1194,15 @@ impl Client {
     ///   %CODEX_HOME% 또는 %USERPROFILE%\.codex 의 config.toml
     pub fn config(self) -> PathBuf {
         let b = bases();
+        if let Some(p) = self.home_config(&b) {
+            return p;
+        }
         #[cfg(windows)]
         {
             match self {
                 Client::ClaudeCode => b.var_path("CLAUDE_CONFIG_DIR").unwrap_or_else(|| b.home.clone()).join(".claude.json"),
                 Client::ClaudeApp => claude_app_config(&b),
-                Client::Codex => codex_home(&b).join("config.toml"),
+                _ => codex_home(&b).join("config.toml"),
             }
         }
         #[cfg(not(windows))]
@@ -1181,20 +1211,26 @@ impl Client {
             match self {
                 Client::ClaudeCode => h.join(".claude.json"),
                 Client::ClaudeApp => h.join("Library/Application Support/Claude/claude_desktop_config.json"),
-                Client::Codex => h.join(".codex/config.toml"),
+                _ => h.join(".codex/config.toml"),
             }
         }
     }
     /// 이 컴퓨터에 설치되어 있는가
     pub fn installed(self) -> bool {
+        let b = bases();
+        match self {
+            Client::KimiCode => return find_cli("kimi").is_some() || kimi_home(&b).exists(),
+            Client::OpenCode => return find_cli("opencode").is_some() || opencode_dir(&b).exists(),
+            Client::Pi => return find_cli("pi").is_some() || pi_agent_dir(&b).exists(),
+            _ => {}
+        }
         #[cfg(windows)]
         {
-            let b = bases();
             match self {
                 Client::ClaudeCode => find_cli("claude").is_some() || self.config().exists(),
                 Client::ClaudeApp => claude_app_installed(&b),
                 // Codex 데스크톱 앱(MSIX)도 CLI 와 같은 ~/.codex 를 쓴다
-                Client::Codex => find_cli("codex").is_some() || codex_home(&b).exists() || !package_ids(&b, "OpenAI.Codex").is_empty(),
+                _ => find_cli("codex").is_some() || codex_home(&b).exists() || !package_ids(&b, "OpenAI.Codex").is_empty(),
             }
         }
         #[cfg(not(windows))]
@@ -1202,7 +1238,7 @@ impl Client {
             match self {
                 Client::ClaudeCode => find_cli("claude").is_some() || self.config().exists(),
                 Client::ClaudeApp => Path::new("/Applications/Claude.app").exists() || self.config().parent().map(|d| d.exists()).unwrap_or(false),
-                Client::Codex => find_cli("codex").is_some() || home().join(".codex").exists(),
+                _ => find_cli("codex").is_some() || b.home.join(".codex").exists(),
             }
         }
     }
@@ -1216,6 +1252,30 @@ impl Client {
 #[cfg(windows)]
 fn codex_home(b: &Bases) -> PathBuf {
     b.var_path("CODEX_HOME").unwrap_or_else(|| b.home.join(".codex"))
+}
+
+/// Kimi Code 설정 폴더: %KIMI_CODE_HOME% 또는 ~/.kimi-code
+fn kimi_home(b: &Bases) -> PathBuf {
+    b.var_path("KIMI_CODE_HOME").unwrap_or_else(|| b.home.join(".kimi-code"))
+}
+
+/// OpenCode 전역 설정 폴더: %XDG_CONFIG_HOME%/opencode 또는 ~/.config/opencode (Windows 도 같은 규칙)
+fn opencode_dir(b: &Bases) -> PathBuf {
+    b.var_path("XDG_CONFIG_HOME").unwrap_or_else(|| b.home.join(".config")).join("opencode")
+}
+
+/// pi 에이전트 폴더: %PI_CODING_AGENT_DIR% 또는 ~/.pi/agent
+fn pi_agent_dir(b: &Bases) -> PathBuf {
+    b.var_path("PI_CODING_AGENT_DIR").unwrap_or_else(|| b.home.join(".pi").join("agent"))
+}
+
+/// JSON 설정에서 MCP 서버 목록이 들어 있는 키
+fn servers_key(c: Client) -> &'static str {
+    if c == Client::OpenCode {
+        "mcp"
+    } else {
+        "mcpServers"
+    }
 }
 
 /// 설치된 MSIX 패키지 `<이름>_<게시자 ID>` 의 게시자 ID 들 (%LOCALAPPDATA%\Packages 기준, 소문자, 정렬)
@@ -1309,7 +1369,12 @@ fn claude_app_installed(b: &Bases) -> bool {
 
 fn registered_in(c: Client, p: &Path) -> Option<String> {
     match c {
-        Client::ClaudeCode | Client::ClaudeApp => {
+        Client::OpenCode => {
+            // OpenCode 는 command 가 [실행 파일, 인자…] 배열
+            let v = read_json(p).ok()?;
+            v["mcp"][SERVER_NAME]["command"][0].as_str().map(String::from)
+        }
+        Client::ClaudeCode | Client::ClaudeApp | Client::KimiCode | Client::Pi => {
             let v = read_json(p).ok()?;
             v["mcpServers"][SERVER_NAME]["command"].as_str().map(String::from)
         }
@@ -1334,14 +1399,29 @@ pub fn status_all() -> Vec<ClientStatus> {
         .collect()
 }
 
-/// Claude Code / Claude 앱 의 mcpServers.ghostdesk 항목.
+/// JSON 설정을 쓰는 클라이언트의 ghostdesk 항목.
 /// 참고: Claude Code 에는 서버별 도구 시간 제한 필드가 없다 (전역 환경 변수 MCP_TOOL_TIMEOUT 으로만 조절).
 fn json_entry(c: Client, exe: &str) -> Value {
+    let env = json!({ "GHOSTDESK_CLIENT_NAME": c.name() });
     match c {
-        Client::ClaudeCode => json!({ "type": "stdio", "command": exe, "args": ["--mcp"], "env": { "GHOSTDESK_CLIENT_NAME": c.name() } }),
-        _ => json!({ "command": exe, "args": ["--mcp"], "env": { "GHOSTDESK_CLIENT_NAME": c.name() } }),
+        Client::ClaudeCode => json!({ "type": "stdio", "command": exe, "args": ["--mcp"], "env": env }),
+        // desk_open 은 승인 대기·GUI 실행으로 오래 걸릴 수 있어 Codex 와 같은 시간 제한을 준다
+        Client::KimiCode => json!({
+            "command": exe, "args": ["--mcp"], "env": env,
+            "startupTimeoutMs": CODEX_STARTUP_TIMEOUT_SEC * 1000,
+            "toolTimeoutMs": CODEX_TOOL_TIMEOUT_SEC * 1000,
+        }),
+        Client::OpenCode => json!({
+            "type": "local", "command": [exe, "--mcp"], "environment": env, "enabled": true, "timeout": OPENCODE_TIMEOUT_MS,
+        }),
+        // pi-mcp-adapter 는 쉬는 서버를 10분 뒤 끊는데, 연결이 끊기면 GhostDesk 가 그 연결의 화면을 닫는다 → 계속 유지
+        Client::Pi => json!({ "command": exe, "args": ["--mcp"], "env": env, "lifecycle": "lazy-keep-alive" }),
+        _ => json!({ "command": exe, "args": ["--mcp"], "env": env }),
     }
 }
+
+/// pi 등록 뒤의 안내 (pi 자체에는 MCP 가 없다)
+const PI_NOTE: &str = "pi 에는 MCP 확장이 필요: pi install npm:pi-mcp-adapter";
 
 /// Claude 앱 설정을 바꾼 뒤의 안내 (Windows 의 Claude 앱은 창을 닫아도 트레이에 남아 있다)
 const CLAUDE_APP_RESTART: &str = if cfg!(windows) {
@@ -1353,7 +1433,15 @@ const CLAUDE_APP_RESTART: &str = if cfg!(windows) {
 /// 한 클라이언트에 ghostdesk 를 등록한다 (이미 같은 경로면 그대로).
 pub fn register(c: Client, exe: &Path) -> Result<String> {
     let exe_s = exe.display().to_string();
-    if c.registered().as_deref() == Some(exe_s.as_str()) && (c != Client::Codex || codex_has_timeouts(&c.config())) {
+    let up_to_date = match c {
+        Client::Codex => codex_has_timeouts(&c.config()),
+        // 시간 제한 등 항목 전체가 같아야 그대로 둔다
+        Client::KimiCode | Client::OpenCode | Client::Pi => {
+            read_json(&c.config()).map(|v| v[servers_key(c)][SERVER_NAME] == json_entry(c, &exe_s)).unwrap_or(false)
+        }
+        _ => true,
+    };
+    if c.registered().as_deref() == Some(exe_s.as_str()) && up_to_date {
         return Ok("이미 연결됨".into());
     }
     let label = format!("GHOSTDESK_CLIENT_NAME={}", c.name());
@@ -1380,7 +1468,7 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
                 guard_write(d);
                 std::fs::create_dir_all(d)?;
             }
-            json_set_server(&p, Some(json_entry(c, &exe_s)))?;
+            json_set_server(&p, "mcpServers", Some(json_entry(c, &exe_s)))?;
             let shown = show_path(&p);
             Ok(match cli_err {
                 Some(e) => format!("{shown} 에 추가 (claude CLI 실패로 직접 수정: {})", first_line(&e.to_string())),
@@ -1393,7 +1481,7 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
                 guard_write(d);
                 std::fs::create_dir_all(d)?;
             }
-            json_set_server(&p, Some(json_entry(c, &exe_s)))?;
+            json_set_server(&p, "mcpServers", Some(json_entry(c, &exe_s)))?;
             // macOS 는 위치가 하나뿐이라 파일 이름만, Windows 는 앱 버전마다 위치가 달라 실제 경로를 보여 준다
             let shown = if cfg!(windows) { show_path(&p) } else { "claude_desktop_config.json".to_string() };
             Ok(format!("{shown} 에 추가 ({CLAUDE_APP_RESTART})"))
@@ -1408,6 +1496,19 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
             }
             codex_set_server(&p, Some(codex_table(&exe_s, c.name())))?;
             Ok(format!("{} 에 추가", show_path(&p)))
+        }
+        // 세 클라이언트 모두 CLI 없이 JSON 파일을 직접 고친다 (kimi/opencode CLI 는 대화형이거나 시간 제한을 못 넣음)
+        Client::KimiCode | Client::OpenCode | Client::Pi => {
+            let p = c.config();
+            if let Some(d) = p.parent() {
+                guard_write(d);
+                std::fs::create_dir_all(d)?;
+            }
+            json_set_server(&p, servers_key(c), Some(json_entry(c, &exe_s)))?;
+            Ok(match c {
+                Client::Pi => format!("{} 에 추가 ({PI_NOTE})", show_path(&p)),
+                _ => format!("{} 에 추가", show_path(&p)),
+            })
         }
     }
 }
@@ -1446,15 +1547,19 @@ pub fn unregister(c: Client) -> Result<String> {
                     return Ok("해제됨".into());
                 }
             }
-            json_set_server(&p, None)?;
+            json_set_server(&p, "mcpServers", None)?;
             Ok(removed_msg(&p, None))
         }
         Client::ClaudeApp => {
-            json_set_server(&p, None)?;
+            json_set_server(&p, "mcpServers", None)?;
             Ok(removed_msg(&p, Some(CLAUDE_APP_RESTART)))
         }
         Client::Codex => {
             codex_set_server(&p, None)?;
+            Ok(removed_msg(&p, None))
+        }
+        Client::KimiCode | Client::OpenCode | Client::Pi => {
+            json_set_server(&p, servers_key(c), None)?;
             Ok(removed_msg(&p, None))
         }
     }
@@ -1621,7 +1726,7 @@ mod tests {
         let p = h.path(".claude.json");
         std::fs::write(&p, "{\"a\":1}").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        json_set_server(&p, Some(json!({"command": "/x/ghostdesk"}))).unwrap();
+        json_set_server(&p, "mcpServers", Some(json!({"command": "/x/ghostdesk"}))).unwrap();
         assert_eq!(mode_of(&p), 0o600, "권한이 넓어지면 안 됨");
         assert_eq!(read_json(&p).unwrap()["mcpServers"][SERVER_NAME]["command"], "/x/ghostdesk");
         assert_eq!(mode_of(&with_suffix(&p, ".ghostdesk-backup")), 0o600, "백업도 같은 권한");
@@ -1631,13 +1736,13 @@ mod tests {
         let q = h.path("other.json");
         std::fs::write(&q, "{}").unwrap();
         std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o640)).unwrap();
-        json_set_server(&q, Some(json!({"command": "c"}))).unwrap();
+        json_set_server(&q, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(mode_of(&q), 0o640);
 
         // 새 파일은 0600
         let n = h.path("new/claude_desktop_config.json");
         std::fs::create_dir_all(n.parent().unwrap()).unwrap();
-        json_set_server(&n, Some(json!({"command": "c"}))).unwrap();
+        json_set_server(&n, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(mode_of(&n), 0o600);
 
         // 심볼릭 링크: 링크는 그대로, 실제 대상 파일이 바뀜
@@ -1647,7 +1752,7 @@ mod tests {
         std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o600)).unwrap();
         let link = h.path("link.json");
         symlink("dotfiles/claude.json", &link).unwrap();
-        json_set_server(&link, Some(json!({"command": "/x/ghostdesk"}))).unwrap();
+        json_set_server(&link, "mcpServers", Some(json!({"command": "/x/ghostdesk"}))).unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "링크가 일반 파일로 바뀌면 안 됨");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&dot).unwrap()).unwrap();
         assert_eq!(v["keep"], true);
@@ -1669,25 +1774,25 @@ mod tests {
         let p = h.path(".claude.json");
         let broken = "{\"oauthAccount\": {\"x\": 1}, broken";
         std::fs::write(&p, broken).unwrap();
-        assert!(json_set_server(&p, Some(json!({"command": "c"}))).is_err());
+        assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), broken, "해석 못 하는 파일은 덮어쓰지 않음");
 
         // 잘못된 UTF-8
         std::fs::write(&p, b"{\"a\": \"\xff\xfe\"}").unwrap();
-        assert!(json_set_server(&p, Some(json!({"command": "c"}))).is_err());
+        assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\": \"\xff\xfe\"}");
 
         // 최상위가 객체가 아님 / mcpServers 가 객체가 아님 → 패닉 없이 오류
         std::fs::write(&p, "[1,2]").unwrap();
-        assert!(json_set_server(&p, Some(json!({"command": "c"}))).is_err());
+        assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         std::fs::write(&p, "{\"mcpServers\": \"x\"}").unwrap();
-        assert!(json_set_server(&p, Some(json!({"command": "c"}))).is_err());
+        assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"mcpServers\": \"x\"}");
 
         // 읽을 수 없는 경로 (디렉터리)
         let d = h.path("dir.json");
         std::fs::create_dir_all(&d).unwrap();
-        assert!(json_set_server(&d, Some(json!({"command": "c"}))).is_err());
+        assert!(json_set_server(&d, "mcpServers", Some(json!({"command": "c"}))).is_err());
 
         // Codex: 해석 못 하는 TOML 은 그대로
         let c = h.path("config.toml");
@@ -1698,7 +1803,7 @@ mod tests {
 
         // 없는 파일은 빈 설정으로 시작
         let missing = h.path("missing.json");
-        json_set_server(&missing, Some(json!({"command": "c"}))).unwrap();
+        json_set_server(&missing, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(read_json(&missing).unwrap()["mcpServers"][SERVER_NAME]["command"], "c");
     }
 
@@ -1709,17 +1814,17 @@ mod tests {
         let original = "{\"original\": true}";
         std::fs::write(&p, original).unwrap();
         let b = with_suffix(&p, ".ghostdesk-backup");
-        json_set_server(&p, Some(json!({"command": "/a"}))).unwrap();
+        json_set_server(&p, "mcpServers", Some(json!({"command": "/a"}))).unwrap();
         assert_eq!(std::fs::read_to_string(&b).unwrap(), original);
-        json_set_server(&p, None).unwrap();
-        json_set_server(&p, Some(json!({"command": "/b"}))).unwrap();
+        json_set_server(&p, "mcpServers", None).unwrap();
+        json_set_server(&p, "mcpServers", Some(json!({"command": "/b"}))).unwrap();
         assert_eq!(std::fs::read_to_string(&b).unwrap(), original, "백업은 처음 원본 그대로");
         // 바꿀 것이 없으면 쓰지 않음
         let before = std::fs::read_to_string(&p).unwrap();
-        json_set_server(&p, Some(json!({"command": "/b"}))).unwrap();
+        json_set_server(&p, "mcpServers", Some(json!({"command": "/b"}))).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
         // 해제하면 다른 키는 남고 ghostdesk 만 빠짐
-        json_set_server(&p, None).unwrap();
+        json_set_server(&p, "mcpServers", None).unwrap();
         let v = read_json(&p).unwrap();
         assert_eq!(v["original"], true);
         assert!(v["mcpServers"].get(SERVER_NAME).is_none());
@@ -1801,7 +1906,7 @@ mod tests {
         let p = h.path(".claude.json");
         std::fs::write(&p, "\u{FEFF}{\n  \"numStartups\": 3,\n  \"mcpServers\": {\"other\": {\"command\": \"x\"}}\n}").unwrap();
         assert!(read_json(&p).is_ok(), "BOM 이 있어도 읽음");
-        json_set_server(&p, Some(json_entry(Client::ClaudeCode, exe))).unwrap();
+        json_set_server(&p, "mcpServers", Some(json_entry(Client::ClaudeCode, exe))).unwrap();
         let bytes = std::fs::read(&p).unwrap();
         assert!(bytes.starts_with(&BOM), "BOM 유지");
         assert!(!bytes[3..].starts_with(&BOM), "BOM 이 두 번 붙으면 안 됨");
@@ -1811,7 +1916,7 @@ mod tests {
         assert_eq!(v["mcpServers"][SERVER_NAME]["type"], "stdio");
         assert_eq!(registered_in(Client::ClaudeCode, &p).as_deref(), Some(exe));
         assert!(std::fs::read(with_suffix(&p, ".ghostdesk-backup")).unwrap().starts_with(&BOM), "백업은 원본 그대로");
-        json_set_server(&p, None).unwrap();
+        json_set_server(&p, "mcpServers", None).unwrap();
         assert!(std::fs::read(&p).unwrap().starts_with(&BOM));
         assert!(registered_in(Client::ClaudeCode, &p).is_none());
         assert_eq!(read_json(&p).unwrap()["mcpServers"]["other"]["command"], "x");
@@ -1819,7 +1924,7 @@ mod tests {
         // BOM 없는 파일에는 붙이지 않음
         let q = h.path("plain.json");
         std::fs::write(&q, "{}").unwrap();
-        json_set_server(&q, Some(json!({"command": "c"}))).unwrap();
+        json_set_server(&q, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert!(!std::fs::read(&q).unwrap().starts_with(&BOM));
 
         // Codex config.toml
@@ -1872,7 +1977,7 @@ mod tests {
         .enumerate()
         {
             let p = h.path(&format!("claude_desktop_config-{i}.json"));
-            json_set_server(&p, Some(json_entry(Client::ClaudeApp, exe))).unwrap();
+            json_set_server(&p, "mcpServers", Some(json_entry(Client::ClaudeApp, exe))).unwrap();
             let raw = std::fs::read_to_string(&p).unwrap();
             let v: Value = serde_json::from_str(&raw).expect("올바른 JSON");
             assert_eq!(v["mcpServers"][SERVER_NAME]["command"].as_str(), Some(exe));
@@ -1922,6 +2027,58 @@ mod tests {
         assert!(st.iter().any(|s| s.client == Client::Codex && s.installed && s.registered.is_some()));
     }
 
+    /// Kimi Code · OpenCode · pi: 위치, 항목 모양, 다른 설정 보존, 환경변수
+    #[test]
+    fn kimi_opencode_pi_entries() {
+        let h = FakeHome::new("harness");
+        let exe = Path::new("/x/ghostdesk");
+        let home = bases().home;
+        assert_eq!(Client::KimiCode.config(), home.join(".kimi-code").join("mcp.json"));
+        assert_eq!(Client::OpenCode.config(), home.join(".config").join("opencode").join("opencode.json"));
+        assert_eq!(Client::Pi.config(), home.join(".pi").join("agent").join("mcp.json"));
+        assert!(!Client::KimiCode.installed() && !Client::OpenCode.installed() && !Client::Pi.installed());
+
+        // OpenCode: opencode.jsonc 만 있으면 그 파일을 고치고, 다른 설정은 그대로
+        let oc = home.join(".config").join("opencode");
+        mkdir(&oc);
+        std::fs::write(oc.join("opencode.jsonc"), r#"{"$schema":"https://opencode.ai/config.json","provider":{"p":{}}}"#).unwrap();
+        assert!(Client::OpenCode.installed());
+        assert_eq!(Client::OpenCode.config(), oc.join("opencode.jsonc"));
+        register(Client::OpenCode, exe).unwrap();
+        let v = read_json(&oc.join("opencode.jsonc")).unwrap();
+        assert_eq!(v["provider"], json!({"p":{}}));
+        let g = &v["mcp"][SERVER_NAME];
+        assert_eq!((g["type"].as_str(), g["command"].clone()), (Some("local"), json!(["/x/ghostdesk", "--mcp"])));
+        assert_eq!(g["environment"]["GHOSTDESK_CLIENT_NAME"], "OpenCode");
+        assert_eq!(Client::OpenCode.registered().as_deref(), Some("/x/ghostdesk"));
+        // 주석이 있는 JSONC 는 해석하지 못하므로 덮어쓰지 않는다
+        std::fs::write(oc.join("opencode.jsonc"), "{ // 주석\n}").unwrap();
+        assert!(register(Client::OpenCode, Path::new("/y")).is_err());
+        assert_eq!(std::fs::read_to_string(oc.join("opencode.jsonc")).unwrap(), "{ // 주석\n}");
+
+        // Kimi: 시간 제한, 예전 항목(시간 제한 없음)은 다시 쓴다
+        let kp = Client::KimiCode.config();
+        mkdir(kp.parent().unwrap());
+        std::fs::write(&kp, r#"{"mcpServers":{"other":{"command":"a"},"ghostdesk":{"command":"/x/ghostdesk"}}}"#).unwrap();
+        assert_ne!(register(Client::KimiCode, exe).unwrap(), "이미 연결됨");
+        let v = read_json(&kp).unwrap();
+        assert_eq!(v["mcpServers"]["other"]["command"], "a");
+        assert_eq!(v["mcpServers"][SERVER_NAME]["toolTimeoutMs"], CODEX_TOOL_TIMEOUT_SEC * 1000);
+        assert_eq!(register(Client::KimiCode, exe).unwrap(), "이미 연결됨");
+
+        // pi: 연결 유지 + 확장 안내
+        assert!(register(Client::Pi, exe).unwrap().contains("pi-mcp-adapter"));
+        assert_eq!(read_json(&Client::Pi.config()).unwrap()["mcpServers"][SERVER_NAME]["lifecycle"], "lazy-keep-alive");
+
+        // 환경변수로 바꾼 위치
+        h.set_env("KIMI_CODE_HOME", h.path("k"));
+        h.set_env("XDG_CONFIG_HOME", h.path("xdg"));
+        h.set_env("PI_CODING_AGENT_DIR", h.path("pi"));
+        assert_eq!(Client::KimiCode.config(), h.path("k").join("mcp.json"));
+        assert_eq!(Client::OpenCode.config(), h.path("xdg").join("opencode").join("opencode.json"));
+        assert_eq!(Client::Pi.config(), h.path("pi").join("mcp.json"));
+    }
+
     /// 테스트는 실제 사용자 파일을 절대 건드리지 않는다
     #[test]
     fn tests_never_touch_real_user_files() {
@@ -1950,7 +2107,7 @@ mod tests {
         let o = outside.clone();
         assert!(std::thread::spawn(move || write_atomic(&o, b"{}", None)).join().is_err(), "write_atomic 은 막혀야 함");
         let o = outside.clone();
-        assert!(std::thread::spawn(move || json_set_server(&o, Some(json!({})))).join().is_err());
+        assert!(std::thread::spawn(move || json_set_server(&o, "mcpServers", Some(json!({})))).join().is_err());
         let o = outside.clone();
         assert!(std::thread::spawn(move || codex_set_server(&o, Some(codex_table("x", "Codex")))).join().is_err());
         let o = outside.clone();
@@ -2284,7 +2441,7 @@ mod tests {
         // 보통처럼 열어 둔 상태 (삭제 공유 허용: Node·Rust 의 기본값)
         {
             let _reader = std::fs::File::open(&p).unwrap();
-            json_set_server(&p, Some(json!({"command": "c"}))).unwrap();
+            json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         }
         assert_eq!(read_json(&p).unwrap()["mcpServers"][SERVER_NAME]["command"], "c");
         assert_eq!(read_json(&p).unwrap()["a"], 1);
@@ -2292,12 +2449,12 @@ mod tests {
         {
             let _lock = std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ */).open(&p).unwrap();
             let before = std::fs::read(&p).unwrap();
-            let e = json_set_server(&p, Some(json!({"command": "d"}))).unwrap_err();
+            let e = json_set_server(&p, "mcpServers", Some(json!({"command": "d"}))).unwrap_err();
             assert!(format!("{e:#}").contains("바꾸지 못했습니다"), "{e:#}");
             assert_eq!(std::fs::read(&p).unwrap(), before);
             assert!(!with_suffix(&p, ".ghostdesk-tmp").exists());
         }
-        json_set_server(&p, Some(json!({"command": "d"}))).unwrap();
+        json_set_server(&p, "mcpServers", Some(json!({"command": "d"}))).unwrap();
     }
 
     /// 이 컴퓨터의 실제 위치를 보여 주기만 한다 (읽기 전용: 폴더 목록·존재 여부만 보고 파일 내용은 읽지 않는다).

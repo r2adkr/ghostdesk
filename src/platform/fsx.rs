@@ -12,13 +12,6 @@ pub fn strip_bom(s: &str) -> (&str, bool) {
     }
 }
 
-/// BOM 을 떼고 읽는다.
-pub fn read_text(p: &Path) -> std::io::Result<String> {
-    let s = std::fs::read_to_string(p)?;
-    let (t, _) = strip_bom(&s);
-    Ok(t.to_string())
-}
-
 /// Windows 에서 다른 프로세스(백신·인덱서·사용자 앱)가 잠깐 파일을 쥐고 있어 생기는
 /// 공유 위반(32)·잠금 위반(33)·접근 거부(5)인가.
 pub fn is_transient_lock(e: &std::io::Error) -> bool {
@@ -59,22 +52,6 @@ pub fn remove_file_retry(p: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         r => r,
     })
-}
-
-/// 같은 사용자만 읽고 쓸 수 있게 한다. Unix: 0600 (폴더면 0700).
-/// Windows: %LOCALAPPDATA% 아래는 기본 ACL 이 이미 본인·SYSTEM·Administrators 로 한정되므로 아무것도 하지 않는다.
-pub fn set_private(p: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if p.is_dir() { 0o700 } else { 0o600 };
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = p;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

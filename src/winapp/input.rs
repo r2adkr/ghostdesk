@@ -219,7 +219,8 @@ pub fn plan_combo(combo: &str) -> Result<KeyPlan> {
     let vk = c.main.key_code as u32;
     let ctrl = c.mods & MOD_CTRL != 0;
     let alt = c.mods & MOD_ALT != 0;
-    if c.mods & MOD_META != 0 || vk == 0x5B || vk == 91 {
+    // 0x5B/0x5C = 왼쪽/오른쪽 Windows 키
+    if c.mods & MOD_META != 0 || vk == 0x5B || vk == 0x5C {
         bail!("Windows 키 조합은 앱에 보낼 수 없습니다 (시작 메뉴·시스템 단축키는 사용자 세션 전체에 작용)");
     }
     // 메뉴 모드·시스템 메뉴·컨텍스트 메뉴는 사용자 화면에 팝업을 그린다

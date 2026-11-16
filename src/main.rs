@@ -1,6 +1,6 @@
 //! GhostDesk — 사용자의 화면·마우스·키보드·브라우저 창을 전혀 건드리지 않고,
-//! 사용자 브라우저 프로필(로그인 상태)을 복제한 격리 브라우저 위에서
-//! 하나 또는 여러 Claude computer-use 에이전트를 동시에 돌리는 데스크톱 앱.
+//! 격리된 화면(로그인을 복사한 브라우저·숨긴 앱·별도 세션·원격 데스크톱) 위에서
+//! 하나 또는 여러 computer-use 에이전트(Claude·GPT·Gemini 등)를 동시에 돌리는 데스크톱 앱.
 //!
 //! Windows 에서도 콘솔 서브시스템 실행 파일이다: MCP 호스트(stdio)와 `--connect`·`--selftest*` 같은
 //! 명령줄 모드가 표준 입출력과 종료 코드를 그대로 쓰게 하기 위해서다. GUI 로 실행되면 이 프로세스만을 위해
@@ -105,6 +105,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if background {
         viewport = viewport.with_active(false);
+    }
+    // Windows: 기본 창 틀 대신 앱이 제목 표시줄을 그린다 (app/titlebar.rs). 제목은 작업 표시줄·Alt+Tab 용으로 남긴다.
+    #[cfg(windows)]
+    {
+        viewport = viewport.with_decorations(false);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(

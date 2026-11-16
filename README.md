@@ -18,7 +18,7 @@ The UI is currently in Korean. Windows 10/11 x64 is supported; a supported Chrom
 
 | | 여기서 바로 실행 | 다른 앱의 에이전트가 사용 (MCP) |
 |---|---|---|
-| 누가 일하나 | GhostDesk 안의 Claude 에이전트 | Claude 앱 · Claude Code · Codex 등 |
+| 누가 일하나 | GhostDesk 안의 Claude 에이전트 | Claude 앱 · Claude Code · Codex · Kimi Code · OpenCode · pi 등 |
 | 필요한 것 | Claude API 키 (⚙ 설정) | 없음 (연결만) |
 | 시작 | **+ 새 에이전트** → 무엇을 조작할지 고르고 할 일 입력 | 상단의 **외부 연결** → 모두 연결 (또는 설정 붙여 넣기) |
 
@@ -48,12 +48,13 @@ cargo build --release
 - **직접 조작** 으로 언제든 사람이 넘겨받아(로그인·2단계 인증 등) 도울 수 있습니다.
 - 상단의 **화면 모아보기** 는 목록·패널 없이 모든 에이전트의 화면만 창 가득 크게 모아 보여 줍니다 (F11 — macOS 는 ⌃⌘F — 전체 화면, Esc 닫기). 질문을 기다리거나 오류가 난 에이전트는 노랑·빨강 테두리로 표시됩니다.
 
-## 외부 에이전트 연결 (Claude 앱 / Claude Code / Codex) — 자동
+## 외부 에이전트 연결 (Claude 앱 / Claude Code / Codex / Kimi Code / OpenCode / pi) — 자동
 
-GhostDesk 를 켜면 자동으로 `~/Applications/GhostDesk.app` 에 설치되고, 이 Mac 에 있는 **Claude Code · Claude 앱 · Codex 에 MCP 서버로 등록**됩니다.
+GhostDesk 를 켜면 자동으로 `~/Applications/GhostDesk.app` 에 설치되고, 이 Mac 에 있는 **Claude Code · Claude 앱 · Codex · Kimi Code · OpenCode · pi 에 MCP 서버로 등록**됩니다.
 그다음부터는 그 에이전트에게 **"GhostDesk 로 …해줘"** 라고만 말하면 됩니다 (Claude 앱은 한 번 재시작 필요).
 
-- 등록 방법: Claude Code 는 `claude mcp add --scope user`, Claude 앱은 `claude_desktop_config.json`, Codex 는 `~/.codex/config.toml` (서식·주석·다른 서버 보존, 고치기 전 `.ghostdesk-backup` 백업)
+- 등록 방법: Claude Code 는 `claude mcp add --scope user`, Claude 앱은 `claude_desktop_config.json`, Codex 는 `~/.codex/config.toml`, Kimi Code 는 `~/.kimi-code/mcp.json`, OpenCode 는 `~/.config/opencode/opencode.json`(`opencode.jsonc` 만 있으면 그 파일, 주석이 있으면 고치지 않음), pi 는 `~/.pi/agent/mcp.json` (서식·주석·다른 서버 보존, 고치기 전 `.ghostdesk-backup` 백업)
+- **pi 는 MCP 를 기본 지원하지 않습니다.** 등록 뒤 한 번 `pi install npm:pi-mcp-adapter` 로 MCP 확장을 설치하고 pi 를 다시 시작하세요. 이 확장은 쉬는 서버를 끊는데 연결이 끊기면 GhostDesk 화면도 닫히므로, 항목에 `"lifecycle": "lazy-keep-alive"` 를 넣어 둡니다.
 - 상태 확인·해제·자동 연결 끄기: 상단의 **외부 연결** 창
 - 터미널: `ghostdesk --connect` / `ghostdesk --disconnect`
 
@@ -71,6 +72,12 @@ claude mcp add ghostdesk -e GHOSTDESK_CLIENT_NAME="Claude Code" -- "/Application
 [mcp_servers.ghostdesk]
 command = "/Applications/GhostDesk.app/Contents/MacOS/ghostdesk"
 args = ["--mcp"]
+```
+
+Kimi Code (`~/.kimi-code/mcp.json`) · pi (`~/.pi/agent/mcp.json`) 는 위 JSON 과 같은 `mcpServers` 형식이고, OpenCode 는 `mcp` 아래에 명령을 배열로 씁니다:
+
+```json
+"mcp": { "ghostdesk": { "type": "local", "command": ["/Applications/GhostDesk.app/Contents/MacOS/ghostdesk", "--mcp"], "enabled": true, "timeout": 30000 } }
 ```
 
 제공 도구: `desk_open`(browser / app / session / remote), `desk_action`(computer-use 동작: 클릭·입력·스크롤… 결과로 스크린샷), `desk_browser`(주소 이동·탭), `desk_app`(앱 메뉴·접근성 요소), `desk_list`, `desk_close`.
@@ -125,7 +132,7 @@ Windows 10/11 에서 같은 GUI·MCP 서버가 동작합니다 (Windows 11 x64 �
    ```powershell
    cargo build --release
    .\target\release\ghostdesk.exe              # GUI
-   .\target\release\ghostdesk.exe --connect    # 설치 + Claude Code · Claude 앱 · Codex 연결
+   .\target\release\ghostdesk.exe --connect    # 설치 + Claude Code · Claude 앱 · Codex · Kimi Code · OpenCode · pi 연결
    ```
 - C 런타임을 정적으로 링크하므로(`.cargo/config.toml`) 다른 PC 에 `ghostdesk.exe` 하나만 복사해도 실행됩니다.
 - `ghostdesk.exe` 는 MCP(stdio)·명령줄 모드 때문에 콘솔 프로그램이지만, 탐색기에서 더블클릭하면 콘솔 창 없이 GUI 만 뜹니다
@@ -185,6 +192,9 @@ GhostDesk 를 켜면(또는 `ghostdesk.exe --connect`) `%LOCALAPPDATA%\Programs\
 | Claude Code | `claude mcp add --scope user` (CLI 가 없거나 실패하면 `%USERPROFILE%\.claude.json` 직접 수정, `CLAUDE_CONFIG_DIR` 지원) |
 | Claude 앱 | Microsoft Store 판: `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`, 설치 프로그램 판: `%APPDATA%\Claude\claude_desktop_config.json` — **트레이 아이콘에서 완전히 종료한 뒤** 다시 실행해야 적용 |
 | Codex | `%CODEX_HOME%\config.toml` 또는 `%USERPROFILE%\.codex\config.toml` |
+| Kimi Code | `%KIMI_CODE_HOME%\mcp.json` 또는 `%USERPROFILE%\.kimi-code\mcp.json` |
+| OpenCode | `%XDG_CONFIG_HOME%\opencode\opencode.json` 또는 `%USERPROFILE%\.config\opencode\opencode.json` (`opencode.jsonc` 만 있으면 그 파일) |
+| pi | `%PI_CODING_AGENT_DIR%\mcp.json` 또는 `%USERPROFILE%\.pi\agent\mcp.json` — `pi install npm:pi-mcp-adapter` 필요 |
 
 - 실행 중인 `ghostdesk.exe` 위에 새 버전을 설치하면 기존 파일을 `ghostdesk.exe.old-*` 로 밀어 두고 바꿉니다(다음 설치 때 정리).
 - 제어 연결은 유닉스 소켓 대신 이름 있는 파이프 `\\.\pipe\GhostDesk-control-<사용자 SID>` 입니다 (같은 사용자만 접근하도록 ACL 설정, 원격 접속 거부, 양쪽에서 상대 사용자 확인,
@@ -225,7 +235,7 @@ cargo test
 | `src/platform/*` | 운영체제 차이 흡수 (경로, 프로세스 그룹/Job, 제어 IPC 소켓/파이프, 단축키 변환, 기능 지원 여부, Win32 도우미) |
 | `src/session.rs`, `src/winapp/child.rs` | macOS 전용 계정·Windows 자식 세션의 헬퍼 RPC, 화면 캡처·입력, 명명 파이프/소켓 연결 |
 | `src/vdisplay.rs` | 실험: CGVirtualDisplay 가상 모니터 위 앱 조작 |
-| `src/install.rs` | ~/Applications (Windows: %LOCALAPPDATA%\Programs\GhostDesk) 설치 + Claude Code·Claude 앱·Codex 자동 연결 |
+| `src/install.rs` | ~/Applications (Windows: %LOCALAPPDATA%\Programs\GhostDesk) 설치 + Claude Code·Claude 앱·Codex·Kimi Code·OpenCode·pi 자동 연결 |
 | `build.rs`, `windows/ghostdesk.exe.manifest` | Windows 실행 파일 매니페스트 (탐색기 실행 시 콘솔 없음) |
 | `src/rfb.rs` | VNC(RFB) 클라이언트 |
 | `src/control.rs`, `src/mcp.rs` | 외부 에이전트용 제어 소켓과 MCP 서버 |

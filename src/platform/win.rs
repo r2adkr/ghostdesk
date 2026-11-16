@@ -451,7 +451,6 @@ pub struct TopWindow {
     pub cloaked: bool,
     /// 레이어드 창의 투명도 (None 이면 레이어드 아님 / 알 수 없음)
     pub alpha: Option<u8>,
-    pub tool_window: bool,
 }
 
 impl TopWindow {
@@ -495,7 +494,7 @@ pub fn window_info(hwnd: HWND) -> TopWindow {
     use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, IsIconic,
-        IsWindowVisible, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+        IsWindowVisible, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
     };
     unsafe {
         let mut title = [0u16; 256];
@@ -528,7 +527,6 @@ pub fn window_info(hwnd: HWND) -> TopWindow {
             minimized: IsIconic(hwnd) != 0,
             cloaked: cloaked != 0,
             alpha,
-            tool_window: ex & WS_EX_TOOLWINDOW != 0,
         }
     }
 }

@@ -210,7 +210,9 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
             },
         } },
         max_steps: 10,
+        reply_lang: "Korean",
         llm: Llm::new(
+            crate::llm::Provider::Anthropic,
             std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "test".into()),
             "claude-opus-5-5".into(),
             "medium".into(),
@@ -223,7 +225,8 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
         {
             let log = shared.log.lock();
-            for l in &log[printed..] {
+            // 기록은 오래되면 앞에서부터 버려지므로 범위를 넘지 않게 읽는다
+            for l in log.get(printed..).unwrap_or_default() {
                 println!("[{:>5.1}s] {:?}: {}", l.secs, l.kind, l.text);
             }
             printed = log.len();

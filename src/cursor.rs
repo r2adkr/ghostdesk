@@ -12,12 +12,14 @@ use std::{
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use serde_json::Value;
 
+use crate::{agent::coord, llm::short};
+
 /// 효과가 화면에 남아 있는 시간
 const FX_LIFE: Duration = Duration::from_millis(1600);
 /// 궤적이 남아 있는 시간
 const TRAIL_LIFE: Duration = Duration::from_millis(2500);
 /// 키 입력 효과 라벨 앞의 기호. macOS 는 ⌘(기존과 같음), 그 밖은 Lucide 키보드 아이콘.
-/// 여기서는 '기본 수정키'가 아니라 '키를 눌렀다'는 표시이므로 platform::text::PRIMARY_MOD_LABEL("Ctrl")을
+/// 여기서는 '기본 수정키'가 아니라 '키를 눌렀다'는 표시이므로 "Ctrl" 같은 수정키 이름을
 /// 쓰지 않는다 ("Ctrl Return" 처럼 잘못 읽히지 않게). Windows 사용자에게 ⌘ 는 낯선 Mac 전용 기호다.
 const KEY_GLYPH: &str = if cfg!(target_os = "macos") { "⌘" } else { crate::icon::KEYBOARD };
 
@@ -72,19 +74,6 @@ pub struct CursorState {
     pub fx: VecDeque<CursorFx>,
     pub trail: VecDeque<((f64, f64), Instant)>,
     pub last_change: Option<Instant>,
-}
-
-fn coord(v: &Value) -> Option<(f64, f64)> {
-    let a = v.as_array()?;
-    Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
-}
-
-fn short(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(n).collect::<String>())
-    }
 }
 
 impl CursorState {

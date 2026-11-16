@@ -1,0 +1,311 @@
+//! OpenAI 호환 Chat Completions (GPT·Gemini·Grok·OpenRouter·Mistral·Ollama).
+//!
+//! 에이전트의 대화(Claude 형식)를 보내기 직전에 이 형식으로 바꾸고, 답을 Claude 형식으로 되돌린다.
+//! - Claude 의 computer toolset 은 `computer` 함수 하나(action + 인자)로 흉내 낸다.
+//!   답의 `computer` 호출은 toolset 호출(`name` = 동작, `toolset_name`)로 바꿔 돌려준다.
+//! - 오래된 스크린샷은 에이전트가 이미 글로 바꿔 두므로(agent::history) 여기서는 있는 그대로 옮긴다.
+
+use anyhow::{anyhow, bail, Result};
+use base64::Engine as _;
+use serde_json::{json, Value};
+
+use super::{short, Llm};
+
+impl Llm {
+    pub(super) async fn send_openai(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": to_messages(system, messages),
+            "tools": to_tools(tools),
+            "tool_choice": "auto",
+        });
+        if self.provider.takes_effort() {
+            body["reasoning_effort"] = json!(effort(&self.effort));
+        }
+        let url = format!("{}/chat/completions", self.provider.base_url());
+        let resp = match self.post(&url, &body, &[]).await {
+            // 생각 깊이를 받지 않는 모델(예: gpt-4.1)이면 빼고 한 번 더
+            Err(e) if body.get("reasoning_effort").is_some() && format!("{e:#}").contains("reasoning") => {
+                body.as_object_mut().unwrap().remove("reasoning_effort");
+                self.post(&url, &body, &[]).await?
+            }
+            r => r?,
+        };
+        from_response(&resp)
+    }
+}
+
+/// Claude 의 effort(low~max) → OpenAI 의 reasoning_effort(low/medium/high)
+fn effort(e: &str) -> &'static str {
+    match e {
+        "low" => "low",
+        "medium" => "medium",
+        _ => "high",
+    }
+}
+
+/// Claude computer toolset 을 대신하는 함수 하나
+fn computer_function() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "computer",
+            "description": "Operate the screen shown in the screenshots. Coordinates are integer pixels [x, y] in the most recent screenshot (its size is written next to it). \
+Actions: screenshot; left_click / right_click / middle_click / double_click / triple_click (coordinate; text = modifier keys to hold, e.g. \"shift\"); mouse_move (coordinate); \
+left_click_drag (start_coordinate -> coordinate); left_mouse_down; left_mouse_up; scroll (coordinate, scroll_direction, scroll_amount); type (text); \
+key (text, xdotool style such as \"Return\", \"ctrl+s\", \"alt+Tab\"; repeat); hold_key (text, duration); wait (duration seconds); zoom (region [x0, y0, x1, y1] to see details); cursor_position.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": [
+                        "screenshot", "left_click", "right_click", "middle_click", "double_click", "triple_click", "mouse_move",
+                        "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "wait", "zoom", "cursor_position"
+                    ] },
+                    "coordinate": { "type": "array", "items": { "type": "integer" }, "description": "[x, y]" },
+                    "start_coordinate": { "type": "array", "items": { "type": "integer" }, "description": "[x, y] drag start" },
+                    "text": { "type": "string" },
+                    "scroll_direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+                    "scroll_amount": { "type": "integer" },
+                    "duration": { "type": "number" },
+                    "repeat": { "type": "integer" },
+                    "region": { "type": "array", "items": { "type": "integer" }, "description": "[x0, y0, x1, y1]" }
+                },
+                "required": ["action"]
+            }
+        }
+    })
+}
+
+fn to_tools(tools: &Value) -> Value {
+    let out = list(tools)
+        .iter()
+        .map(|t| {
+            if t["type"].as_str().is_some_and(|s| s.starts_with("computer")) {
+                computer_function()
+            } else {
+                json!({ "type": "function", "function": {
+                    "name": t["name"], "description": t["description"], "parameters": t["input_schema"]
+                } })
+            }
+        })
+        .collect();
+    Value::Array(out)
+}
+
+/// 스크린샷 블록 → OpenAI 이미지 조각 (앞에 크기를 적어 좌표를 맞추게 한다)
+fn image_parts(b: &Value) -> Vec<Value> {
+    let media = b["source"]["media_type"].as_str().unwrap_or("image/jpeg");
+    let data = b["source"]["data"].as_str().unwrap_or_default();
+    let mut out = Vec::with_capacity(2);
+    if let Some((w, h)) = image_size(data) {
+        out.push(json!({ "type": "text", "text": format!("[screenshot {w}x{h} px]") }));
+    }
+    out.push(json!({ "type": "image_url", "image_url": { "url": format!("data:{media};base64,{data}") } }));
+    out
+}
+
+fn image_size(b64: &str) -> Option<(u32, u32)> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn list(v: &Value) -> &[Value] {
+    v.as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Claude 형식 assistant 턴 → OpenAI assistant 메시지. 글도 호출도 없으면(사고만 있었으면) 보내지 않는다:
+/// 빈 assistant 메시지는 여러 제공자가 거절한다.
+fn assistant_message(blocks: &[Value]) -> Option<Value> {
+    let text: Vec<&str> = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+    let calls: Vec<Value> = blocks
+        .iter()
+        .filter(|b| b["type"] == "tool_use")
+        .map(|b| {
+            let (name, args) = if b.get("toolset_name").is_some() {
+                let mut a = if b["input"].is_object() { b["input"].clone() } else { json!({}) };
+                a["action"] = b["name"].clone();
+                ("computer", a)
+            } else {
+                (b["name"].as_str().unwrap_or_default(), b["input"].clone())
+            };
+            let mut c = json!({ "id": b["id"], "type": "function", "function": { "name": name, "arguments": args.to_string() } });
+            // Gemini 의 thought signature 같은 제공자 전용 값은 받은 그대로 되돌려 보낸다
+            if let Some(x) = b.get("_extra") {
+                c["extra_content"] = x.clone();
+            }
+            c
+        })
+        .collect();
+    let text = text.join("\n");
+    if text.trim().is_empty() && calls.is_empty() {
+        return None;
+    }
+    // 호출만 있으면 content 는 null (OpenAI 규격. 빈 문자열을 거절하는 제공자가 있다)
+    let mut msg = json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) } });
+    if !calls.is_empty() {
+        msg["tool_calls"] = Value::Array(calls);
+    }
+    Some(msg)
+}
+
+fn to_messages(system: &str, messages: &[Value]) -> Vec<Value> {
+    let mut out = vec![json!({ "role": "system", "content": system })];
+    for m in messages {
+        if m["role"] == "assistant" {
+            out.extend(assistant_message(list(&m["content"])));
+            continue;
+        }
+        if let Some(s) = m["content"].as_str() {
+            out.push(json!({ "role": "user", "content": s }));
+            continue;
+        }
+        // user: 도구 결과는 tool 메시지로 먼저(호출 바로 뒤에 와야 한다), 이미지·글은 그 뒤 user 메시지 하나로
+        let mut parts = Vec::new();
+        for b in list(&m["content"]) {
+            match b["type"].as_str() {
+                Some("tool_result") => {
+                    let mut t = text_of(&b["content"]);
+                    if b["is_error"] == true && !t.starts_with("Error") {
+                        t = format!("Error: {t}");
+                    }
+                    let id = b["tool_use_id"].as_str().or(b["id"].as_str());
+                    out.push(json!({ "role": "tool", "tool_call_id": id, "content": if t.is_empty() { "OK".into() } else { t } }));
+                    for c in list(&b["content"]).iter().filter(|c| c["type"] == "image") {
+                        parts.extend(image_parts(c));
+                    }
+                }
+                Some("text") => parts.push(json!({ "type": "text", "text": b["text"] })),
+                Some("image") => parts.extend(image_parts(b)),
+                _ => {}
+            }
+        }
+        if !parts.is_empty() {
+            out.push(json!({ "role": "user", "content": parts }));
+        }
+    }
+    out
+}
+
+/// OpenAI 호환 답 → Claude 형식 답. 성공(200)으로 와도 본문이 오류이거나 비어 있으면 오류로 돌려준다
+/// (OpenRouter 등은 상위 제공자의 실패를 200 + `error` 로 알린다).
+fn from_response(resp: &Value) -> Result<Value> {
+    if let Some(e) = resp.get("error").filter(|e| !e.is_null()) {
+        let why = e["message"].as_str().map(String::from).unwrap_or_else(|| e.to_string());
+        bail!("AI 응답 오류: {}", short(&why, 400));
+    }
+    let choice = resp["choices"].get(0).ok_or_else(|| anyhow!("AI 응답에 내용이 없습니다: {}", short(&resp.to_string(), 300)))?;
+    let msg = &choice["message"];
+    let mut content = Vec::new();
+    // 일부 제공자(DeepSeek·OpenRouter 등)는 생각 과정을 따로 준다: 기록에만 보인다
+    if let Some(r) = msg["reasoning_content"].as_str().or(msg["reasoning"].as_str()).filter(|s| !s.trim().is_empty()) {
+        content.push(json!({ "type": "thinking", "thinking": r }));
+    }
+    if let Some(t) = msg["content"].as_str().filter(|s| !s.trim().is_empty()) {
+        content.push(json!({ "type": "text", "text": t }));
+    }
+    let calls = list(&msg["tool_calls"]);
+    for (i, c) in calls.iter().enumerate() {
+        let name = c["function"]["name"].as_str().unwrap_or_default();
+        let mut input: Value = match &c["function"]["arguments"] {
+            Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
+            v if v.is_object() => v.clone(),
+            _ => json!({}),
+        };
+        let id = c["id"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| format!("call_{i}"));
+        let mut b = if name == "computer" {
+            let action = input.as_object_mut().and_then(|o| o.remove("action")).and_then(|a| a.as_str().map(String::from)).unwrap_or_default();
+            json!({ "type": "tool_use", "id": id, "name": action, "input": input, "toolset_name": "computer" })
+        } else {
+            json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        };
+        if let Some(x) = c.get("extra_content") {
+            b["_extra"] = x.clone();
+        }
+        content.push(b);
+    }
+    // 호출이 있으면 finish_reason 과 상관없이 tool_use (Gemini 는 호출이 있어도 "stop" 을 준다)
+    let stop = match choice["finish_reason"].as_str() {
+        _ if !calls.is_empty() => "tool_use",
+        Some("length") => "max_tokens",
+        Some("content_filter") => "refusal",
+        _ => "end_turn",
+    };
+    Ok(json!({
+        "content": content,
+        "stop_reason": stop,
+        "usage": {
+            "input_tokens": resp["usage"]["prompt_tokens"],
+            "output_tokens": resp["usage"]["completion_tokens"],
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude 형식 대화가 OpenAI 형식으로 바뀌고, 답의 computer 호출이 Claude 형식으로 되돌아온다
+    #[test]
+    fn openai_round_trip() {
+        let img = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "AAAA" } });
+        let messages = vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": "작업" }, img.clone()] }),
+            json!({ "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "..." },
+                { "type": "tool_use", "id": "c1", "name": "left_click", "input": { "coordinate": [10, 20] }, "toolset_name": "computer", "_extra": { "google": { "thought_signature": "s" } } },
+                { "type": "tool_use", "id": "c2", "name": "ask_user", "input": { "question": "?" } }
+            ] }),
+            json!({ "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "c1", "toolset_name": "computer", "content": [{ "type": "text", "text": "OK" }, img.clone()] },
+                { "type": "tool_result", "tool_use_id": "c2", "is_error": true, "content": "실패" }
+            ] }),
+            // 사고만 있는 턴은 보내지 않는다
+            json!({ "role": "assistant", "content": [{ "type": "thinking", "thinking": "..." }] }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "계속" }] }),
+        ];
+        let m = to_messages("sys", &messages);
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "tool", "user", "user"]);
+        assert!(m[2]["content"].is_null(), "호출만 있으면 content 는 null");
+        let call = &m[2]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "computer");
+        let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["action"], "left_click");
+        assert_eq!(call["extra_content"]["google"]["thought_signature"], "s");
+        assert_eq!(m[3]["tool_call_id"], "c1");
+        assert_eq!(m[4]["content"], "Error: 실패");
+        // 도구 결과의 스크린샷은 tool 메시지 뒤 user 메시지로 간다
+        assert!(list(&m[5]["content"]).iter().any(|p| p["type"] == "image_url"));
+
+        // Gemini 처럼 호출이 있는데 "stop" 을 줘도 tool_use
+        let resp = json!({
+            "choices": [{ "finish_reason": "stop", "message": { "content": null, "tool_calls": [
+                { "id": "x", "type": "function", "function": { "name": "computer", "arguments": "{\"action\":\"type\",\"text\":\"hi\"}" } }
+            ] } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2 }
+        });
+        let r = from_response(&resp).unwrap();
+        assert_eq!(r["stop_reason"], "tool_use");
+        assert_eq!(r["content"][0]["name"], "type");
+        assert_eq!(r["content"][0]["input"]["text"], "hi");
+        assert_eq!(r["content"][0]["toolset_name"], "computer");
+        assert_eq!(r["usage"]["input_tokens"], 5);
+    }
+
+    /// 200 으로 온 오류·빈 답은 빈 턴이 아니라 오류
+    #[test]
+    fn error_bodies_are_errors() {
+        let e = from_response(&json!({ "error": { "message": "upstream overloaded", "code": 502 } })).unwrap_err();
+        assert!(format!("{e}").contains("upstream overloaded"));
+        assert!(from_response(&json!({ "choices": [] })).is_err());
+        assert!(from_response(&json!({ "error": null, "choices": [{ "message": { "content": "hi" } }] })).is_ok());
+    }
+}

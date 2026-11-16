@@ -1,0 +1,1056 @@
+//! 새 에이전트 창: 일할 곳(웹·앱·별도 화면·원격) 고르기 → 설정 → 시작.
+
+use super::*;
+use super::labels::profile_short;
+
+impl NewAgentForm {
+    /// 처음 여는 새 에이전트 창의 기본값. `profile_idx`: 로그인을 복사할 기본 브라우저 프로필
+    pub(super) fn new(profile_idx: Option<usize>) -> Self {
+        NewAgentForm {
+            choice: None,
+            app_search: String::new(),
+            web_use_login: false,
+            app_use_login: false,
+            session_account: "ghostdesk-agent".into(),
+            kind: FormKind::Browser,
+            electron_idx: None,
+            electron_clone: false,
+            electron_clone_consent: false,
+            electron_refresh: false,
+            native_app: String::new(),
+            native_new_instance: false,
+            native_attach: false,
+            native_current_session: false,
+            native_vdisplay: false,
+            native_vdisplay_consent: false,
+            remote_host: String::new(),
+            remote_port: 5900,
+            remote_user: String::new(),
+            remote_pass: String::new(),
+            remote_dedicated: false,
+            name: tr("에이전트 1").into(),
+            workspace: "ws-1".into(),
+            refresh: false,
+            browser_idx: 0,
+            profile_idx,
+            start_url: "https://www.google.com".into(),
+            task: String::new(),
+            headless: true,
+            size_idx: 0,
+            max_steps: 60,
+        }
+    }
+}
+
+/// 느린 조회를 백그라운드에서 돌려 결과를 칸에 채운다 (None = 아직 확인 중). 끝나면 화면을 다시 그린다.
+pub(super) fn load_in_background<T: Send + 'static>(rt: &Handle, ctx: &egui::Context, f: impl FnOnce() -> T + Send + 'static) -> Slot<T> {
+    let slot = Arc::new(parking_lot::Mutex::new(None));
+    let (s, ctx) = (slot.clone(), ctx.clone());
+    rt.spawn_blocking(move || {
+        let v = f();
+        *s.lock() = Some(v);
+        ctx.request_repaint();
+    });
+    slot
+}
+
+/// '로컬 앱' 목록 (이름, 경로). macOS 는 /Applications 를 바로 읽고,
+/// Windows 는 설치된 프로그램(레지스트리·시작 메뉴 등)이 느릴 수 있어 백그라운드에서 읽는다.
+pub(super) fn native_app_list(rt: &Handle, ctx: &egui::Context) -> Slot<Vec<(String, String)>> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (rt, ctx);
+        Arc::new(parking_lot::Mutex::new(Some(list_mac_apps())))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if caps::NATIVE_APPS {
+            load_in_background(rt, ctx, crate::native::installed_apps)
+        } else {
+            Arc::new(parking_lot::Mutex::new(Some(Vec::new())))
+        }
+    }
+}
+
+impl GhostApp {
+    /// 개발용: GHOSTDESK_DEMO=<n> 이면 브라우저 에이전트 n 개를 자동 시작한다.
+    /// 데모는 사용자 데이터를 쓰지 않는다: 빈 프로필, 빈 페이지.
+    pub(super) fn spawn_demos(&mut self, ctx: &egui::Context) {
+        while self.pending_demo > 0 {
+            self.pending_demo -= 1;
+            self.form.kind = FormKind::Browser;
+            self.form.profile_idx = None;
+            self.form.start_url = "about:blank".into();
+            self.form.task = tr("데모 작업").into();
+            self.spawn_agent(ctx);
+        }
+    }
+}
+
+pub(super) const SIZES: &[(u32, u32)] = &[(1280, 800), (1366, 768), (1440, 900), (1024, 768)];
+
+/// '로컬 앱' 카드를 보여 줄지 (Electron 숨김 실행 또는 일반 앱 백엔드가 있는 OS)
+pub(super) const LOCAL_APP_CARD: bool = caps::ELECTRON || caps::NATIVE_APPS;
+
+/// '로컬 앱'(Mac 앱 / Windows 앱) 목록의 한 항목
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AppListItem {
+    label: String,
+    path: String,
+    /// 숨김 실행 가능한 Electron 앱이면 그 인덱스
+    electron: Option<usize>,
+    /// 고를 수 없는 항목이면 그 이유 (숨김 실행이 안 되는 Electron 앱)
+    disabled: Option<String>,
+}
+
+impl GhostApp {
+    pub(super) fn spawn_agent(&mut self, ctx: &egui::Context) {
+        if self.missing_key() {
+            self.key_warn = true;
+            if self.wizard_open {
+                // 새 에이전트 창 안에서는 키 칸 아래 안내 + 키 칸으로 포커스 (아래쪽 알림은 겹치므로 생략)
+                self.wizard_key_field = true;
+                self.focus_key = true;
+                return;
+            }
+            return self.notify(ctx, trf("설정에서 {} API 키를 넣어 주세요.", &[&self.provider.short_name()]));
+        }
+        self.key_warn = false;
+        let ws_name = self.form.workspace.trim().to_string();
+        if ws_name.is_empty() {
+            return self.notify(ctx, tr("작업공간 이름을 입력하세요."));
+        }
+        if self.agents.iter().any(|a| profiles::slug(&a.shared.workspace_name) == profiles::slug(&ws_name)) {
+            return self.notify(ctx, tr("같은 작업공간을 쓰는 에이전트가 이미 있습니다. 다른 이름을 쓰세요."));
+        }
+        // Windows 는 CON·NUL·COM1 같은 장치 이름을 폴더 이름으로 쓸 수 없다
+        if cfg!(windows) && crate::platform::paths::is_reserved_name(&profiles::slug(&ws_name)) {
+            return self.notify(ctx, trf("'{}' 은(는) Windows 에서 폴더 이름으로 쓸 수 없습니다. 다른 작업공간 이름을 쓰세요.", &[&ws_name]));
+        }
+        let target = match self.form.kind {
+            FormKind::Browser => {
+                let Some(browser) = self.browsers.get(self.form.browser_idx).cloned() else {
+                    return self.notify(ctx, tr("Chromium 계열 브라우저(Chrome/Edge/Brave/Whale 등)를 찾지 못했습니다."));
+                };
+                let source = match self.form.profile_idx.and_then(|i| browser.profiles.get(i)) {
+                    Some(p) => ProfileSource::Clone {
+                        profile_dir: p.dir.clone(),
+                        browser: browser.clone(),
+                        refresh: self.form.refresh,
+                    },
+                    None => ProfileSource::Empty { browser: browser.clone() },
+                };
+                let (w, h) = SIZES[self.form.size_idx];
+                DeskTarget::Browser {
+                    source,
+                    headless: self.form.headless,
+                    width: w,
+                    height: h,
+                    start_url: self.form.start_url.clone(),
+                }
+            }
+            FormKind::Electron => {
+                if !caps::ELECTRON {
+                    return self.notify(ctx, unsupported(tr("Electron 앱 숨김 실행")));
+                }
+                let apps = self.electron_apps.lock().clone().unwrap_or_default();
+                let Some(app) = self.form.electron_idx.and_then(|i| apps.get(i)).cloned() else {
+                    return self.notify(ctx, tr("Electron 앱을 선택하세요."));
+                };
+                if !app.hideable {
+                    return self.notify(ctx, trf("{} 은(는) 지원하지 않습니다: {}", &[&app.name, &app.reason.clone().unwrap_or_default()]));
+                }
+                let profile = if self.form.electron_clone {
+                    let Some(src) = app.user_data_guess.clone() else {
+                        return self.notify(ctx, tr("이 앱의 원본 데이터 폴더를 찾지 못했습니다. 빈 프로필을 쓰세요."));
+                    };
+                    if !self.form.electron_clone_consent {
+                        return self.notify(ctx, tr("앱 데이터(로그인 정보·쿠키) 복제에 동의해야 합니다."));
+                    }
+                    crate::electron::ElectronProfile::Clone { source: src, refresh: self.form.electron_refresh }
+                } else {
+                    crate::electron::ElectronProfile::Empty
+                };
+                let (w, h) = SIZES[self.form.size_idx];
+                DeskTarget::Electron { app, profile, width: w, height: h }
+            }
+            FormKind::Native => {
+                if !caps::NATIVE_APPS {
+                    return self.notify(ctx, unsupported(tr(text::LOCAL_APPS)));
+                }
+                let app = self.form.native_app.trim().to_string();
+                if app.is_empty() {
+                    return self.notify(
+                        ctx,
+                        pick(tr("앱(.app 경로 또는 번들 id)을 입력하거나 고르세요."), tr("앱(실행 파일 .exe 경로 또는 이름)을 입력하거나 고르세요.")),
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                if let Err(e) = crate::macos::preflight() {
+                    return self.notify(ctx, format!("{e:#}"));
+                }
+                // 가상 디스플레이는 이 OS 에서 지원할 때만 (Windows 에서는 체크박스도 보이지 않는다)
+                if self.form.native_vdisplay && caps::VDISPLAY {
+                    if !self.form.native_vdisplay_consent {
+                        return self.notify(ctx, tr("가상 디스플레이 사용에 대한 안내를 확인하고 동의 체크를 켜세요."));
+                    }
+                    let (w, h) = SIZES[self.form.size_idx];
+                    DeskTarget::VDisplay(crate::vdisplay::VirtualDisplayOptions {
+                        app,
+                        width: w,
+                        height: h,
+                        attach_consent: self.form.native_attach,
+                        ..Default::default()
+                    })
+                } else {
+                    DeskTarget::Native(crate::native::NativeOptions {
+                        app,
+                        new_instance: self.form.native_new_instance,
+                        attach_consent: self.form.native_attach,
+                        host: if cfg!(windows) && self.form.native_current_session {
+                            crate::native::NativeHost::CurrentSession
+                        } else {
+                            crate::native::NativeHost::Auto
+                        },
+                        ..Default::default()
+                    })
+                }
+            }
+            FormKind::Session => {
+                if !caps::SESSION {
+                    return self.notify(ctx, unsupported(tr("별도 계정 세션")));
+                }
+                // Windows 자식 세션은 같은 계정이라 계정 이름이 필요 없다
+                if cfg!(target_os = "macos") && self.form.session_account.trim().is_empty() {
+                    return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요."));
+                }
+                DeskTarget::Session { account: self.form.session_account.trim().to_string() }
+            }
+            FormKind::Remote => {
+                if self.form.remote_host.trim().is_empty() {
+                    return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요."));
+                }
+                DeskTarget::Remote(RemoteTarget {
+                    host: self.form.remote_host.trim().to_string(),
+                    port: self.form.remote_port,
+                    username: Some(self.form.remote_user.trim().to_string()),
+                    password: Some(self.form.remote_pass.clone()),
+                    dedicated_ack: self.form.remote_dedicated,
+                })
+            }
+        };
+        let cfg = AgentConfig {
+            name: self.form.name.clone(),
+            workspace: ws_name.clone(),
+            task: self.form.task.clone(),
+            target,
+            max_steps: self.form.max_steps,
+            reply_lang: self.lang.english_name(),
+            llm: Llm::new(
+                self.provider,
+                self.key().trim().to_string(),
+                self.models[self.pi()].trim().to_string(),
+                EFFORTS[self.effort_idx].to_string(),
+            ),
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let shared = AgentShared::new(id, cfg.name.clone(), ws_name, ctx.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let max_steps = cfg.max_steps;
+        let task = self.rt.spawn(agent::run_agent(shared.clone(), cfg, rx));
+        let mut handle = AgentHandle::new(&self.rt, shared, tx, task);
+        handle.max_steps = max_steps;
+        self.agents.push(handle);
+        self.form.name = trf("에이전트 {}", &[&self.next_id]);
+        self.form.workspace = format!("ws-{}", self.next_id);
+        self.form.task.clear();
+    }
+
+    pub(super) fn open_wizard(&mut self) {
+        self.wizard_open = true;
+        self.form.choice = None;
+        self.key_warn = false;
+        self.wizard_key_field = self.missing_key();
+    }
+
+    /// Windows 자식 세션 기능 상태 + 켜기(관리자 승인) 버튼
+    #[cfg(windows)]
+    pub(super) fn child_session_status(&mut self, ui: &mut egui::Ui) {
+        let req = self.child_enable.lock().clone();
+        if matches!(req, ChildEnable::Done(_)) && self.child_enabled != Some(true) {
+            self.child_enabled = None; // 요청이 끝났으면 다시 확인
+        }
+        let on = *self.child_enabled.get_or_insert_with(crate::winapp::child::enabled);
+        if on {
+            ui.label(RichText::new(trf("{}  자식 세션 기능이 켜져 있습니다.", &[&icon::CIRCLE_CHECK])).color(theme::body()));
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tr("자식 세션 기능이 꺼져 있습니다.")).color(theme::danger()));
+            let waiting = req == ChildEnable::Waiting;
+            if ui.add_enabled(!waiting, egui::Button::new(trf("{}  자식 세션 켜기 (관리자 승인)", &[&icon::LOCK_OPEN]))).clicked() {
+                *self.child_enable.lock() = ChildEnable::Waiting;
+                let st = self.child_enable.clone();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let r = crate::winapp::child::request_enable().map_err(|e| format!("{e:#}"));
+                    *st.lock() = ChildEnable::Done(r);
+                    ctx.request_repaint();
+                });
+            }
+            if waiting {
+                theme::spinner(ui, 14.0, theme::muted());
+            }
+        });
+        if let ChildEnable::Done(Err(e)) = &req {
+            ui.label(RichText::new(e).color(theme::danger()));
+        }
+    }
+
+    /// 별도 계정 세션(RDP 방식) 처음 설정 안내 창
+    pub(super) fn session_guide_window(&mut self, ctx: &egui::Context) {
+        if !self.show_session_guide {
+            return;
+        }
+        let exe = "/Users/Shared/GhostDesk/bin/ghostdesk";
+        #[cfg(unix)]
+        let uid = unsafe { libc::getuid() };
+        #[cfg(not(unix))]
+        let uid = 0u32;
+        let max_h = (ctx.content_rect().height() - 160.0).max(240.0);
+        let mut close = false;
+        let m = egui::Modal::new(egui::Id::unique("session_guide")).frame(theme::modal_frame()).show(ctx, |ui| {
+            ui.set_width(620.0);
+            close |= theme::modal_header(ui, pick(tr("별도 계정 세션 설정"), tr("자식 세션(PiP) 설정")));
+            theme::modal_scroll(ui, max_h, |ui| {
+                ui.label(crate::session::SETUP_GUIDE_KO);
+                #[cfg(unix)]
+                ui.add_space(6.0);
+                #[cfg(unix)]
+                ui.horizontal(|ui| {
+                    ui.strong(tr("LaunchAgent plist (에이전트 계정의 ~/Library/LaunchAgents 에 저장)"));
+                });
+                #[cfg(unix)]
+                {
+                    let plist = crate::session::launch_agent_plist(exe, uid);
+                    if ui.small_button(trf("{}  복사", &[&icon::COPY])).clicked() {
+                        ui.ctx().copy_text(plist.clone());
+                    }
+                    ui.add(egui::TextEdit::multiline(&mut plist.as_str()).code_editor().desired_width(f32::INFINITY));
+                }
+                #[cfg(not(unix))]
+                let _ = (exe, uid);
+            });
+        });
+        if close || m.should_close() {
+            self.show_session_guide = false;
+        }
+    }
+
+    /// ＋ 새 에이전트: 어디서 일할지 고르고, 할 일을 적는다. 나머지는 고급 설정에 접어 둔다.
+    pub(super) fn new_agent_window(&mut self, ctx: &egui::Context) {
+        if !self.wizard_open {
+            return;
+        }
+        const W: f32 = 600.0;
+        let max_h = (ctx.content_rect().height() - 200.0).max(260.0);
+        let mut close = false;
+        let mut start = false;
+        let mut go_connect = false;
+        let kinds = kinds();
+        let m = egui::Modal::new(egui::Id::unique("new_agent")).frame(theme::modal_frame()).show(ctx, |ui| {
+            ui.set_width(W);
+            close |= theme::modal_header(ui, tr("새 에이전트"));
+            theme::modal_scroll(ui, max_h, |ui| {
+                ui.set_width(W);
+                theme::section(ui, tr("어디서 일할까요"));
+                ui.add_space(4.0);
+                let gap = 8.0;
+                let n = kinds.len() as f32;
+                let tw = ((W - gap * (n - 1.0)) / n).floor();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for k in &kinds {
+                        if theme::tile(ui, self.form.choice == Some(k.choice), k.icon, k.title, Vec2::new(tw, 52.0)).clicked() {
+                            self.form.choice = Some(k.choice);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                // 고른 곳의 설명은 한 줄만 (칸마다 적어 두지 않는다)
+                let Some(choice) = self.form.choice else {
+                    ui.label(theme::hint(tr("에이전트가 일할 곳을 하나 골라 주세요")));
+                    return;
+                };
+                if let Some(k) = kinds.iter().find(|k| k.choice == choice) {
+                    ui.label(theme::hint(k.about));
+                }
+                ui.add_space(14.0);
+                match choice {
+                    Choice::Web => self.simple_web(ui),
+                    Choice::App => self.simple_app(ui),
+                    Choice::Remote => self.form_remote(ui),
+                    Choice::Session => self.form_session(ui),
+                }
+                ui.add_space(18.0);
+                theme::section(ui, tr("할 일"));
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.form.task)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(10, 8))
+                        .hint_text(tr("예) 네이버에서 오늘 날씨를 찾아 요약해줘  (비워 두면 나중에 지시)")),
+                );
+                ui.add_space(10.0);
+                egui::CollapsingHeader::new(tr("고급 설정")).default_open(false).show(ui, |ui| self.advanced(ui, choice));
+                if self.wizard_key_field {
+                    ui.add_space(18.0);
+                    theme::section(ui, tr("AI 와 API 키"));
+                    ui.add_space(4.0);
+                    self.provider_combo(ui, W);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let link_w = 96.0;
+                        if self.key_warn && self.missing_key() {
+                            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, theme::warn());
+                        }
+                        let w = (ui.available_width() - link_w).max(120.0);
+                        let r = self.key_field(ui, w, egui::Id::unique("wizard_api_key"));
+                        if std::mem::take(&mut self.focus_key) {
+                            r.request_focus();
+                        }
+                        if r.changed() {
+                            self.key_warn = false;
+                        }
+                        if ui
+                            .link(tr("키 없이 쓰기"))
+                            .on_hover_text(tr("Claude 앱·Claude Code 같은 AI 앱에 연결하면 키가 필요 없어요"))
+                            .clicked()
+                        {
+                            go_connect = true;
+                        }
+                    });
+                    self.key_help(ui);
+                    if self.key_warn && self.missing_key() {
+                        ui.label(RichText::new(tr("시작하려면 API 키를 넣어 주세요")).size(12.0).color(theme::warn()));
+                    }
+                }
+            });
+            ui.add_space(16.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ready = self.form.choice.is_some();
+                if ui.add_enabled_ui(ready, |ui| theme::primary(ui, tr("   시작   "))).inner.clicked() {
+                    start = true;
+                }
+                if theme::secondary(ui, tr("취소")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        // 바깥 클릭으로는 닫지 않는다 (적던 내용을 실수로 잃지 않게). Esc 와 ✕·취소로 닫는다.
+        let esc = m.is_top_modal && !m.any_popup_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if start {
+            self.start_from_wizard(ctx);
+        }
+        if close || esc {
+            self.wizard_open = false;
+        }
+        if go_connect {
+            self.wizard_open = false;
+            self.open_connect(ctx);
+        }
+    }
+
+    /// 웹사이트: 시작 주소 + 내 브라우저 로그인 사용. 브라우저·프로필·화면 크기는 고급 설정.
+    pub(super) fn simple_web(&mut self, ui: &mut egui::Ui) {
+        if self.browsers.is_empty() {
+            ui.colored_label(theme::danger(), tr("Chrome·Edge·Brave·Whale 같은 Chromium 계열 브라우저를 찾지 못했어요."));
+            return;
+        }
+        egui::Grid::new("simple_web").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(tr("시작 주소"));
+            ui.add(field(&mut self.form.start_url));
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        let bname = self.browsers.get(self.form.browser_idx).map(|b| b.name.clone()).unwrap_or_default();
+        let profiles = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.clone()).unwrap_or_default();
+        // 복제할 프로필이 없으면 스위치는 꺼진 채 비활성 (비활성 스위치에 true 가 남지 않게)
+        if profiles.is_empty() {
+            self.form.web_use_login = false;
+        }
+        ui.horizontal(|ui| {
+            let r = ui
+                .add_enabled(!profiles.is_empty(), theme::switch(&mut self.form.web_use_login, trf("내 {} 로그인 사용", &[&bname])))
+                .on_hover_text(tr("내 브라우저의 로그인을 복사해서 써요. 원래 브라우저는 건드리지 않아요. 어떤 프로필을 복사할지는 고급 설정에서 골라요."));
+            if r.changed() && self.form.web_use_login && self.form.profile_idx.is_none_or(|i| i >= profiles.len()) {
+                self.form.profile_idx = Some(0);
+            }
+            // 프로필이 여럿이면 어느 것을 복제하는지 이름만 (계정 주소는 보이지 않게)
+            if self.form.web_use_login && profiles.len() > 1 {
+                if let Some(p) = self.form.profile_idx.and_then(|i| profiles.get(i)) {
+                    ui.label(theme::hint(profile_short(&p.name)));
+                }
+            }
+        });
+    }
+
+    /// 앱: 먼저 목록에서 고르고, 고른 앱에 맞는 선택지만 그 아래에 보인다.
+    pub(super) fn simple_app(&mut self, ui: &mut egui::Ui) {
+        let electrons = self.electron_apps.lock().clone().unwrap_or_default();
+        let current = cfg!(windows) && self.form.native_current_session;
+        if current {
+            self.form.native_attach = false;
+            self.form.app_use_login = false;
+            self.form.native_app = current_session_app_path(&electrons, &self.form.native_app);
+        }
+        ui.add(field(&mut self.form.app_search).hint_text(pick(tr("앱 검색 (예: Code, 텍스트 편집기, 카카오톡)"), tr("앱 검색 (예: Code, 카카오톡, Character Map)"))));
+        ui.add_space(6.0);
+        let q = self.form.app_search.to_lowercase();
+        let natives = self.native_apps.lock().clone();
+        let detecting = self.electron_apps.lock().is_none() || natives.is_none();
+        let items = app_list_items(&electrons, &natives.unwrap_or_default(), current);
+        // Electron 감지가 늦게 끝났으면, 이미 고른 앱이 Electron 인지 다시 맞춘다 (네이티브 경로로 새지 않게)
+        if self.form.electron_idx.is_none() {
+            self.form.electron_idx = electrons.iter().position(|e| electron_matches(e, &self.form.native_app));
+        }
+        egui::Frame::new().fill(theme::bg()).stroke(Stroke::new(1.0, theme::border())).corner_radius(theme::CARD_RADIUS).inner_margin(Margin::same(6)).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // 한 줄짜리 목록: 왼쪽 정렬, 행마다 폭 전체를 누를 수 있게
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for it in items.iter().filter(|it| q.is_empty() || it.label.to_lowercase().contains(&q) || it.path.to_lowercase().contains(&q)) {
+                        match &it.disabled {
+                            // 숨김 실행이 안 되는 Electron 앱: 목록에는 보이되 고를 수 없고, 이유를 알려 준다
+                            Some(reason) => {
+                                ui.add_enabled(false, egui::Button::selectable(false, it.label.as_str())).on_disabled_hover_text(reason.as_str());
+                            }
+                            None => {
+                                let sel = self.form.native_app == it.path;
+                                if ui.add(egui::Button::selectable(sel, it.label.as_str()).min_size(Vec2::new(0.0, 28.0))).clicked() {
+                                    self.form.native_app = it.path.clone();
+                                    self.form.electron_idx = it.electron;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        if detecting {
+            ui.horizontal(|ui| {
+                theme::spinner(ui, 14.0, theme::muted());
+                ui.label(theme::hint(pick(tr("Electron 앱을 확인하는 중…"), tr("설치된 앱을 확인하는 중…"))));
+            });
+        } else if self.form.native_app.is_empty() && items.iter().any(|it| it.electron.is_some()) {
+            ui.label(theme::hint(trf("{} 표시 앱은 완전히 숨겨서 실행돼요", &[&icon::STAR])))
+                .on_hover_text(pick(tr("나머지 앱은 창을 숨긴 채 조작해요."), tr("나머지 앱은 창을 화면 밖에 두고 조작해요.")));
+        }
+        ui.add_space(8.0);
+        // Windows: 숨은 화면(자식 세션)에서 내 계정 그대로 실행. 목록 자체가 바뀌므로 고르기 전에도 보인다.
+        if cfg!(windows) {
+            ui.add(theme::switch(&mut self.form.native_current_session, tr("숨은 화면에서 내 계정 그대로 실행")))
+                .on_hover_text(tr("보이지 않는 별도 Windows 화면에 앱을 새로 띄워요. 앱의 실제 로그인과 데이터를 써요."));
+        }
+        if current {
+            self.form.electron_idx = None;
+            theme::tinted(theme::warn()).show(ui, |ui| {
+                ui.label(
+                    tr("에이전트가 한 일은 실제 계정에 남아요. 시작 전에 그 앱을 완전히 꺼 주세요 (트레이 아이콘까지). \
+                     Store 앱 · 관리자 권한 앱 · 일부 게임은 안 될 수 있어요."),
+                );
+            });
+            return;
+        }
+        if self.form.native_app.is_empty() {
+            return;
+        }
+        let electron = self.form.electron_idx.and_then(|i| electrons.get(i)).filter(|e| electron_matches(e, &self.form.native_app));
+        match electron {
+            Some(e) if !e.hideable => {
+                ui.colored_label(theme::danger(), trf("{} 은(는) 숨김 실행을 지원하지 않아요: {}", &[&e.name, &e.reason.clone().unwrap_or_default()]));
+            }
+            Some(e) => {
+                // 원본 데이터 폴더가 없으면 스위치는 꺼진 채 비활성 (비활성 스위치에 true 가 남지 않게)
+                if e.user_data_guess.is_none() {
+                    self.form.app_use_login = false;
+                }
+                ui.add_enabled(e.user_data_guess.is_some(), theme::switch(&mut self.form.app_use_login, trf("내 {} 로그인 복사해서 쓰기", &[&e.name])))
+                    .on_hover_text(tr("앱 데이터를 작업공간으로 복사해서 써요. 원래 앱은 건드리지 않아요."));
+            }
+            None => {
+                self.form.electron_idx = None;
+                ui.add(theme::switch(&mut self.form.native_attach, tr("지금 켜 둔 내 앱 쓰기")))
+                    .on_hover_text(tr("카카오톡처럼 한 번에 하나만 로그인되는 앱에 써요. 작업 중에는 그 창이 숨겨져요. 끄면 숨긴 앱을 새로 띄워요."));
+                // 가상 디스플레이(CGVirtualDisplay)는 macOS 전용: 다른 OS 에서는 스위치를 보이지 않고 꺼 둔다
+                if caps::VDISPLAY {
+                    ui.add(theme::switch(&mut self.form.native_vdisplay, trf("{}  가상 디스플레이에서 실행 (실험)", &[&icon::FLASK])))
+                        .on_hover_text(tr("앱 창을 숨기는 대신 보이지 않는 가상 모니터 위에 띄워 드래그·우클릭 같은 실제 마우스 동작을 그대로 써요."));
+                } else {
+                    self.form.native_vdisplay = false;
+                }
+                if self.form.native_vdisplay {
+                    theme::tinted(theme::warn()).show(ui, |ui| {
+                        ui.label(RichText::new(tr("가상 모니터가 디스플레이 배치의 가장 바깥에 잠시 추가됩니다. 그동안 마우스 커서가 그쪽으로 넘어갈 수 있고, 설정에 따라 Dock·메뉴 막대가 그 화면에도 보일 수 있습니다. 작업이 끝나면 가상 모니터는 제거됩니다.")).small());
+                        ui.add(theme::switch(&mut self.form.native_vdisplay_consent, tr("이해했고 가상 모니터 추가에 동의합니다")));
+                    });
+                } else {
+                    self.form.native_vdisplay_consent = false;
+                }
+                // macOS 권한(손쉬운 사용·화면 기록) 안내는 macOS 에서만. Windows 는 이런 권한 동의가 없다.
+                #[cfg(target_os = "macos")]
+                {
+                    let t = crate::macos::tcc_status();
+                    if !(t.accessibility && t.screen_capture) {
+                        ui.colored_label(theme::warn(), tr("이 방식은 시스템 설정 > 개인정보 보호 및 보안 에서 '손쉬운 사용'과 '화면 및 시스템 오디오 기록' 권한이 필요합니다."));
+                    }
+                }
+                ui.label(theme::hint(pick(
+                    tr("클릭은 버튼 누르기·입력칸 선택 같은 동작으로 바뀌어요 (드래그·우클릭 불가). 캡처 중 메뉴 막대에 화면 기록 표시가 나타나요."),
+                    tr("일부 앱(게임 등)은 화면이 비어 보일 수 있어요."),
+                )));
+            }
+        }
+    }
+
+    pub(super) fn start_from_wizard(&mut self, ctx: &egui::Context) {
+        match self.form.choice {
+            Some(Choice::Web) => {
+                self.form.kind = FormKind::Browser;
+                let n = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.len()).unwrap_or(0);
+                // 고급 설정에서 고른 프로필을 존중한다 (범위를 벗어났을 때만 첫 프로필)
+                self.form.profile_idx = match (self.form.web_use_login && n > 0, self.form.profile_idx) {
+                    (false, _) => None,
+                    (true, Some(i)) if i < n => Some(i),
+                    (true, _) => Some(0),
+                };
+            }
+            Some(Choice::App) => {
+                if self.form.native_app.trim().is_empty() {
+                    return self.notify(ctx, tr("조작할 앱을 고르세요."));
+                }
+                if cfg!(windows) && self.form.native_current_session {
+                    let electrons = self.electron_apps.lock().clone().unwrap_or_default();
+                    self.form.native_app = current_session_app_path(&electrons, self.form.native_app.trim());
+                    self.form.kind = FormKind::Native;
+                    self.form.native_new_instance = true;
+                    self.form.native_attach = false;
+                    self.form.electron_idx = None;
+                } else {
+                    // Electron 앱은 감지 결과로만 판단한다: 감지 전이거나 숨김 실행이 안 되는 앱을
+                    // 조용히 네이티브(창 숨김) 방식으로 돌리지 않는다.
+                    let Some(electrons) = self.electron_apps.lock().clone() else {
+                        return self.notify(ctx, tr("앱 목록을 확인하는 중입니다. 잠시 후 다시 시작하세요."));
+                    };
+                    let found = electrons.iter().position(|e| electron_matches(e, self.form.native_app.trim()));
+                    if let Some(i) = found {
+                        let e = &electrons[i];
+                        if !e.hideable {
+                            return self.notify(ctx, trf("{} 은(는) 숨김 실행을 지원하지 않습니다: {}", &[&e.name, &e.reason.clone().unwrap_or_default()]));
+                        }
+                        self.form.electron_idx = Some(i);
+                    } else {
+                        self.form.electron_idx = None;
+                    }
+                    if let Some(e) = self.form.electron_idx.and_then(|i| electrons.get(i)) {
+                        self.form.kind = FormKind::Electron;
+                        let clone = self.form.app_use_login && e.user_data_guess.is_some();
+                        self.form.electron_clone = clone;
+                        // 체크박스 문구가 '앱 데이터를 복제'임을 명시하므로 체크 자체를 동의로 본다
+                        self.form.electron_clone_consent = clone;
+                    } else {
+                        self.form.kind = FormKind::Native;
+                        self.form.native_new_instance = !self.form.native_attach;
+                    }
+                }
+            }
+            Some(Choice::Remote) => self.form.kind = FormKind::Remote,
+            Some(Choice::Session) => self.form.kind = FormKind::Session,
+            None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요.")),
+        }
+        let before = self.agents.len();
+        self.spawn_agent(ctx);
+        if self.agents.len() > before {
+            self.wizard_open = false;
+            self.form.web_use_login = false;
+            self.form.app_use_login = false;
+            self.form.native_current_session = false;
+            self.selected = Some(self.agents.len() - 1);
+        }
+    }
+
+    /// 원격 컴퓨터: 주소(:포트) · 사용자 · 비밀번호 + 에이전트 전용 머신 확인
+    pub(super) fn form_remote(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("form_remote").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(tr("주소"));
+            ui.horizontal(|ui| {
+                // 포트는 거의 바꾸지 않으므로 주소 칸 옆에 작게
+                let w = (ui.available_width() - 76.0).max(160.0);
+                ui.add(field(&mut self.form.remote_host).hint_text(tr("예) 192.168.0.20 또는 vm.local")).desired_width(w));
+                ui.label(":");
+                ui.add(egui::DragValue::new(&mut self.form.remote_port).range(1..=65535)).on_hover_text(tr("포트 (보통 5900)"));
+            });
+            ui.end_row();
+            ui.label(tr("사용자"));
+            ui.add(field(&mut self.form.remote_user).hint_text(tr("필요할 때만 (macOS 화면 공유는 계정 이름)")));
+            ui.end_row();
+            ui.label(tr("비밀번호"));
+            ui.add(field(&mut self.form.remote_pass).password(true));
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        ui.add(theme::switch(&mut self.form.remote_dedicated, tr("에이전트 전용 머신입니다"))).on_hover_text(pick(
+            tr("macOS 화면 공유에 접속할 때 필요합니다. \
+             GhostDesk 는 Apple 의 세션 선택 단계를 구현하지 않아, 대상 Mac 의 콘솔 사용자와 다른 계정으로 접속하면 그 Mac 의 화면이 전환될 수 있습니다. 이 Mac 자신에는 항상 접속을 거부합니다."),
+            tr("macOS 화면 공유나 이 PC 의 VNC 서버에 접속할 때 필요합니다. \
+             GhostDesk 는 Apple 의 세션 선택 단계를 구현하지 않아, 대상 Mac 의 콘솔 사용자와 다른 계정으로 접속하면 그 Mac 의 화면이 전환될 수 있습니다. \
+             또 이 PC 자신에서 실행 중인 VNC 서버는 지금 보고 계신 실제 화면일 수 있어, 확인 없이는 접속하지 않습니다. \
+             WSL·Hyper-V 가상 머신처럼 이 PC 주소로 전달되는 별도 데스크톱일 때만 켜세요."),
+        ));
+    }
+
+    /// 별도 계정 세션(macOS: 전용 계정 이름) / 자식 세션(Windows: 기능 켜짐 여부) + 처음 설정 안내
+    pub(super) fn form_session(&mut self, ui: &mut egui::Ui) {
+        if cfg!(target_os = "macos") {
+            egui::Grid::new("form_session").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(tr("전용 계정"));
+                ui.add(field(&mut self.form.session_account));
+                ui.end_row();
+            });
+        }
+        #[cfg(windows)]
+        self.child_session_status(ui);
+        ui.add_space(4.0);
+        if ui.link(trf("{}  처음 설정 방법 보기", &[&icon::BOOK_OPEN])).clicked() {
+            self.show_session_guide = true;
+        }
+    }
+
+    /// 고급 설정: 이름·작업공간·최대 단계 + 고른 종류의 세부 설정 (한 표에 모아 칸을 맞춘다)
+    pub(super) fn advanced(&mut self, ui: &mut egui::Ui, choice: Choice) {
+        egui::Grid::new("adv").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(tr("이름"));
+            ui.add(field(&mut self.form.name));
+            ui.end_row();
+            ui.label(tr("작업공간"));
+            ui.add(field(&mut self.form.workspace)).on_hover_text(tr("에이전트마다 달라야 해요. 같은 이름을 쓰면 전에 복사한 로그인을 다시 써요."));
+            ui.end_row();
+            ui.label(tr("최대 단계")).on_hover_text(tr("에이전트가 내 확인 없이 할 수 있는 동작 수예요. 다 쓰면 멈추고 기다려요."));
+            ui.horizontal(|ui| {
+                let mut unlimited = self.form.max_steps == 0;
+                if ui.add(theme::switch(&mut unlimited, tr("무제한"))).changed() {
+                    self.form.max_steps = if unlimited { 0 } else { 60 };
+                }
+                if !unlimited {
+                    ui.add(egui::DragValue::new(&mut self.form.max_steps).range(1..=1000));
+                }
+            });
+            ui.end_row();
+            match choice {
+                Choice::Web => self.browser_rows(ui),
+                Choice::App => {
+                    ui.label(tr("직접 지정"));
+                    ui.add(field(&mut self.form.native_app).hint_text(pick(tr("번들 id 또는 .app 경로"), tr("실행 파일(.exe) 경로 또는 프로그램 이름"))))
+                        .on_hover_text(tr("목록에 없는 앱을 쓸 때만 적어요."));
+                    ui.end_row();
+                }
+                Choice::Remote | Choice::Session => {}
+            }
+        });
+    }
+
+    /// 고급 설정의 브라우저 줄들: 브라우저 · 복사할 프로필 · 다시 복사 · 화면 크기 · 창 숨기기
+    fn browser_rows(&mut self, ui: &mut egui::Ui) {
+        ui.label(tr("브라우저"));
+        let bname = self.browsers.get(self.form.browser_idx).map(|b| b.name.clone()).unwrap_or(tr("(없음)").into());
+        egui::ComboBox::from_id_salt("browser").selected_text(bname).show_ui(ui, |ui| {
+            for (i, b) in self.browsers.iter().enumerate() {
+                if ui.selectable_label(self.form.browser_idx == i, &b.name).clicked() {
+                    self.form.browser_idx = i;
+                    self.form.profile_idx = if b.profiles.is_empty() { None } else { Some(0) };
+                }
+            }
+        });
+        ui.end_row();
+
+        ui.label(tr("프로필"));
+        let profiles = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.clone()).unwrap_or_default();
+        // 위의 '로그인 사용' 스위치와 같은 설정을 보여 준다: 프로필을 고르면 스위치가 켜지고,
+        // '빈 프로필' 을 고르면 꺼진다 (어느 쪽도 다른 쪽에 덮이지 않음)
+        let picked = if self.form.web_use_login { self.form.profile_idx.and_then(|i| profiles.get(i)) } else { None };
+        let ptext = picked.map_or_else(|| tr("빈 프로필 (로그인 없음)").to_string(), |p| trf("복사: {}", &[&p.name]));
+        egui::ComboBox::from_id_salt("profile").selected_text(ptext).width(220.0).show_ui(ui, |ui| {
+            for (i, p) in profiles.iter().enumerate() {
+                let sel = self.form.web_use_login && self.form.profile_idx == Some(i);
+                if ui.selectable_label(sel, trf("복사: {}", &[&p.name])).clicked() {
+                    self.form.profile_idx = Some(i);
+                    self.form.web_use_login = true;
+                }
+            }
+            if ui.selectable_label(!self.form.web_use_login, tr("빈 프로필 (로그인 없음)")).clicked() {
+                self.form.web_use_login = false;
+            }
+        });
+        ui.end_row();
+
+        ui.label("");
+        ui.add(theme::switch(&mut self.form.refresh, tr("원본에서 다시 복사 (로그인 새로 고침)")));
+        ui.end_row();
+
+        ui.label(tr("화면 크기"));
+        let (w, h) = SIZES[self.form.size_idx];
+        egui::ComboBox::from_id_salt("size").selected_text(format!("{w}x{h}")).show_ui(ui, |ui| {
+            for (i, (w, h)) in SIZES.iter().enumerate() {
+                ui.selectable_value(&mut self.form.size_idx, i, format!("{w}x{h}"));
+            }
+        });
+        ui.end_row();
+
+        ui.label("");
+        ui.add(theme::switch(&mut self.form.headless, tr("브라우저 창 숨기기")))
+            .on_hover_text(tr("끄면 실제 브라우저 창이 보여요. 그래도 내 마우스 · 키보드는 쓰지 않아요."));
+        ui.end_row();
+    }
+}
+
+/// 새 에이전트 창 왼쪽 이름 칸의 너비 (표마다 같게 해 줄을 맞춘다)
+const LABEL_W: f32 = 72.0;
+
+/// 폭을 꽉 채우는 한 줄 입력칸 (창 안의 입력칸 모양을 하나로 맞춘다)
+/// 이 OS 에서 안 되는 기능을 고른 경우의 안내 (`text::unsupported` 의 화면용 번역판)
+fn unsupported(feature: &str) -> String {
+    trf("{} 은(는) {} 에서 아직 지원하지 않습니다 (현재 macOS 전용)", &[&feature, &text::OS_NAME])
+}
+
+fn field(s: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(s).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 6))
+}
+
+/// '어디서 일할까요' 의 한 칸
+struct Kind {
+    choice: Choice,
+    icon: &'static str,
+    title: &'static str,
+    /// 골랐을 때 아래에 한 줄로 보일 설명
+    about: &'static str,
+}
+
+/// 이 OS 에서 쓸 수 있는 곳만 (지원하지 않는 종류는 보이지 않는다 — platform::caps)
+fn kinds() -> Vec<Kind> {
+    let mut v = vec![Kind {
+        choice: Choice::Web,
+        icon: icon::GLOBE,
+        title: tr("웹사이트"),
+        about: tr("보이지 않는 브라우저에서 일해요. 내 화면 · 마우스 · 키보드는 그대로예요."),
+    }];
+    if LOCAL_APP_CARD {
+        v.push(Kind { choice: Choice::App, icon: text::APP_ICON, title: tr(text::LOCAL_APPS), about: tr("앱을 보이지 않게 띄워서 일해요. 내 화면은 그대로예요.") });
+    }
+    if caps::SESSION {
+        v.push(Kind {
+            choice: Choice::Session,
+            icon: icon::USER,
+            title: pick(tr("별도 계정 세션"), tr("자식 세션")),
+            about: pick(
+                tr("이 Mac 의 다른 사용자 계정 화면을 통째로 써요. 내 로그인은 없어요. 처음 한 번 설정이 필요해요."),
+                tr("같은 PC 에 보이지 않는 Windows 화면을 하나 더 만들어 써요. 진행은 이 창에서 봐요."),
+            ),
+        });
+    }
+    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터나 가상 머신에 VNC 로 접속해서 일해요.") });
+    v
+}
+
+/// 앱 경로 비교. Windows 는 대소문자·구분자 차이를 무시한다 (macOS 는 기존대로 그대로 비교).
+pub(super) fn same_app_path(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        let norm = |s: &str| s.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        norm(a) == norm(b)
+    } else {
+        a == b
+    }
+}
+
+/// 고른 경로가 이 Electron 앱인가 (macOS: 앱 번들 경로. Windows: 설치 폴더 또는 실행 파일 경로)
+pub(super) fn electron_matches(e: &crate::electron::ElectronApp, path: &str) -> bool {
+    same_app_path(&e.bundle.display().to_string(), path) || (cfg!(windows) && same_app_path(&e.exe.display().to_string(), path))
+}
+
+/// 자식 세션('현재 계정' 모드)에서 실행할 경로: 고른 것이 Electron 앱이면 그 실행 파일, 아니면 고른 경로 그대로.
+pub(super) fn current_session_app_path(electrons: &[crate::electron::ElectronApp], selected: &str) -> String {
+    electrons.iter().find(|e| electron_matches(e, selected))
+        .map(|e| e.exe.display().to_string()).unwrap_or_else(|| selected.to_string())
+}
+
+/// Electron 앱(숨김 실행 가능 별표 / 불가 — 비활성 + 이유)과 나머지 로컬 앱을 한 목록으로 만든다.
+/// 감지된 Electron 앱은 네이티브 항목으로 다시 넣지 않는다 (네이티브 경로로 조용히 새지 않게).
+/// Windows 에서는 설치 목록의 실행 파일 경로가 Electron 앱의 실행 파일과 같아도 같은 앱으로 본다.
+pub(super) fn app_list_items(electrons: &[crate::electron::ElectronApp], native_apps: &[(String, String)], current_session: bool) -> Vec<AppListItem> {
+    let mut items: Vec<AppListItem> = Vec::new();
+    for (i, e) in electrons.iter().enumerate() {
+        let path = if cfg!(windows) && current_session { &e.exe } else { &e.bundle }.display().to_string();
+        if items.iter().any(|it| same_app_path(&it.path, &path)) {
+            continue;
+        }
+        if cfg!(windows) && current_session {
+            items.push(AppListItem { label: e.name.clone(), path, electron: None, disabled: None });
+            continue;
+        }
+        if e.hideable {
+            items.push(AppListItem { label: format!("{} {}", icon::STAR, e.name), path, electron: Some(i), disabled: None });
+        } else {
+            let reason = e.reason.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| tr("숨김 실행을 지원하지 않습니다").into());
+            items.push(AppListItem {
+                label: trf("{} — 숨김 실행 불가", &[&e.name]),
+                path,
+                electron: None,
+                disabled: Some(trf("{} 은(는) 숨김 실행을 지원하지 않습니다: {}", &[&e.name, &reason])),
+            });
+        }
+    }
+    for (name, path) in native_apps {
+        let dup = items.iter().any(|it| same_app_path(&it.path, path))
+            || (cfg!(windows) && electrons.iter().any(|e| electron_matches(e, path)));
+        if !dup {
+            items.push(AppListItem { label: name.clone(), path: path.clone(), electron: None, disabled: None });
+        }
+    }
+    // 고를 수 있는 앱을 먼저, 숨김 실행이 안 되는 앱은 맨 뒤에 (순서는 그대로)
+    items.sort_by_key(|it| it.disabled.is_some());
+    items
+}
+
+/// /Applications, /System/Applications 의 앱 목록 (이름, 경로)
+#[cfg(target_os = "macos")]
+pub(super) fn list_mac_apps() -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    for dir in ["/Applications", "/System/Applications", "/System/Applications/Utilities"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "app").unwrap_or(false) {
+                    let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    v.push((name, p.display().to_string()));
+                }
+            }
+        }
+    }
+    v.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn electron(name: &str, hideable: bool, reason: Option<&str>) -> crate::electron::ElectronApp {
+        crate::electron::ElectronApp {
+            name: name.into(),
+            bundle_id: format!("test.{name}"),
+            bundle: PathBuf::from(format!("/Applications/{name}.app")),
+            exe: PathBuf::from(format!("/Applications/{name}.app/Contents/MacOS/{name}")),
+            app_version: None,
+            electron_version: None,
+            fuses: None,
+            hideable,
+            reason: reason.map(String::from),
+            family: crate::electron::AppFamily::Generic,
+            user_data_guess: None,
+            main_script: None,
+            running: false,
+            launch_profile: String::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_session_preserves_an_existing_electron_selection() {
+        let app = electron("Code", true, None);
+        let apps = vec![app.clone()];
+        let previous = app_list_items(&apps, &[], false);
+        assert_eq!(current_session_app_path(&apps, &previous[0].path), app.exe.display().to_string());
+        assert_eq!(current_session_app_path(&apps, "charmap"), "charmap");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_session_allows_native_electron_apps() {
+        let app = electron("Discord", false, Some("인스펙터 퓨즈 꺼짐"));
+        let items = app_list_items(&[app.clone()], &[], true);
+        assert!(items[0].disabled.is_none(), "명시한 현재 계정 모드는 CDP 퓨즈를 요구하지 않음");
+        assert_eq!(items[0].electron, None);
+        assert_eq!(items[0].path, app.exe.display().to_string());
+    }
+
+    #[test]
+    fn non_hideable_electron_apps_are_listed_disabled() {
+        let electrons = vec![electron("Code", true, None), electron("Discord", false, Some("퓨즈가 꺼져 있음"))];
+        let natives = vec![
+            ("Code".to_string(), "/Applications/Code.app".to_string()),
+            ("Discord".to_string(), "/Applications/Discord.app".to_string()),
+            ("TextEdit".to_string(), "/System/Applications/TextEdit.app".to_string()),
+        ];
+        let items = app_list_items(&electrons, &natives, false);
+        assert_eq!(items.len(), 3, "{items:?}");
+        let code = items.iter().find(|i| i.path.ends_with("Code.app")).unwrap();
+        assert_eq!(code.electron, Some(0));
+        assert!(code.disabled.is_none());
+        // 숨김 실행이 안 되는 Electron 앱은 사라지지 않고 비활성 + 이유로 보이며, 네이티브 항목으로 다시 들어가지 않는다
+        let discord: Vec<_> = items.iter().filter(|i| i.path.ends_with("Discord.app")).collect();
+        assert_eq!(discord.len(), 1);
+        assert!(discord[0].disabled.as_deref().unwrap().contains("퓨즈가 꺼져 있음"));
+        assert_eq!(discord[0].electron, None);
+        let te = items.iter().find(|i| i.path.ends_with("TextEdit.app")).unwrap();
+        assert!(te.disabled.is_none() && te.electron.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_app_list_merges_electron_exe() {
+        let mut code = electron("Code", true, None);
+        code.bundle = PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code");
+        code.exe = PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe");
+        let mut slack = electron("Slack", false, Some("퓨즈가 꺼져 있음"));
+        slack.bundle = PathBuf::from(r"C:\Users\u\AppData\Local\slack");
+        slack.exe = PathBuf::from(r"C:\Users\u\AppData\Local\slack\slack.exe");
+        let electrons = vec![code, slack];
+        let natives = vec![
+            ("Visual Studio Code".to_string(), r"c:\users\u\appdata\local\programs\microsoft vs code\code.exe".to_string()),
+            ("Slack".to_string(), r"C:\Users\u\AppData\Local\slack\slack.exe".to_string()),
+            ("메모장".to_string(), r"C:\Windows\notepad.exe".to_string()),
+        ];
+        let items = app_list_items(&electrons, &natives, false);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0].electron, Some(0));
+        assert_eq!(items[1].label, "메모장");
+        assert!(items[2].disabled.is_some(), "숨김 실행이 안 되는 Electron 앱은 네이티브로 새지 않고 맨 뒤에");
+        // 실행 파일 경로를 직접 적어도 Electron 앱으로 인식
+        assert!(electron_matches(&electrons[0], r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe"));
+        assert!(electron_matches(&electrons[0], r"c:/users/u/appdata/local/programs/microsoft vs code/"));
+        assert!(!electron_matches(&electrons[0], r"C:\Windows\notepad.exe"));
+    }
+
+    #[test]
+    fn unsupported_cards_follow_caps() {
+        // macOS 는 모든 카드, Windows 는 가상 디스플레이 없음 (별도 세션 = 자식 세션)
+        if cfg!(target_os = "macos") {
+            assert!(LOCAL_APP_CARD && caps::SESSION && caps::VDISPLAY);
+            assert_eq!(text::PRIMARY_MOD, "cmd");
+        }
+        if cfg!(windows) {
+            assert!(LOCAL_APP_CARD && caps::SESSION && !caps::VDISPLAY);
+            assert_eq!(text::LOCAL_APPS, "Windows 앱");
+            // 직접 조작의 복사/잘라내기는 Windows 에서 ctrl
+            assert_eq!(format!("{}+c", text::PRIMARY_MOD), "ctrl+c");
+        }
+        assert_eq!(pick("mac", "other"), if cfg!(target_os = "macos") { "mac" } else { "other" });
+        // 새 에이전트 창의 칸도 같은 caps 를 따른다: 웹이 맨 앞, 원격이 맨 뒤
+        let k = kinds();
+        assert_eq!(k.len(), 2 + LOCAL_APP_CARD as usize + caps::SESSION as usize);
+        assert!(k.first().unwrap().choice == Choice::Web && k.last().unwrap().choice == Choice::Remote);
+    }
+}

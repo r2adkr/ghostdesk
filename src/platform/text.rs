@@ -15,9 +15,6 @@ pub const OS_NAME: &str = if cfg!(target_os = "macos") {
 /// 기본 단축키 수정키 이름 (에이전트에게 알려 줄 때): macOS 는 cmd, 그 밖은 ctrl
 pub const PRIMARY_MOD: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
 
-/// 화면 표시용 기본 수정키 기호
-pub const PRIMARY_MOD_LABEL: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
-
 /// 로컬 앱 카드 아이콘 (Lucide app-window, 함께 넣은 아이콘 글꼴로 그려 OS 와 상관없이 같은 모양)
 pub const APP_ICON: &str = crate::icon::APP_WINDOW;
 

@@ -20,6 +20,3 @@ pub const VDISPLAY: bool = cfg!(target_os = "macos");
 
 /// 🧑‍💻 별도 세션 — macOS: 전용 계정(세션 헬퍼 + LaunchAgent), Windows: 같은 계정의 자식 세션(PiP)
 pub const SESSION: bool = cfg!(any(target_os = "macos", windows));
-
-/// 외부 에이전트 연결 (제어 소켓/명명 파이프 + MCP stdio)
-pub const MCP: bool = cfg!(any(unix, windows));

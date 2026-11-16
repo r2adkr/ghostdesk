@@ -1,0 +1,599 @@
+//! 에이전트 하나의 상세 보기: 라이브 화면·직접 조작·기록·지시.
+
+use super::*;
+use super::labels::{status_color, status_text};
+
+/// 사용자의 직접 조작 입력 하나 (에이전트 좌표)
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum TakeoverInput {
+    /// 드래그 시작: 그 지점으로 이동한 뒤 버튼 누름
+    DragStart(f64, f64),
+    MouseMove(f64, f64),
+    MouseUp,
+    Click { pos: (f64, f64), button: MouseButton, count: u32 },
+    Type(String),
+    /// 사람이 누른 키 조합 (클립보드 조합도 그대로 전달)
+    Key(String),
+    Scroll { pos: Option<(f64, f64)>, dx: f64, dy: f64 },
+}
+
+impl TakeoverInput {
+    async fn apply(self, w: &crate::desk::Desk) -> anyhow::Result<()> {
+        match self {
+            TakeoverInput::DragStart(x, y) => {
+                w.mouse_move(x, y, 0).await?;
+                w.mouse_down(MouseButton::Left, 1, 0).await
+            }
+            TakeoverInput::MouseMove(x, y) => w.mouse_move(x, y, 0).await,
+            TakeoverInput::MouseUp => w.mouse_up(MouseButton::Left, 1, 0).await,
+            TakeoverInput::Click { pos, button, count } => w.click(Some(pos), button, count, 0).await,
+            TakeoverInput::Type(t) => w.type_text(&t).await,
+            TakeoverInput::Key(k) => w.key_by_human(&k, 1).await,
+            TakeoverInput::Scroll { pos, dx, dy } => w.scroll(pos, dx, dy, 0).await,
+        }
+    }
+}
+
+impl GhostApp {
+    /// 상세 보기 오른쪽 패널: 이름·상태 → 제어 → (질문/외부 안내) → 기록 → 아래쪽 지시 입력
+    pub(super) fn detail_side(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
+        let a = &mut self.agents[idx];
+        let st = a.shared.status();
+        let mut remove = false;
+        // 1줄: ● 이름 ……… ⋯ (제거는 메뉴 안에: 실수로 누르지 않게)
+        ui.horizontal(|ui| {
+            theme::dot(ui, crate::cursor::agent_color(a.shared.id), 5.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button(RichText::new(icon::ELLIPSIS).size(18.0).color(theme::body()), |ui| {
+                    if ui
+                        .button(RichText::new(tr("에이전트 제거")).color(theme::danger()))
+                        .on_hover_text(tr("에이전트 화면을 닫아요 (작업공간 폴더는 남아요)"))
+                        .clicked()
+                    {
+                        remove = true;
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text(tr("더 보기"));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(&a.shared.name).size(18.0).strong().color(theme::text())).truncate());
+                });
+            });
+        });
+        let tokens = *a.shared.tokens.lock();
+        let paused = a.shared.paused.load(Ordering::Relaxed);
+        let info = trf("단계 {} · 토큰 {} / {} · 작업공간 {}", &[&a.shared.steps.load(Ordering::Relaxed), &tokens.0, &tokens.1, &a.shared.workspace_name]);
+        // 일하는 중이면 도는 표시 + 반짝이는 상태 글, 멈춰 있으면 색 칩
+        if is_working(&st) && !paused {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                theme::spinner(ui, 15.0, theme::text());
+                theme::shimmer(ui, &crate::llm::short(&status_text(&st), 48), 13.0)
+            })
+            .response
+            .on_hover_text(info);
+        } else {
+            theme::chip(ui, status_color(&st), &status_text(&st)).on_hover_text(info);
+        }
+        // 단계: 마지막 지시 뒤로 몇 번 움직였는지 (최대 단계가 있으면 막대로)
+        let run = a.shared.run_steps.load(Ordering::Relaxed);
+        if run > 0 {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if a.max_steps > 0 {
+                    ui.label(theme::hint(trf("단계 {} / {}", &[&run, &a.max_steps])));
+                    let w = ui.available_width().min(220.0);
+                    theme::progress(ui, egui::Id::unique(("steps", a.shared.id)), run as f32 / a.max_steps as f32, w);
+                } else {
+                    ui.label(theme::hint(trf("단계 {}", &[&run])));
+                }
+            });
+        }
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if theme::secondary(ui, if paused { tr("재개") } else { tr("일시정지") }).clicked() {
+                a.shared.paused.store(!paused, Ordering::Relaxed);
+            }
+            if theme::secondary(ui, tr("중지")).on_hover_text(tr("지금 동작만 끝내고 멈춰요. 다시 지시하면 이어서 해요.")).clicked() {
+                a.shared.stop.store(true, Ordering::SeqCst);
+                a.shared.paused.store(false, Ordering::Relaxed);
+            }
+            let before = a.takeover;
+            if theme::toggle(ui, a.takeover, tr("직접 조작"), theme::takeover())
+                .on_hover_text(tr("에이전트를 멈추고 내가 직접 화면을 눌러요 (로그인 · 인증할 때)"))
+                .clicked()
+            {
+                a.takeover = !a.takeover;
+            }
+            if a.takeover != before {
+                a.shared.paused.store(a.takeover, Ordering::Relaxed);
+            }
+            if theme::icon_toggle(ui, a.pip, icon::PICTURE_IN_PICTURE, tr("작은 창(PiP)으로 띄우기 — 다른 일을 하면서 지켜볼 수 있어요")).clicked() {
+                a.pip = !a.pip;
+            }
+        });
+
+        if let AgentStatus::WaitingUser(q) = &st {
+            ui.add_space(2.0);
+            theme::tinted(theme::warn()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(tr("에이전트의 질문")).strong().color(theme::warn()));
+                // 긴 질문도 아래 답변 칸을 밀어내지 않게 높이를 제한한다
+                egui::ScrollArea::vertical().id_salt("question").max_height(160.0).show(ui, |ui| {
+                    ui.label(q);
+                });
+            });
+        }
+        let external = a.shared.external.lock().clone();
+        if let Some(client) = &external {
+            ui.add_space(2.0);
+            theme::tinted(theme::info()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(trf("{} 이(가) 조작하는 화면", &[&client])).strong().color(theme::info_text()));
+                ui.label(theme::hint(tr("지시는 그 AI 앱에서 해 주세요. 여기서는 지켜보거나 '직접 조작'으로 도울 수 있어요.")));
+            });
+        }
+        ui.add_space(6.0);
+
+        // 가운데: 기록, 아래: 지시 입력 (GhostDesk 안의 에이전트만).
+        // 입력칸 높이는 지난 프레임에 잰 값으로 기록 영역을 남겨 두고, 높이가 바뀌면 한 번 더 그려 맞춘다.
+        // 자리가 모자라면 기록을 줄인다 (입력칸과 보내기 단추는 늘 보이게).
+        let has_composer = external.is_none();
+        let composer_id = egui::Id::unique(("composer_h", a.shared.id));
+        let composer_h: f32 = ui.data(|d| d.get_temp(composer_id)).unwrap_or(150.0);
+        let log_h = (ui.available_height() - if has_composer { composer_h + 10.0 } else { 0.0 }).max(0.0);
+        if log_h >= 60.0 {
+            egui::Frame::new().fill(theme::bg()).corner_radius(theme::CARD_RADIUS).inner_margin(Margin::same(10)).show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("log")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .max_height(log_h - 20.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 7.0;
+                        let log = a.shared.log.lock();
+                        // 마지막 동작 줄은 그 동작이 아직 진행 중이면 도는 표시로
+                        let acting = matches!(st, AgentStatus::Acting(_)) && !paused;
+                        let last_action = log.iter().rposition(|l| l.kind == LogKind::Action);
+                        let n = log.len();
+                        for (i, l) in log.iter().enumerate() {
+                            let live = acting && Some(i) == last_action;
+                            if i + 1 == n {
+                                // 새로 들어온 줄은 서서히 나타난다
+                                let t = theme::appear(ui.ctx(), egui::Id::unique(("log_in", a.shared.id)), n as u64, 0.25);
+                                ui.scope(|ui| {
+                                    ui.multiply_opacity(t);
+                                    log_row(ui, l, live);
+                                });
+                            } else {
+                                log_row(ui, l, live);
+                            }
+                        }
+                    });
+            });
+        }
+
+        if has_composer {
+            ui.add_space(10.0);
+            let waiting = matches!(st, AgentStatus::WaitingUser(_));
+            let composer = ui.scope(|ui| {
+                let mut remove_q = None;
+                {
+                    let q = a.shared.queue.lock();
+                    if !q.is_empty() {
+                        egui::ScrollArea::vertical().id_salt("queue").max_height(84.0).show(ui, |ui| {
+                            for (i, t) in q.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(theme::hint(trf("다음 {}. {}", &[&(i + 1), &crate::llm::short(t, 40)])));
+                                    if ui.small_button(icon::X).on_hover_text(tr("대기열에서 빼기")).clicked() {
+                                        remove_q = Some(i);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+                if let Some(i) = remove_q {
+                    a.shared.queue.lock().remove(i);
+                }
+                let hint = if waiting {
+                    pick(tr("답변 입력 (Cmd+Enter 전송)"), tr("답변 입력 (Ctrl+Enter 전송)"))
+                } else {
+                    pick(tr("지시 입력 (Cmd+Enter 전송)"), tr("지시 입력 (Ctrl+Enter 전송)"))
+                };
+                let te = ui.add(
+                    egui::TextEdit::multiline(&mut a.input)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(10, 8))
+                        .hint_text(hint),
+                );
+                let send_key = te.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if (theme::primary(ui, if waiting { tr("답변 보내기") } else { tr("보내기") }).on_hover_text(tr("지금 바로 지시해요")).clicked() || send_key)
+                        && !a.input.trim().is_empty()
+                    {
+                        let text = a.input.trim().to_string();
+                        let cmd = if waiting { AgentCmd::Answer(text) } else { AgentCmd::Instruction(text) };
+                        let _ = a.tx.send(cmd);
+                        a.input.clear();
+                    }
+                    if !waiting
+                        && theme::secondary(ui, tr("다음 작업으로"))
+                            .on_hover_text(tr("지금 일이 끝나면 이어서 할 일로 줄 세워 둬요. 멈춰 있을 때는 '보내기'로 먼저 다시 시작해 주세요."))
+                            .clicked()
+                        && !a.input.trim().is_empty()
+                    {
+                        a.shared.queue.lock().push_back(a.input.trim().to_string());
+                        a.input.clear();
+                        let _ = a.tx.send(AgentCmd::Wake);
+                    }
+                });
+            });
+            let h = composer.response.rect.height();
+            if (h - composer_h).abs() > 0.5 {
+                ui.data_mut(|d| d.insert_temp(composer_id, h));
+                ui.ctx().request_repaint();
+            }
+        }
+        remove
+    }
+
+    pub(super) fn detail_view(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let rt = self.rt.clone();
+        let ws_opt = self.agents[idx].shared.workspace();
+        let browser = ws_opt.as_ref().and_then(|w| w.as_browser().cloned());
+        let (views, active) = ws_opt.as_ref().map(|w| w.views()).unwrap_or_default();
+        // 1줄: ‹ 모두 보기 · (브라우저: ◀ ▶ ⟳ + 주소 / 앱: 지금 창 제목) · 오른쪽 끝 가상 마우스
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(RichText::new(tr("‹  모두 보기")).color(theme::text())).frame_when_inactive(false).min_size(Vec2::new(0.0, 32.0)))
+                .clicked()
+            {
+                self.view = View::Grid;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::icon_toggle(ui, self.show_cursor, icon::MOUSE_POINTER, tr("가상 마우스 표시")).clicked() {
+                    self.show_cursor = !self.show_cursor;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if let Some(b) = &browser {
+                        let w = b.clone();
+                        if theme::icon_button(ui, icon::ARROW_LEFT, tr("뒤로")).clicked() {
+                            rt.spawn(async move { let _ = w.history_go(-1).await; });
+                        }
+                        let w = b.clone();
+                        if theme::icon_button(ui, icon::ARROW_RIGHT, tr("앞으로")).clicked() {
+                            rt.spawn(async move { let _ = w.history_go(1).await; });
+                        }
+                        let w = b.clone();
+                        if theme::icon_button(ui, icon::ROTATE_CW, tr("새로 고침")).clicked() {
+                            rt.spawn(async move { let _ = w.reload().await; });
+                        }
+                        let w = b.clone();
+                        if theme::icon_button(ui, "＋", tr("새 탭")).clicked() {
+                            rt.spawn(async move { let _ = w.new_tab("").await; });
+                        }
+                        let a = &mut self.agents[idx];
+                        let cur = b.active_tab().map(|t| t.url).unwrap_or_default();
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut a.url_input)
+                                .desired_width(f32::INFINITY)
+                                .margin(Margin::symmetric(10, 6))
+                                .hint_text(cur),
+                        );
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !a.url_input.trim().is_empty() {
+                            let w = b.clone();
+                            let u = std::mem::take(&mut a.url_input);
+                            rt.spawn(async move { let _ = w.navigate(&u).await; });
+                        }
+                    } else if let Some(t) = views.iter().find(|t| Some(&t.id) == active.as_ref()) {
+                        let title = if t.title.is_empty() { t.detail.clone() } else { t.title.clone() };
+                        ui.add(egui::Label::new(theme::hint(title)).truncate());
+                    }
+                });
+            });
+        });
+        // 2줄: 탭/창이 둘 이상일 때만 (넘치면 다음 줄로)
+        if views.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                for (i, t) in views.iter().enumerate() {
+                    let title = if t.title.is_empty() { t.detail.clone() } else { t.title.clone() };
+                    let sel = Some(&t.id) == active.as_ref();
+                    if ui.add(egui::Button::selectable(sel, crate::llm::short(&title, 24))).on_hover_text(&t.detail).clicked() && !sel {
+                        if let Some(ws) = &ws_opt {
+                            let w = ws.clone();
+                            rt.spawn(async move { let _ = w.switch_view(i).await; });
+                        }
+                    }
+                }
+            });
+        }
+        let a = &mut self.agents[idx];
+        let Some(ws) = ws_opt else {
+            ui.centered_and_justified(|ui| ui.label(RichText::new(status_text(&a.shared.status())).color(theme::muted())));
+            return;
+        };
+        ui.add_space(6.0);
+
+        // 라이브 화면 (가운데 정렬, 비율 유지)
+        let avail = ui.available_size();
+        let (sw, sh) = ws.size();
+        let scale = (avail.x / sw.max(1) as f32).min(avail.y / sh.max(1) as f32).max(0.05);
+        let size = Vec2::new(sw as f32 * scale, sh as f32 * scale);
+        let sense = if a.takeover { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let pad = ((avail.x - size.x) / 2.0).max(0.0);
+        let resp = ui
+            .horizontal(|ui| {
+                ui.add_space(pad);
+                match &a.texture {
+                    Some(t) => ui.add(egui::Image::new((t.id(), size)).corner_radius(theme::CARD_RADIUS).sense(sense)),
+                    None => {
+                        let r = ui.allocate_response(size, sense);
+                        preparing(ui, r.rect, tr("화면 준비 중…"));
+                        r
+                    }
+                }
+            })
+            .inner;
+        let rect = resp.rect;
+        if !a.takeover {
+            // 검은 페이지도 바탕과 구분되게 얇은 테두리
+            ui.painter().rect_stroke(rect, 10, Stroke::new(1.0, theme::border()), StrokeKind::Outside);
+        }
+        // 가상 마우스: 격리 화면에는 실제 커서가 없으므로 에이전트 동작을 기록해 그린다.
+        if self.show_cursor && a.texture.is_some() {
+            let mut st = a.shared.cursor.lock();
+            let again = crate::cursor::paint(
+                ui.painter(), rect, scale, &mut st, &mut a.cursor_view, ws.mouse_pos(),
+                crate::cursor::agent_color(a.shared.id), Some(&a.shared.name), false,
+            );
+            if again {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+        let shared = a.shared.clone();
+        let rec = move |name: &str, input: serde_json::Value, pos: (f64, f64)| {
+            shared.cursor.lock().record(name, &input, pos, true);
+        };
+        if a.takeover {
+            // 직접 조작 중: 주황 테두리 + 왼쪽 위 표시
+            let p = ui.painter();
+            p.rect_stroke(rect, 10, egui::Stroke::new(2.0, theme::takeover()), egui::StrokeKind::Outside);
+            let at = rect.left_top() + Vec2::new(12.0, 10.0);
+            let g = p.layout_no_wrap(tr("직접 조작 중").to_string(), egui::FontId::proportional(12.0), Color32::BLACK);
+            p.rect_filled(egui::Rect::from_min_size(at, g.size()).expand2(Vec2::new(8.0, 3.0)), 255, theme::takeover());
+            p.galley(at, g, Color32::BLACK);
+        }
+
+        if !a.takeover {
+            return;
+        }
+        let to_page = |p: egui::Pos2| (((p.x - rect.min.x) / scale) as f64, ((p.y - rect.min.y) / scale) as f64);
+        let hovered = resp.hovered();
+        if hovered || resp.has_focus() {
+            resp.request_focus();
+        }
+        // 모든 입력은 에이전트별 큐 하나로 보내 순서대로 적용한다
+        let input = a.input_tx.clone();
+        let send = move |ev: TakeoverInput| {
+            let _ = input.send(ev);
+        };
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let (x, y) = to_page(p);
+                rec("left_mouse_down", serde_json::json!({ "coordinate": [x, y] }), (x, y));
+                send(TakeoverInput::DragStart(x, y));
+            }
+        } else if resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let (x, y) = to_page(p);
+                rec("mouse_move", serde_json::json!({ "coordinate": [x, y] }), (x, y));
+                send(TakeoverInput::MouseMove(x, y));
+            }
+        }
+        if resp.drag_stopped() {
+            send(TakeoverInput::MouseUp);
+        } else if resp.clicked() || resp.secondary_clicked() || resp.double_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let (x, y) = to_page(p);
+                let (btn, count) = if resp.secondary_clicked() {
+                    (MouseButton::Right, 1)
+                } else if resp.double_clicked() {
+                    (MouseButton::Left, 2)
+                } else {
+                    (MouseButton::Left, 1)
+                };
+                let name = match (btn, count) {
+                    (MouseButton::Right, _) => "right_click",
+                    (_, 2) => "double_click",
+                    _ => "left_click",
+                };
+                rec(name, serde_json::json!({ "coordinate": [x, y] }), (x, y));
+                send(TakeoverInput::Click { pos: (x, y), button: btn, count });
+            }
+        }
+        if !hovered {
+            // 화면 밖으로 나가면 입력기가 꺼지므로 조합 중이던 글자 표시도 지운다
+            a.preedit.clear();
+            return;
+        }
+        // Windows: 직접 조작 중에는 입력기(IME)를 켜 둔다. egui 는 글 입력칸에 포커스가 없으면 IME 를 꺼 버려
+        // (ImmAssociateContextEx) 한글 자판이 영문 글자로 들어온다. 조합이 확정되면(Commit) Type 으로 보낸다.
+        if cfg!(windows) {
+            let at = resp.hover_pos().unwrap_or(rect.left_top());
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Normal,
+                    rect,
+                    cursor_rect: egui::Rect::from_min_size(at, Vec2::new(1.0, 18.0)),
+                    should_interrupt_composition: false,
+                });
+            });
+        }
+        let events = ui.input(|i| i.events.clone());
+        for ev in events {
+            match ev {
+                // 붙여넣기: 사람이 직접 한 조작이므로 사용자의 클립보드 글자를 그대로 입력한다
+                egui::Event::Text(t) | egui::Event::Paste(t) => {
+                    rec("type", serde_json::json!({ "text": t }), ws.mouse_pos());
+                    send(TakeoverInput::Type(t));
+                }
+                // egui 는 cmd+C / cmd+X (Windows: ctrl+C·ctrl+Insert / ctrl+X·shift+Delete) 를 Key 대신
+                // Copy / Cut 으로 바꾸므로 격리 화면에 그 OS 의 키 조합으로 전달한다. Windows 의 Insert/Delete 는
+                // 누른 조합 그대로 (그 화면 안에서 복사·잘라내기가 일어난다. Electron 의 클립보드 차단은 에이전트에게만 적용)
+                egui::Event::Copy | egui::Event::Cut => {
+                    let combo = crate::platform::input::takeover_clipboard_combo(matches!(ev, egui::Event::Copy), ui.input(|i| i.modifiers));
+                    rec("key", serde_json::json!({ "text": combo }), ws.mouse_pos());
+                    send(TakeoverInput::Key(combo));
+                }
+                // 조합 중인 글자는 화면에만 보여 준다 (Windows 에서만 IME 를 켜므로 그때만 온다)
+                egui::Event::Ime(egui::ImeEvent::Preedit { text: t, .. }) if cfg!(windows) => {
+                    a.preedit = t;
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    a.preedit.clear();
+                    send(TakeoverInput::Type(t));
+                }
+                egui::Event::MouseWheel { delta, unit, .. } => {
+                    let mul = match unit {
+                        egui::MouseWheelUnit::Point => 1.0,
+                        egui::MouseWheelUnit::Line => 40.0,
+                        egui::MouseWheelUnit::Page => 600.0,
+                    };
+                    let (dx, dy) = (-(delta.x * mul) as f64, -(delta.y * mul) as f64);
+                    let pos = resp.hover_pos().map(to_page);
+                    if let Some(p) = pos {
+                        let dir = if dy.abs() >= dx.abs() { if dy < 0.0 { "up" } else { "down" } } else if dx < 0.0 { "left" } else { "right" };
+                        rec("scroll", serde_json::json!({ "coordinate": [p.0, p.1], "scroll_direction": dir }), p);
+                    }
+                    send(TakeoverInput::Scroll { pos, dx, dy });
+                }
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    if let Some(combo) = egui_key_combo(key, modifiers) {
+                        rec("key", serde_json::json!({ "text": combo }), ws.mouse_pos());
+                        send(TakeoverInput::Key(combo));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !a.preedit.is_empty() {
+            let painter = ui.painter();
+            let at = resp.hover_pos().unwrap_or(rect.left_bottom()) + Vec2::new(14.0, 14.0);
+            let galley = painter.layout_no_wrap(a.preedit.clone(), egui::FontId::proportional(16.0), Color32::WHITE);
+            let bg = egui::Rect::from_min_size(at, galley.size()).expand(4.0);
+            painter.rect_filled(bg, 4.0, theme::raised());
+            painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0, theme::takeover()), egui::StrokeKind::Outside);
+            painter.galley(at, galley, Color32::WHITE);
+        }
+    }
+}
+
+/// 직접 조작 입력 큐와 그것을 순서대로 적용하는 task 하나. 보내는 쪽(AgentHandle)이 사라지면 task 도 끝난다.
+pub(super) fn spawn_input_queue(rt: &Handle, shared: Arc<AgentShared>) -> mpsc::UnboundedSender<TakeoverInput> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<TakeoverInput>();
+    rt.spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if shared.removed.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(w) = shared.workspace() {
+                let _ = ev.apply(&w).await;
+            }
+        }
+    });
+    tx
+}
+
+/// 아직 첫 화면이 오지 않은 자리: 카드 바탕 + 가운데 도는 표시 + 글
+pub(super) fn preparing(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    let p = ui.painter();
+    p.rect_filled(rect, theme::CARD_RADIUS, theme::card());
+    theme::paint_spinner(p, rect.center() - Vec2::new(0.0, 14.0), 22.0, theme::muted(), ui.input(|i| i.time));
+    p.text(rect.center() + Vec2::new(0.0, 16.0), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), theme::muted());
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// 지금 일하는 중인 상태인가 (준비 · 생각 · 실행)
+pub(super) fn is_working(st: &AgentStatus) -> bool {
+    matches!(st, AgentStatus::Preparing(_) | AgentStatus::Thinking | AgentStatus::Acting(_))
+}
+
+/// 기록 한 줄: 종류 표시 + 글 (줄바꿈하면 표시 오른쪽으로 들여 씀). 시각은 마우스를 올리면.
+/// 동작 줄은 단계처럼 보인다: 끝난 동작은 ✓, 진행 중인 동작(`live`)은 도는 표시.
+pub(super) fn log_row(ui: &mut egui::Ui, l: &crate::agent::LogEntry, live: bool) {
+    let (dot, color) = match l.kind {
+        LogKind::User => (theme::info_text(), theme::text()),
+        LogKind::Assistant => (theme::muted(), theme::text()),
+        LogKind::Thinking => (theme::muted(), theme::muted()),
+        LogKind::Action => (theme::success(), theme::body()),
+        LogKind::Info => (theme::muted(), theme::muted()),
+        LogKind::Error => (theme::danger(), theme::danger()),
+    };
+    let row = ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (r, _) = ui.allocate_exact_size(Vec2::new(12.0, 18.0), egui::Sense::hover());
+        let mark = egui::pos2(r.center().x, r.top() + 9.0);
+        match (l.kind, live) {
+            (LogKind::Action, true) => {
+                theme::paint_spinner(ui.painter(), mark, 12.0, theme::text(), ui.input(|i| i.time));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            (LogKind::Action, false) => {
+                ui.painter().text(mark, egui::Align2::CENTER_CENTER, icon::CIRCLE_CHECK, egui::FontId::proportional(11.0), dot);
+            }
+            _ => {
+                ui.painter().circle_filled(mark, 3.0, dot);
+            }
+        }
+        let mut t = RichText::new(&l.text).color(color);
+        match l.kind {
+            LogKind::User => t = t.strong(),
+            LogKind::Thinking => t = t.italics(),
+            LogKind::Action | LogKind::Info => t = t.size(13.0),
+            _ => {}
+        }
+        ui.add(egui::Label::new(t).wrap());
+    });
+    row.response.on_hover_text(trf("{}초", &[&format!("{:.1}", l.secs)]));
+}
+
+/// egui 키 이벤트 → xdotool 스타일 조합. 일반 글자는 Text 이벤트로 오므로 수정키가 있을 때만 처리.
+pub(super) fn egui_key_combo(key: egui::Key, m: egui::Modifiers) -> Option<String> {
+    use egui::Key::*;
+    let base = match key {
+        Enter => "Return".to_string(),
+        Tab => "Tab".into(),
+        Backspace => "BackSpace".into(),
+        Delete => "Delete".into(),
+        Escape => "Escape".into(),
+        ArrowUp => "Up".into(),
+        ArrowDown => "Down".into(),
+        ArrowLeft => "Left".into(),
+        ArrowRight => "Right".into(),
+        Home => "Home".into(),
+        End => "End".into(),
+        PageUp => "Page_Up".into(),
+        PageDown => "Page_Down".into(),
+        F1 => "F1".into(), F2 => "F2".into(), F3 => "F3".into(), F4 => "F4".into(),
+        F5 => "F5".into(), F6 => "F6".into(), F7 => "F7".into(), F8 => "F8".into(),
+        F9 => "F9".into(), F10 => "F10".into(), F11 => "F11".into(), F12 => "F12".into(),
+        k => {
+            let name = k.name();
+            if name.chars().count() == 1 && (m.ctrl || m.mac_cmd || m.alt) {
+                name.to_ascii_lowercase()
+            } else {
+                return None;
+            }
+        }
+    };
+    let mut s = String::new();
+    if m.mac_cmd { s.push_str("cmd+"); }
+    if m.ctrl { s.push_str("ctrl+"); }
+    if m.alt { s.push_str("alt+"); }
+    if m.shift { s.push_str("shift+"); }
+    s.push_str(&base);
+    Some(s)
+}

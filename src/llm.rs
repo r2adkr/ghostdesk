@@ -1,40 +1,42 @@
-//! Claude Messages API 클라이언트 (Rust 공식 SDK 가 없으므로 raw HTTP).
+//! AI API 클라이언트 (Rust 공식 SDK 가 없으므로 raw HTTP).
 //!
-//! - computer use: `computer_toolset_20260801` (GA, beta 헤더 없음)
-//! - adaptive thinking + `display: "updates"` 로 도구 호출 사이의 진행 메모를 받는다
-//! - 오래된 스크린샷은 서버 측 context editing(`clear_tool_uses_20250919`)으로 정리
-//! - 안전 분류기 거절 시 서버 측 fallback(`fallbacks: "default"`)
+//! 대화는 에이전트 쪽에서 늘 Claude Messages 형식으로 쌓는다. 제공자가 Claude 면 그대로(anthropic),
+//! 아니면 보내기 직전에 OpenAI 호환 형식으로 바꿔 보내고 답도 Claude 형식으로 되돌린다(openai).
+//! 그래서 에이전트는 제공자를 몰라도 된다.
+
+mod anthropic;
+mod openai;
+mod provider;
 
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
-pub const MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5"];
+pub(crate) use anthropic::KEEP_TOOL_USES;
+pub use provider::Provider;
+
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Clone)]
 pub struct Llm {
     http: reqwest::Client,
+    pub provider: Provider,
     pub api_key: String,
     pub model: String,
     pub effort: String,
 }
 
+fn http() -> reqwest::Client {
+    reqwest::Client::builder().timeout(Duration::from_secs(600)).build().expect("HTTP 클라이언트 생성 실패")
+}
+
 impl Llm {
-    pub fn new(api_key: String, model: String, effort: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()
-            .expect("HTTP 클라이언트 생성 실패");
-        Llm { http, api_key, model, effort }
+    pub fn new(provider: Provider, api_key: String, model: String, effort: String) -> Self {
+        Llm { http: http(), provider, api_key, model, effort }
     }
 
-    fn is_haiku(&self) -> bool {
-        self.model.contains("haiku")
-    }
-
-    /// 백엔드 종류에 맞는 도구 목록. 대화 중에는 바꾸지 않는다.
+    /// 백엔드 종류에 맞는 도구 목록 (Claude 형식). 대화 중에는 바꾸지 않는다.
     pub fn tools(kind: crate::desk::DeskKind) -> Value {
         use crate::desk::DeskKind;
         let mut tools = vec![json!({ "type": "computer_toolset_20260801" })];
@@ -93,49 +95,26 @@ impl Llm {
             })
     }
 
+    /// 한 턴을 보내고 Claude 형식의 답(`content`·`stop_reason`·`usage`)을 돌려준다.
     pub async fn send(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
-        let mut betas = vec!["context-management-2025-06-27"];
-        let mut thinking = json!({ "type": "adaptive" });
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": 16000,
-            "system": system,
-            "output_config": { "effort": self.effort },
-            "tools": tools,
-            "context_management": {
-                "edits": [{
-                    "type": "clear_tool_uses_20250919",
-                    "trigger": { "type": "input_tokens", "value": 60000 },
-                    "keep": { "type": "tool_uses", "value": 6 },
-                    "clear_at_least": { "type": "input_tokens", "value": 10000 }
-                }]
-            },
-            "messages": messages,
-            // 자동 프롬프트 캐싱: 매 턴 늘어나는 대화의 앞부분을 캐시해 지연·비용을 줄인다
-            "cache_control": { "type": "ephemeral" },
-        });
-        if !self.is_haiku() {
-            betas.push("thinking-display-updates-2026-08-18");
-            betas.push("server-side-fallback-2026-07-01");
-            thinking["display"] = json!("updates");
-            body["fallbacks"] = json!("default");
+        if self.provider == Provider::Anthropic {
+            self.send_anthropic(system, tools, messages).await
+        } else {
+            self.send_openai(system, tools, messages).await
         }
-        body["thinking"] = thinking;
+    }
 
+    /// 재시도(일시 오류는 지수 대기 후 최대 5번)를 포함한 POST
+    pub(super) async fn post(&self, url: &str, body: &Value, extra: &[(&str, &str)]) -> Result<Value> {
+        let name = self.provider.short_name();
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let res = self
-                .http
-                .post(format!("{}/v1/messages", base_url()))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", betas.join(","))
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-            match res {
+            let mut req = auth(self.http.post(url), self.provider, &self.api_key).header("content-type", "application/json");
+            for (k, v) in extra {
+                req = req.header(*k, *v);
+            }
+            match req.json(body).send().await {
                 Ok(r) => {
                     let status = r.status();
                     let text = r.text().await.unwrap_or_default();
@@ -144,12 +123,12 @@ impl Llm {
                     }
                     let retryable = matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529);
                     if !retryable || attempt >= 5 {
-                        bail!("Claude API 오류 {status}: {}", short(&text, 800));
+                        bail!("{name} API 오류 {status}: {}", short(&text, 800));
                     }
                 }
                 Err(e) => {
                     if attempt >= 5 {
-                        bail!("Claude API 연결 실패: {e}");
+                        bail!("{name} API 연결 실패: {e}");
                     }
                 }
             }
@@ -158,13 +137,44 @@ impl Llm {
     }
 }
 
-/// 프록시/테스트용으로 ANTHROPIC_BASE_URL 을 존중한다.
-fn base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "https://api.anthropic.com".into())
+fn auth(req: reqwest::RequestBuilder, p: Provider, key: &str) -> reqwest::RequestBuilder {
+    match p {
+        Provider::Anthropic => req.header("x-api-key", key),
+        _ if key.trim().is_empty() => req,
+        _ => req.bearer_auth(key.trim()),
+    }
+}
+
+/// 제공자가 실제로 쓸 수 있는 모델 이름 목록 (`GET /models`). 글·이미지 대화와 상관없는 모델은 뺀다.
+pub async fn list_models(p: Provider, key: &str) -> Result<Vec<String>> {
+    let url = match p {
+        Provider::Anthropic => format!("{}/v1/models?limit=100", p.base_url()),
+        _ => format!("{}/models", p.base_url()),
+    };
+    let mut req = auth(http().get(url), p, key).timeout(Duration::from_secs(20));
+    if p == Provider::Anthropic {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    let r = req.send().await.map_err(|e| anyhow!("{} 에 연결하지 못했습니다: {e}", p.short_name()))?;
+    let status = r.status();
+    let text = r.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("{} 오류 {status}: {}", p.short_name(), short(&text, 200));
+    }
+    let v: Value = serde_json::from_str(&text)?;
+    const SKIP: &[&str] = &["embed", "tts", "whisper", "dall-e", "image", "audio", "realtime", "moderation", "transcribe", "veo", "imagen", "aqa"];
+    let mut ids: Vec<String> = v["data"]
+        .as_array()
+        .or_else(|| v["models"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str().or_else(|| m["name"].as_str()))
+        .map(|id| id.trim_start_matches("models/").to_string())
+        .filter(|id| !SKIP.iter().any(|s| id.to_lowercase().contains(s)))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 pub fn short(s: &str, n: usize) -> String {
