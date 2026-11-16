@@ -8,11 +8,11 @@ Rust + egui 데스크톱 앱입니다 (**macOS · Windows 10/11**). 마우스·�
 
 ## Download and run (Windows)
 
-1. Download [GhostDesk v0.1.1 for Windows x64](https://github.com/r2adkr/ghostdesk/releases/download/v0.1.1/GhostDesk-0.1.1-windows-x64.exe) and double-click it. No installer, Rust, or separate runtime installation is required.
+1. Download [GhostDesk v0.2.0 for Windows x64](https://github.com/r2adkr/ghostdesk/releases/download/v0.2.0/GhostDesk-0.2.0-windows-x64.exe) and double-click it. No installer, Rust, or separate runtime installation is required. Later versions show an **update notice** in the sidebar; click **Update**, then **Restart to update**.
 2. **Home (홈)** opens first. Enter a task to configure a new agent. **All agents (모든 에이전트)** shows the agents' actual live screens; click a screen to open its details.
-3. Use your own Anthropic API key for the built-in agent, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
+3. Use your own API key (Claude, OpenAI, Gemini, OpenRouter, … or a local Ollama) for the built-in agent and pick the model under the home composer, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
 
-The UI is currently in Korean. Windows 10/11 x64 is supported; a supported Chromium browser such as Edge is required for web workspaces. The executable is unsigned, so Windows may show a security warning. Windows child sessions remain experimental, require an administrator account, and have not been verified with real capture/input.
+The UI is available in Korean, English, Japanese, and Chinese (Settings → Language). Windows 10/11 x64 is supported; a supported Chromium browser such as Edge is required for web workspaces. The executable is unsigned, so Windows may show a security warning. Windows child sessions remain experimental, require an administrator account, and have not been verified with real capture/input.
 
 ## 두 가지 사용법
 
@@ -236,6 +236,8 @@ cargo test
 | `src/session.rs`, `src/winapp/child.rs` | macOS 전용 계정·Windows 자식 세션의 헬퍼 RPC, 화면 캡처·입력, 명명 파이프/소켓 연결 |
 | `src/vdisplay.rs` | 실험: CGVirtualDisplay 가상 모니터 위 앱 조작 |
 | `src/install.rs` | ~/Applications (Windows: %LOCALAPPDATA%\Programs\GhostDesk) 설치 + Claude Code·Claude 앱·Codex·Kimi Code·OpenCode·pi 자동 연결 |
+| `src/update.rs` | GitHub 최신 릴리스 확인 → 사이드바 새 버전 알림 → (Windows x64) 내려받아 SHA256 확인 후 실행 중인 exe 와 바꿔치기 · 다시 시작 |
+| `.github/workflows/release.yml` | `v*` 태그를 올리면 Windows x64 exe 와 SHA256SUMS.txt 를 빌드해 릴리스로 올림 (설명은 태그 메시지) |
 | `build.rs`, `windows/ghostdesk.exe.manifest` | Windows 실행 파일 매니페스트 (탐색기 실행 시 콘솔 없음) |
 | `src/rfb.rs` | VNC(RFB) 클라이언트 |
 | `src/control.rs`, `src/mcp.rs` | 외부 에이전트용 제어 소켓과 MCP 서버 |

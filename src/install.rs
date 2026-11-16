@@ -414,7 +414,7 @@ fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
 
 /// `staging` 을 `target` 자리에 놓는다 (Windows).
 #[cfg(windows)]
-fn swap_in(staging: &Path, target: &Path) -> Result<()> {
+pub(crate) fn swap_in(staging: &Path, target: &Path) -> Result<()> {
     // 실행 중이 아니면 한 번에 바꿔치기 (MoveFileExW + REPLACE_EXISTING, 원자적)
     let first = match std::fs::rename(staging, target) {
         Ok(()) => return Ok(()),
@@ -584,7 +584,7 @@ impl Sha256 {
     }
 }
 
-fn sha256_file(p: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_file(p: &Path) -> std::io::Result<String> {
     let mut f = std::fs::File::open(p)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];

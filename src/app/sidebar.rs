@@ -54,11 +54,68 @@ impl GhostApp {
             {
                 self.open_connect(ui.ctx());
             }
+            self.update_notice(ui);
             ui.add_space(4.0);
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 if !self.agents.is_empty() {
                     ui.add_space(20.0);
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.agent_list(ui));
+                }
+            });
+        });
+    }
+
+    /// 새 버전 알림 카드 (외부 연결 위): 알림 → 내려받기(진행 막대) → 다시 시작해서 적용
+    fn update_notice(&mut self, ui: &mut egui::Ui) {
+        use crate::update::State;
+        let st = self.update.lock().clone();
+        let r = match &st {
+            State::None => return,
+            State::Available(r) | State::Downloading(r, _) | State::Ready(r) | State::Failed(r, _) => r.clone(),
+        };
+        ui.add_space(8.0);
+        theme::tinted(theme::info()).show(ui, |ui| {
+            // 사이드바 아래쪽은 아래에서 위로 쌓이므로 카드 안은 위에서 아래로 다시 놓는다
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(RichText::new(trf("새 버전 {} 이 나왔어요", &[&r.version])).strong().color(theme::text()));
+                match &st {
+                    State::Downloading(_, f) => {
+                        ui.horizontal(|ui| {
+                            theme::spinner(ui, 13.0, theme::muted());
+                            ui.label(theme::hint(trf("내려받는 중… {}%", &[&((f * 100.0) as u32)])));
+                        });
+                        theme::progress(ui, egui::Id::unique("update_progress"), *f, ui.available_width());
+                    }
+                    State::Ready(_) => {
+                        if theme::primary(ui, tr("다시 시작해서 적용"))
+                            .on_hover_text(tr("GhostDesk 를 껐다 켜요. 일하던 에이전트는 멈춰요."))
+                            .clicked()
+                        {
+                            crate::update::request_relaunch(ui.ctx());
+                        }
+                    }
+                    _ => {
+                        let failed = matches!(st, State::Failed(..));
+                        if let State::Failed(_, e) = &st {
+                            ui.label(RichText::new(trf("업데이트 실패: {}", &[&crate::llm::short(e, 120)])).size(12.0).color(theme::warn()));
+                        }
+                        ui.horizontal(|ui| {
+                            if r.installable() {
+                                if theme::primary(ui, if failed { tr("다시 시도") } else { tr("업데이트") })
+                                    .on_hover_text(tr("새 버전을 내려받아 바꿔 넣어요. 다 받으면 다시 시작해서 적용해요."))
+                                    .clicked()
+                                {
+                                    crate::update::download(&self.rt, self.update.clone(), ui.ctx().clone());
+                                }
+                                ui.hyperlink_to(RichText::new(tr("새 소식")).size(12.0), &r.page);
+                            } else {
+                                // 앱 안에서 바꿔 넣을 수 없는 OS: 릴리스 페이지에서 직접 받는다
+                                ui.hyperlink_to(RichText::new(tr("내려받기")).size(12.0), &r.page);
+                            }
+                        });
+                    }
                 }
             });
         });

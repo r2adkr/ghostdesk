@@ -32,6 +32,7 @@ mod llm;
 mod profiles;
 mod rfb;
 mod selftest;
+mod update;
 
 fn main() -> anyhow::Result<()> {
     // DLL 심기 방지: 실행 중에 이름만으로 읽는 DLL(그래픽 스택의 opengl32·d3d12·dxgi·d3dcompiler_47 등)을
@@ -121,6 +122,10 @@ fn main() -> anyhow::Result<()> {
     // drop(rt) 는 실행 중인 spawn_blocking(프로필 복제·설치 등)이 끝날 때까지 무기한 기다린다.
     // 창을 닫았으면 잠깐만 기다리고 프로세스를 끝낸다 (중단된 복제는 다음 실행 때 다시 만든다).
     rt.shutdown_timeout(std::time::Duration::from_secs(3));
+    // 업데이트 후 '다시 시작': 단일 실행 뮤텍스를 먼저 놓아야 새 창이 바로 뜬다
+    #[cfg(windows)]
+    drop(_single);
+    update::relaunch_if_requested();
     Ok(())
 }
 

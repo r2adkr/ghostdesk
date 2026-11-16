@@ -233,6 +233,8 @@ pub struct GhostApp {
     wall_fs_before: bool,
     /// 지난 프레임의 사이드바·상세 오른쪽 패널 너비 (제목 표시줄을 같은 열로 나눠 칠한다)
     title_cols: titlebar::Columns,
+    /// 새 버전 알림 · 내려받기 상태 (백그라운드에서 갱신)
+    update: crate::update::Shared,
 }
 
 impl GhostApp {
@@ -254,7 +256,9 @@ impl GhostApp {
             });
         }
         let connect_state = connect::start(&rt, &cc.egui_ctx);
+        let update = crate::update::start(&rt, &cc.egui_ctx);
         let mut app = GhostApp {
+            update,
             connect_state,
             control_rx,
             control_error,
