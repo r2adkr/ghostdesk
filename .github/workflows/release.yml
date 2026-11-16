@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # checkout 은 태그를 커밋을 가리키는 가벼운 태그로 받아 온다 → 그대로 두면 릴리스 설명이 커밋 메시지가 된다.
+      # 주석 달린 태그(메시지 = 릴리스 설명)를 다시 받는다.
+      - name: Fetch tag message
+        run: git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+
       # rust-toolchain.toml 의 버전을 rustup 이 받아 쓴다
       - name: Build
         run: cargo build --release --locked
