@@ -24,5 +24,18 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      # 실패하면 실패한 테스트와 panic 문구를 오류 주석으로 남긴다
+      # (공개 저장소의 실행 로그는 로그인해야 보이지만 주석은 누구나 볼 수 있다)
       - name: Test
-        run: cargo test --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^test .* FAILED$" test.log | head -20 | while read -r line; do echo "::error::$line"; done
+            # panic 줄과 그 아래 메시지 두 줄을 한 줄로
+            awk '/panicked at/ {msg=$0; for (i = 0; i < 2 && (getline nxt) > 0; i++) msg = msg " | " nxt; print msg}' test.log \
+              | head -10 | while read -r line; do echo "::error::${line:0:900}"; done
+          fi
+          exit "$status"
