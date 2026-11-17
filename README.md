@@ -200,6 +200,7 @@ GhostDesk 를 켜면(또는 `ghostdesk.exe --connect`) `%LOCALAPPDATA%\Programs\
 | OpenCode | `%XDG_CONFIG_HOME%\opencode\opencode.json` 또는 `%USERPROFILE%\.config\opencode\opencode.json` (`opencode.jsonc` 만 있으면 그 파일) |
 | pi | `%PI_CODING_AGENT_DIR%\mcp.json` 또는 `%USERPROFILE%\.pi\agent\mcp.json` — `pi install npm:pi-mcp-adapter` 필요 |
 
+- 목록에 없는 AI 앱은 macOS 와 같이 **외부 연결 → 다른 AI 앱** 에서 MCP 설정을 복사하거나 연결 패키지를 만듭니다 (`ghostdesk.exe --export-kit [폴더]`, 기본은 내려받기 폴더, 다 만들면 탐색기로 엽니다). 설정의 `command` 는 위 설치 경로입니다.
 - 실행 중인 `ghostdesk.exe` 위에 새 버전을 설치하면 기존 파일을 `ghostdesk.exe.old-*` 로 밀어 두고 바꿉니다(다음 설치 때 정리).
 - 제어 연결은 유닉스 소켓 대신 이름 있는 파이프 `\\.\pipe\GhostDesk-control-<사용자 SID>` 입니다 (같은 사용자만 접근하도록 ACL 설정, 원격 접속 거부, 양쪽에서 상대 사용자 확인,
   낮은 무결성 수준(샌드박스) 프로세스가 같은 이름의 파이프를 먼저 만들어 가로채는 것도 거부).

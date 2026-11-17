@@ -159,8 +159,8 @@ mod tests {
         }
     }
 
-    /// 일본어·중국어를 고르면 가나·간체자가 그려지고, 한글도 그대로 그려진다
-    #[cfg(windows)]
+    /// 일본어·중국어를 고르면 가나·간체자가 그려지고, 한글도 그대로 그려진다 (글꼴은 메모리 맵으로 연다)
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn cjk_fonts_cover_their_language() {
         for (lang, sample) in [(Lang::Ja, "設定を開く ひらがな カタカナ"), (Lang::Zh, "设置 选择模型 语言")] {
