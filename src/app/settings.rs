@@ -1,4 +1,4 @@
-//! Settings window (language, AI connections, current AI, display, work) and the model picker
+//! Settings window (tabs: General, AI, Permissions on macOS, About) and the model picker
 //! on the home screen. The new-agent window reuses the current connection's key and URL fields.
 //!
 //! The rules for one connection (name, URL, missing setup) live in `ai.rs`; this module only
@@ -134,7 +134,7 @@ impl GhostApp {
     pub(super) fn setup_fields(&mut self, ui: &mut egui::Ui, width: f32, focus_key: bool) -> bool {
         let Some(i) = self.conn_index(self.ai_current) else {
             if theme::secondary(ui, trf("{}  AI 추가", &[&icon::PLUS])).clicked() {
-                self.show_settings = true;
+                self.open_settings(SettingsTab::Ai);
             }
             return false;
         };
@@ -320,7 +320,7 @@ impl GhostApp {
             }
             ui.separator();
             if ui.button(format!("{}  {}", icon::SETTINGS, tr("AI 회사 · API 키 관리"))).clicked() {
-                self.show_settings = true;
+                self.open_settings(SettingsTab::Ai);
                 ui.close();
             }
             if let Some((id, m)) = chosen {
@@ -367,7 +367,14 @@ impl GhostApp {
 
     // ---- settings window ----
 
-    /// ⚙ Settings: language, AI connections, current AI, display, work.
+    /// Opens Settings on a given tab.
+    pub(super) fn open_settings(&mut self, tab: SettingsTab) {
+        self.settings_tab = tab;
+        self.show_settings = true;
+    }
+
+    /// ⚙ Settings, split into tabs: General (language, display, work) · AI (connections, current
+    /// AI) · Permissions (macOS only) · About.
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -375,118 +382,46 @@ impl GhostApp {
         const W: f32 = 520.0;
         const LABEL: f32 = 96.0;
         let field = W - LABEL - 14.0;
-        let max_h = (ctx.content_rect().height() - 160.0).max(260.0);
+        let max_h = (ctx.content_rect().height() - 200.0).max(260.0);
+        // every tab gets the same height so the window doesn't jump around when switching
+        let body_h = max_h.min(440.0);
         let mut close = false;
         let mut lang = self.lang;
-        let (ti, to) = self.agents.iter().fold((0, 0), |acc, a| {
-            let t = *a.shared.tokens.lock();
-            (acc.0 + t.0, acc.1 + t.1)
-        });
+        let perm_ok = self.permissions_ok(ctx);
+        let mut tabs = vec![SettingsTab::General, SettingsTab::Ai];
+        if cfg!(target_os = "macos") {
+            tabs.push(SettingsTab::Permissions);
+        }
+        tabs.push(SettingsTab::About);
         let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(W);
             close |= theme::modal_header(ui, tr("설정"));
-            theme::modal_scroll(ui, max_h, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for &t in &tabs {
+                    // a missing permission is flagged on its tab so it's findable from any tab
+                    let label = match t {
+                        SettingsTab::Permissions if !perm_ok => format!("{} {}", tr(t.label()), icon::SHIELD_ALERT),
+                        _ => tr(t.label()).to_string(),
+                    };
+                    if theme::tab(ui, self.settings_tab == t, &label).clicked() {
+                        self.settings_tab = t;
+                    }
+                }
+            });
+            ui.separator();
+            ui.add_space(10.0);
+            theme::modal_scroll(ui, body_h, |ui| {
                 ui.set_width(W);
-                egui::Grid::new("settings_lang").num_columns(2).min_col_width(LABEL).spacing([14.0, 10.0]).show(ui, |ui| {
-                    ui.label(tr("언어"));
-                    // language names always in their own language (findable even if you can't read the current one)
-                    egui::ComboBox::from_id_salt("lang").width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
-                        for l in Lang::ALL {
-                            ui.selectable_value(&mut lang, l, l.native_name());
-                        }
-                    });
-                    ui.end_row();
-                });
-
-                // with a permission off, show this section at the top where it's easy to find (back to its
-                // usual spot once everything is on)
-                #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-                let perm_first = !self.permissions_ok(ctx);
-                #[cfg(target_os = "macos")]
-                if perm_first {
-                    ui.add_space(18.0);
-                    theme::section(ui, tr("권한"));
-                    ui.add_space(4.0);
-                    self.permission_rows(ui);
-                }
-
-                ui.add_space(18.0);
-                theme::section(ui, tr("AI 연결"));
-                ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
-                ui.add_space(4.0);
-                self.conn_cards(ui, W);
-                self.add_conn_button(ui);
-                ui.add_space(4.0);
-                if prefs::CAN_REMEMBER_KEYS {
-                    ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
-                        .on_hover_text(tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
-                } else {
-                    ui.label(theme::hint(self.key_storage_note()));
-                }
-
-                if !self.ai.is_empty() {
-                    ui.add_space(18.0);
-                    theme::section(ui, tr("지금 쓰는 AI"));
-                    ui.add_space(4.0);
-                    egui::Grid::new("settings_ai").num_columns(2).min_col_width(LABEL).spacing([14.0, 10.0]).show(ui, |ui| {
-                        ui.label(tr("AI"));
-                        let title = self.cur().map(AiConn::title).unwrap_or_default();
-                        egui::ComboBox::from_id_salt("current_ai").width(field).selected_text(title).show_ui(ui, |ui| {
-                            for c in &self.ai {
-                                ui.selectable_value(&mut self.ai_current, c.id, c.title());
-                            }
-                        });
-                        ui.end_row();
-                        ui.label(tr("모델"));
-                        self.model_field(ui, field);
-                        ui.end_row();
-                        if self.cur().is_some_and(|c| c.provider.supports_effort()) {
-                            ui.label(tr("생각 깊이"));
-                            self.effort_slider(ui, field);
-                            ui.end_row();
-                        }
-                    });
-                }
-
-                ui.add_space(18.0);
-                theme::section(ui, tr("화면"));
-                ui.add_space(4.0);
-                ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
-                    .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
-                ui.add_space(6.0);
-                if theme::secondary(ui, tr("사용 설명 다시 보기")).clicked() {
-                    self.show_settings = false;
-                    self.save_prefs();
-                    self.open_tour();
-                }
-
-                ui.add_space(18.0);
-                theme::section(ui, tr("작업"));
-                ui.add_space(4.0);
-                ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
-                    .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
-                ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요.")));
-                #[cfg(target_os = "macos")]
-                if !perm_first {
-                    ui.add_space(18.0);
-                    theme::section(ui, tr("권한"));
-                    ui.add_space(4.0);
-                    self.permission_rows(ui);
-                }
-                if ti + to > 0 {
-                    ui.add_space(10.0);
-                    ui.label(theme::hint(trf("지금까지 쓴 양: 보낸 글 {} · 받은 글 {} 토큰", &[&ti, &to])));
-                }
-
-                ui.add_space(18.0);
-                theme::section(ui, tr("정보"));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
-                    ui.hyperlink_to(RichText::new(tr("릴리스 노트")).size(12.0), crate::update::RELEASES_PAGE);
-                });
-                if let crate::update::State::Available(r) | crate::update::State::Failed(r, _) = &*self.update.lock() {
-                    ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
+                ui.set_min_height(body_h);
+                match self.settings_tab {
+                    SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
+                    SettingsTab::Ai => self.settings_ai(ui, W, LABEL, field),
+                    SettingsTab::Permissions => {
+                        #[cfg(target_os = "macos")]
+                        self.permission_rows(ui);
+                    }
+                    SettingsTab::About => self.settings_about(ui),
                 }
             });
         });
@@ -496,6 +431,99 @@ impl GhostApp {
         if close || m.should_close() {
             self.show_settings = false;
             self.save_prefs();
+        }
+    }
+
+    /// General tab: language, display, work.
+    fn settings_general(&mut self, ui: &mut egui::Ui, lang: &mut Lang, label_w: f32, field: f32) {
+        egui::Grid::new("settings_lang").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
+            ui.label(tr("언어"));
+            // language names always in their own language (findable even if you can't read the current one)
+            egui::ComboBox::from_id_salt("lang").width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
+                for l in Lang::ALL {
+                    ui.selectable_value(lang, l, l.native_name());
+                }
+            });
+            ui.end_row();
+        });
+
+        ui.add_space(18.0);
+        theme::section(ui, tr("화면"));
+        ui.add_space(4.0);
+        ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
+            .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
+        ui.add_space(6.0);
+        if theme::secondary(ui, tr("사용 설명 다시 보기")).clicked() {
+            self.show_settings = false;
+            self.save_prefs();
+            self.open_tour();
+        }
+
+        ui.add_space(18.0);
+        theme::section(ui, tr("작업"));
+        ui.add_space(4.0);
+        ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
+            .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
+        ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요.")));
+    }
+
+    /// AI tab: connections (keys) and the AI/model in use.
+    fn settings_ai(&mut self, ui: &mut egui::Ui, width: f32, label_w: f32, field: f32) {
+        theme::section(ui, tr("AI 연결"));
+        ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
+        ui.add_space(4.0);
+        self.conn_cards(ui, width);
+        self.add_conn_button(ui);
+        ui.add_space(4.0);
+        if prefs::CAN_REMEMBER_KEYS {
+            ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
+                .on_hover_text(tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
+        } else {
+            ui.label(theme::hint(self.key_storage_note()));
+        }
+
+        if self.ai.is_empty() {
+            return;
+        }
+        ui.add_space(18.0);
+        theme::section(ui, tr("지금 쓰는 AI"));
+        ui.add_space(4.0);
+        egui::Grid::new("settings_ai").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
+            ui.label(tr("AI"));
+            let title = self.cur().map(AiConn::title).unwrap_or_default();
+            egui::ComboBox::from_id_salt("current_ai").width(field).selected_text(title).show_ui(ui, |ui| {
+                for c in &self.ai {
+                    ui.selectable_value(&mut self.ai_current, c.id, c.title());
+                }
+            });
+            ui.end_row();
+            ui.label(tr("모델"));
+            self.model_field(ui, field);
+            ui.end_row();
+            if self.cur().is_some_and(|c| c.provider.supports_effort()) {
+                ui.label(tr("생각 깊이"));
+                self.effort_slider(ui, field);
+                ui.end_row();
+            }
+        });
+    }
+
+    /// About tab: version, release notes, token usage so far.
+    fn settings_about(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
+            ui.hyperlink_to(RichText::new(tr("릴리스 노트")).size(12.0), crate::update::RELEASES_PAGE);
+        });
+        if let crate::update::State::Available(r) | crate::update::State::Failed(r, _) = &*self.update.lock() {
+            ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
+        }
+        let (ti, to) = self.agents.iter().fold((0, 0), |acc, a| {
+            let t = *a.shared.tokens.lock();
+            (acc.0 + t.0, acc.1 + t.1)
+        });
+        if ti + to > 0 {
+            ui.add_space(10.0);
+            ui.label(theme::hint(trf("지금까지 쓴 양: 보낸 글 {} · 받은 글 {} 토큰", &[&ti, &to])));
         }
     }
 
@@ -607,7 +635,7 @@ impl GhostApp {
                     }
                     ui.label(theme::hint(tr(p.label())));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button(icon::X).on_hover_text(tr("이 AI 연결 지우기")).clicked() {
+                        if theme::icon_button(ui, icon::X, tr("이 AI 연결 지우기")).clicked() {
                             remove = Some(i);
                         }
                         if self.ai[i].configured() && p.takes_key() {
@@ -664,5 +692,27 @@ impl GhostApp {
                 }
             }
         });
+    }
+}
+
+/// Settings window tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum SettingsTab {
+    #[default]
+    General,
+    Ai,
+    /// macOS only (permissions needed to drive Mac apps).
+    Permissions,
+    About,
+}
+
+impl SettingsTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "일반",
+            Self::Ai => "AI",
+            Self::Permissions => "권한",
+            Self::About => "정보",
+        }
     }
 }

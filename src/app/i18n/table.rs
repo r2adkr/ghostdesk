@@ -363,6 +363,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["새 버전을 내려받아 바꿔 넣어요. 다 받으면 다시 시작해서 적용해요.", "Downloads the new version and swaps it in. Restart when it's done to apply it.", "新しいバージョンをダウンロードして入れ替えます。完了したら再起動して適用します。", "下载新版本并替换。下载完成后重启即可生效。"],
     ["새 소식", "What's new", "新機能", "更新内容"],
     ["정보", "About", "情報", "关于"],
+    ["일반", "General", "一般", "常规"],
     ["GhostDesk 버전 {}", "GhostDesk version {}", "GhostDesk バージョン {}", "GhostDesk 版本 {}"],
     ["릴리스 노트", "Release notes", "リリースノート", "发行说明"],
     ["{} 은(는) {} 에서 아직 지원하지 않습니다 (현재 macOS 전용)", "{} isn't supported on {} yet (macOS only for now)", "{} は {} ではまだ対応していません (現在は macOS のみ)", "{} 尚不支持 {}（目前仅限 macOS）"],

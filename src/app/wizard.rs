@@ -698,7 +698,7 @@ impl GhostApp {
                             if ui.link(tr("권한 설정")).on_hover_text(tr("설정의 '권한'에서 하나씩 허용할 수 있어요")).clicked() {
                                 // close the new-agent window so the two don't overlap (typed text is kept)
                                 self.wizard_open = false;
-                                self.show_settings = true;
+                                self.open_settings(settings::SettingsTab::Permissions);
                             }
                         });
                     }

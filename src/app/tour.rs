@@ -247,7 +247,7 @@ impl GhostApp {
                     self.view = View::Detail;
                 }
             }
-            Scene::Settings => self.show_settings = true,
+            Scene::Settings => self.open_settings(settings::SettingsTab::Ai),
             Scene::Connect => {
                 self.open_connect(ctx);
                 // auto-install/connect is off while capturing (GHOSTDESK_NO_AUTOCONNECT), so only show the

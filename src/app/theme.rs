@@ -392,6 +392,25 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> Response {
     .on_hover_text(tip)
 }
 
+/// One tab in a tab row: plain text, with an accent underline when selected.
+pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> Response {
+    let color = if selected { text() } else { muted() };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(14.0), color);
+    let size = Vec2::new(galley.size().x + 20.0, 34.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        let color = if resp.hovered() && !selected { body() } else { color };
+        p.galley_with_override_text_color(rect.center() - galley.size() / 2.0 - Vec2::new(0.0, 1.0), galley, color);
+        if selected {
+            let bar = egui::Rect::from_min_max(egui::pos2(rect.left() + 6.0, rect.bottom() - 2.0), egui::pos2(rect.right() - 6.0, rect.bottom()));
+            p.rect_filled(bar, 1, accent());
+        }
+    }
+    resp
+}
+
 /// On/off button (tinted when on).
 pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, color: Color32) -> Response {
     let b = egui::Button::new(RichText::new(label).color(if on { color } else { text() })).min_size(Vec2::new(0.0, 32.0));

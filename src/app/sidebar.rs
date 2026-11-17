@@ -97,7 +97,7 @@ impl GhostApp {
                             crate::update::request_relaunch(ui.ctx());
                         }
                     } else if theme::primary(ui, tr("권한 설정")).clicked() {
-                        self.show_settings = true;
+                        self.open_settings(settings::SettingsTab::Permissions);
                     }
                     if ui.link(theme::hint(tr("나중에"))).on_hover_text(tr("다음에 켤 때 다시 알려 드려요")).clicked() {
                         self.perm_notice_hidden = true;
