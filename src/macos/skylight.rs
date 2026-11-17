@@ -1,9 +1,12 @@
-//! SkyLight(WindowServer) 비공개 API — dlsym 으로만 접근한다 (링크 의존성 없음).
+//! Private SkyLight (WindowServer) APIs, resolved with dlsym only so there is no link-time
+//! dependency.
 //!
-//! 안전 규칙:
-//! - `SLPSPostEventRecordTo` 레코드는 **우리가 띄운(또는 사용자가 동의한) 대상 프로세스의 PSN 에만** 보낸다.
-//!   사용자의 front 프로세스에 defocus 레코드를 보내는 cua-driver 원본 방식은 쓰지 않는다.
-//! - `_SLPSSetFrontProcessWithOptions` / `SetFrontProcess` / `CGWarpMouseCursorPosition` 은 절대 부르지 않는다.
+//! Safety rules:
+//! - `SLPSPostEventRecordTo` records are only ever sent to the PSN of a target process we
+//!   launched (or the user consented to). We don't use cua-driver's approach of sending a
+//!   defocus record to the user's front process.
+//! - Never call `_SLPSSetFrontProcessWithOptions`, `SetFrontProcess` or
+//!   `CGWarpMouseCursorPosition`.
 
 use std::ffi::{c_void, CString};
 use std::sync::OnceLock;
@@ -25,7 +28,7 @@ fn skylight_loaded() -> bool {
     }) != 0
 }
 
-/// 전역 심볼 주소 (없으면 null)
+/// Address of a global symbol, or null.
 pub fn sym(name: &str) -> *mut c_void {
     skylight_loaded();
     let c = CString::new(name).unwrap();
@@ -44,7 +47,7 @@ pub fn psn_for_pid(pid: i32) -> Option<Psn> {
     (unsafe { f(pid, &mut psn) } == 0).then_some(psn)
 }
 
-/// WindowServer 기준 front 프로세스의 pid (`_SLPSGetFrontProcess` + `GetProcessPID`). 실패 시 -1.
+/// Pid of WindowServer's front process (`_SLPSGetFrontProcess` + `GetProcessPID`), or -1.
 pub fn front_pid() -> i32 {
     type GetFront = unsafe extern "C" fn(*mut Psn) -> i32;
     type ToPid = unsafe extern "C" fn(*const Psn, *mut i32) -> i32;
@@ -71,7 +74,7 @@ fn post_record(psn: &Psn, rec: &[u8; 0xf8]) -> i32 {
         return -1;
     }
     let f: F = unsafe { std::mem::transmute(p) };
-    // 가끔 -600(procNotFound 류)을 돌려주므로 몇 번 재시도
+    // occasionally returns -600 (procNotFound and friends), so retry a few times
     let mut r = -1;
     for _ in 0..4 {
         r = unsafe { f(psn, rec.as_ptr()) };
@@ -83,14 +86,17 @@ fn post_record(psn: &Psn, rec: &[u8; 0xf8]) -> i32 {
     r
 }
 
-/// 대상 프로세스 내부의 AppKit "키 창" 상태를 설정하는 SkyLight 레코드를 **대상 PSN 에만** 보낸다.
+/// Posts SkyLight records that set AppKit's key-window state inside the target process, and
+/// only to the target's PSN.
 ///
-/// 순서: defocus(0x0d, 0x8a=0x02) → focus(0x0d, 0x8a=0x01) → make-key(0x01, 0x02). 248바이트 레코드.
-/// WindowServer 의 front 프로세스나 사용자의 포커스는 바뀌지 않는다.
+/// Sequence: defocus (0x0d, 0x8a=0x02) → focus (0x0d, 0x8a=0x01) → make-key (0x01, 0x02), each
+/// a 248-byte record. WindowServer's front process and the user's focus are unaffected.
 ///
-/// 한계 (이 Mac 에서 확인): 앱이 처음부터 숨겨진 상태라면 이 레코드는 효과가 없었다.
-/// 효과가 있는 경우에도 Cmd 단축키·메뉴·마우스 클릭이 동작하는지는 반드시 결과를 다시 읽어 검증할 것.
-/// 반환: 각 레코드의 결과 코드.
+/// Caveat (observed on this machine): the records had no effect on apps that started hidden.
+/// Even when they do take effect, verify by reading the result back whether Cmd shortcuts,
+/// menus and clicks actually work.
+///
+/// Returns the result code of each record.
 pub fn post_key_window_records(pid: i32, wid: u32) -> Result<Vec<i32>, String> {
     let psn = psn_for_pid(pid).ok_or_else(|| format!("pid {pid} 의 PSN 을 얻지 못했습니다"))?;
     let mut codes = Vec::new();

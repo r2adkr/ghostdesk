@@ -1,10 +1,11 @@
-//! 새 에이전트 창: 일할 곳(웹·앱·별도 화면·원격) 고르기 → 설정 → 시작.
+//! New-agent window: pick where to work (web, app, separate screen, remote) → settings → start.
 
 use super::*;
 use super::labels::profile_short;
 
 impl NewAgentForm {
-    /// 처음 여는 새 에이전트 창의 기본값. `profile_idx`: 로그인을 복사할 기본 브라우저 프로필
+    /// Defaults for a freshly opened new-agent window. `profile_idx` is the default browser profile
+    /// to copy logins from.
     pub(super) fn new(profile_idx: Option<usize>) -> Self {
         NewAgentForm {
             choice: None,
@@ -42,7 +43,8 @@ impl NewAgentForm {
     }
 }
 
-/// 느린 조회를 백그라운드에서 돌려 결과를 칸에 채운다 (None = 아직 확인 중). 끝나면 화면을 다시 그린다.
+/// Runs a slow lookup in the background and fills the slot with the result (`None` = still
+/// checking). Repaints when done.
 pub(super) fn load_in_background<T: Send + 'static>(rt: &Handle, ctx: &egui::Context, f: impl FnOnce() -> T + Send + 'static) -> Slot<T> {
     let slot = Arc::new(parking_lot::Mutex::new(None));
     let (s, ctx) = (slot.clone(), ctx.clone());
@@ -54,8 +56,8 @@ pub(super) fn load_in_background<T: Send + 'static>(rt: &Handle, ctx: &egui::Con
     slot
 }
 
-/// '로컬 앱' 목록 (이름, 경로). macOS 는 /Applications 를 바로 읽고,
-/// Windows 는 설치된 프로그램(레지스트리·시작 메뉴 등)이 느릴 수 있어 백그라운드에서 읽는다.
+/// The local app list `(name, path)`. macOS reads /Applications directly; on Windows installed
+/// programs (registry, Start menu, …) can be slow, so they're read in the background.
 pub(super) fn native_app_list(rt: &Handle, ctx: &egui::Context) -> Slot<Vec<(String, String)>> {
     #[cfg(target_os = "macos")]
     {
@@ -73,15 +75,17 @@ pub(super) fn native_app_list(rt: &Handle, ctx: &egui::Context) -> Slot<Vec<(Str
 }
 
 impl GhostApp {
-    /// 개발용: GHOSTDESK_DEMO=<n> 이면 브라우저 에이전트 n 개를 자동 시작한다.
-    /// 데모는 사용자 데이터를 쓰지 않는다: 빈 프로필, 빈 페이지.
+    /// Development: with GHOSTDESK_DEMO=<n>, auto-starts n browser agents.
+    ///
+    /// Demos never use user data: empty profile, blank page.
     pub(super) fn spawn_demos(&mut self, ctx: &egui::Context) {
         while self.pending_demo > 0 {
             self.pending_demo -= 1;
             self.form.kind = FormKind::Browser;
             self.form.profile_idx = None;
             self.form.start_url = "about:blank".into();
-            // 사용 설명 사진(tour.rs)처럼 그럴듯한 작업이 필요하면 GHOSTDESK_DEMO_TASK 로 바꾼다
+            // override with GHOSTDESK_DEMO_TASK when a plausible task is needed (e.g. the guide screenshots
+            // in tour.rs)
             self.form.task = std::env::var("GHOSTDESK_DEMO_TASK").unwrap_or_else(|_| tr("데모 작업").into());
             self.spawn_agent(ctx);
         }
@@ -90,32 +94,35 @@ impl GhostApp {
 
 pub(super) const SIZES: &[(u32, u32)] = &[(1280, 800), (1366, 768), (1440, 900), (1024, 768)];
 
-/// '로컬 앱' 카드를 보여 줄지 (Electron 숨김 실행 또는 일반 앱 백엔드가 있는 OS)
+/// Whether to show the local app card (OSes with hidden Electron launch or a regular app
+/// backend).
 pub(super) const LOCAL_APP_CARD: bool = caps::ELECTRON || caps::NATIVE_APPS;
 
-/// '로컬 앱'(Mac 앱 / Windows 앱) 목록의 한 항목
+/// One entry in the local app list (Mac apps / Windows apps).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct AppListItem {
     label: String,
     path: String,
-    /// 숨김 실행 가능한 Electron 앱이면 그 인덱스
+    /// Index if this is an Electron app that can be launched hidden.
     electron: Option<usize>,
-    /// 고를 수 없는 항목이면 그 이유 (숨김 실행이 안 되는 Electron 앱)
+    /// Why the entry can't be picked, if so (Electron apps that can't be launched hidden).
     disabled: Option<String>,
 }
 
-/// 자동 모드가 고른 곳
+/// Where auto mode decided to work.
 #[derive(Debug, Clone, PartialEq)]
 enum AutoPick {
     Web,
     App { label: String, path: String, electron: Option<usize> },
 }
 
-/// 할 일 문장에 나오는 이 컴퓨터의 앱 (고를 수 없는 앱은 뺀다). 여럿이면 이름이 가장 긴 것
-/// ('Visual Studio Code' 와 'Code' 가 함께 맞으면 앞의 것). 주소(http·www)가 있으면 웹으로 본다.
-/// 영어 이름은 낱말 경계에서만 맞춘다 ('Notes' 가 'footnotes' 에 맞지 않게). 두 글자 미만 이름은 보지 않는다.
-/// 운영체제 기본 앱(날씨·메모·사진·뉴스 …)은 흔한 낱말과 이름이 같아 '날씨 앱'·'Notes app' 처럼 '앱' 을 함께 말할 때만 고른다
-/// ("오늘 날씨 찾아줘" 는 웹으로).
+/// The app on this computer named in the task (unpickable apps excluded); the longest name wins
+/// when several match ('Visual Studio Code' over 'Code'). A URL (http, www) means web.
+///
+/// English names only match on word boundaries ('Notes' doesn't match 'footnotes'), and names
+/// shorter than two characters are ignored. Built-in OS apps (Weather, Notes, Photos, News, …)
+/// share names with common words, so they're only picked when the word "app" comes with them, as
+/// in '날씨 앱' or 'Notes app' ("오늘 날씨 찾아줘" goes to the web).
 fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem> {
     let t = task.to_lowercase();
     if t.contains("http://") || t.contains("https://") || t.contains("www.") {
@@ -133,7 +140,7 @@ fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem>
         .iter()
         .filter(|it| it.disabled.is_none())
         .filter_map(|it| {
-            // 보이는 이름(메모)과 파일 이름(Notes) 둘 다로 찾는다
+            // match on both the display name (메모) and the file name (Notes)
             let file = std::path::Path::new(&it.path).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
             let shown = it.label.trim().trim_end_matches(".app").to_lowercase();
             let system = is_system_app(&it.path);
@@ -151,7 +158,8 @@ fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem>
         .map(|(_, it)| it)
 }
 
-/// 운영체제에 기본으로 들어 있는 앱인가 (macOS: /System/Applications, Windows: Windows 폴더 아래)
+/// Whether an app ships with the OS (macOS: /System/Applications; Windows: under the Windows
+/// folder).
 fn is_system_app(path: &str) -> bool {
     let p = path.to_lowercase().replace('\\', "/");
     p.starts_with("/system/") || p.contains("/windows/system32/") || p.contains(":/windows/")
@@ -162,7 +170,8 @@ impl GhostApp {
         if let Some(msg) = self.missing_setup() {
             self.key_warn = true;
             if self.wizard_open {
-                // 새 에이전트 창 안에서는 키 칸 아래 안내 + 키 칸으로 포커스 (아래쪽 알림은 겹치므로 생략)
+                // inside the new-agent window, show the hint under the key field and focus it (the bottom toast
+                // would overlap)
                 self.wizard_key_field = true;
                 self.focus_key = true;
                 return;
@@ -177,7 +186,7 @@ impl GhostApp {
         if self.agents.iter().any(|a| profiles::slug(&a.shared.workspace_name) == profiles::slug(&ws_name)) {
             return self.notify(ctx, tr("같은 작업공간을 쓰는 에이전트가 이미 있습니다. 다른 이름을 쓰세요."));
         }
-        // Windows 는 CON·NUL·COM1 같은 장치 이름을 폴더 이름으로 쓸 수 없다
+        // Windows can't use device names like CON, NUL, COM1 as folder names
         if cfg!(windows) && crate::platform::paths::is_reserved_name(&profiles::slug(&ws_name)) {
             return self.notify(ctx, trf("'{}' 은(는) Windows 에서 폴더 이름으로 쓸 수 없습니다. 다른 작업공간 이름을 쓰세요.", &[&ws_name]));
         }
@@ -243,7 +252,7 @@ impl GhostApp {
                 if let Err(e) = crate::macos::preflight() {
                     return self.notify(ctx, format!("{e:#}"));
                 }
-                // 가상 디스플레이는 이 OS 에서 지원할 때만 (Windows 에서는 체크박스도 보이지 않는다)
+                // virtual display only where this OS supports it (on Windows the check box isn't even shown)
                 if self.form.native_vdisplay && caps::VDISPLAY {
                     if !self.form.native_vdisplay_consent {
                         return self.notify(ctx, tr("가상 디스플레이 사용에 대한 안내를 확인하고 동의 체크를 켜세요."));
@@ -274,7 +283,7 @@ impl GhostApp {
                 if !caps::SESSION {
                     return self.notify(ctx, unsupported(tr("별도 계정 세션")));
                 }
-                // Windows 자식 세션은 같은 계정이라 계정 이름이 필요 없다
+                // Windows child sessions use the same account, so no account name is needed
                 if cfg!(target_os = "macos") && self.form.session_account.trim().is_empty() {
                     return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요."));
                 }
@@ -300,7 +309,7 @@ impl GhostApp {
             target,
             max_steps: self.form.max_steps,
             reply_lang: self.lang.english_name(),
-            // missing_setup 을 위에서 확인했으므로 연결이 있다
+            // missing_setup was checked above, so a connection exists
             llm: self.cur().map(|c| c.llm(EFFORTS[self.effort_idx])).expect("missing_setup checked the connection"),
         };
         let id = self.next_id;
@@ -319,18 +328,19 @@ impl GhostApp {
 
     pub(super) fn open_wizard(&mut self) {
         self.wizard_open = true;
-        // 자동이 미리 골라져 있다: 할 일만 적고 시작하면 된다 (창 높이도 처음부터 같아 위치가 튀지 않는다)
+        // auto comes preselected: just write the task and start (the window height is the same from the
+        // start, so its position doesn't jump)
         self.form.choice = Some(Choice::Auto);
         self.key_warn = false;
         self.wizard_key_field = self.missing_setup().is_some();
     }
 
-    /// Windows 자식 세션 기능 상태 + 켜기(관리자 승인) 버튼
+    /// Windows child sessions feature state plus an enable (admin approval) button.
     #[cfg(windows)]
     pub(super) fn child_session_status(&mut self, ui: &mut egui::Ui) {
         let req = self.child_enable.lock().clone();
         if matches!(req, ChildEnable::Done(_)) && self.child_enabled != Some(true) {
-            self.child_enabled = None; // 요청이 끝났으면 다시 확인
+            self.child_enabled = None; // recheck once the request is done
         }
         let on = *self.child_enabled.get_or_insert_with(crate::winapp::child::enabled);
         if on {
@@ -359,7 +369,7 @@ impl GhostApp {
         }
     }
 
-    /// 별도 계정 세션(RDP 방식) 처음 설정 안내 창
+    /// First-time setup guide for the separate account session (RDP-style).
     pub(super) fn session_guide_window(&mut self, ctx: &egui::Context) {
         if !self.show_session_guide {
             return;
@@ -399,7 +409,8 @@ impl GhostApp {
         }
     }
 
-    /// ＋ 새 에이전트: 어디서 일할지 고르고, 할 일을 적는다. 나머지는 고급 설정에 접어 둔다.
+    /// ＋ New agent: pick where to work and write the task. Everything else is folded into
+    /// advanced settings.
     pub(super) fn new_agent_window(&mut self, ctx: &egui::Context) {
         if !self.wizard_open {
             return;
@@ -429,7 +440,7 @@ impl GhostApp {
                     }
                 });
                 ui.add_space(6.0);
-                // 고른 곳의 설명은 한 줄만 (칸마다 적어 두지 않는다)
+                // a single line describing the chosen place (not one per card)
                 let Some(choice) = self.form.choice else {
                     ui.label(theme::hint(tr("에이전트가 일할 곳을 하나 골라 주세요")));
                     return;
@@ -461,7 +472,8 @@ impl GhostApp {
                     ui.add_space(18.0);
                     theme::section(ui, tr("AI 와 API 키"));
                     ui.add_space(4.0);
-                    // 지금 쓰는 연결에 빠진 주소·키를 바로 넣는다 (다른 AI 는 설정·홈의 모델 단추에서 고른다)
+                    // fill in the current connection's missing URL or key right here (other AIs are picked in
+                    // Settings or the home model button)
                     if self.key_warn && self.missing_setup().is_some() {
                         ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, theme::warn());
                     }
@@ -497,7 +509,7 @@ impl GhostApp {
                 }
             });
         });
-        // 바깥 클릭으로는 닫지 않는다 (적던 내용을 실수로 잃지 않게). Esc 와 ✕·취소로 닫는다.
+        // clicking outside doesn't close it (so typed text isn't lost by accident); Esc, ✕ and Cancel do
         let esc = m.is_top_modal && !m.any_popup_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if start {
             self.start_from_wizard(ctx);
@@ -511,8 +523,7 @@ impl GhostApp {
         }
     }
 
-    /// 웹사이트: 시작 주소 + 내 브라우저 로그인 사용. 브라우저·프로필·화면 크기는 고급 설정.
-    /// 자동: 지금 할 일로 어디서 일할지 미리 보여 준다 (시작할 때 `auto_pick` 그대로 쓴다)
+    /// Auto: previews where the current task will run (the same `auto_pick` is used at start).
     fn simple_auto(&mut self, ui: &mut egui::Ui) {
         let line = match self.auto_pick() {
             AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
@@ -523,7 +534,7 @@ impl GhostApp {
         ui.label(theme::hint(tr("다르게 하려면 위에서 직접 고르세요.")));
     }
 
-    /// 자동 모드의 결정: 할 일에 이 컴퓨터의 앱 이름이 있으면 그 앱, 아니면 웹사이트
+    /// Auto mode's decision: the app if the task names an app on this computer, otherwise the web.
     fn auto_pick(&self) -> AutoPick {
         if !LOCAL_APP_CARD {
             return AutoPick::Web;
@@ -550,7 +561,7 @@ impl GhostApp {
         ui.add_space(6.0);
         let bname = self.browsers.get(self.form.browser_idx).map(|b| b.name.clone()).unwrap_or_default();
         let profiles = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.clone()).unwrap_or_default();
-        // 복제할 프로필이 없으면 스위치는 꺼진 채 비활성 (비활성 스위치에 true 가 남지 않게)
+        // with no profile to clone the switch is off and disabled (so a disabled switch never holds true)
         if profiles.is_empty() {
             self.form.web_use_login = false;
         }
@@ -561,7 +572,7 @@ impl GhostApp {
             if r.changed() && self.form.web_use_login && self.form.profile_idx.is_none_or(|i| i >= profiles.len()) {
                 self.form.profile_idx = Some(0);
             }
-            // 프로필이 여럿이면 어느 것을 복제하는지 이름만 (계정 주소는 보이지 않게)
+            // with several profiles, show just the name of the one being cloned (never the account address)
             if self.form.web_use_login && profiles.len() > 1 {
                 if let Some(p) = self.form.profile_idx.and_then(|i| profiles.get(i)) {
                     ui.label(theme::hint(profile_short(&p.name)));
@@ -570,7 +581,7 @@ impl GhostApp {
         });
     }
 
-    /// 앱: 먼저 목록에서 고르고, 고른 앱에 맞는 선택지만 그 아래에 보인다.
+    /// App: pick from the list first; only options relevant to the chosen app show below it.
     pub(super) fn simple_app(&mut self, ui: &mut egui::Ui) {
         let electrons = self.electron_apps.lock().clone().unwrap_or_default();
         let current = cfg!(windows) && self.form.native_current_session;
@@ -585,19 +596,20 @@ impl GhostApp {
         let natives = self.native_apps.lock().clone();
         let detecting = self.electron_apps.lock().is_none() || natives.is_none();
         let items = app_list_items(&electrons, &natives.unwrap_or_default(), current);
-        // Electron 감지가 늦게 끝났으면, 이미 고른 앱이 Electron 인지 다시 맞춘다 (네이티브 경로로 새지 않게)
+        // if Electron detection finished late, recheck whether the chosen app is Electron (so it doesn't
+        // leak onto the native path)
         if self.form.electron_idx.is_none() {
             self.form.electron_idx = electrons.iter().position(|e| electron_matches(e, &self.form.native_app));
         }
         egui::Frame::new().fill(theme::bg()).stroke(Stroke::new(1.0, theme::border())).corner_radius(theme::CARD_RADIUS).inner_margin(Margin::same(6)).show(ui, |ui| {
             egui::ScrollArea::vertical().max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                // 한 줄짜리 목록: 왼쪽 정렬, 행마다 폭 전체를 누를 수 있게
+                // one-line list: left-aligned, each row clickable across its full width
                 ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for it in items.iter().filter(|it| q.is_empty() || it.label.to_lowercase().contains(&q) || it.path.to_lowercase().contains(&q)) {
                         match &it.disabled {
-                            // 숨김 실행이 안 되는 Electron 앱: 목록에는 보이되 고를 수 없고, 이유를 알려 준다
+                            // Electron apps that can't be launched hidden: listed but unpickable, with the reason
                             Some(reason) => {
                                 ui.add_enabled(false, egui::Button::selectable(false, it.label.as_str())).on_disabled_hover_text(reason.as_str());
                             }
@@ -623,7 +635,8 @@ impl GhostApp {
                 .on_hover_text(pick(tr("나머지 앱은 창을 숨긴 채 조작해요."), tr("나머지 앱은 창을 화면 밖에 두고 조작해요.")));
         }
         ui.add_space(8.0);
-        // Windows: 숨은 화면(자식 세션)에서 내 계정 그대로 실행. 목록 자체가 바뀌므로 고르기 전에도 보인다.
+        // Windows: run as the current account on a hidden screen (child session). It changes the list
+        // itself, so it shows before picking too.
         if cfg!(windows) {
             ui.add(theme::switch(&mut self.form.native_current_session, tr("숨은 화면에서 내 계정 그대로 실행")))
                 .on_hover_text(tr("보이지 않는 별도 Windows 화면에 앱을 새로 띄워요. 앱의 실제 로그인과 데이터를 써요."));
@@ -647,7 +660,8 @@ impl GhostApp {
                 ui.colored_label(theme::danger(), trf("{} 은(는) 숨김 실행을 지원하지 않아요: {}", &[&e.name, &e.reason.clone().unwrap_or_default()]));
             }
             Some(e) => {
-                // 원본 데이터 폴더가 없으면 스위치는 꺼진 채 비활성 (비활성 스위치에 true 가 남지 않게)
+                // with no original data folder the switch is off and disabled (so a disabled switch never holds
+                // true)
                 if e.user_data_guess.is_none() {
                     self.form.app_use_login = false;
                 }
@@ -658,7 +672,7 @@ impl GhostApp {
                 self.form.electron_idx = None;
                 ui.add(theme::switch(&mut self.form.native_attach, tr("지금 켜 둔 내 앱 쓰기")))
                     .on_hover_text(tr("카카오톡처럼 한 번에 하나만 로그인되는 앱에 써요. 작업 중에는 그 창이 숨겨져요. 끄면 숨긴 앱을 새로 띄워요."));
-                // 가상 디스플레이(CGVirtualDisplay)는 macOS 전용: 다른 OS 에서는 스위치를 보이지 않고 꺼 둔다
+                // virtual display (CGVirtualDisplay) is macOS-only: elsewhere the switch is hidden and off
                 if caps::VDISPLAY {
                     ui.add(theme::switch(&mut self.form.native_vdisplay, trf("{}  가상 디스플레이에서 실행 (실험)", &[&icon::FLASK])))
                         .on_hover_text(tr("앱 창을 숨기는 대신 보이지 않는 가상 모니터 위에 띄워 드래그·우클릭 같은 실제 마우스 동작을 그대로 써요."));
@@ -673,7 +687,8 @@ impl GhostApp {
                 } else {
                     self.form.native_vdisplay_consent = false;
                 }
-                // macOS 권한(손쉬운 사용·화면 기록) 안내는 macOS 에서만. Windows 는 이런 권한 동의가 없다.
+                // macOS permission hints (Accessibility, Screen Recording) only on macOS; Windows has no such
+                // consent
                 #[cfg(target_os = "macos")]
                 {
                     let t = crate::macos::tcc_status();
@@ -681,7 +696,7 @@ impl GhostApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(theme::warn(), tr("이 방식은 macOS 의 '손쉬운 사용'과 '화면 기록' 권한이 필요해요."));
                             if ui.link(tr("권한 설정")).on_hover_text(tr("설정의 '권한'에서 하나씩 허용할 수 있어요")).clicked() {
-                                // 창 두 개가 겹치지 않게 새 에이전트 창은 닫는다 (적던 내용은 남는다)
+                                // close the new-agent window so the two don't overlap (typed text is kept)
                                 self.wizard_open = false;
                                 self.show_settings = true;
                             }
@@ -711,7 +726,7 @@ impl GhostApp {
             Some(Choice::Web) => {
                 self.form.kind = FormKind::Browser;
                 let n = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.len()).unwrap_or(0);
-                // 고급 설정에서 고른 프로필을 존중한다 (범위를 벗어났을 때만 첫 프로필)
+                // respect the profile chosen in advanced settings (first profile only if out of range)
                 self.form.profile_idx = match (self.form.web_use_login && n > 0, self.form.profile_idx) {
                     (false, _) => None,
                     (true, Some(i)) if i < n => Some(i),
@@ -730,8 +745,8 @@ impl GhostApp {
                     self.form.native_attach = false;
                     self.form.electron_idx = None;
                 } else {
-                    // Electron 앱은 감지 결과로만 판단한다: 감지 전이거나 숨김 실행이 안 되는 앱을
-                    // 조용히 네이티브(창 숨김) 방식으로 돌리지 않는다.
+                    // Electron apps are decided purely by detection: apps not yet detected, or that can't be
+                    // launched hidden, are never quietly run the native (hidden window) way
                     let Some(electrons) = self.electron_apps.lock().clone() else {
                         return self.notify(ctx, tr("앱 목록을 확인하는 중입니다. 잠시 후 다시 시작하세요."));
                     };
@@ -749,7 +764,7 @@ impl GhostApp {
                         self.form.kind = FormKind::Electron;
                         let clone = self.form.app_use_login && e.user_data_guess.is_some();
                         self.form.electron_clone = clone;
-                        // 체크박스 문구가 '앱 데이터를 복제'임을 명시하므로 체크 자체를 동의로 본다
+                        // the check box text says it clones app data, so checking it counts as consent
                         self.form.electron_clone_consent = clone;
                     } else {
                         self.form.kind = FormKind::Native;
@@ -759,7 +774,7 @@ impl GhostApp {
             }
             Some(Choice::Remote) => self.form.kind = FormKind::Remote,
             Some(Choice::Session) => self.form.kind = FormKind::Session,
-            // 자동은 위에서 웹·앱으로 바뀌어 여기 오지 않는다
+            // auto was already turned into web or app above and never gets here
             Some(Choice::Auto) | None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요.")),
         }
         let before = self.agents.len();
@@ -773,12 +788,12 @@ impl GhostApp {
         }
     }
 
-    /// 원격 컴퓨터: 주소(:포트) · 사용자 · 비밀번호 + 에이전트 전용 머신 확인
+    /// Remote computer: address (:port), user, password, plus the dedicated-machine confirmation.
     pub(super) fn form_remote(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("form_remote").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label(tr("주소"));
             ui.horizontal(|ui| {
-                // 포트는 거의 바꾸지 않으므로 주소 칸 옆에 작게
+                // the port rarely changes, so it's small, next to the address field
                 let w = (ui.available_width() - 76.0).max(160.0);
                 ui.add(field(&mut self.form.remote_host).hint_text(tr("예) 192.168.0.20 또는 vm.local")).desired_width(w));
                 ui.label(":");
@@ -803,7 +818,8 @@ impl GhostApp {
         ));
     }
 
-    /// 별도 계정 세션(macOS: 전용 계정 이름) / 자식 세션(Windows: 기능 켜짐 여부) + 처음 설정 안내
+    /// Separate account session (macOS: dedicated account name) / child session (Windows: whether the
+    /// feature is on), plus the first-time setup guide.
     pub(super) fn form_session(&mut self, ui: &mut egui::Ui) {
         if cfg!(target_os = "macos") {
             egui::Grid::new("form_session").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -820,7 +836,8 @@ impl GhostApp {
         }
     }
 
-    /// 고급 설정: 이름·작업공간·최대 단계 + 고른 종류의 세부 설정 (한 표에 모아 칸을 맞춘다)
+    /// Advanced settings: name, workspace, max steps, plus details for the chosen kind (in one grid
+    /// so the fields line up).
     pub(super) fn advanced(&mut self, ui: &mut egui::Ui, choice: Choice) {
         egui::Grid::new("adv").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label(tr("이름"));
@@ -853,7 +870,8 @@ impl GhostApp {
         });
     }
 
-    /// 고급 설정의 브라우저 줄들: 브라우저 · 복사할 프로필 · 다시 복사 · 화면 크기 · 창 숨기기
+    /// Browser rows of the advanced settings: browser, profile to copy, recopy, screen size, hide
+    /// window.
     fn browser_rows(&mut self, ui: &mut egui::Ui) {
         ui.label(tr("브라우저"));
         let bname = self.browsers.get(self.form.browser_idx).map(|b| b.name.clone()).unwrap_or(tr("(없음)").into());
@@ -869,8 +887,8 @@ impl GhostApp {
 
         ui.label(tr("프로필"));
         let profiles = self.browsers.get(self.form.browser_idx).map(|b| b.profiles.clone()).unwrap_or_default();
-        // 위의 '로그인 사용' 스위치와 같은 설정을 보여 준다: 프로필을 고르면 스위치가 켜지고,
-        // '빈 프로필' 을 고르면 꺼진다 (어느 쪽도 다른 쪽에 덮이지 않음)
+        // mirrors the "use login" switch above: picking a profile turns the switch on, picking "empty
+        // profile" turns it off (neither overrides the other)
         let picked = if self.form.web_use_login { self.form.profile_idx.and_then(|i| profiles.get(i)) } else { None };
         let ptext = picked.map_or_else(|| tr("빈 프로필 (로그인 없음)").to_string(), |p| trf("복사: {}", &[&p.name]));
         egui::ComboBox::from_id_salt("profile").selected_text(ptext).width(220.0).show_ui(ui, |ui| {
@@ -907,11 +925,10 @@ impl GhostApp {
     }
 }
 
-/// 새 에이전트 창 왼쪽 이름 칸의 너비 (표마다 같게 해 줄을 맞춘다)
+/// Width of the label column in the new-agent window (same in every grid so rows line up).
 const LABEL_W: f32 = 72.0;
 
-/// 폭을 꽉 채우는 한 줄 입력칸 (창 안의 입력칸 모양을 하나로 맞춘다)
-/// 이 OS 에서 안 되는 기능을 고른 경우의 안내 (`text::unsupported` 의 화면용 번역판)
+/// Notice for a feature this OS doesn't support (the UI translation of `text::unsupported`).
 fn unsupported(feature: &str) -> String {
     trf("{} 은(는) {} 에서 아직 지원하지 않습니다 (현재 macOS 전용)", &[&feature, &text::OS_NAME])
 }
@@ -920,16 +937,16 @@ fn field(s: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(s).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 6))
 }
 
-/// '어디서 일할까요' 의 한 칸
+/// One card under "Where should it work?".
 struct Kind {
     choice: Choice,
     icon: &'static str,
     title: &'static str,
-    /// 골랐을 때 아래에 한 줄로 보일 설명
+    /// One-line description shown below when picked.
     about: &'static str,
 }
 
-/// 이 OS 에서 쓸 수 있는 곳만 (지원하지 않는 종류는 보이지 않는다 — platform::caps)
+/// Only places available on this OS (unsupported kinds are hidden; see `platform::caps`).
 fn kinds() -> Vec<Kind> {
     let mut v = vec![Kind {
         choice: Choice::Auto,
@@ -961,7 +978,8 @@ fn kinds() -> Vec<Kind> {
     v
 }
 
-/// 앱 경로 비교. Windows 는 대소문자·구분자 차이를 무시한다 (macOS 는 기존대로 그대로 비교).
+/// Compares app paths. Windows ignores case and separator differences (macOS compares exactly, as
+/// before).
 pub(super) fn same_app_path(a: &str, b: &str) -> bool {
     if cfg!(windows) {
         let norm = |s: &str| s.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -971,20 +989,25 @@ pub(super) fn same_app_path(a: &str, b: &str) -> bool {
     }
 }
 
-/// 고른 경로가 이 Electron 앱인가 (macOS: 앱 번들 경로. Windows: 설치 폴더 또는 실행 파일 경로)
+/// Whether the chosen path is this Electron app (macOS: app bundle path; Windows: install folder
+/// or executable path).
 pub(super) fn electron_matches(e: &crate::electron::ElectronApp, path: &str) -> bool {
     same_app_path(&e.bundle.display().to_string(), path) || (cfg!(windows) && same_app_path(&e.exe.display().to_string(), path))
 }
 
-/// 자식 세션('현재 계정' 모드)에서 실행할 경로: 고른 것이 Electron 앱이면 그 실행 파일, 아니면 고른 경로 그대로.
+/// Path to run in the child session ("current account" mode): the executable if the chosen app
+/// is Electron, otherwise the chosen path as is.
 pub(super) fn current_session_app_path(electrons: &[crate::electron::ElectronApp], selected: &str) -> String {
     electrons.iter().find(|e| electron_matches(e, selected))
         .map(|e| e.exe.display().to_string()).unwrap_or_else(|| selected.to_string())
 }
 
-/// Electron 앱(숨김 실행 가능 별표 / 불가 — 비활성 + 이유)과 나머지 로컬 앱을 한 목록으로 만든다.
-/// 감지된 Electron 앱은 네이티브 항목으로 다시 넣지 않는다 (네이티브 경로로 조용히 새지 않게).
-/// Windows 에서는 설치 목록의 실행 파일 경로가 Electron 앱의 실행 파일과 같아도 같은 앱으로 본다.
+/// Builds one list from Electron apps (starred if launchable hidden, otherwise disabled with a
+/// reason) and the other local apps.
+///
+/// Detected Electron apps aren't added again as native entries (so they never leak onto the
+/// native path). On Windows an installed program whose executable path matches an Electron app's
+/// executable counts as the same app.
 pub(super) fn app_list_items(electrons: &[crate::electron::ElectronApp], native_apps: &[(String, String)], current_session: bool) -> Vec<AppListItem> {
     let mut items: Vec<AppListItem> = Vec::new();
     for (i, e) in electrons.iter().enumerate() {
@@ -1015,14 +1038,15 @@ pub(super) fn app_list_items(electrons: &[crate::electron::ElectronApp], native_
             items.push(AppListItem { label: name.clone(), path: path.clone(), electron: None, disabled: None });
         }
     }
-    // 고를 수 있는 앱을 먼저, 숨김 실행이 안 되는 앱은 맨 뒤에 (순서는 그대로)
+    // pickable apps first, apps that can't be launched hidden last (order otherwise kept)
     items.sort_by_key(|it| it.disabled.is_some());
     items
 }
 
-/// /Applications, /System/Applications 의 앱 목록 (이름, 경로)
+/// Apps in /Applications and /System/Applications `(name, path)`.
 #[cfg(target_os = "macos")]
-/// 이름은 Finder 처럼 사용자 언어로 보이는 이름 ('Notes' 대신 '메모'). 영어 파일 이름은 경로에 남아 검색·자동 판단에 쓰인다.
+/// Names are shown in the user's language like Finder does ('메모' instead of 'Notes'). The
+/// English file name stays in the path for search and auto mode.
 pub(super) fn list_mac_apps() -> Vec<(String, String)> {
     use objc2_foundation::{NSFileManager, NSString};
     let fm = NSFileManager::defaultManager();
@@ -1104,7 +1128,8 @@ mod tests {
         let code = items.iter().find(|i| i.path.ends_with("Code.app")).unwrap();
         assert_eq!(code.electron, Some(0));
         assert!(code.disabled.is_none());
-        // 숨김 실행이 안 되는 Electron 앱은 사라지지 않고 비활성 + 이유로 보이며, 네이티브 항목으로 다시 들어가지 않는다
+        // Electron apps that can't be launched hidden don't vanish: they show disabled with a reason and
+        // aren't re-added as native entries
         let discord: Vec<_> = items.iter().filter(|i| i.path.ends_with("Discord.app")).collect();
         assert_eq!(discord.len(), 1);
         assert!(discord[0].disabled.as_deref().unwrap().contains("퓨즈가 꺼져 있음"));
@@ -1133,7 +1158,7 @@ mod tests {
         assert_eq!(items[0].electron, Some(0));
         assert_eq!(items[1].label, "메모장");
         assert!(items[2].disabled.is_some(), "숨김 실행이 안 되는 Electron 앱은 네이티브로 새지 않고 맨 뒤에");
-        // 실행 파일 경로를 직접 적어도 Electron 앱으로 인식
+        // typing the executable path directly is also recognized as the Electron app
         assert!(electron_matches(&electrons[0], r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe"));
         assert!(electron_matches(&electrons[0], r"c:/users/u/appdata/local/programs/microsoft vs code/"));
         assert!(!electron_matches(&electrons[0], r"C:\Windows\notepad.exe"));
@@ -1141,7 +1166,7 @@ mod tests {
 
     #[test]
     fn unsupported_cards_follow_caps() {
-        // macOS 는 모든 카드, Windows 는 가상 디스플레이 없음 (별도 세션 = 자식 세션)
+        // macOS has every card; Windows has no virtual display (separate session = child session)
         if cfg!(target_os = "macos") {
             assert!(LOCAL_APP_CARD && caps::SESSION && caps::VDISPLAY);
             assert_eq!(text::PRIMARY_MOD, "cmd");
@@ -1149,11 +1174,11 @@ mod tests {
         if cfg!(windows) {
             assert!(LOCAL_APP_CARD && caps::SESSION && !caps::VDISPLAY);
             assert_eq!(text::LOCAL_APPS, "Windows 앱");
-            // 직접 조작의 복사/잘라내기는 Windows 에서 ctrl
+            // takeover copy/cut uses ctrl on Windows
             assert_eq!(format!("{}+c", text::PRIMARY_MOD), "ctrl+c");
         }
         assert_eq!(pick("mac", "other"), if cfg!(target_os = "macos") { "mac" } else { "other" });
-        // 새 에이전트 창의 칸도 같은 caps 를 따른다: 웹이 맨 앞, 원격이 맨 뒤
+        // the new-agent window's cards follow the same caps: web first, remote last
         let k = kinds();
         assert_eq!(k.len(), 3 + LOCAL_APP_CARD as usize + caps::SESSION as usize);
         assert!(k[0].choice == Choice::Auto && k[1].choice == Choice::Web && k.last().unwrap().choice == Choice::Remote);
@@ -1177,7 +1202,7 @@ mod tests {
         assert_eq!(pick("https://code.org 에서 강의 찾아줘"), None, "주소가 있으면 웹");
         assert_eq!(pick("네이버에서 오늘 날씨 찾아줘"), None);
 
-        // 기본 앱은 '앱' 을 함께 말할 때만
+        // built-in apps only when "app" is said along with them
         let sys = |label: &str| AppListItem { label: label.into(), path: format!("/System/Applications/{label}.app"), electron: None, disabled: None };
         let items = vec![sys("날씨"), sys("메모"), sys("Notes"), AppListItem { label: "계산기".into(), path: "/System/Applications/Calculator.app".into(), electron: None, disabled: None }];
         let pick = |t: &str| auto_app(t, &items).map(|it| it.label.as_str());
@@ -1185,7 +1210,7 @@ mod tests {
         assert_eq!(pick("날씨 앱에서 서울 날씨 봐줘"), Some("날씨"));
         assert_eq!(pick("메모앱에 장보기 목록 적어줘"), Some("메모"));
         assert_eq!(pick("open the Notes app"), Some("Notes"));
-        // 보이는 이름이 한국어여도 영어 파일 이름으로 찾는다
+        // found by the English file name even when the display name is Korean
         assert_eq!(pick("open the Calculator app"), Some("계산기"));
         assert!(is_system_app(r"C:\Windows\System32\notepad.exe") && !is_system_app(r"C:\Program Files\Slack\slack.exe"));
     }

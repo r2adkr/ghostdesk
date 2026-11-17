@@ -1,44 +1,48 @@
-//! 앱이 직접 그리는 제목 표시줄과 창 가장자리 (Windows · macOS).
+//! Custom-drawn title bar and window edges (Windows and macOS).
 //!
-//! Windows 는 기본 창 틀을 없애고(`main.rs` 의 `with_decorations(false)`), macOS 는 내용을 제목 줄 밑까지 넓히고
-//! 기본 제목 줄을 투명하게 숨긴 뒤(`with_fullsize_content_view`), 그 자리를 아래 열과 같은 색으로 나눠 칠한다:
-//! 사이드바 위는 사이드바 색, 작업 영역 위는 작업 영역 색, 상세 보기의 오른쪽 패널 위는 그 패널 색.
-//! 그래서 경계선 없이 각 열이 창 위끝까지 이어져 보인다. 앱 이름은 사이드바 머리 자리에 둔다.
-//! 빈 곳을 끌면 창 이동, 두 번 누르면 최대화/복원. Windows 는 오른쪽 끝에 최소화·최대화·닫기를 그리고,
-//! macOS 는 왼쪽 위의 기본 신호등 단추를 그대로 쓴다 (앱 이름은 그 오른쪽으로 비켜 둔다).
-//! 테두리가 없어진 창의 크기 바꾸기는 `resize_edges` 가 가장자리에서 운영체제에 넘긴다.
-//! Aero Snap·Windows 11 둥근 모서리·창 그림자는 winit 이 남겨 둔 창 스타일 덕분에 그대로 동작한다.
+//! Windows drops the native frame (`with_decorations(false)` in `main.rs`); macOS extends the
+//! content under the title bar and hides the native one (`with_fullsize_content_view`). The
+//! strip is then painted in the colors of the columns below it: sidebar color above the
+//! sidebar, workspace color above the workspace, and the right panel's color above the detail
+//! view's right panel, so every column runs to the top of the window without a seam. The app
+//! name sits in the sidebar's header spot.
+//!
+//! Dragging empty space moves the window and double-clicking maximizes/restores. Windows gets
+//! minimize, maximize and close drawn at the right end; macOS keeps the native traffic lights at
+//! the top left (the app name moves right to clear them). With the frame gone, `resize_edges`
+//! hands edge drags to the OS for resizing. Aero Snap, Windows 11 rounded corners and the window
+//! shadow keep working thanks to the window styles winit leaves in place.
 
 use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, ViewportCommand};
 
 use super::i18n::tr;
 use super::theme;
 
-/// 높이: macOS 는 신호등 단추가 놓인 기본 제목 줄 높이(28)에 맞춘다
+/// Height. On macOS it matches the native title bar that holds the traffic lights (28).
 pub const HEIGHT: f32 = if cfg!(target_os = "macos") { 28.0 } else { 40.0 };
-/// macOS 신호등 단추(닫기·최소화·확대)가 차지하는 왼쪽 너비
+/// Width taken by the macOS traffic lights (close, minimize, zoom) on the left.
 const MAC_TRAFFIC_W: f32 = 78.0;
-/// 창 단추 하나의 너비 (Windows 기본 단추와 같은 46px)
+/// Width of one window button (46 px, same as the native Windows buttons).
 const BUTTON_W: f32 = 46.0;
-/// 창 크기를 바꾸는 가장자리 두께
+/// Thickness of the resize edges.
 const EDGE: f32 = 7.0;
-/// 닫기 단추의 빨강 (Windows 기본과 같은 색: 사용자가 이미 아는 위험 신호)
+/// Close button red, the same as native Windows: a danger signal users already know.
 const CLOSE_RED: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 const CLOSE_RED_PRESSED: Color32 = Color32::from_rgb(0xa3, 0x23, 0x17);
 
-/// 앱이 그린 제목 표시줄을 쓸 것인가: Windows·macOS 에서 전체 화면이 아닐 때
+/// Whether to use the custom title bar: on Windows and macOS, when not full screen.
 pub fn visible(ctx: &egui::Context) -> bool {
     (cfg!(windows) || cfg!(target_os = "macos")) && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
 }
 
-/// 제목 표시줄 아래에 놓인 옆 패널의 너비 (0 이면 그쪽 패널 없음)
+/// Widths of the side panels below the title bar (0 = no panel on that side).
 #[derive(Clone, Copy, Default)]
 pub struct Columns {
     pub left: f32,
     pub right: f32,
 }
 
-/// 제목 표시줄을 그린다. `Panel::top` 안에서 부른다.
+/// Draws the title bar. Call inside `Panel::top`.
 pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     let ctx = ui.ctx().clone();
     let rect = ui.max_rect();
@@ -52,7 +56,8 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     if cols.right > 0.0 {
         p.rect_filled(right, 0, theme::surface());
     }
-    // 아래 패널 사이의 구분선을 위끝까지 잇는다 (egui 처럼 선 두께 반만큼 패널 안쪽에 그려야 같은 화소에 놓인다)
+    // extend the separators between the panels below up to the top. Like egui, draw half the stroke
+    // width inside the panel so it lands on the same pixels.
     let line = ui.visuals().widgets.noninteractive.bg_stroke;
     let half = 0.5 * line.width;
     if cols.left > 0.0 {
@@ -62,10 +67,10 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
         p.vline(right.left() + half, rect.y_range(), line);
     }
 
-    // 앱 이름: 사이드바의 아이콘·글 줄과 같은 세로줄에 맞춘다 (사이드바 안쪽 여백 10 + 아이콘 가운데 18 / 글 36)
-    // macOS 는 신호등 단추 오른쪽으로 비켜 둔다
+    // app name: aligned with the sidebar's icon/text columns (sidebar inner margin 10 + icon center
+    // 18 / text 36); on macOS it moves right of the traffic lights
     let mac = cfg!(target_os = "macos");
-    // macOS: 신호등 단추의 가운데(위에서 15.5)에 맞춰 조금 내린다
+    // macOS: nudge down to the traffic lights' center (15.5 from the top)
     let cy = rect.center().y + if mac { 2.0 } else { 0.0 };
     let fg = theme::text();
     let x0 = rect.left() + if mac { MAC_TRAFFIC_W - 10.0 } else { 0.0 };
@@ -73,7 +78,8 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     p.text(pos2(x0 + 28.0, cy), egui::Align2::CENTER_CENTER, crate::icon::GHOST, FontId::proportional(icon_size), fg);
     p.text(pos2(x0 + 46.0, cy), egui::Align2::LEFT_CENTER, "GhostDesk", FontId::proportional(text_size), fg);
 
-    // 빈 곳: 끌면 이동, 두 번 누르면 최대화/복원 (단추보다 먼저 만들어 단추가 위에서 눌리게)
+    // empty space: drag to move, double-click to maximize/restore. Created before the buttons so
+    // the buttons win clicks on top.
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     let drag_rect = if mac {
         rect.with_min_x(rect.left() + MAC_TRAFFIC_W)
@@ -87,7 +93,7 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
-    // macOS 는 창 단추를 운영체제가 그린다
+    // macOS draws the window buttons natively
     if mac {
         return;
     }
@@ -129,17 +135,17 @@ fn caption_button(ui: &mut egui::Ui, rect: Rect, kind: Caption, focused: bool) -
     let (fill, fg) = match (kind, hot) {
         (Caption::Close, true) => (if pressed { CLOSE_RED_PRESSED } else { CLOSE_RED }, Color32::WHITE),
         (_, true) => (if pressed { theme::overlay_pressed() } else { theme::overlay_hover() }, theme::text()),
-        // 창이 앞에 있지 않으면 단추 글자를 흐리게 (Windows 기본 창과 같은 신호)
+        // dim the glyphs when the window isn't focused (same cue as native Windows windows)
         _ => (Color32::TRANSPARENT, if focused { theme::text() } else { theme::muted() }),
     };
     let p = ui.painter();
     p.rect_filled(rect, 0, fill);
-    // 1px 선을 화면 화소에 맞춰 또렷하게 그린다
+    // snap the 1 px lines to device pixels so they stay crisp
     let ppp = ui.ctx().pixels_per_point();
     let snap = |v: f32| (v * ppp).round() / ppp + 0.5 / ppp;
     let c = pos2(snap(rect.center().x), snap(rect.center().y));
     let s = Stroke::new(1.0, fg);
-    let h = 5.0; // 기호 반 크기 (10px)
+    let h = 5.0; // half glyph size (10 px)
     match kind {
         Caption::Minimize => {
             p.line_segment([pos2(c.x - h, c.y), pos2(c.x + h, c.y)], s);
@@ -148,7 +154,7 @@ fn caption_button(ui: &mut egui::Ui, rect: Rect, kind: Caption, focused: bool) -
             p.rect_stroke(Rect::from_center_size(c, vec2(2.0 * h, 2.0 * h)), 1, s, egui::StrokeKind::Middle);
         }
         Caption::Restore => {
-            // 앞 네모 + 뒤 네모의 위·오른쪽 모서리
+            // front square plus the top and right edges of the back one
             let front = Rect::from_center_size(c + vec2(-1.0, 1.0), vec2(8.0, 8.0));
             p.rect_stroke(front, 1, s, egui::StrokeKind::Middle);
             let (l, t, r, b) = (front.left() + 2.0, front.top() - 2.0, front.right() + 2.0, front.bottom() - 2.0);
@@ -163,8 +169,10 @@ fn caption_button(ui: &mut egui::Ui, rect: Rect, kind: Caption, focused: bool) -
     resp.on_hover_text(tip)
 }
 
-/// 창 가장자리에서 크기 바꾸기. 모든 위젯을 그린 뒤 부른다 (가장자리 커서가 위젯 커서보다 우선).
-/// 최대화·전체 화면일 때와 Windows 가 아닐 때는 아무것도 하지 않는다.
+/// Resizing from the window edges. Call after drawing every widget (the edge cursor takes
+/// priority over widget cursors).
+///
+/// Does nothing when maximized or full screen, or when not on Windows.
 pub fn resize_edges(ctx: &egui::Context) {
     if !cfg!(windows) || ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)) {
         return;
@@ -187,7 +195,8 @@ pub fn resize_edges(ctx: &egui::Context) {
     }
 }
 
-/// `pos` 가 창 `r` 의 어느 가장자리 위인가 (모서리는 조금 넓게 잡아 대각선으로 잡기 쉽게)
+/// Which edge of window `r` the point `pos` is over. Corners are grabbed a bit generously so
+/// diagonal resizing is easy to hit.
 fn edge_at(r: Rect, pos: egui::Pos2) -> Option<egui::ResizeDirection> {
     use egui::ResizeDirection as D;
     if !r.expand(1.0).contains(pos) {
@@ -225,7 +234,7 @@ mod tests {
         assert_eq!(at(1.0, 300.0), Some(D::West));
         assert_eq!(at(799.0, 300.0), Some(D::East));
         assert_eq!(at(2.0, 2.0), Some(D::NorthWest));
-        // 모서리 근처의 가장자리는 대각선으로
+        // edges near a corner resize diagonally
         assert_eq!(at(10.0, 1.0), Some(D::NorthWest));
         assert_eq!(at(798.0, 590.0), Some(D::SouthEast));
         assert_eq!(at(900.0, 300.0), None);

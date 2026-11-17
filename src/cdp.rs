@@ -1,7 +1,7 @@
-//! 최소한의 Chrome DevTools Protocol(CDP) 클라이언트.
+//! A minimal Chrome DevTools Protocol (CDP) client.
 //!
-//! 브라우저 레벨 웹소켓 하나에 `flatten` 세션을 붙여서, 탭(타깃)마다
-//! `sessionId` 를 달아 명령을 보낸다.
+//! Uses a single browser-level WebSocket with `flatten` sessions attached, and tags each command
+//! with the `sessionId` of its target (tab).
 
 use std::{
     collections::HashMap,

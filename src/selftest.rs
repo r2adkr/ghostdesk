@@ -1,10 +1,12 @@
-//! `ghostdesk --selftest [출력.png | --browser=<이름|실행 파일>]`
+//! `ghostdesk --selftest [out.png | --browser=<name|executable>]`
 //!
-//! 빈 임시 프로필로 headless 브라우저를 띄워 클릭/타이핑(영문+한글)/단축키/스크롤/
-//! 탭 전환을 CDP 로 수행하고 결과를 검증한다. 사용자 프로필은 건드리지 않는다.
+//! Starts a headless browser with an empty temporary profile, drives clicks, typing (English
+//! and Korean), shortcuts, scrolling and tab switching over CDP, and checks the results. The
+//! user's profiles are never touched.
 //!
-//! 브라우저 고르기: `--browser=edge` 또는 환경변수 `GHOSTDESK_SELFTEST_BROWSER` (이름 일부, 또는 실행 파일 경로).
-//! 실행 파일 경로를 주면 설치된 브라우저 목록(프로필 정보)도 읽지 않는다. 없으면 감지된 첫 브라우저.
+//! Pick the browser with `--browser=edge` or `GHOSTDESK_SELFTEST_BROWSER` (part of a name, or
+//! an executable path). With an executable path the installed-browser scan (profile info) is
+//! skipped. Defaults to the first browser found.
 
 use std::{
     path::PathBuf,
@@ -16,7 +18,7 @@ use anyhow::{ensure, Result};
 
 use crate::{browser::{BrowserWorkspace, LaunchOptions, MouseButton}, profiles};
 
-/// 셀프 테스트에 쓸 브라우저 (표시 이름, 실행 파일)
+/// The browser for the self-test: `(display name, executable)`.
 fn pick_browser(choice: Option<String>) -> Result<(String, PathBuf)> {
     if let Some(c) = &choice {
         let p = PathBuf::from(c.trim().trim_matches('"'));
@@ -52,7 +54,7 @@ const PAGE: &str = r#"data:text/html;charset=utf-8,<html><body style='font:20px 
 </body></html>"#;
 
 pub async fn run(out: Option<String>) -> Result<()> {
-    // 두 번째 인자로 `--browser=…` 를 줄 수도 있다 (그때는 스크린샷을 저장하지 않는다)
+    // the second argument may be `--browser=…` instead (then no screenshot is saved)
     let (out, choice) = match out {
         Some(o) if o.starts_with("--browser=") => (None, Some(o["--browser=".len()..].to_string())),
         o => (o, std::env::var("GHOSTDESK_SELFTEST_BROWSER").ok().filter(|s| !s.trim().is_empty())),
@@ -136,11 +138,13 @@ pub async fn run(out: Option<String>) -> Result<()> {
     println!("✔ 라이브 프레임 수신: {}개", frames.load(Ordering::Relaxed));
     ensure!(frames.load(Ordering::Relaxed) > 0, "screencast 프레임 없음");
 
-    // Windows: 브라우저와 헬퍼 프로세스가 모두 Job 객체 안에 있고, 종료 뒤 하나도 남지 않아야 한다
+    // Windows: the browser and all its helper processes must be inside the Job object, and none
+    // may survive shutdown
     #[cfg(windows)]
     let job_pids = {
         let pid = ws.browser_pid().ok_or_else(|| anyhow::anyhow!("브라우저 pid 없음"))?;
-        // (런처형 브라우저면 본 pid 는 이미 끝났고 실제 브라우저만 Job 에 있다)
+        // (for launcher-style browsers the original pid has already exited and only the real browser
+        // is in the Job)
         let pids = crate::platform::proc::group_pids(pid).unwrap_or_default();
         ensure!(!pids.is_empty(), "브라우저가 Job 객체에 들어 있지 않음 (pid {pid})");
         println!("✔ Job 객체: 프로세스 {}개", pids.len());
@@ -169,10 +173,12 @@ pub async fn run(out: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// `ghostdesk --agent-test "<작업>"` : GUI 없이 에이전트 루프 하나를 빈 프로필로 실행한다.
-/// (ANTHROPIC_BASE_URL 로 가짜 서버를 지정해 루프를 검증할 때 사용.
-///  GHOSTDESK_TEST_OPENAI_URL 을 주면 그 주소의 OpenAI 호환 API('Custom')로 돌린다:
-///  키는 GHOSTDESK_TEST_OPENAI_KEY, 모델은 GHOSTDESK_TEST_OPENAI_MODEL)
+/// `ghostdesk --agent-test "<task>"`: runs a single agent loop without the GUI, on an empty
+/// profile.
+///
+/// Used to exercise the loop against a fake server via `ANTHROPIC_BASE_URL`. With
+/// `GHOSTDESK_TEST_OPENAI_URL` it runs against that OpenAI-compatible API ("Custom") instead,
+/// using `GHOSTDESK_TEST_OPENAI_KEY` and `GHOSTDESK_TEST_OPENAI_MODEL`.
 pub async fn run_agent_cli(task: String) -> Result<()> {
     use crate::{agent::{self, AgentConfig, AgentShared, DeskTarget, ProfileSource}, llm::Llm};
     let browser = profiles::detect().into_iter().next().ok_or_else(|| anyhow::anyhow!("브라우저 없음"))?;
@@ -183,7 +189,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         name: "cli".into(),
         workspace: ws_name.clone(),
         task,
-        // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] 이면 원격 데스크톱(VNC) 백엔드로 실행
+        // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend
         target: if let Ok(name) = std::env::var("GHOSTDESK_TEST_ELECTRON") {
             let app = crate::electron::detect_apps()
                 .into_iter()
@@ -237,7 +243,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(300)).await;
         {
             let log = shared.log.lock();
-            // 기록은 오래되면 앞에서부터 버려지므로 범위를 넘지 않게 읽는다
+            // the log drops old entries from the front, so don't read past its end
             for l in log.get(printed..).unwrap_or_default() {
                 println!("[{:>5.1}s] {:?}: {}", l.secs, l.kind, l.text);
             }

@@ -1,12 +1,12 @@
-//! Accessibility(AX) API 의 얇은 안전 래퍼.
+//! A thin, safe wrapper over the Accessibility (AX) API.
 //!
-//! - 모든 호출은 대상 앱에 mach 메시지를 보내는 블로킹 호출이다. async 코드에서는
-//!   `tokio::task::spawn_blocking` 안에서 부를 것.
-//! - AX 반환 코드는 자주 거짓말을 한다 (Success 인데 반영 안 됨, 실패인데 반영됨).
-//!   중요한 변경은 반드시 다시 읽어서 검증한다.
-//! - 앱이 숨겨진 상태에서도 AXValue / AXSelectedTextRange / AXFocused 설정과
-//!   컨트롤의 AXPress 는 동작한다 (이 Mac 에서 검증). 단, AXRaise·AXMinimized=false·
-//!   앱 unhide 는 창을 사용자 화면에 띄우므로 이 모듈에서는 절대 쓰지 않는다.
+//! - Every call is a blocking mach message to the target app. From async code, call it inside
+//!   `tokio::task::spawn_blocking`.
+//! - AX return codes lie a lot (Success without effect, failure with effect), so always read
+//!   important changes back to verify them.
+//! - Setting AXValue / AXSelectedTextRange / AXFocused and AXPress on controls work even while
+//!   the app is hidden (verified on this Mac). AXRaise, AXMinimized=false and unhiding the app
+//!   all put windows on the user's screen, so this module never uses them.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -18,8 +18,10 @@ use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFRange, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 
-/// 스레드 간에 옮길 수 있는 AX 요소 핸들.
-/// AXUIElementRef 는 불변 토큰이고 모든 API 가 스레드 안전하므로 Send/Sync 로 취급한다.
+/// An AX element handle that can move between threads.
+///
+/// `AXUIElementRef` is an immutable token and the whole API is thread-safe, so it is treated
+/// as `Send + Sync`.
 #[derive(Clone)]
 pub struct El(pub CFRetained<AXUIElement>);
 unsafe impl Send for El {}
@@ -33,7 +35,7 @@ impl std::fmt::Debug for El {
 
 impl PartialEq for El {
     fn eq(&self, other: &Self) -> bool {
-        // CFEqual 은 같은 UI 요소를 가리키면 true
+        // CFEqual is true when both refer to the same UI element
         let a: &CFType = &self.0;
         let b: &CFType = &other.0;
         a == b
@@ -48,7 +50,7 @@ fn cfs(s: &str) -> CFRetained<CFString> {
     CFString::from_str(s)
 }
 
-/// CFType → 사람이 읽을 문자열 (문자열/숫자/불리언만).
+/// Converts a `CFType` to a readable string (strings, numbers and booleans only).
 pub fn cf_to_string(v: &CFType) -> Option<String> {
     if let Some(s) = v.downcast_ref::<CFString>() {
         return Some(s.to_string());
@@ -114,7 +116,8 @@ extern "C" {
 }
 
 impl El {
-    /// 앱(프로세스) 루트 요소. 메시지 타임아웃을 짧게 둬서 멈춘 앱 때문에 오래 막히지 않게 한다.
+    /// The app (process) root element. Uses a short messaging timeout so a hung app can't block us
+    /// for long.
     pub fn app(pid: i32) -> El {
         let a = unsafe { AXUIElement::new_application(pid) };
         unsafe { a.set_messaging_timeout(2.5) };
@@ -187,7 +190,7 @@ impl El {
         self.element("AXParent")
     }
 
-    /// 여러 속성을 한 번의 IPC 로 읽는다. 실패한 속성은 None.
+    /// Reads several attributes in one IPC round trip. Failed attributes are `None`.
     pub fn multi(&self, attrs: &[&str]) -> Vec<Option<CFRetained<CFType>>> {
         let names: Vec<CFRetained<CFString>> = attrs.iter().map(|a| cfs(a)).collect();
         let arr = CFArray::from_retained_objects(&names);
@@ -270,7 +273,7 @@ impl El {
         arr.iter().filter_map(|s| cf_to_string(&s)).collect()
     }
 
-    /// 매개변수 속성 (예: AXRangeForPosition, AXStringForRange)
+    /// A parameterized attribute (e.g. AXRangeForPosition, AXStringForRange).
     pub fn param(&self, attr: &str, p: &CFType) -> Option<CFRetained<CFType>> {
         let mut v: *const CFType = std::ptr::null();
         let e = unsafe { self.0.copy_parameterized_attribute_value(&cfs(attr), p, NonNull::from(&mut v)) };
@@ -281,14 +284,14 @@ impl El {
         }
     }
 
-    /// 전역 좌표(포인트)의 글자 인덱스 범위 (텍스트 요소만)
+    /// Character range at a global point, in points (text elements only).
     pub fn range_for_position(&self, p: CGPoint) -> Option<CFRange> {
         let pv = point_value(p)?;
         let r = self.param("AXRangeForPosition", &pv)?;
         cf_range(&r)
     }
 
-    /// AX 창 요소 → CGWindowID (private `_AXUIElementGetWindow`)
+    /// AX window element → CGWindowID (private `_AXUIElementGetWindow`).
     pub fn window_id(&self) -> Option<u32> {
         let mut wid: u32 = 0;
         let r = unsafe { _AXUIElementGetWindow(CFRetained::as_ptr(&self.0).as_ptr(), &mut wid) };
@@ -300,7 +303,7 @@ impl El {
         (unsafe { self.0.pid(NonNull::from(&mut p)) } == AXError::Success).then_some(p)
     }
 
-    /// 전역 좌표에서 앱이 보고하는 요소 (앱 자체 hit-test).
+    /// The element the app reports at a global point (the app's own hit test).
     pub fn element_at(&self, x: f32, y: f32) -> Option<El> {
         let mut out: *const AXUIElement = std::ptr::null();
         let e = unsafe { self.0.copy_element_at_position(x, y, NonNull::from(&mut out)) };

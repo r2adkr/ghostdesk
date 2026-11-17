@@ -1,4 +1,5 @@
-//! 모델의 도구 호출 실행: computer 동작, 화면별 보조 도구, ask_user. 외부(MCP) 에이전트도 같은 함수를 쓴다.
+//! Executes the model's tool calls: computer actions, per-screen helper tools and `ask_user`.
+//! External (MCP) agents go through the same functions.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -24,8 +25,10 @@ fn ok(text: impl Into<String>) -> Result<Outcome> {
     Ok(Outcome { text: text.into(), image: None })
 }
 
-/// 한 턴의 도구 호출을 차례로 실행하고 결과(tool_result 목록)를 돌려준다.
-/// 마지막 결과에는 최신 화면과 창·탭 목록을 붙이되, 모델이 이미 본 것과 같으면 생략한다(`seen`).
+/// Runs one turn's tool calls in order and returns their `tool_result`s.
+///
+/// The last result gets the current screenshot and window/tab list attached, unless the model
+/// has already seen the same thing (`seen`).
 pub(super) async fn execute_batch(
     shared: &Arc<AgentShared>,
     ws: &Desk,
@@ -65,7 +68,8 @@ pub(super) async fn execute_batch(
         shared.set_status(AgentStatus::Acting(short(&desc, 60)));
         shared.log(LogKind::Action, desc);
 
-        // 화면의 가상 마우스가 실제 이동과 같은 곡선으로 미끄러지도록 목표를 알리는 콜백
+        // tells the on-screen cursor where we're heading so it glides along the same curve as the
+        // real movement
         let aim = |p: (f64, f64)| {
             shared.cursor.lock().aim(p, ws.mouse_pos());
             shared.ctx.request_repaint();
@@ -101,7 +105,7 @@ pub(super) async fn execute_batch(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 배치가 스크린샷으로 끝나지 않았다면 최신 화면과 탭 정보를 마지막 결과에 덧붙인다.
+    // if the batch didn't end with a screenshot, attach the latest screen and tabs to the last result
     settle(ws).await;
     let uses = tool_uses.len();
     let mut extra = Vec::new();
@@ -149,7 +153,8 @@ fn mods_from(v: &Value) -> i64 {
     })
 }
 
-/// 좌표가 있으면 사람처럼 그 지점까지 미끄러져 간다 (화면 표시 + 실제 mouseMoved 연속 전송).
+/// Glides to the target like a person would, updating the on-screen cursor and sending a
+/// stream of real `mouseMoved` events. No-op without coordinates.
 async fn glide(ws: &Desk, p: (f64, f64), aim: &(dyn Fn((f64, f64)) + Sync)) -> Result<()> {
     aim(p);
     ws.glide_to(p.0, p.1, 0).await
@@ -252,7 +257,7 @@ async fn exec_custom(
             let ans = loop {
                 match rx.recv().await {
                     Some(AgentCmd::Answer(a)) | Some(AgentCmd::Instruction(a)) => break a,
-                    // 대기열 알림은 질문의 답이 아니므로 계속 기다린다
+                    // a queue notification is not an answer, keep waiting
                     Some(AgentCmd::Wake) => continue,
                     None => return Err(anyhow!("에이전트 종료")),
                 }
@@ -265,7 +270,8 @@ async fn exec_custom(
     }
 }
 
-/// 화면 종류별 보조 도구(browser_control / app_control / app_menu). 외부(MCP) 에이전트도 같은 함수를 쓴다.
+/// Per-screen helper tools (`browser_control`, `app_control`, `app_menu`). Shared with
+/// external (MCP) agents.
 pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Result<Outcome> {
     match name {
         "app_control" => {
@@ -287,7 +293,7 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
             match input["action"].as_str().unwrap_or("list") {
                 "click" => {
                     let path = input["path"].as_str().ok_or_else(|| anyhow!("path 가 필요합니다"))?;
-                    // 단축키와 같은 이유로 메뉴의 복사·잘라내기·붙여넣기도 막는다 (사용자의 실제 클립보드)
+                    // block copy/cut/paste menu items for the same reason as the shortcuts: the clipboard is the user's
                     if is_clipboard_menu_path(path) {
                         return Err(anyhow!(
                             "Electron 앱 화면에서는 복사·잘라내기·붙여넣기 메뉴('{path}')를 쓸 수 없습니다: 이 앱은 사용자의 실제 시스템 클립보드를 공유합니다. \
@@ -331,7 +337,8 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
     }
 }
 
-/// 메뉴 경로("Edit > Paste")의 항목이 복사·잘라내기·붙여넣기인가. 단어 단위로 본다 ("Shortcuts" 는 해당 없음).
+/// Whether a menu path ("Edit > Paste") names copy, cut or paste. Matches whole words, so
+/// "Shortcuts" doesn't count.
 fn is_clipboard_menu_path(path: &str) -> bool {
     path.split('>').any(|seg| {
         let l = seg.trim().to_lowercase();

@@ -1,5 +1,6 @@
-//! 번역 표: [한국어 원문, English, 日本語, 中文(간체)]. `i18n` 이 원문으로 찾는다.
-//! 원문은 코드의 tr("…") / trf("…") 글과 글자 하나까지 같아야 한다 (자리표시 {} 수도 같게).
+//! Translation table: `[Korean source, English, Japanese, Chinese (Simplified)]`, looked up by
+//! the Korean source. Each source must match the `tr("…")` / `trf("…")` text in the code exactly,
+//! including the number of `{}` placeholders.
 
 pub(super) const TABLE: &[[&str; 4]] = &[
     ["   허용   ", "   Allow   ", "   許可   ", "   允许"],

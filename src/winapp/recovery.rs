@@ -1,8 +1,11 @@
-//! Mode B 복구 기록: 사용자의 앱 창을 화면 밖으로 옮겨 둔 채 GhostDesk 가 비정상 종료되면 그 창이 화면 밖에 남는다.
-//! 옮길 때마다 원래 배치를 파일에 적어 두고, 정상적으로 되돌리면 지운다. 다음 실행 때 남아 있는 기록의 창이 아직
-//! 화면 밖에 있으면 원래 자리로 되돌린다 ([`recover`]).
+//! Mode B recovery log: if GhostDesk crashes while a user's app window is parked off-screen, the
+//! window stays there.
 //!
-//! 위치: `<데이터 루트>\winapp-parked.json` (시험할 때는 GHOSTDESK_WINAPP_RECOVERY_DIR 로 바꿀 수 있다).
+//! Each move writes the original placement to a file, and a normal restore removes it. On the
+//! next run, any logged window that's still off-screen is put back ([`recover`]).
+//!
+//! Location: `<data root>\winapp-parked.json` (override with `GHOSTDESK_WINAPP_RECOVERY_DIR`
+//! for tests).
 
 use std::path::PathBuf;
 
@@ -14,9 +17,11 @@ use crate::platform::win as pw;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// 이 프로세스에서 지금 화면 밖에 옮겨 둔(살아 있는 Mode B 작업공간의) 창들.
-/// `recover` 는 이 창들을 건드리지 않는다: 두 번째 작업공간을 실행할 때나 GUI 시작 때 복구가 돌아도
-/// 진행 중인 작업공간의 창을 사용자 화면으로 되돌리지 않게. (비정상 종료 뒤 새 프로세스에서는 비어 있다)
+/// Windows this process currently has parked off-screen (live mode B workspaces).
+///
+/// `recover` leaves these alone, so recovery running at GUI startup or when a second workspace
+/// starts never pulls an in-progress workspace's windows back onto the user's screen. Empty in a
+/// fresh process after a crash.
 static LIVE: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
 fn path() -> PathBuf {
@@ -48,18 +53,20 @@ fn save(v: &[Value]) {
     }
 }
 
-/// 기록 하나 (옮기기 전의 원래 상태)
+/// One record: the original state before the move.
 #[derive(Clone, Copy, Debug)]
 pub struct Record {
     pub pid: u32,
     pub hwnd: Hwnd,
     pub placement: Placement,
     pub was_visible: bool,
-    /// 스냅(Aero Snap·스냅 레이아웃)된 창의 실제 화면 사각형 — 배치의 보통 위치와 다를 때만
+    /// Actual screen rectangle of a snapped window (Aero Snap, snap layouts), only when it differs
+    /// from the placement's normal position.
     pub arranged: Option<(i32, i32, i32, i32)>,
 }
 
-/// JSON 으로. "flags"·"rect" 는 나중에 더한 항목이라 읽을 때는 없어도 된다 (이전 기록과 호환).
+/// Encodes as JSON. "flags" and "rect" were added later and are optional when reading (old
+/// records stay compatible).
 pub fn encode(pid: u32, h: Hwnd, pl: &Placement, was_visible: bool, arranged: Option<(i32, i32, i32, i32)>) -> Value {
     let mut v = json!({
         "pid": pid,
@@ -95,8 +102,11 @@ pub fn decode(v: &Value) -> Option<Record> {
     })
 }
 
-/// 저장해 둔 원래 상태로 되돌린다 (활성화하지 않음, 비동기). 배치를 되돌렸으면 true.
-/// 보이던 보통 창은 배치(보통 위치)로 되돌린 뒤, 스냅된 창이었으면 실제 사각형으로 다시 맞춘다.
+/// Restores the saved original state without activating (async). Returns true if the placement
+/// was restored.
+///
+/// A normal window that was visible goes back to its placement (normal position), then a
+/// snapped one is resized to its actual rectangle.
 pub fn apply_original(h: Hwnd, mut pl: Placement, was_visible: bool, arranged: Option<(i32, i32, i32, i32)>) -> bool {
     let normal_shown = pl.show_cmd == w32::SW_SHOWNORMAL;
     pl.show_cmd = match pl.show_cmd {
@@ -105,7 +115,8 @@ pub fn apply_original(h: Hwnd, mut pl: Placement, was_visible: bool, arranged: O
         c => c,
     };
     if !was_visible {
-        // 처음 봤을 때 숨어 있던 창(그 뒤 앱이 보여 줬을 수 있음)은 자리만 되돌리고 보임 상태는 지금 그대로 둔다
+        // windows hidden when first seen (the app may have shown them since) only get their position
+        // back; visibility stays as it is now
         pl.show_cmd = w32::keep_visibility_cmd(h);
     }
     let ok = w32::set_placement_async(h, &pl);
@@ -117,7 +128,8 @@ pub fn apply_original(h: Hwnd, mut pl: Placement, was_visible: bool, arranged: O
     ok
 }
 
-/// 최소화된 창은 최소화된 채로 두고 복원 위치(보통 위치)만 원래 배치로 고친다. 원래 최대화였으면 '복원하면 최대화'.
+/// Leaves a minimized window minimized and only fixes its restore position (normal position)
+/// from the original placement. Originally maximized windows restore maximized.
 fn fix_minimized_restore_position(h: Hwnd, mut pl: Placement) -> bool {
     if pl.show_cmd == w32::SW_SHOWMAXIMIZED {
         pl.flags |= w32::WPF_RESTORETOMAXIMIZED;
@@ -126,7 +138,7 @@ fn fix_minimized_restore_position(h: Hwnd, mut pl: Placement) -> bool {
     w32::set_placement_async(h, &pl)
 }
 
-/// 옮긴 사용자 창 하나를 기록한다
+/// Records one moved user window.
 pub fn remember(pid: u32, h: Hwnd, pl: &Placement, was_visible: bool, arranged: Option<(i32, i32, i32, i32)>) {
     let _g = LOCK.lock();
     {
@@ -141,12 +153,13 @@ pub fn remember(pid: u32, h: Hwnd, pl: &Placement, was_visible: bool, arranged: 
     save(&v);
 }
 
-/// 셀프테스트용: 이 창의 기록을 '비정상 종료한 이전 프로세스가 남긴 것' 처럼 다룬다 (살아 있는 목록에서만 뺀다)
+/// For the self-test: treats this window's record as left over by a crashed process (only
+/// removes it from the live list).
 pub fn simulate_crashed_record(h: Hwnd) {
     LIVE.lock().retain(|x| *x != h as i64);
 }
 
-/// 되돌린 창들의 기록을 지운다
+/// Removes the records of restored windows.
 pub fn forget(hwnds: &[Hwnd]) {
     let _g = LOCK.lock();
     LIVE.lock().retain(|x| !hwnds.iter().any(|h| *x == *h as i64));
@@ -158,12 +171,14 @@ pub fn forget(hwnds: &[Hwnd]) {
     }
 }
 
-/// 지난번에 되돌리지 못한(비정상 종료) 사용자 창을 원래 자리로. 되돌린 창 수.
-/// 창이 아직 있고, 같은 프로세스 것이고, 지금 어느 모니터에도 걸치지 않을 때만 되돌린다.
+/// Puts user windows left off-screen by a crash back where they were, returning how many.
+///
+/// Only restores a window that still exists, belongs to the same process and isn't on any
+/// monitor right now.
 pub fn recover() -> usize {
     let _g = LOCK.lock();
     let all = load();
-    // 이 프로세스의 살아 있는 작업공간이 옮겨 둔 창은 복구 대상이 아니다 (기록도 그대로 둔다)
+    // windows parked by this process's live workspaces aren't recovered (their records stay)
     let live = LIVE.lock().clone();
     let (keep, v): (Vec<Value>, Vec<Value>) =
         all.into_iter().partition(|e| e["hwnd"].as_i64().is_some_and(|h| live.contains(&h)));
@@ -179,9 +194,10 @@ pub fn recover() -> usize {
             continue;
         }
         if w32::is_iconic(h) {
-            // 지금 최소화된 창은 되살리지 않는다: 작업 표시줄에서 닿을 수 있고, 되살리면 사용자가 다른 작업 중일 때
-            // (포그라운드 잠금을 못 얻어) 활성화되어 포커스를 빼앗을 수 있다. 복원 위치가 화면 밖에 남아 있을 때만
-            // 그것을 원래대로 고쳐, 사용자가 복원하면 제자리에 나타나게 한다.
+            // don't restore windows that are minimized now: they're reachable from the taskbar, and
+            // restoring them while the user is busy elsewhere can activate them (without the foreground
+            // lock) and steal focus. Only fix a restore position left off-screen, so they reappear in
+            // place when the user restores them.
             let restore_off_screen = w32::get_placement(h)
                 .is_some_and(|c| !pw::intersects_any_monitor(w32::normal_to_screen(h, c.normal)));
             if restore_off_screen && fix_minimized_restore_position(h, r.placement) {
@@ -220,14 +236,14 @@ mod tests {
         let p2 = r.placement;
         assert_eq!((p2.show_cmd, p2.normal, p2.min_pos, p2.max_pos, p2.flags), (2, (1, 2, 300, 400), (-1, -1), (-8, -8), 2));
         assert!(decode(&json!({"pid": 1})).is_none());
-        // 스냅된 창의 실제 사각형
+        // a snapped window's actual rectangle
         let v = encode(42, 0x1234, &Placement { show_cmd: 1, flags: 0, ..pl }, true, Some((-7, 0, 967, 1047)));
         assert_eq!(decode(&v).unwrap().arranged, Some((-7, 0, 967, 1047)));
     }
 
     #[test]
     fn old_records_still_decode() {
-        // flags·rect 가 없던 이전 버전의 기록
+        // a record from an older version without flags and rect
         let v = json!({"pid": 7, "hwnd": 99, "show_cmd": 1, "normal": [1, 2, 3, 4], "min": [-1, -1], "max": [-1, -1], "was_visible": true});
         let r = decode(&v).unwrap();
         assert_eq!((r.pid, r.hwnd, r.placement.flags, r.arranged), (7, 99, 0, None));

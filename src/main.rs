@@ -1,10 +1,11 @@
-//! GhostDesk — 사용자의 화면·마우스·키보드·브라우저 창을 전혀 건드리지 않고,
-//! 격리된 화면(로그인을 복사한 브라우저·숨긴 앱·별도 세션·원격 데스크톱) 위에서
-//! 하나 또는 여러 computer-use 에이전트(Claude·GPT·Gemini 등)를 동시에 돌리는 데스크톱 앱.
+//! GhostDesk: a desktop app that runs one or more computer-use agents (Claude, GPT, Gemini, …)
+//! side by side on isolated screens (browsers with copied logins, hidden apps, separate sessions,
+//! remote desktops) without ever touching the user's screen, mouse, keyboard or browser windows.
 //!
-//! Windows 에서도 콘솔 서브시스템 실행 파일이다: MCP 호스트(stdio)와 `--connect`·`--selftest*` 같은
-//! 명령줄 모드가 표준 입출력과 종료 코드를 그대로 쓰게 하기 위해서다. GUI 로 실행되면 이 프로세스만을 위해
-//! 생긴 콘솔 창(탐색기에서 더블클릭한 경우)은 바로 떼어 낸다.
+//! It's a console-subsystem executable on Windows too, so the MCP host (stdio) and command-line
+//! modes like `--connect` and `--selftest*` get standard I/O and exit codes as is. When run as a
+//! GUI, a console window created just for this process (double-click in Explorer) is detached
+//! right away.
 
 mod agent;
 mod app;
@@ -24,7 +25,7 @@ mod native;
 mod platform;
 #[cfg(windows)]
 mod winapp;
-// macOS: 전용 계정 세션, Windows: 자식 세션(PiP) — 같은 헬퍼 RPC
+// macOS: dedicated account session; Windows: child session (PiP). Same helper RPC.
 #[cfg(any(unix, windows))]
 mod session;
 mod vdisplay;
@@ -36,21 +37,23 @@ mod selftest;
 mod update;
 
 fn main() -> anyhow::Result<()> {
-    // DLL 심기 방지: 실행 중에 이름만으로 읽는 DLL(그래픽 스택의 opengl32·d3d12·dxgi·d3dcompiler_47 등)을
-    // 실행 파일 폴더(내려받은 폴더일 수 있음)·현재 폴더·PATH 가 아니라 System32 에서만 찾는다.
-    // 정적 가져오기는 build.rs 의 /DEPENDENTLOADFLAG 가 맡는다. 가장 먼저 해야 한다.
+    // DLL planting defense: DLLs loaded by name at runtime (graphics stack: opengl32, d3d12, dxgi,
+    // d3dcompiler_47, …) are only searched for in System32, not the executable's folder (possibly
+    // Downloads), the current folder or PATH. Static imports are covered by /DEPENDENTLOADFLAG in
+    // build.rs. Must come first.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
         SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
-    // MCP 호스트가 넘긴 표준 입출력 파이프가 GhostDesk 창·브라우저로 상속되어 새지 않게 (모든 모드)
+    // keep the stdio pipes the MCP host gave us from leaking into the GhostDesk window and browsers
+    // (all modes)
     #[cfg(windows)]
     platform::win::harden_std_handles();
     let args: Vec<String> = std::env::args().collect();
-    // 외부 에이전트가 GhostDesk 를 시험용으로 하나 더 띄웠다 (control.rs 의 app_target):
-    // 빈 데이터 폴더를 쓰고(설정·키·제어 연결이 따로) 다른 AI 앱에 자동으로 연결·설치하지 않는다.
-    // 다른 스레드가 생기기 전이라 환경변수를 바꿔도 안전하다.
+    // an external agent launched an extra GhostDesk for testing (control.rs app_target): use an
+    // empty data folder (separate settings, keys and control endpoint) and don't auto-connect to or
+    // install into other AI apps. No other threads exist yet, so changing env vars is safe.
     if let Some(dir) = args.iter().position(|a| a == control::ISOLATED_DATA_ARG).and_then(|i| args.get(i + 1)) {
         std::env::set_var("GHOSTDESK_DATA_DIR", dir);
         std::env::set_var("GHOSTDESK_NO_AUTOCONNECT", "1");
@@ -62,23 +65,23 @@ fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("--selftest-electron") => return rt.block_on(electron::selftest(&args[2..])),
         Some("--selftest-native") => return rt.block_on(native::selftest(&args[2..])),
-        // 실제 가상 모니터를 만드는 테스트: --yes 가 있어야만 실행
+        // test that creates a real virtual monitor: only runs with --yes
         Some("--selftest-vdisplay") => return rt.block_on(vdisplay::selftest(&args[2..])),
         Some("--selftest-session") => return rt.block_on(session::selftest(&args[2..])),
         Some("--session-helper") => return rt.block_on(session::run_helper(&args[2..])),
         #[cfg(unix)]
         Some("--print-session-plist") => return session::print_session_plist(&args[2..]),
-        // 관리자 권한(UAC)으로 실행됨: Windows 자식 세션 기능 켜기
+        // running elevated (UAC): enable the Windows child sessions feature
         #[cfg(windows)]
         Some("--enable-child-sessions") => return winapp::child::enable_cli(),
-        // 외부 에이전트(Claude 앱 / Claude Code / Codex)용 MCP 서버 (stdio)
+        // MCP server for external agents (Claude app / Claude Code / Codex), over stdio
         Some("--mcp") => return rt.block_on(mcp::run(&args[2..])),
-        // 설치 + Claude Code · Claude 앱 · Codex 자동 연결 / 해제
+        // install + auto-connect / disconnect Claude Code, the Claude app and Codex
         Some("--connect") => return install::cli(&args[2..], true),
         Some("--disconnect") => return install::cli(&args[2..], false),
-        // 목록에 없는 에이전트용 연결 패키지(MCP 설정·스킬·플러그인)를 만든다
+        // build a connection kit (MCP config, skill, plugin) for agents not in the list
         Some("--export-kit") => return kit::cli(&args[2..]),
-        // 릴리스용 macOS 앱 번들(zip) 만들기 (.github/workflows/release.yml)
+        // build the macOS app bundle (zip) for releases (.github/workflows/release.yml)
         #[cfg(target_os = "macos")]
         Some("--package-macos") => return install::package_macos(&args[2..]),
         _ => {}
@@ -87,18 +90,20 @@ fn main() -> anyhow::Result<()> {
         return rt.block_on(selftest::run_agent_cli(args.get(2).cloned().unwrap_or_default()));
     }
 
-    // ── GUI ──
-    // Windows: 이 프로세스만을 위해 생긴 콘솔(이전 Windows 에서 탐색기로 실행)이 있으면 콘솔 없이 다시 띄우고 끝낸다.
+    // ---- GUI ----
+    // Windows: if a console was created just for this process (launched from Explorer on older
+    // Windows), relaunch without a console and exit.
     #[cfg(windows)]
     if relaunch_without_console(&args) {
         return Ok(());
     }
-    // Windows: 창은 사용자당 하나만. 이미 떠 있으면 그 창을 앞으로 가져오고 끝낸다
-    // (macOS 는 LaunchServices 가 같은 일을 한다). `--background` 는 사용자가 직접 띄운 것이 아니라
-    // (예: MCP 서버가 자동으로 띄움) 포커스를 빼앗지 않는다.
+    // Windows: one window per user. If one is already up, bring it to the front and exit (on macOS
+    // LaunchServices does this). With `--background` (not started by the user, e.g. auto-launched by
+    // the MCP server) focus isn't taken.
     #[cfg(windows)]
     let background = args.iter().skip(1).any(|a| a == "--background");
-    // Windows: 새로 내려받은 exe 를 실행했으면 옛 GhostDesk 를 닫고 설치본을 이것으로 바꾼 뒤 설치본을 띄운다
+    // Windows: when a freshly downloaded exe is run, close the old GhostDesk, replace the installed
+    // copy with this one, and launch the installed copy
     #[cfg(windows)]
     if !background && install::take_over_install() {
         return Ok(());
@@ -108,14 +113,16 @@ fn main() -> anyhow::Result<()> {
         gui_instance::Start::Proceed(guard) => guard,
         gui_instance::Start::Exit => return Ok(()),
     };
-    // 탐색기 더블클릭 등으로 이 프로세스만을 위해 생긴 콘솔 창은 닫는다 (터미널에서 실행했으면 그대로)
+    // close a console window created just for this process (double-click in Explorer, …); leave it if
+    // started from a terminal
     #[cfg(windows)]
     detach_console_for_gui();
-    // 지난번 GhostDesk 가 비정상 종료되어 화면 밖에 남은 사용자 앱 창(내 앱 '이미 실행 중인 앱에 연결')을 되돌린다
+    // put back user app windows left off-screen by a crashed GhostDesk ("attach to a running app")
     #[cfg(windows)]
     std::thread::spawn(native::recover_parked_windows);
 
-    // macOS: 내려받은 새 버전을 압축 푼 자리에서 바로 열었으면, 옛 설치본을 이것으로 바꾸고 설치본으로 다시 연다
+    // macOS: if the new version was opened right where it was unpacked, replace the old installed
+    // copy with it and reopen from the install location
     #[cfg(target_os = "macos")]
     if install::take_over_install() {
         return Ok(());
@@ -131,13 +138,14 @@ fn main() -> anyhow::Result<()> {
     if background {
         viewport = viewport.with_active(false);
     }
-    // Windows: 기본 창 틀 대신 앱이 제목 표시줄을 그린다 (app/titlebar.rs). 제목은 작업 표시줄·Alt+Tab 용으로 남긴다.
+    // Windows: the app draws its own title bar instead of the native frame (app/titlebar.rs). The
+    // title stays for the taskbar and Alt+Tab.
     #[cfg(windows)]
     {
         viewport = viewport.with_decorations(false);
     }
-    // macOS: Windows 와 같은 모양으로, 내용을 제목 표시줄 밑까지 넓히고 기본 제목 줄은 투명하게 숨긴다.
-    // 창 단추(신호등)와 크기 바꾸기·전체 화면은 macOS 기본 동작을 그대로 쓴다.
+    // macOS: same look as Windows, with the content extended under the title bar and the native
+    // title bar hidden transparently. The traffic lights, resizing and full screen stay native.
     #[cfg(target_os = "macos")]
     {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
@@ -149,28 +157,31 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(app::GhostApp::new(cc, handle)))),
     )
     .map_err(|e| anyhow::anyhow!("GUI 실행 실패: {e}"))?;
-    // drop(rt) 는 실행 중인 spawn_blocking(프로필 복제·설치 등)이 끝날 때까지 무기한 기다린다.
-    // 창을 닫았으면 잠깐만 기다리고 프로세스를 끝낸다 (중단된 복제는 다음 실행 때 다시 만든다).
+    // drop(rt) waits forever for running spawn_blocking tasks (profile cloning, installs, …). Once
+    // the window is closed, wait briefly and exit (an interrupted clone is rebuilt next run).
     rt.shutdown_timeout(std::time::Duration::from_secs(3));
-    // 업데이트 후 '다시 시작': 단일 실행 뮤텍스를 먼저 놓아야 새 창이 바로 뜬다
+    // "Restart" after an update: release the single-instance mutex first so the new window shows up
+    // right away
     #[cfg(windows)]
     drop(_single);
     update::relaunch_if_requested();
     Ok(())
 }
 
-/// GUI 를 콘솔 없이 다시 띄웠으면 true (이 프로세스는 바로 끝낸다).
+/// Returns true if the GUI was relaunched without a console (this process exits right away).
 ///
-/// Windows 11 24H2 이상은 실행 파일 매니페스트(consoleAllocationPolicy=detached) 덕분에 탐색기에서 실행해도
-/// 콘솔이 생기지 않아 여기 걸리지 않는다. 그 전 버전에서 이 프로세스 혼자 콘솔을 쓰고 있으면, FreeConsole 만으로는
-/// 기본 터미널이 Windows Terminal 일 때 빈 탭이 GUI 가 끝날 때까지 남으므로, 콘솔 없이(DETACHED_PROCESS)
-/// 같은 인자로 자신을 다시 띄우고 이 프로세스는 끝낸다 → 콘솔(탭)도 곧바로 닫힌다.
+/// On Windows 11 24H2 and later the executable manifest (consoleAllocationPolicy=detached) means
+/// no console is created when launched from Explorer, so this never triggers. On earlier
+/// versions, if this process has a console to itself, FreeConsole alone leaves an empty tab until
+/// the GUI exits when Windows Terminal is the default terminal. So we relaunch ourselves with the
+/// same args without a console (DETACHED_PROCESS) and exit, which closes the console (tab) too.
 #[cfg(windows)]
 fn relaunch_without_console(args: &[String]) -> bool {
     use std::os::windows::process::CommandExt;
     const GUARD: &str = "GHOSTDESK_GUI_RELAUNCHED";
     if std::env::var_os(GUARD).is_some() {
-        // 다시 띄운 쪽: 표시만 지우고 계속 (그래도 콘솔이 있으면 아래 detach_console_for_gui 가 처리)
+        // the relaunched side: just clear the marker and continue (detach_console_for_gui below handles
+        // any remaining console)
         std::env::remove_var(GUARD);
         return false;
     }
@@ -191,14 +202,19 @@ fn relaunch_without_console(args: &[String]) -> bool {
         .is_ok()
 }
 
-/// GUI 로 실행될 때 이 프로세스만을 위해 생긴 콘솔 창을 떼어 낸다 (`platform::win::detach_own_console`).
-/// (보통은 `relaunch_without_console` 가 먼저 처리한다. 다시 띄우기에 실패했을 때의 대비책.)
+/// Detaches a console window created just for this process when running as a GUI
+/// (`platform::win::detach_own_console`). Usually `relaunch_without_console` handles it first;
+/// this is the fallback when relaunching fails.
 ///
-/// 콘솔을 떼면 콘솔을 가리키던 표준 핸들 값이 닫힌 채로 남는다. 그대로 두면
-/// - 기본(inherit) 표준 입출력으로 자식을 띄우는 `Command::spawn` 이 ERROR_INVALID_HANDLE 로 실패하고,
-/// - 나중에 다른 커널 객체(파일·파이프)가 같은 핸들 값을 받으면 `println!`/`eprintln!` 이 그곳에 쓰인다.
-/// 그래서 콘솔이었던 표준 핸들만 NULL 로 바꿔 둔다. Rust std 는 NULL 표준 핸들을 '없음'으로 다룬다
-/// (출력은 버리고, 자식에게는 표준 핸들을 넘기지 않는다). 파이프·파일로 넘겨받은 핸들은 그대로 둔다.
+/// Detaching leaves the std handles that pointed at the console as closed handle values. Left
+/// alone,
+/// - `Command::spawn` with default (inherited) stdio fails with ERROR_INVALID_HANDLE, and
+/// - if another kernel object (file, pipe) later gets the same handle value, `println!` /
+///   `eprintln!` would write into it.
+///
+/// So the std handles that were the console are set to NULL. Rust std treats NULL std handles as
+/// absent (output is discarded, children get none). Handles passed in as pipes or files are left
+/// alone.
 #[cfg(windows)]
 fn detach_console_for_gui() {
     use windows_sys::Win32::System::Console::{
@@ -207,7 +223,7 @@ fn detach_console_for_gui() {
     let ids = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
     unsafe {
         if GetConsoleWindow().is_null() {
-            return; // 콘솔 창이 없음 (MCP 등이 DETACHED_PROCESS·CREATE_NO_WINDOW 로 띄움)
+            return; // no console window (launched by MCP and others with DETACHED_PROCESS / CREATE_NO_WINDOW)
         }
         let was_console = ids.map(|id| {
             let h = GetStdHandle(id);
@@ -216,7 +232,7 @@ fn detach_console_for_gui() {
         });
         platform::win::detach_own_console();
         if !GetConsoleWindow().is_null() {
-            return; // 터미널에서 실행해 콘솔을 함께 쓰는 중: 그대로 둔다
+            return; // started from a terminal and sharing its console: leave it
         }
         for (id, console) in ids.into_iter().zip(was_console) {
             if console {
@@ -226,9 +242,11 @@ fn detach_console_for_gui() {
     }
 }
 
-/// 처음 창 크기 (논리 좌표). 기본 1500x920.
-/// Windows 는 노트북에서 150% 배율이 흔해(1920x1080 → 논리 1280x720) 기본 크기가 화면보다 커질 수 있으므로
-/// 주 모니터의 작업 영역(작업 표시줄 제외) 안으로 줄인다.
+/// Initial window size in logical units, 1500x920 by default.
+///
+/// On Windows 150% scaling is common on laptops (1920x1080 → 1280x720 logical), so the default
+/// can exceed the screen; it's shrunk to fit the primary monitor's work area (excluding the
+/// taskbar).
 fn initial_window_size() -> [f32; 2] {
     const DEFAULT: [f32; 2] = [1500.0, 920.0];
     #[cfg(windows)]
@@ -240,8 +258,8 @@ fn initial_window_size() -> [f32; 2] {
     DEFAULT
 }
 
-/// `want` 를 작업 영역 `work`(논리 좌표) 안에 들어가게 줄인다. 창 테두리·제목 표시줄 여유를 두고,
-/// 최소 크기(900x600)보다 작게는 줄이지 않는다.
+/// Shrinks `want` to fit the work area `work` (logical units), leaving room for the window frame
+/// and title bar, but never below the minimum size (900x600).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn fit_window(want: [f32; 2], work: [f32; 2]) -> [f32; 2] {
     let w = want[0].min(work[0] - 40.0).max(900.0);
@@ -249,7 +267,7 @@ fn fit_window(want: [f32; 2], work: [f32; 2]) -> [f32; 2] {
     [w, h]
 }
 
-/// 주 모니터 작업 영역의 크기 (논리 좌표 = 실제 픽셀 / 배율).
+/// Size of the primary monitor's work area (logical = physical pixels / scale).
 #[cfg(windows)]
 fn windows_work_area_points() -> Option<[f32; 2]> {
     use windows_sys::Win32::Foundation::RECT;
@@ -257,20 +275,20 @@ fn windows_work_area_points() -> Option<[f32; 2]> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
     let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut RECT as *mut _, 0) } != 0;
-    // DPI 를 인식하지 않는 프로세스면 GetDpiForSystem 은 96 이고 작업 영역도 이미 배율이 적용된 값이다.
+    // for a DPI-unaware process GetDpiForSystem is 96 and the work area is already scaled
     let dpi = unsafe { GetDpiForSystem() }.max(96) as f32;
     let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
     (ok && w > 0.0 && h > 0.0).then(|| [w * 96.0 / dpi, h * 96.0 / dpi])
 }
 
-/// Windows GUI 단일 실행: 사용자(SID)별 이름 있는 뮤텍스.
+/// Windows GUI single instance: a named mutex per user (SID).
 #[cfg(windows)]
 mod gui_instance {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 
-    /// 뮤텍스 핸들. 프로세스가 끝날 때까지 들고 있어야 다른 실행이 "이미 떠 있음" 을 안다.
+    /// Mutex handle. Must be held until the process exits so other launches know one is running.
     pub struct Guard(HANDLE);
 
     impl Drop for Guard {
@@ -280,13 +298,13 @@ mod gui_instance {
     }
 
     pub enum Start {
-        /// 첫 번째 창: 계속 실행 (None 이면 뮤텍스를 만들지 못했지만 그래도 실행)
+        /// First window: keep running (`None` if the mutex couldn't be created; run anyway).
         Proceed(Option<Guard>),
-        /// 이미 떠 있는 창이 있음: 이 프로세스는 끝낸다
+        /// A window is already up: this process exits.
         Exit,
     }
 
-    /// 세션 안에서 사용자마다 다른 이름 (Local\ = 현재 로그인 세션)
+    /// A per-user name within the session (Local\ = the current logon session).
     pub fn mutex_name(sid: Option<&str>) -> String {
         match sid {
             Some(s) if !s.is_empty() => format!("Local\\GhostDesk-GUI-{s}"),
@@ -294,7 +312,7 @@ mod gui_instance {
         }
     }
 
-    /// 뮤텍스를 만든다: Ok((핸들, 이미 있었는가)), 실패하면 Err(Win32 오류 코드).
+    /// Creates the mutex: `Ok((handle, already existed))`, or `Err(Win32 error code)`.
     pub fn create(name: &str) -> Result<(Guard, bool), u32> {
         use windows_sys::Win32::System::Threading::CreateMutexW;
         let w = crate::platform::win::wide(name);
@@ -309,7 +327,8 @@ mod gui_instance {
         }
     }
 
-    /// 이 실행 파일과 같은 이름의 프로세스가 가진 "GhostDesk" 최상위 창 (자기 자신 제외)
+    /// The "GhostDesk" top-level window of a process with this executable's name (excluding
+    /// ourselves).
     fn existing_window() -> Option<crate::platform::win::TopWindow> {
         use crate::platform::win;
         let me = std::process::id();
@@ -322,7 +341,7 @@ mod gui_instance {
             .map(win::window_info)
             .filter(|w| w.pid != me && w.title == "GhostDesk")
             .find(|w| {
-                // 같은 제목의 다른 창(예: 'GhostDesk' 폴더를 연 탐색기)은 건드리지 않는다
+                // leave other windows with the same title alone (e.g. Explorer showing a 'GhostDesk' folder)
                 win::process_path(w.pid)
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                     .is_some_and(|n| {
@@ -331,7 +350,8 @@ mod gui_instance {
             })
     }
 
-    /// 사용자가 직접 다시 실행한 경우에만 부른다: 최소화돼 있으면 복원하고 앞으로 가져온다.
+    /// Only called when the user launched it again themselves: restores it if minimized and brings
+    /// it to the front.
     fn bring_to_front(hwnd: HWND) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
         unsafe {
@@ -344,9 +364,11 @@ mod gui_instance {
         }
     }
 
-    /// 첫 번째 창이면 Proceed. 이미 창이 있으면 (activate 일 때) 그 창을 앞으로 가져오고 Exit.
-    /// 앞선 실행이 아직 창을 띄우는 중이거나 닫히는 중일 수 있으므로 잠시(최대 10초) 기다려 본다:
-    /// 앞선 프로세스가 끝나 뮤텍스가 사라지면 이쪽이 첫 번째가 된다.
+    /// `Proceed` for the first window. If one already exists, brings it to the front (with
+    /// `activate`) and returns `Exit`.
+    ///
+    /// A previous launch may still be opening or closing its window, so wait a little (up to 10 s):
+    /// if the previous process exits and the mutex goes away, this one becomes the first.
     pub fn acquire(activate: bool) -> Start {
         let sid = crate::platform::win::current_user_sid().ok();
         let name = mutex_name(sid.as_deref());
@@ -354,15 +376,16 @@ mod gui_instance {
         loop {
             match create(&name) {
                 Ok((g, false)) => return Start::Proceed(Some(g)),
-                // 이미 있음: 내 핸들을 닫아야 앞선 프로세스가 끝났을 때 뮤텍스가 사라진다
+                // already exists: close our handle so the mutex disappears when the earlier process exits
                 Ok((g, true)) => drop(g),
-                // 관리자 권한으로 뜬 GhostDesk 가 만든 뮤텍스는 열 수 없다(접근 거부): 그래도 '이미 있음'
+                // a mutex created by an elevated GhostDesk can't be opened (access denied), but it still exists
                 Err(ERROR_ACCESS_DENIED) => {}
-                // 그 밖의 실패: 단일 실행 확인 없이 실행한다 (제어 서버가 외부 연결 중복을 한 번 더 막는다)
+                // any other failure: run without the single-instance check (the control server still prevents
+                // duplicate external connections)
                 Err(_) => return Start::Proceed(None),
             }
             if let Some(w) = existing_window() {
-                // 아직 보이지 않는 창(첫 화면을 그리기 전)은 곧 스스로 나타난다
+                // a window not yet visible (before its first frame) shows up on its own shortly
                 if w.visible {
                     if activate {
                         bring_to_front(w.hwnd as HWND);
@@ -384,11 +407,11 @@ mod tests {
 
     #[test]
     fn window_fits_small_screens() {
-        // 1920x1080 @150% → 논리 1280x(720-작업 표시줄)
+        // 1920x1080 @150% → logical 1280x(720 - taskbar)
         assert_eq!(fit_window([1500.0, 920.0], [1280.0, 680.0]), [1240.0, 600.0]);
-        // 큰 화면에서는 그대로
+        // unchanged on a large screen
         assert_eq!(fit_window([1500.0, 920.0], [2560.0, 1400.0]), [1500.0, 920.0]);
-        // 아주 작은 화면이어도 최소 크기 아래로는 줄이지 않음
+        // never below the minimum size, even on a tiny screen
         assert_eq!(fit_window([1500.0, 920.0], [800.0, 500.0]), [900.0, 600.0]);
         let s = initial_window_size();
         assert!(s[0] >= 900.0 && s[0] <= 1500.0 && s[1] >= 600.0 && s[1] <= 920.0, "{s:?}");
@@ -402,7 +425,7 @@ mod tests {
     fn gui_mutex_detects_second_instance() {
         assert_eq!(gui_instance::mutex_name(Some("S-1-5-21-1-2-3-1001")), "Local\\GhostDesk-GUI-S-1-5-21-1-2-3-1001");
         assert_eq!(gui_instance::mutex_name(None), "Local\\GhostDesk-GUI");
-        // 실제 GUI 와 겹치지 않는 시험용 이름
+        // a test-only name that can't clash with the real GUI
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("Local\\GhostDesk-test-{}-{nanos}", std::process::id());
         let (first, already) = gui_instance::create(&name).unwrap();
@@ -411,7 +434,7 @@ mod tests {
         assert!(already, "두 번째 실행은 이미 있음을 알아야 함");
         drop(second);
         drop(first);
-        // 모두 닫히면 다시 첫 번째가 된다
+        // once all are closed, the next one is first again
         let (_again, already) = gui_instance::create(&name).unwrap();
         assert!(!already);
     }

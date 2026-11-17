@@ -1,7 +1,8 @@
-//! UI Automation (COM, MTA): 요소 목록·패턴 실행·값 읽기/쓰기.
+//! UI Automation (COM, MTA): element listing, pattern invocation, value reads and writes.
 //!
-//! 규칙: 포커스·전경을 바꾸는 호출(IUIAutomationElement::SetFocus 등)은 절대 쓰지 않는다.
-//! IsOffscreen 은 화면 밖에 둔 창에서 늘 참이므로 쓰지 않는다. 모든 호출 스레드는 MTA 로 초기화한다.
+//! Rules: never call anything that moves focus or the foreground (`IUIAutomationElement::SetFocus`
+//! and friends). Don't use `IsOffscreen` either; it is always true for windows parked off-screen.
+//! Every calling thread is initialized as MTA.
 
 use std::sync::OnceLock;
 
@@ -14,14 +15,14 @@ use windows::Win32::UI::Accessibility::*;
 
 use super::w32::Hwnd;
 
-/// 이 스레드를 MTA 로 (이미 초기화되어 있으면 그대로)
+/// Joins this thread to the MTA (no-op if already initialized).
 pub fn com_init() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 }
 
-/// MTA 에서 만든 UIA 객체는 MTA 스레드 사이에서 함께 쓸 수 있다
+/// UIA objects created in the MTA can be shared between MTA threads.
 struct Uia(IUIAutomation);
 unsafe impl Send for Uia {}
 unsafe impl Sync for Uia {}
@@ -42,13 +43,13 @@ fn automation() -> Result<IUIAutomation> {
     u.as_ref().map(|u| u.0.clone()).ok_or_else(|| anyhow!("UI Automation 을 초기화하지 못했습니다"))
 }
 
-/// 스레드 사이에서 옮길 수 있는 UIA 요소 (모든 사용 스레드는 MTA)
+/// A UIA element that can move between threads (every thread using it is MTA).
 #[derive(Clone)]
 pub struct UiEl(pub IUIAutomationElement);
 unsafe impl Send for UiEl {}
 unsafe impl Sync for UiEl {}
 
-/// 요소 하나의 정보 (캐시로 한 번에 읽음)
+/// Information about one element, read in a single cached request.
 #[derive(Clone)]
 pub struct Node {
     pub el: UiEl,
@@ -56,7 +57,7 @@ pub struct Node {
     pub name: String,
     pub aid: String,
     pub class: String,
-    /// 화면 좌표 (l, t, r, b), 실제 픽셀
+    /// Screen rectangle `(l, t, r, b)` in physical pixels.
     pub rect: (i32, i32, i32, i32),
     pub enabled: bool,
     pub focused: bool,
@@ -236,8 +237,11 @@ fn read_node(el: &IUIAutomationElement) -> Node {
     }
 }
 
-/// 창의 컨트롤 보기 트리를 깊이 우선으로 읽는다: (깊이, 요소). 제목 표시줄·메뉴 막대 하위는 건너뛴다.
-/// keep(node) 가 false 인 요소의 하위는 내려가지 않는다 (예: 창 내용 영역 밖).
+/// Walks the window's control-view tree depth first, returning `(depth, element)` pairs. Title
+/// bar and menu bar subtrees are skipped.
+///
+/// Children of elements for which `keep(node)` returns false are not visited (e.g. anything
+/// outside the window's content area).
 pub fn snapshot(top: Hwnd, max_depth: usize, max_visits: usize, keep: impl Fn(&Node) -> bool) -> Result<Vec<(usize, Node)>> {
     let a = automation()?;
     unsafe {
@@ -279,13 +283,13 @@ pub fn snapshot(top: Hwnd, max_depth: usize, max_visits: usize, keep: impl Fn(&N
     }
 }
 
-/// 창(또는 컨트롤) 핸들의 요소
+/// The element for a window (or control) handle.
 pub fn element_for(h: Hwnd) -> Result<UiEl> {
     let a = automation()?;
     unsafe { Ok(UiEl(a.ElementFromHandle(HWND(h as *mut _))?)) }
 }
 
-/// 메뉴 막대의 최상위 항목 이름 (HMENU 가 없는 앱용)
+/// Names of the menu bar's top-level items, for apps without an HMENU.
 pub fn menubar_items(top: Hwnd) -> Vec<(String, bool)> {
     let Ok(nodes) = snapshot_menubar(top) else { return vec![] };
     nodes
@@ -352,7 +356,8 @@ impl UiEl {
         unsafe { p.CurrentIsSelected().ok().map(|b| b.as_bool()) }
     }
 
-    /// 펼침/접힘 전환 (트리 항목 등). 콤보 상자에는 쓰지 않는다 (목록이 사용자 화면에 그려진다).
+    /// Toggles expand/collapse (tree items and the like). Not for combo boxes: their drop-down list
+    /// is drawn on the user's screen.
     pub fn expand_toggle(&self) -> Result<String> {
         let p: IUIAutomationExpandCollapsePattern =
             self.pattern(UIA_ExpandCollapsePatternId).ok_or_else(|| anyhow!("펼치기를 지원하지 않습니다"))?;
@@ -384,13 +389,13 @@ impl UiEl {
         Ok(())
     }
 
-    /// 문서 전체 글자 (TextPattern)
+    /// The whole document's text (TextPattern).
     pub fn document_text(&self) -> Option<String> {
         let p: IUIAutomationTextPattern = self.pattern(UIA_TextPatternId)?;
         unsafe { p.DocumentRange().ok()?.GetText(-1).ok().map(|b| b.to_string()) }
     }
 
-    /// 선택된 글자 (TextPattern)
+    /// The selected text (TextPattern).
     pub fn selection_text(&self) -> Option<String> {
         let p: IUIAutomationTextPattern = self.pattern(UIA_TextPatternId)?;
         unsafe {
@@ -408,7 +413,7 @@ impl UiEl {
         }
     }
 
-    /// 문서 전체 선택 (TextPattern, 포커스는 바꾸지 않음)
+    /// Selects the whole document (TextPattern), without moving focus.
     pub fn select_all_text(&self) -> Result<()> {
         let p: IUIAutomationTextPattern = self.pattern(UIA_TextPatternId).ok_or_else(|| anyhow!("TextPattern 없음"))?;
         unsafe { p.DocumentRange()?.Select()? };
@@ -428,7 +433,8 @@ impl UiEl {
         unsafe { self.0.CurrentIsEnabled().map(|b| b.as_bool()).unwrap_or(true) }
     }
 
-    /// 자식 요소들 중 이름이 맞는 것 (콤보 상자 목록 항목 등) — 펼치지 않고 찾는다
+    /// Finds a descendant with the given name (combo box list items, etc.) without expanding
+    /// anything.
     pub fn find_descendant_named(&self, want: &str) -> Option<UiEl> {
         let a = automation().ok()?;
         unsafe {

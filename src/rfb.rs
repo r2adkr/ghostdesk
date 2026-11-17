@@ -1,38 +1,40 @@
-//! RFB(VNC) 클라이언트 백엔드 — "원격 데스크톱" 형태의 격리 화면.
+//! RFB (VNC) client backend: the "remote desktop" kind of isolated screen.
 //!
-//! 에이전트가 사용자 콘솔과 분리된 화면(별도 로그인 세션의 VNC 서버, VM, 컨테이너의
-//! Xvnc 등)을 조작할 수 있도록, RFB 프로토콜로 접속해 프레임버퍼를 받고
-//! PointerEvent/KeyEvent 만으로 입력한다. OS 의 실제 커서·키보드에는 손대지 않는다.
+//! Lets the agent drive a screen separate from the user's console (a VNC server in a separate
+//! login session, a VM, Xvnc in a container, …). Connects over RFB, receives the framebuffer and
+//! sends input only as PointerEvent/KeyEvent. The real OS cursor and keyboard are never touched.
 //!
-//! 추가 crate 없음: 프로젝트의 기존 의존성(tokio, anyhow, image, parking_lot)만 쓴다.
-//! (Windows 에서만 OS 난수를 위해 getrandom 을 쓴다. 그 밖은 /dev/urandom.)
-//! VNC 인증용 DES, ARD 인증용 MD5 / AES-128-ECB / Diffie-Hellman(몽고메리 modpow)은
-//! 이 파일 하단에 작게 직접 구현했다 (FIPS/RFC 테스트 벡터 단위 테스트 포함).
+//! No extra crates: only the project's existing dependencies (tokio, anyhow, image,
+//! parking_lot). (getrandom is used for OS randomness on Windows only; elsewhere it's
+//! /dev/urandom.) DES for VNC auth and MD5 / AES-128-ECB / Diffie-Hellman (Montgomery modpow) for
+//! ARD auth are small hand-rolled implementations at the bottom of this file, unit-tested against
+//! FIPS/RFC test vectors.
 //!
-//! 지원 범위
-//! - 버전: RFB 3.3 / 3.7 / 3.8, Apple 의 "RFB 003.889" (기본적으로 3.8 로 응답 —
-//!   libvncclient 와 동일. `ReplyVersion::Apple889` 로 3.889 응답도 가능)
-//! - 보안 타입: None(1), VNC Authentication(2), Apple Remote Desktop(30)
-//!   선택 순서: None 제공 시 None → (username+password) 있으면 ARD → password 있으면 VNC
-//! - 인코딩: Raw(0), CopyRect(1), RRE(2), Hextile(5)
-//!   의사 인코딩: DesktopSize(-223), LastRect(-224), Cursor(-239, 옵션),
-//!   ExtendedDesktopSize(-308, 수신 시 파싱만)
-//!   ZRLE(16)/Tight 는 zlib 이 필요해 구현하지 않았다.
-//! - 픽셀 형식: 항상 SetPixelFormat 으로 32bpp/depth 24/little-endian/true-colour
-//!   (R<<16|G<<8|B) 를 요청하고, 내부 프레임버퍼는 RGBA8 로 유지한다.
+//! Supported:
+//! - Versions: RFB 3.3 / 3.7 / 3.8 and Apple's "RFB 003.889" (replies 3.8 by default, like
+//!   libvncclient; `ReplyVersion::Apple889` replies 3.889).
+//! - Security types: None(1), VNC Authentication(2), Apple Remote Desktop(30).
+//!   Selection order: None if offered → ARD with username+password → VNC with a password.
+//! - Encodings: Raw(0), CopyRect(1), RRE(2), Hextile(5).
+//!   Pseudo-encodings: DesktopSize(-223), LastRect(-224), Cursor(-239, optional),
+//!   ExtendedDesktopSize(-308, parsed only).
+//!   ZRLE(16)/Tight need zlib and aren't implemented.
+//! - Pixel format: always requests 32bpp/depth 24/little-endian/true-colour (R<<16|G<<8|B) via
+//!   SetPixelFormat and keeps the internal framebuffer as RGBA8.
 //!
-//! 좌표계: 공개 API 의 좌표는 "에이전트 좌표"다. 기본은 프레임버퍼 픽셀과 같고,
-//! `RfbOptions::max_agent_size` 를 주면 프레임버퍼를 그 안에 들어가도록 축소한 크기가
-//! 에이전트 좌표계가 된다 (Retina/5K 화면을 computer-use 권장 해상도로 낮출 때).
+//! Coordinates: the public API uses "agent coordinates". By default they equal framebuffer
+//! pixels; with `RfbOptions::max_agent_size`, the framebuffer scaled down to fit inside it becomes
+//! the agent coordinate space (to bring Retina/5K screens down to the resolution computer use
+//! recommends).
 //!
-//! 키 매핑: xdotool 이름 → X11 keysym. `super`/`cmd`/`meta`/`win` 은 기본적으로
-//! Super_L(0xffeb) 로 보낸다. macOS 서버(화면 공유)가 Command 로 받는 keysym 이
-//! Super_L 인지 Meta_L(0xffe7) 인지는 실제 서버로 검증하지 못했다 — 필요하면
-//! `RfbOptions::cmd_keysym` 을 `KEYSYM_META_L` 로 바꾼다.
+//! Keys: xdotool names → X11 keysyms. `super`/`cmd`/`meta`/`win` go out as Super_L (0xffeb) by
+//! default. Whether a macOS server (Screen Sharing) maps Super_L or Meta_L (0xffe7) to Command
+//! hasn't been verified against a real server; switch `RfbOptions::cmd_keysym` to
+//! `KEYSYM_META_L` if needed.
 //!
-//! 한글 등 비 Latin-1 문자: `type_text` 는 Unicode keysym(0x01000000 + 코드포인트)을
-//! 보낸다. Xvnc/TigerVNC 계열은 대체로 받아들이지만, macOS 화면 공유는 이를 무시할 수
-//! 있다(미검증). 클립보드 붙여넣기로 몰래 대체하지 않는다.
+//! Korean and other non-Latin-1 text: `type_text` sends Unicode keysyms (0x01000000 + code
+//! point). Xvnc/TigerVNC generally accept them, but macOS Screen Sharing may ignore them
+//! (unverified). We don't quietly fall back to pasting through the clipboard.
 
 #![allow(dead_code)]
 
@@ -59,10 +61,11 @@ use tokio::{
 use crate::browser::MouseButton;
 use crate::desk::ViewInfo;
 
-/// 프레임버퍼가 바뀔 때마다 호출된다 (UI repaint 요청용). 리더 태스크에서 호출되므로 가볍게.
+/// Called whenever the framebuffer changes (to request a UI repaint). Runs on the reader task, so
+/// keep it cheap.
 pub type FrameCallback = Arc<dyn Fn() + Send + Sync>;
 
-// keys.rs 와 같은 수정키 비트 (CDP modifiers 규약)
+// same modifier bits as keys.rs (CDP modifiers convention)
 const MOD_ALT: i64 = 1;
 const MOD_CTRL: i64 = 2;
 const MOD_META: i64 = 4;
@@ -87,12 +90,12 @@ const ENC_LAST_RECT: i32 = -224;
 const ENC_CURSOR: i32 = -239;
 const ENC_EXT_DESKTOP_SIZE: i32 = -308;
 
-/// 3.889(Apple) 서버에 어떤 버전으로 응답할지.
+/// Which version to reply to a 3.889 (Apple) server with.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReplyVersion {
-    /// 3.889 서버에도 "RFB 003.008" 로 응답 (libvncclient 와 동일, 표준 흐름)
+    /// Reply "RFB 003.008" even to 3.889 servers (like libvncclient; the standard flow).
     Auto,
-    /// 서버가 3.889 면 "RFB 003.889" 로 그대로 응답
+    /// Reply "RFB 003.889" as is when the server is 3.889.
     Apple889,
 }
 
@@ -102,21 +105,25 @@ pub struct RfbOptions {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
-    /// ClientInit shared-flag (true = 다른 클라이언트를 끊지 않음)
+    /// ClientInit shared-flag (true = don't disconnect other clients).
     pub shared: bool,
     pub reply_version: ReplyVersion,
-    /// 에이전트 좌표계 최대 크기 (None = 프레임버퍼 그대로)
+    /// Maximum agent coordinate size (None = framebuffer as is).
     pub max_agent_size: Option<(u32, u32)>,
-    /// Cursor 의사 인코딩 요청 여부. 켜면 서버가 커서를 프레임버퍼에 그리지 않는 대신
-    /// 모양을 따로 보내고, 스크린샷에는 현재 마우스 위치에 합성해 넣는다.
+    /// Whether to request the Cursor pseudo-encoding. When on, the server sends the cursor shape
+    /// separately instead of drawing it into the framebuffer, and screenshots composite it at the
+    /// current mouse position.
     pub cursor_pseudo: bool,
-    /// Command(⌘)/super 로 보낼 keysym (기본 Super_L)
+    /// keysym sent for Command (⌘)/super (Super_L by default).
     pub cmd_keysym: u32,
     pub connect_timeout: Duration,
-    /// 연속 키 입력 사이 지연
+    /// Delay between consecutive key presses.
     pub key_delay: Duration,
-    /// Some(이유): 실제로 TCP 접속한 상대 주소가 이 컴퓨터 자신이면 아무것도 주고받기 전에 이 이유로 거절한다.
-    /// (호스트 이름을 따로 풀어 확인하면 DNS 응답이 바뀌는 사이에 빠져나갈 수 있으므로 접속한 소켓으로 본다)
+    /// Some(reason): if the peer address of the actual TCP connection is this computer itself, refuse
+    /// with this reason before exchanging anything.
+    ///
+    /// Checked on the connected socket, since resolving the host name separately could be bypassed
+    /// by a changing DNS answer.
     pub refuse_local: Option<String>,
 }
 
@@ -139,18 +146,19 @@ impl RfbOptions {
     }
 }
 
-/// 버전/보안 타입만 읽고 끊는 탐지 결과.
+/// Result of a probe that only reads the version and security types, then disconnects.
 #[derive(Clone, Debug)]
 pub struct Greeting {
-    /// 서버가 보낸 ProtocolVersion 원문 (개행 제외)
+    /// ProtocolVersion string as sent by the server (without the newline).
     pub server_version: String,
-    /// 우리가 응답한 버전 원문
+    /// Version string we replied with.
     pub reply_version: String,
-    /// 3.7+ : 서버가 제공한 보안 타입 목록. 3.3 : 서버가 지정한 타입 하나.
+    /// 3.7+: security types offered by the server. 3.3: the single type the server picked.
     pub security_types: Vec<u8>,
-    /// 보안 타입 0개일 때 서버가 보낸 사유
+    /// Reason sent by the server when it offers zero security types.
     pub failure_reason: Option<String>,
-    /// 실제로 접속한 상대 주소 (호스트 이름을 따로 다시 풀지 않고 이 연결 기준으로 판단할 때 쓴다)
+    /// Peer address actually connected to (for decisions based on this connection rather than
+    /// resolving the host name again).
     pub peer: Option<std::net::SocketAddr>,
 }
 
@@ -183,9 +191,11 @@ struct Framebuffer {
     rgba: Vec<u8>,
 }
 
-/// 서버가 알려 주는 프레임버퍼 크기의 상한 (8192x8192 = 2^26 픽셀, RGBA 256MiB).
-/// ServerInit/DesktopSize 는 u16 이라 65535x65535 까지 올 수 있는데, 그대로 받으면
-/// 17GiB 를 할당하고 모든 픽셀의 alpha 를 써서 메모리를 실제로 소모한다.
+/// Upper bound on the framebuffer size the server announces (8192x8192 = 2^26 pixels, 256 MiB of
+/// RGBA).
+///
+/// ServerInit/DesktopSize are u16, so up to 65535x65535 can arrive; accepting that as is would
+/// allocate 17 GiB and actually consume it by writing every pixel's alpha.
 const MAX_FB_PIXELS: u64 = 1 << 26;
 
 fn check_fb_dims(w: u32, h: u32) -> Result<()> {
@@ -211,7 +221,7 @@ impl Framebuffer {
         Ok(())
     }
 
-    /// 32bpp little-endian (B,G,R,X) 픽셀 데이터를 (x,y,w,h) 영역에 기록
+    /// Writes 32bpp little-endian (B,G,R,X) pixel data into the (x,y,w,h) region.
     fn put_bgrx(&mut self, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
         let stride = self.w as usize * 4;
         for row in 0..h as usize {
@@ -259,17 +269,17 @@ struct CursorShape {
     hot_y: u32,
     w: u32,
     h: u32,
-    /// RGBA, 마스크 밖은 alpha 0
+    /// RGBA; alpha 0 outside the mask.
     rgba: Vec<u8>,
 }
 
 #[derive(Default)]
 struct InputState {
-    /// 에이전트 좌표
+    /// Agent coordinates.
     mouse: (f64, f64),
-    /// RFB 버튼 마스크 (bit0 왼쪽, bit1 가운데, bit2 오른쪽)
+    /// RFB button mask (bit0 left, bit1 middle, bit2 right).
     buttons: u8,
-    /// 마우스 동작에 붙여 누르고 있는 수정키 (MOD_* 비트)
+    /// Modifiers held down along with mouse actions (MOD_* bits).
     held_mods: i64,
 }
 
@@ -282,9 +292,9 @@ pub struct RfbDesk {
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     input: Mutex<InputState>,
     closed: AtomicBool,
-    /// FramebufferUpdate 완료 횟수
+    /// Number of completed FramebufferUpdates.
     seq_tx: watch::Sender<u64>,
-    /// 최근 refresh 요청 이후 받은 픽셀 사각형 면적 합
+    /// Total area of pixel rectangles received since the last refresh request.
     coverage: AtomicU64,
     notes: Mutex<Vec<String>>,
     on_frame: FrameCallback,
@@ -294,7 +304,7 @@ pub struct RfbDesk {
     last_request: Mutex<Instant>,
 }
 
-/// 기본 옵션으로 접속.
+/// Connects with default options.
 pub async fn connect(
     host: &str,
     port: u16,
@@ -308,7 +318,8 @@ pub async fn connect(
     RfbDesk::connect_with(o, on_frame).await
 }
 
-/// 버전 문자열과 보안 타입 목록만 읽고 즉시 끊는다 (인증 시도 없음, 입력 전송 없음).
+/// Reads only the version string and security type list, then disconnects right away (no auth
+/// attempt, no input sent).
 pub async fn probe(host: &str, port: u16, reply: ReplyVersion, timeout: Duration) -> Result<Greeting> {
     let fut = async {
         let mut s = TcpStream::connect((host, port)).await.context("TCP 접속 실패")?;
@@ -345,15 +356,20 @@ pub async fn probe(host: &str, port: u16, reply: ReplyVersion, timeout: Duration
     tokio::time::timeout(timeout, fut).await.map_err(|_| anyhow!("probe 시간 초과"))?
 }
 
-/// `host` 가 이 컴퓨터 자신을 가리키는가 (루프백·미지정 주소 또는 이 컴퓨터의 네트워크 인터페이스 주소).
-/// 이 컴퓨터의 VNC 서버에 접속하면 에이전트가 사용자의 실제 화면을 조작하게 되므로 호출하는 쪽이 막는다.
+/// Whether `host` points at this computer itself (loopback/unspecified, or an address of one of
+/// this computer's network interfaces).
+///
+/// Connecting to this computer's own VNC server would let the agent drive the user's real screen,
+/// so callers block it.
 pub async fn is_local_host(host: &str, port: u16) -> bool {
     let Ok(addrs) = tokio::net::lookup_host((host, port)).await else { return false };
     addrs.into_iter().any(is_local_addr)
 }
 
-/// `refuse_local` 이 있으면 접속한 소켓의 상대 주소가 이 컴퓨터 자신일 때 그 이유로 거절한다.
-/// 상대 주소를 알 수 없으면 확인할 수 없으므로 거절한다.
+/// With `refuse_local`, refuses with that reason when the connected socket's peer is this
+/// computer itself.
+///
+/// If the peer address is unknown it can't be checked, so it's refused.
 fn check_peer(s: &TcpStream, refuse_local: Option<&str>) -> Result<()> {
     let Some(why) = refuse_local else { return Ok(()) };
     match s.peer_addr() {
@@ -363,25 +379,26 @@ fn check_peer(s: &TcpStream, refuse_local: Option<&str>) -> Result<()> {
     }
 }
 
-/// 주소 하나가 이 컴퓨터의 것인가.
+/// Whether an address belongs to this computer.
 ///
-/// 인터페이스 목록(/sbin/ifconfig, GetAdaptersAddresses 등)을 읽지 않고 그 주소로 UDP 소켓을 bind 해 본다.
-/// 운영체제는 자기 인터페이스에 할당된 주소에만 bind 를 허락하므로(EADDRNOTAVAIL / WSAEADDRNOTAVAIL)
-/// 별도 프로세스·권한·크레이트 없이 macOS·Windows·Linux 에서 같은 기준으로 판단한다.
-/// (bind 만 하고 바로 닫는다. 패킷은 보내지 않는다. IPv6 링크 로컬 주소는 scope id 를 그대로 쓴다.)
+/// Instead of reading the interface list (/sbin/ifconfig, GetAdaptersAddresses, …), it tries to
+/// bind a UDP socket to the address. The OS only allows binding to addresses assigned to its own
+/// interfaces (EADDRNOTAVAIL / WSAEADDRNOTAVAIL), so macOS, Windows and Linux are judged the same
+/// way with no extra process, privileges or crates. (It only binds and closes right away; no
+/// packet is sent. IPv6 link-local addresses keep their scope id.)
 pub fn is_local_addr(addr: std::net::SocketAddr) -> bool {
     use std::net::{IpAddr, SocketAddr};
     let ip = addr.ip();
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
-    // ::ffff:a.b.c.d 는 IPv4 주소로 본다
+    // ::ffff:a.b.c.d counts as an IPv4 address
     if let IpAddr::V6(v6) = ip {
         if let Some(v4) = v6.to_ipv4_mapped() {
             return is_local_addr(SocketAddr::new(IpAddr::V4(v4), 0));
         }
     }
-    // 멀티캐스트·브로드캐스트 주소는 (일부 OS 에서 bind 가 되더라도) 특정 컴퓨터가 아니다
+    // multicast and broadcast addresses aren't a specific computer (even if some OSes allow the bind)
     if ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
         return false;
     }
@@ -396,8 +413,9 @@ impl RfbDesk {
         let desk = tokio::time::timeout(timeout, Self::connect_inner(opts, on_frame))
             .await
             .map_err(|_| anyhow!("RFB 접속/인증 시간 초과"))??;
-        // 첫 프레임을 잠깐 기다린다 (실패해도 진행). 접속 타임아웃 밖에서 기다려야
-        // 핸드셰이크가 오래 걸린 경우 이미 성공한 연결이 "시간 초과"로 버려지지 않는다.
+        // wait briefly for the first frame (carry on if it doesn't come). This has to be outside the
+        // connect timeout, so a slow handshake doesn't throw away an already successful connection as
+        // "timed out".
         let _ = desk.wait_coverage(Duration::from_secs(3)).await;
         Ok(desk)
     }
@@ -444,7 +462,7 @@ impl RfbDesk {
         for e in &encs {
             msg.extend_from_slice(&e.to_be_bytes());
         }
-        // ── 첫 전체 화면 요청
+        // ---- initial full-screen request ----
         msg.extend_from_slice(&fb_request(false, 0, 0, w as u16, h as u16));
         s.write_all(&msg).await?;
 
@@ -474,7 +492,7 @@ impl RfbDesk {
         Ok(desk)
     }
 
-    // ───────────────────────── 조회 ─────────────────────────
+    // ---- queries ----
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
@@ -492,30 +510,30 @@ impl RfbDesk {
         self.security_type
     }
 
-    /// 프레임버퍼 실제 크기
+    /// Actual framebuffer size.
     pub fn fb_size(&self) -> (u32, u32) {
         let fb = self.fb.lock();
         (fb.w, fb.h)
     }
 
-    /// 에이전트 좌표계 크기 (= 스크린샷 PNG 크기)
+    /// Agent coordinate space size (= screenshot PNG size).
     pub fn size(&self) -> (u32, u32) {
         let (w, h) = self.fb_size();
         agent_size(w, h, self.opts.max_agent_size)
     }
 
-    /// FramebufferUpdate 완료 횟수 (UI 가 텍스처 갱신 여부 판단용)
+    /// Number of completed FramebufferUpdates (lets the UI decide whether to refresh its texture).
     pub fn frame_seq(&self) -> u64 {
         *self.seq_tx.borrow()
     }
 
-    /// 현재 프레임버퍼(RGBA8, 프레임버퍼 해상도)에 접근
+    /// Gives access to the current framebuffer (RGBA8, framebuffer resolution).
     pub fn with_frame<R>(&self, f: impl FnOnce(u32, u32, &[u8]) -> R) -> R {
         let fb = self.fb.lock();
         f(fb.w, fb.h, &fb.rgba)
     }
 
-    /// 서버가 마지막으로 보낸 ServerCutText (Latin-1 디코드)
+    /// The last ServerCutText sent by the server (decoded as Latin-1).
     pub fn server_clipboard(&self) -> Option<String> {
         self.server_clipboard.lock().clone()
     }
@@ -550,17 +568,17 @@ impl RfbDesk {
         self.input.lock().mouse
     }
 
-    // ───────────────────────── 화면 ─────────────────────────
+    // ---- screen ----
 
-    /// 다음 FramebufferUpdate 가 끝날 때까지 대기. 업데이트가 왔으면 true.
+    /// Waits until the next FramebufferUpdate completes. Returns true if an update came.
     pub async fn wait_next_update(&self, timeout: Duration) -> bool {
         let mut rx = self.seq_tx.subscribe();
         rx.borrow_and_update();
         matches!(tokio::time::timeout(timeout, rx.changed()).await, Ok(Ok(())))
     }
 
-    /// 비증분 전체 화면 요청을 보내고, 그 이후 받은 사각형 면적이 화면 전체를 덮을 때까지
-    /// (또는 timeout 까지) 기다린다. 전체가 갱신되었으면 true.
+    /// Sends a non-incremental full-screen request and waits until the area received since then
+    /// covers the whole screen (or until the timeout). Returns true if the whole screen was updated.
     pub async fn refresh(&self, timeout: Duration) -> Result<bool> {
         self.coverage.store(0, Ordering::SeqCst);
         let (w, h) = self.fb_size();
@@ -589,7 +607,7 @@ impl RfbDesk {
         }
     }
 
-    /// 현재 프레임버퍼의 PNG (에이전트 좌표계 크기). 촬영 전 새 전체 프레임을 요청한다.
+    /// PNG of the current framebuffer (agent coordinate size). Requests a fresh full frame first.
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         if self.is_closed() {
             bail!("RFB 연결이 끊어졌습니다");
@@ -608,7 +626,7 @@ impl RfbDesk {
         encode_png_rgb(img)
     }
 
-    /// 영역 확대 PNG. region = [x0,y0,x1,y1] (에이전트 좌표)
+    /// Zoomed-in PNG of a region. region = [x0,y0,x1,y1] (agent coordinates).
     pub async fn zoom(&self, region: [f64; 4]) -> Result<Vec<u8>> {
         if self.is_closed() {
             bail!("RFB 연결이 끊어졌습니다");
@@ -617,7 +635,7 @@ impl RfbDesk {
         let (aw, ah) = self.size();
         let (fw, fh) = self.fb_size();
         if fw == 0 || fh == 0 {
-            // 아래 clamp(fx0 + 1, fw) 가 min > max 로 panic 하는 것을 막는다
+            // keeps the clamp(fx0 + 1, fw) below from panicking with min > max
             bail!("원격 프레임버퍼 크기가 0 입니다");
         }
         let sx = fw as f64 / aw as f64;
@@ -630,7 +648,7 @@ impl RfbDesk {
         let fy1 = ((y1 * sy).ceil() as u32).clamp(fy0 + 1, fh);
         let img = self.composite_rgb();
         let crop = image::imageops::crop_imm(&img, fx0, fy0, fx1 - fx0, fy1 - fy0).to_image();
-        // 에이전트 화면 크기에 맞게 확대 (가로세로비 유지, 1~8배)
+        // scale up to the agent screen size (keeping the aspect ratio, 1-8x)
         let (cw, ch) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
         let scale = (aw as f64 / cw).min(ah as f64 / ch).clamp(1.0, 8.0);
         let tw = ((cw * scale).round() as u32).max(1);
@@ -643,7 +661,8 @@ impl RfbDesk {
         encode_png_rgb(out)
     }
 
-    /// 프레임버퍼 + (Cursor 의사 인코딩을 받았다면) 커서를 합성한 RGB 이미지 (fb 해상도)
+    /// RGB image of the framebuffer with the cursor composited in (if the Cursor pseudo-encoding was
+    /// received), at framebuffer resolution.
     fn composite_rgb(&self) -> image::RgbImage {
         let (w, h, mut rgb) = {
             let fb = self.fb.lock();
@@ -675,7 +694,7 @@ impl RfbDesk {
         image::RgbImage::from_raw(w, h, rgb).expect("fb 크기 불일치")
     }
 
-    // ───────────────────────── 좌표 ─────────────────────────
+    // ---- coordinates ----
 
     fn to_fb(&self, (x, y): (f64, f64)) -> (u16, u16) {
         let (fw, fh) = self.fb_size();
@@ -690,7 +709,7 @@ impl RfbDesk {
         (x.clamp(0.0, aw.saturating_sub(1) as f64), y.clamp(0.0, ah.saturating_sub(1) as f64))
     }
 
-    // ───────────────────────── 전송 ─────────────────────────
+    // ---- sending ----
 
     async fn send(&self, data: &[u8]) -> Result<()> {
         if self.is_closed() {
@@ -736,7 +755,8 @@ impl RfbDesk {
         v
     }
 
-    /// 마우스 동작용 수정키 상태를 `mods` 로 맞춘다 (차이만 down/up 전송).
+    /// Brings the modifier state for mouse actions to `mods` (sending down/up only for the
+    /// differences).
     async fn set_mods(&self, mods: i64) -> Result<()> {
         let held = self.input.lock().held_mods;
         if held == mods {
@@ -753,7 +773,7 @@ impl RfbDesk {
         Ok(())
     }
 
-    // ───────────────────────── 마우스 ─────────────────────────
+    // ---- mouse ----
 
     pub async fn mouse_move(&self, x: f64, y: f64, mods: i64) -> Result<()> {
         self.set_mods(mods).await?;
@@ -808,8 +828,10 @@ impl RfbDesk {
         self.set_mods(0).await
     }
 
-    /// dx/dy 는 browser.rs 와 같은 "픽셀 델타" 규약 (에이전트는 scroll_amount * 100 을 넘긴다).
-    /// 100 단위마다 휠 버튼 한 번 (4=위, 5=아래, 6=왼쪽, 7=오른쪽) press+release.
+    /// dx/dy follow the same "pixel delta" convention as browser.rs (the agent passes
+    /// scroll_amount * 100).
+    ///
+    /// Every 100 units is one press+release of a wheel button (4=up, 5=down, 6=left, 7=right).
     pub async fn scroll(&self, pos: Option<(f64, f64)>, dx: f64, dy: f64, mods: i64) -> Result<()> {
         self.set_mods(mods).await?;
         if let Some((x, y)) = pos {
@@ -835,9 +857,9 @@ impl RfbDesk {
         self.set_mods(0).await
     }
 
-    // ───────────────────────── 키보드 ─────────────────────────
+    // ---- keyboard ----
 
-    /// xdotool 스타일 조합을 (수정키 keysym 들, 주 keysym) 으로 해석
+    /// Parses an xdotool-style combo into (modifier keysyms, main keysym).
     pub fn parse_combo(&self, combo: &str) -> Result<(Vec<u32>, u32)> {
         let combo = combo.trim();
         let parts: Vec<String> = if combo.ends_with("++") {
@@ -864,7 +886,7 @@ impl RfbDesk {
         let mut mods = syms;
         let shift_held = mods.iter().any(|&k| k == KEYSYM_SHIFT_L || k == 0xffe2);
         if main < 0x100 && (main as u8 as char).is_ascii_lowercase() && shift_held {
-            // shift+a → 'A' keysym (실제 X 클라이언트와 동일)
+            // shift+a → 'A' keysym (same as a real X client)
             main = (main as u8 as char).to_ascii_uppercase() as u32;
         } else if main < 0x100 && needs_shift(main as u8 as char) && !shift_held {
             mods.push(KEYSYM_SHIFT_L);
@@ -902,15 +924,16 @@ impl RfbDesk {
     pub async fn hold_key(&self, combo: &str, secs: f64) -> Result<()> {
         let (mods, main) = self.parse_combo(combo)?;
         self.combo_down(&mods, main).await?;
-        // NaN 이면 clamp 가 NaN 을 돌려주고 from_secs_f64 가 panic 하므로 0 으로 처리
+        // clamp returns NaN for NaN and from_secs_f64 would panic, so treat it as 0
         let secs = if secs.is_finite() { secs.clamp(0.0, 300.0) } else { 0.0 };
         tokio::time::sleep(Duration::from_secs_f64(secs)).await;
         self.combo_up(&mods, main).await
     }
 
-    /// 텍스트 입력. ASCII/Latin-1 은 해당 keysym (필요하면 Shift_L 로 감쌈),
-    /// 그 밖의 문자(한글 등)는 Unicode keysym 0x01000000+코드포인트.
-    /// 주의: macOS 화면 공유 서버가 Unicode keysym 을 받아들이는지는 미검증.
+    /// Types text. ASCII/Latin-1 uses the matching keysym (wrapped in Shift_L if needed); other
+    /// characters (Korean, …) use the Unicode keysym 0x01000000 + code point.
+    ///
+    /// Note: whether macOS Screen Sharing servers accept Unicode keysyms is unverified.
     pub async fn type_text(&self, text: &str) -> Result<()> {
         for ch in text.chars() {
             let (ks, shift) = match ch {
@@ -933,7 +956,7 @@ impl RfbDesk {
         Ok(())
     }
 
-    /// 서버 클립보드에 Latin-1 텍스트를 넣는다 (ClientCutText). 붙여넣기는 하지 않는다.
+    /// Puts Latin-1 text on the server clipboard (ClientCutText). Doesn't paste.
     pub async fn set_server_clipboard(&self, text: &str) -> Result<()> {
         let bytes: Vec<u8> = text.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect();
         let mut m = vec![6u8, 0, 0, 0];
@@ -942,11 +965,11 @@ impl RfbDesk {
         self.send(&m).await
     }
 
-    // ───────────────────────── 종료 ─────────────────────────
+    // ---- shutdown ----
 
     pub async fn shutdown(&self) {
         if !self.is_closed() {
-            // 눌린 채 남은 버튼/수정키 해제
+            // release any buttons and modifiers left pressed
             let pressed = self.input.lock().buttons;
             if pressed != 0 {
                 self.input.lock().buttons = 0;
@@ -973,10 +996,12 @@ impl Drop for RfbDesk {
     }
 }
 
-// ───────────────────────── 리더 태스크 ─────────────────────────
+// ---- reader task ----
 
-/// 리더 태스크가 panic 으로 끝나도 `closed` 를 세우고 대기자를 깨운다.
-/// (없으면 panic 뒤에도 is_closed()==false 로 남아 오래된 프레임을 계속 찍게 된다)
+/// Sets `closed` and wakes waiters even if the reader task ends in a panic.
+///
+/// Without it, is_closed() would stay false after a panic and stale frames would keep being
+/// captured.
 struct ReaderPanicGuard(Weak<RfbDesk>);
 
 impl Drop for ReaderPanicGuard {
@@ -1024,8 +1049,8 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                 rd.read_exact(&mut hdr).await?;
                 let n = u16::from_be_bytes([hdr[1], hdr[2]]);
                 let mut resized = false;
-                // 이 메시지에서 받은 픽셀 면적. 메시지가 끝난 뒤에만 coverage 에 더해
-                // refresh() 가 반쯤 적용된 프레임을 찍지 않게 한다.
+                // pixel area received in this message. It's only added to coverage once the message is done, so
+                // refresh() never captures a half-applied frame.
                 let mut area: u64 = 0;
                 for _ in 0..n {
                     let x = read_u16(rd).await? as u32;
@@ -1054,7 +1079,8 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                         ENC_RRE => {
                             me.fb.lock().check(x, y, w, h)?;
                             let nsub = read_u32(rd).await?;
-                            // 서브사각형은 최소 1픽셀 — 그보다 많으면 비정상 (거대한 할당으로 프로세스가 abort 되는 것 방지)
+                            // subrectangles are at least one pixel, so more than that is bogus (avoids a huge allocation
+                            // aborting the process)
                             if nsub as u64 > w as u64 * h as u64 {
                                 bail!("RRE 서브사각형 수 비정상: {nsub} (사각형 {w}x{h})");
                             }
@@ -1089,16 +1115,16 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                             let ns = read_u8(rd).await?;
                             let mut skip = vec![0u8; 3 + ns as usize * 16];
                             rd.read_exact(&mut skip).await?;
-                            // y = status, 0 이면 성공
+                            // y = status, 0 means success
                             if y == 0 && w > 0 && h > 0 {
                                 me.resize(w, h)?;
                                 resized = true;
                             }
                         }
                         ENC_CURSOR => {
-                            // 커서는 프레임버퍼 범위 검사를 받지 않으므로 크기를 따로 제한한다.
-                            // (w*h*4 를 u32 로 계산하면 65535x65535 에서 오버플로 → debug 는 panic,
-                            //  release 는 잘못된 길이를 읽어 스트림이 어긋난다)
+                            // the cursor isn't bounds-checked against the framebuffer, so cap its size separately. (Computing
+                            // w*h*4 as u32 overflows at 65535x65535: debug panics, release reads the wrong length and the
+                            // stream goes out of sync.)
                             if w > 1024 || h > 1024 {
                                 bail!("Cursor 의사 인코딩 크기 비정상: {w}x{h}");
                             }
@@ -1132,7 +1158,7 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                 me.coverage.fetch_add(area, Ordering::SeqCst);
                 me.seq_tx.send_modify(|s| *s += 1);
                 (me.on_frame)();
-                // 다음 증분 요청 (최소 간격 30ms)
+                // next incremental request (at least 30 ms apart)
                 let wait = {
                     let last = *me.last_request.lock();
                     Duration::from_millis(30).saturating_sub(last.elapsed())
@@ -1152,13 +1178,13 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                 rd.read_exact(&mut skip).await?;
             }
             2 => {
-                // Bell — 무시
+                // Bell: ignored
             }
             3 => {
                 let mut pad = [0u8; 3];
                 rd.read_exact(&mut pad).await?;
                 let len = read_u32(rd).await? as i32;
-                // 음수 길이 = Extended Clipboard (협상하지 않았지만 방어적으로 건너뜀)
+                // negative length = Extended Clipboard (not negotiated, but skipped defensively)
                 let n = len.unsigned_abs() as usize;
                 if n > 64 << 20 {
                     bail!("ServerCutText 길이 비정상: {n}");
@@ -1244,9 +1270,9 @@ async fn read_hextile<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-// ───────────────────────── 핸드셰이크 ─────────────────────────
+// ---- handshake ----
 
-/// (서버 버전 원문, 협상된 minor(3/7/8), 우리의 응답 문자열)
+/// (server version string, negotiated minor (3/7/8), our reply string)
 async fn read_version<R: AsyncRead + Unpin>(s: &mut R, reply: ReplyVersion) -> Result<(String, u32, String)> {
     let mut v = [0u8; 12];
     s.read_exact(&mut v).await.context("ProtocolVersion 수신 실패")?;
@@ -1347,7 +1373,7 @@ async fn negotiate_security(s: &mut TcpStream, minor: u32, o: &RfbOptions) -> Re
         }
         _ => unreachable!(),
     }
-    // SecurityResult: 3.8 은 항상, 3.3/3.7 은 None 이 아닐 때만
+    // SecurityResult: always on 3.8; on 3.3/3.7 only when not None
     if minor >= 8 || chosen != SEC_NONE {
         let r = read_u32(s).await?;
         if r != 0 {
@@ -1363,7 +1389,7 @@ async fn negotiate_security(s: &mut TcpStream, minor: u32, o: &RfbOptions) -> Re
     Ok(chosen)
 }
 
-// ───────────────────────── 유틸 ─────────────────────────
+// ---- utilities ----
 
 fn agent_size(w: u32, h: u32, max: Option<(u32, u32)>) -> (u32, u32) {
     match max {
@@ -1396,7 +1422,7 @@ fn needs_shift(c: char) -> bool {
     c.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(c)
 }
 
-/// xdotool 키 이름 / 한 글자 → X11 keysym
+/// xdotool key name / single character → X11 keysym.
 pub fn keysym_for(name: &str, cmd_keysym: u32) -> Option<u32> {
     let mut chars = name.chars();
     if let (Some(c), None) = (chars.next(), chars.clone().next()) {
@@ -1496,7 +1522,7 @@ async fn read_string<R: AsyncRead + Unpin>(s: &mut R) -> Result<String> {
     s.read_exact(&mut b).await?;
     Ok(String::from_utf8_lossy(&b).to_string())
 }
-/// 32bpp LE (B,G,R,X) 픽셀 하나 → RGBA
+/// One 32bpp LE (B,G,R,X) pixel → RGBA.
 async fn read_pixel<R: AsyncRead + Unpin>(s: &mut R) -> Result<[u8; 4]> {
     let mut p = [0u8; 4];
     s.read_exact(&mut p).await?;
@@ -1505,7 +1531,7 @@ async fn read_pixel<R: AsyncRead + Unpin>(s: &mut R) -> Result<[u8; 4]> {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
-    // Windows: 운영체제 CSPRNG (ProcessPrng — BCryptGenRandom 과 같은 생성기)
+    // Windows: the OS CSPRNG (ProcessPrng, the same generator as BCryptGenRandom)
     #[cfg(windows)]
     {
         if getrandom::fill(&mut out).is_ok() {
@@ -1521,7 +1547,7 @@ fn random_bytes(n: usize) -> Vec<u8> {
             }
         }
     }
-    // 대체: RandomState 해시 + 시간 (보안 강도 낮음; OS 난수 생성기를 쓸 수 없는 환경용)
+    // fallback: RandomState hash + time (weak; for environments without an OS RNG)
     use std::hash::{BuildHasher, Hasher};
     let rs = std::collections::hash_map::RandomState::new();
     for (i, chunk) in out.chunks_mut(8).enumerate() {
@@ -1534,10 +1560,10 @@ fn random_bytes(n: usize) -> Vec<u8> {
     out
 }
 
-// ───────────────────────── 인증 계산 ─────────────────────────
+// ---- authentication ----
 
-/// VNC Authentication: 암호 앞 8바이트(0 패딩)의 각 바이트 비트를 뒤집어 DES 키로 쓰고
-/// 16바이트 챌린지를 8바이트씩 DES-ECB 암호화.
+/// VNC Authentication: uses the first 8 bytes of the password (zero-padded), with each byte's
+/// bits reversed, as the DES key and DES-ECB encrypts the 16-byte challenge 8 bytes at a time.
 pub fn vnc_auth_response(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
     let mut key = [0u8; 8];
     for (i, b) in password.bytes().take(8).enumerate() {
@@ -1552,9 +1578,10 @@ pub fn vnc_auth_response(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// Apple Remote Desktop(30): DH 공유키 → MD5 → AES-128-ECB 로
-/// [username(64, NUL 종료) | password(64, NUL 종료)] 를 암호화.
-/// 반환: (암호문 128바이트, 클라이언트 공개키 keylen 바이트)
+/// Apple Remote Desktop (30): DH shared key → MD5 → AES-128-ECB encrypts
+/// [username (64, NUL-terminated) | password (64, NUL-terminated)].
+///
+/// Returns (128-byte ciphertext, client public key of keylen bytes).
 pub fn ard_auth_response(g: u16, p: &[u8], server_pub: &[u8], user: &str, pass: &str) -> Result<([u8; 128], Vec<u8>)> {
     let keylen = p.len();
     let modulus = bigint::from_be(p);
@@ -1587,7 +1614,7 @@ pub fn ard_auth_response(g: u16, p: &[u8], server_pub: &[u8], user: &str, pass: 
     Ok((ct, bigint::to_be(&pubk, keylen)))
 }
 
-/// 최소 DES (암호화만, 단일 블록).
+/// Minimal DES (encryption only, single block).
 mod des {
     const IP: [u8; 64] = [
         58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40,
@@ -1646,7 +1673,7 @@ mod des {
         ],
     ];
 
-    /// table 의 1-기반 위치(최상위 비트가 1)로 비트를 골라 새 값을 만든다
+    /// Builds a new value by picking bits at the table's 1-based positions (most significant bit is 1).
     fn permute(input: u64, in_bits: u32, table: &[u8]) -> u64 {
         let mut out = 0u64;
         for &p in table {
@@ -1692,7 +1719,7 @@ mod des {
             l = t;
         }
         let pre = ((r as u64) << 32) | l as u64;
-        // 최종 순열 = IP 의 역순열
+        // final permutation = inverse of IP
         let mut fp = [0u8; 64];
         for (i, &p) in IP.iter().enumerate() {
             fp[p as usize - 1] = i as u8 + 1;
@@ -1701,7 +1728,7 @@ mod des {
     }
 }
 
-/// 최소 MD5 (RFC 1321)
+/// Minimal MD5 (RFC 1321).
 mod md5 {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14,
@@ -1748,7 +1775,7 @@ mod md5 {
     }
 }
 
-/// 최소 AES-128 (암호화만, ECB 블록 단위)
+/// Minimal AES-128 (encryption only, one ECB block at a time).
 mod aes128 {
     fn sbox() -> [u8; 256] {
         let mut sbox = [0u8; 256];
@@ -1832,7 +1859,7 @@ mod aes128 {
     }
 }
 
-/// DH 용 최소 큰 정수 (u32 리틀엔디언 limb, 몽고메리 modpow; 홀수 모듈러스 전용)
+/// Minimal big integers for DH (little-endian u32 limbs, Montgomery modpow; odd moduli only).
 mod bigint {
     pub type Big = Vec<u32>;
 
@@ -1886,7 +1913,7 @@ mod bigint {
         a.get(i / 32).map(|w| (w >> (i % 32)) & 1 == 1).unwrap_or(false)
     }
 
-    /// k limb 고정폭 비교/뺄셈
+    /// Fixed-width compare/subtract over k limbs.
     fn geq(a: &[u32], n: &[u32]) -> bool {
         for i in (0..a.len().max(n.len())).rev() {
             let x = a.get(i).copied().unwrap_or(0);
@@ -1912,7 +1939,7 @@ mod bigint {
         }
     }
 
-    /// a mod n (비트 단위; 느리지만 몇 번만 쓴다)
+    /// a mod n (bit by bit; slow, but only used a few times).
     fn modulo(a: &Big, n: &[u32]) -> Vec<u32> {
         let k = n.len();
         let mut r = vec![0u32; k + 1];
@@ -1967,7 +1994,7 @@ mod bigint {
         t
     }
 
-    /// base^exp mod n (n 은 홀수, > 1)
+    /// base^exp mod n (n odd, > 1).
     pub fn modpow(base: &Big, exp: &Big, n: &Big) -> Big {
         let k = n.len();
         let mut inv: u32 = 1;
@@ -2038,7 +2065,7 @@ mod tests {
         m[0] = 0x7f;
         let e = bigint::from_be(&[1, 0, 0, 0, 0, 0, 0, 0, 0]);
         let r = bigint::modpow(&bigint::from_be(&[2]), &e, &bigint::from_be(&m));
-        // 2^64 mod 127: 2^7 ≡ 1 → 64 mod 7 = 1 → 2^64 ≡ 2 (mod 127) → 결과 2^2 = 4
+        // 2^64 mod 127: 2^7 ≡ 1 → 64 mod 7 = 1 → 2^64 ≡ 2 (mod 127) → result 2^2 = 4
         assert_eq!(bigint::to_be(&r, 16)[15], 4);
         assert!(bigint::to_be(&r, 16)[..15].iter().all(|&b| b == 0));
     }
@@ -2052,7 +2079,8 @@ mod tests {
         assert_eq!(keysym_for("한", KEYSYM_SUPER_L), Some(0x0100_0000 + '한' as u32));
     }
 
-    /// agent 는 tokio::spawn 안에서 Desk 메서드를 부르므로 공개 async 메서드의 future 는 Send 여야 한다.
+    /// The agent calls Desk methods inside tokio::spawn, so futures of public async methods must be
+    /// Send.
     #[allow(dead_code, unreachable_code, unused_variables)]
     fn public_futures_are_send() {
         fn s<T: Send>(_: T) {}
@@ -2072,7 +2100,8 @@ mod tests {
         s(d.shutdown());
     }
 
-    /// 최소 RFB 3.8 / None 서버: ServerInit(w,h) 뒤 `update` 바이트를 보내고, 클라이언트 메시지는 버린다.
+    /// Minimal RFB 3.8 / None server: sends the `update` bytes after ServerInit(w,h) and discards
+    /// client messages.
     async fn fake_server(w: u16, h: u16, update: Vec<u8>) -> u16 {
         use tokio::net::TcpListener;
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2157,21 +2186,21 @@ mod tests {
     fn local_addresses() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         let sa = |ip: IpAddr| SocketAddr::new(ip, 5900);
-        // 루프백·미지정 주소
+        // loopback and unspecified addresses
         assert!(is_local_addr(sa(IpAddr::V4(Ipv4Addr::LOCALHOST))));
         assert!(is_local_addr(sa(IpAddr::V4(Ipv4Addr::new(127, 3, 2, 1)))));
         assert!(is_local_addr(sa(IpAddr::V6(Ipv6Addr::LOCALHOST))));
         assert!(is_local_addr(sa(IpAddr::V4(Ipv4Addr::UNSPECIFIED))));
         assert!(is_local_addr(sa("::ffff:127.0.0.1".parse().unwrap())));
-        // 문서용 주소(어느 컴퓨터에도 할당되지 않음)·멀티캐스트·브로드캐스트
+        // documentation addresses (assigned to no computer), multicast and broadcast
         assert!(!is_local_addr(sa("192.0.2.123".parse().unwrap())));
         assert!(!is_local_addr(sa("203.0.113.7".parse().unwrap())));
         assert!(!is_local_addr(sa("2001:db8::1234".parse().unwrap())));
         assert!(!is_local_addr(sa("224.0.0.1".parse().unwrap())));
         assert!(!is_local_addr(sa("ff02::1".parse().unwrap())));
         assert!(!is_local_addr(sa(IpAddr::V4(Ipv4Addr::BROADCAST))));
-        // 이 컴퓨터의 실제 인터페이스 주소 (UDP connect 는 경로만 고르고 패킷을 보내지 않는다).
-        // 네트워크가 없는 환경이면 건너뛴다.
+        // this computer's real interface address (UDP connect only picks a route, no packet is sent).
+        // Skipped when there's no network.
         let own = std::net::UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
             .and_then(|s| s.local_addr())
@@ -2192,14 +2221,14 @@ mod tests {
 
     #[tokio::test]
     async fn refuse_local_checks_the_connected_peer() {
-        // 클라이언트가 보낸 바이트 수를 알려 주는 서버 (버전 문자열을 먼저 보낸다)
+        // server that reports how many bytes the client sent (sends the version string first)
         async fn listener() -> (u16, tokio::sync::oneshot::Receiver<usize>) {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 let (mut s, _) = l.accept().await.unwrap();
-                let _ = s.write_all(b"RFB 003.008\n\x01\x01").await; // 버전 + 보안 타입 1개(None)
+                let _ = s.write_all(b"RFB 003.008\n\x01\x01").await; // version + one security type (None)
                 let mut got = 0;
                 let mut buf = [0u8; 64];
                 while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await {
@@ -2212,7 +2241,7 @@ mod tests {
             });
             (port, rx)
         }
-        // 접속한 상대가 이 컴퓨터면 아무것도 보내지 않고 주어진 이유로 거절
+        // if the peer is this computer, refuse with the given reason without sending anything
         let (port, sent) = listener().await;
         let mut o = RfbOptions::new("127.0.0.1", port);
         o.refuse_local = Some("이 컴퓨터라 거절".into());
@@ -2220,7 +2249,7 @@ mod tests {
         let e = RfbDesk::connect_with(o, Arc::new(|| {})).await.err().expect("거절해야 함");
         assert_eq!(format!("{e}"), "이 컴퓨터라 거절");
         assert_eq!(sent.await.unwrap(), 0, "거절 전에 서버로 아무것도 보내지 않아야 함");
-        // 탐지 연결은 실제로 접속한 상대 주소를 알려 준다
+        // probe connections report the peer address actually connected to
         let (port, _sent) = listener().await;
         let g = probe("127.0.0.1", port, ReplyVersion::Auto, Duration::from_secs(5)).await.unwrap();
         let peer = g.peer.expect("상대 주소");
@@ -2235,7 +2264,7 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.iter().any(|&x| x != 0));
         assert!(random_bytes(0).is_empty());
-        // 8의 배수가 아닌 길이 (대체 경로의 chunk 처리와 같은 길이)
+        // a length that isn't a multiple of 8 (same length as the fallback path's chunk handling)
         assert_eq!(random_bytes(13).len(), 13);
     }
 

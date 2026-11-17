@@ -1,7 +1,9 @@
-//! 앱 실행/숨김/종료와 창 목록 (NSWorkspace, NSRunningApplication, CGWindowList).
+//! Launching, hiding and quitting apps, plus window lists (NSWorkspace, NSRunningApplication,
+//! CGWindowList).
 //!
-//! 금지: unhide / activate / AXRaise / 최소화 해제 — 창이 사용자 화면에 나타난다.
-//! (유일한 예외: Mode B 종료 시 사용자의 앱을 원래 보이던 상태로 되돌리는 `restore_unhide`)
+//! Never unhide, activate, AXRaise or deminiaturize: any of those puts a window on the user's
+//! screen. (The one exception is `restore_unhide`, which returns a user's app to its original
+//! visible state when mode B ends.)
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -16,7 +18,7 @@ use objc2_core_foundation::{CFArray, CFRetained, CGRect, CGPoint, CGSize};
 use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString, NSURL};
 
-/// 대상 앱 식별 결과
+/// A resolved target app.
 #[derive(Clone, Debug)]
 pub struct AppTarget {
     pub path: PathBuf,
@@ -24,7 +26,7 @@ pub struct AppTarget {
     pub name: String,
 }
 
-/// 경로(.app) 또는 번들 id 로 앱을 찾는다.
+/// Finds an app by path (.app) or bundle id.
 pub fn resolve_app(app: &str) -> Result<AppTarget> {
     let ws = NSWorkspace::sharedWorkspace();
     let path = if Path::new(app).exists() {
@@ -48,7 +50,7 @@ fn bundle_identifier(app: &Path) -> Option<String> {
     b.bundleIdentifier().map(|s| s.to_string())
 }
 
-/// 번들 id 로 실행 중인 인스턴스 pid 목록
+/// Pids of running instances with this bundle id.
 pub fn running_pids(bundle_id: &str) -> Vec<i32> {
     NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(bundle_id))
         .iter()
@@ -57,8 +59,9 @@ pub fn running_pids(bundle_id: &str) -> Vec<i32> {
         .collect()
 }
 
-/// `app`(.app 경로)에서 실행 중인 다른 인스턴스(이 프로세스 제외)에 종료를 요청하고(메뉴의 '종료'와 같은 정상 종료),
-/// 최대 `wait` 동안 끝나기를 기다린다. 아직 떠 있는 것이 있으면 false.
+/// Asks other running instances of `app` (.app path, excluding this process) to quit normally,
+/// like the Quit menu item, and waits up to `wait` for them to exit. Returns false if any are
+/// still running.
 pub fn quit_instances_at(bundle_id: &str, app: &Path, wait: Duration) -> bool {
     let me = std::process::id() as i32;
     let want = app.canonicalize().unwrap_or_else(|_| app.to_path_buf());
@@ -92,7 +95,8 @@ pub fn quit_instances_at(bundle_id: &str, app: &Path, wait: Duration) -> bool {
     false
 }
 
-/// 대상 앱의 실행 중인 인스턴스 pid — 번들 id 가 같거나, 번들 id 를 모르면 .app 경로가 같은 프로세스.
+/// Pids of the target's running instances: same bundle id, or same .app path when the bundle id
+/// is unknown.
 pub fn running_pids_for(t: &AppTarget) -> Vec<i32> {
     let want_path = std::fs::canonicalize(&t.path).unwrap_or_else(|_| t.path.clone());
     NSWorkspace::sharedWorkspace()
@@ -112,8 +116,9 @@ pub fn running_pids_for(t: &AppTarget) -> Vec<i32> {
         .collect()
 }
 
-/// Info.plist 의 LSMultipleInstancesProhibited — true 면 새 인스턴스 요청에도 기존 프로세스를 돌려준다
-/// (이때 hides=true 설정 때문에 사용자의 앱이 숨겨질 수 있으므로 실행 전에 거부해야 한다).
+/// Info.plist's `LSMultipleInstancesProhibited`. When true, asking for a new instance returns
+/// the existing process instead, and `hides=true` could then hide the user's app, so this must
+/// be refused before launching.
 pub fn multiple_instances_prohibited(app: &Path) -> bool {
     objc2_foundation::NSBundle::bundleWithPath(&NSString::from_str(&app.to_string_lossy()))
         .and_then(|b| b.objectForInfoDictionaryKey(&NSString::from_str("LSMultipleInstancesProhibited")))
@@ -122,8 +127,9 @@ pub fn multiple_instances_prohibited(app: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 지금 실행 중인 모든 앱(NSRunningApplication)의 pid. 실행 직후 "새 프로세스인가"를 판별할 때 쓴다
-/// (번들 id 를 모르는 앱도 기존 사용자 인스턴스를 우리 것으로 착각하지 않도록).
+/// Pids of every running app (NSRunningApplication). Used right after launch to tell whether a
+/// process is new, so an existing user instance is never mistaken for ours, even for apps
+/// without a known bundle id.
 pub fn all_running_pids() -> std::collections::HashSet<i32> {
     NSWorkspace::sharedWorkspace()
         .runningApplications()
@@ -133,7 +139,7 @@ pub fn all_running_pids() -> std::collections::HashSet<i32> {
         .collect()
 }
 
-/// pid 의 번들 id (실행 중인 앱이 아니면 None)
+/// Bundle id of a pid (`None` if it's not a running app).
 pub fn bundle_id_of(pid: i32) -> Option<String> {
     running_app(pid)?.bundleIdentifier().map(|s| s.to_string())
 }
@@ -151,7 +157,7 @@ pub fn is_running(pid: i32) -> bool {
         || unsafe { libc::kill(pid, 0) } == 0
 }
 
-/// 앱을 숨긴다 (창이 사용자 화면에서 사라짐). 결과로 isHidden 을 돌려준다.
+/// Hides the app (its windows leave the user's screen). Returns `isHidden` afterwards.
 pub fn hide(pid: i32) -> bool {
     match running_app(pid) {
         Some(a) => {
@@ -162,19 +168,23 @@ pub fn hide(pid: i32) -> bool {
     }
 }
 
-/// Mode B 종료 시에만: 사용자의 앱이 원래 보이던 상태였다면 다시 보이게 한다 (활성화는 하지 않음).
+/// Mode B shutdown only: makes the user's app visible again if it was before (without
+/// activating it).
 pub fn restore_unhide(pid: i32) -> bool {
     running_app(pid).map(|a| a.unhide()).unwrap_or(false)
 }
 
-/// 숨김·비활성 상태로 앱의 **새 인스턴스**(또는 첫 인스턴스)를 띄운다.
+/// Launches a **new instance** (or the first one) of an app, hidden and inactive.
 ///
-/// - activates=false, hides=true, addsToRecentItems=false, promptsUserIfNeeded=false
-/// - new_instance=true 면 이미 실행 중이어도 별도 프로세스를 만든다 (createsNewApplicationInstance)
-/// - args 예: ["-ApplePersistenceIgnoreState", "YES"] — 사용자의 창 복원 상태를 읽지/쓰지 않게 한다
-/// - files 가 있으면 그 파일들을 연 채로 시작한다
+/// - `activates=false`, `hides=true`, `addsToRecentItems=false`, `promptsUserIfNeeded=false`
+/// - with `new_instance`, creates a separate process even if the app is already running
+///   (`createsNewApplicationInstance`)
+/// - `args` e.g. `["-ApplePersistenceIgnoreState", "YES"]` keeps the user's window restoration
+///   state from being read or written
+/// - `files` are opened at launch
 ///
-/// 주의: 문서 기반 앱은 실행 직후 창을 잠깐 보였다가 숨는 경우가 있다 → 호출자가 노출 감시를 할 것.
+/// Document-based apps may flash a window right after launch before hiding, so the caller must
+/// run an exposure guard.
 pub fn launch_hidden(app: &Path, files: &[PathBuf], args: &[String], new_instance: bool) -> Result<i32> {
     let ws = NSWorkspace::sharedWorkspace();
     let cfg = NSWorkspaceOpenConfiguration::new();
@@ -220,8 +230,9 @@ pub fn launch_hidden(app: &Path, files: &[PathBuf], args: &[String], new_instanc
     }
 }
 
-/// 프로세스(와 그 프로세스 그룹)를 종료한다. SIGTERM → 최대 3초 대기 → SIGKILL.
-/// AppKit 의 정상 종료(terminate)는 "저장하시겠습니까" 창을 띄울 수 있으므로 쓰지 않는다.
+/// Kills a process (and its process group): SIGTERM, up to 3 s wait, then SIGKILL.
+///
+/// AppKit's graceful `terminate` can raise a "Save changes?" prompt, so it isn't used.
 pub fn kill_process(pid: i32) {
     if pid <= 1 {
         return;
@@ -248,7 +259,7 @@ pub fn kill_process(pid: i32) {
     }
 }
 
-/// CGWindowList 의 창 정보
+/// Window info from CGWindowList.
 #[derive(Clone, Debug)]
 pub struct CgWin {
     pub wid: u32,
@@ -261,13 +272,13 @@ pub struct CgWin {
 }
 
 impl CgWin {
-    /// 사용자 화면에 실제로 보이는가 (onscreen && alpha>0)
+    /// Whether the window is actually visible on the user's screen (onscreen && alpha > 0).
     pub fn visible(&self) -> bool {
         self.onscreen && self.alpha > 0.0
     }
 }
 
-/// 창 목록. pids 가 비어 있으면 전체. onscreen_only=true 면 화면에 올라간 창만.
+/// Window list. Empty `pids` means all; `onscreen_only` limits it to windows on screen.
 pub fn cg_windows(pids: &[i32], onscreen_only: bool) -> Vec<CgWin> {
     let opt = if onscreen_only { CGWindowListOption::OptionOnScreenOnly } else { CGWindowListOption::OptionAll };
     let Some(arr) = CGWindowListCopyWindowInfo(opt, 0) else { return vec![] };
@@ -309,7 +320,7 @@ pub fn cg_windows(pids: &[i32], onscreen_only: bool) -> Vec<CgWin> {
     out
 }
 
-/// 대상 pid 들 중 사용자 화면에 보이는 창
+/// Windows of the given pids that are visible on the user's screen.
 pub fn visible_windows(pids: &[i32]) -> Vec<CgWin> {
     if pids.is_empty() {
         return vec![];

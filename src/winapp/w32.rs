@@ -1,13 +1,14 @@
-//! Win32 보조 함수: 창 핸들·텍스트·스타일·메시지.
+//! Win32 helpers: window handles, text, styles and messages.
 //!
-//! 창 핸들은 스레드 사이에서 옮길 수 있게 `isize`([`Hwnd`])로 들고 다니고, 호출할 때만 HWND 로 바꾼다.
-//! 다른 프로세스의 창에 **동기** 메시지를 보낼 때는 항상 시간 제한(SendMessageTimeoutW + SMTO_ABORTIFHUNG)을 둔다
-//! (앱이 바쁘거나 멈춰도 GhostDesk 가 같이 멈추지 않게).
+//! Window handles are carried as `isize` ([`Hwnd`]) so they can move between threads, and only
+//! turned into HWND at call time. **Synchronous** messages to other processes' windows always
+//! have a timeout (SendMessageTimeoutW + SMTO_ABORTIFHUNG), so GhostDesk doesn't hang along with
+//! a busy or hung app.
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT};
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
-/// 창 핸들 (스레드 사이에서 옮길 수 있는 정수 형태)
+/// Window handle as an integer that can move between threads.
 pub type Hwnd = isize;
 
 #[inline]
@@ -15,7 +16,7 @@ pub fn hw(h: Hwnd) -> HWND {
     h as HWND
 }
 
-// ───────────────────────── 상수 (windows-sys 타입 별칭과 무관하게 쓰려고 직접 둔다) ─────────────────────────
+// ---- constants (defined here so they don't depend on windows-sys type aliases) ----
 
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_SETTEXT: u32 = 0x000C;
@@ -56,7 +57,7 @@ pub const CB_SETCURSEL: u32 = 0x014E;
 pub const CB_FINDSTRINGEXACT: u32 = 0x0158;
 pub const CB_GETEXTENDEDUI: u32 = 0x0156;
 pub const CB_SETEXTENDEDUI: u32 = 0x0155;
-/// CB_ERR (-1) 를 send_timeout 의 usize 로
+/// CB_ERR (-1) as the usize send_timeout returns.
 const CB_ERR_USIZE: usize = usize::MAX;
 pub const CBN_SELCHANGE: u32 = 1;
 pub const BM_GETCHECK: u32 = 0x00F0;
@@ -106,7 +107,7 @@ const GW_OWNER: u32 = 4;
 const SMTO_ABORTIFHUNG: u32 = 0x0002;
 const SMTO_BLOCK: u32 = 0x0001;
 
-// ───────────────────────── windows-sys 기능 목록에 없는 함수 (Cargo.toml 을 건드리지 않으려고 직접 선언) ─────────────────────────
+// ---- functions missing from windows-sys's feature list (declared here to avoid touching Cargo.toml) ----
 
 #[link(name = "user32", kind = "raw-dylib")]
 extern "system" {
@@ -143,7 +144,7 @@ extern "system" {
     fn GetTickCount() -> u32;
 }
 
-/// 사용자의 실제 키보드·마우스 입력이 있은 뒤 지난 ms (보낸 메시지는 포함되지 않는다)
+/// Milliseconds since the user's last real keyboard or mouse input (posted messages don't count).
 pub fn ms_since_user_input() -> u32 {
     let mut l = LastInputInfo { cb_size: std::mem::size_of::<LastInputInfo>() as u32, dw_time: 0 };
     unsafe {
@@ -160,7 +161,7 @@ pub fn print_window(h: Hwnd, hdc: *mut core::ffi::c_void, flags: u32) -> bool {
     unsafe { PrintWindow(hw(h), hdc, flags) != 0 }
 }
 
-/// 가상 키 → 스캔 코드 (MAPVK_VK_TO_VSC)
+/// Virtual key → scan code (MAPVK_VK_TO_VSC).
 pub fn scan_code(vk: u32) -> u32 {
     unsafe { MapVirtualKeyW(vk, 0) }
 }
@@ -175,21 +176,21 @@ pub fn unhook_win_event(h: isize) {
     }
 }
 
-/// 시스템 클립보드 변경 번호 (내용은 읽지 않는다)
+/// System clipboard sequence number (content is never read).
 pub fn clipboard_sequence() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
-/// 마지막으로 클립보드에 쓴 창 (내용은 읽지 않는다)
+/// Window that last wrote to the clipboard (content is never read).
 pub fn clipboard_owner() -> Hwnd {
     unsafe { GetClipboardOwner() as Hwnd }
 }
 
-// ───────────────────────── 커널 핸들 ─────────────────────────
+// ---- kernel handles ----
 
-/// 소유한 커널 핸들 (Drop 에서 닫는다)
+/// An owned kernel handle, closed on drop.
 pub struct Handle(pub HANDLE);
-// 커널 핸들은 스레드 사이에서 옮겨도 안전하다
+// kernel handles are safe to move between threads
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 impl Drop for Handle {
@@ -202,11 +203,13 @@ impl Drop for Handle {
 
 // ───────────────────────── DPI ─────────────────────────
 
-/// 이 스레드를 잠시 대상 창의 DPI 인식 방식으로 바꾼다 (Drop 에서 되돌림).
+/// Temporarily switches this thread to the target window's DPI awareness (restored on drop).
 ///
-/// DPI 를 모르는 오래된 앱(대부분의 고전 Win32 앱)은 125%·150% 화면에서 DWM 이 늘려 그린다. 그런 창을
-/// PrintWindow 는 **논리 크기**로 그리고, 앱이 받는 마우스 좌표도 논리 좌표다. 그래서 캡처·자식 창 찾기·좌표 변환을
-/// 그 창의 DPI 문맥에서 하면 크기·좌표가 모두 앱 자신의 좌표계로 맞춰진다 (DPI 를 아는 앱이면 아무것도 바뀌지 않음).
+/// DWM stretches DPI-unaware apps (most classic Win32 apps) at 125% or 150%. PrintWindow draws
+/// such windows at their **logical size**, and the mouse coordinates the app receives are
+/// logical too. Doing capture, child window lookup and coordinate conversion in the window's DPI
+/// context therefore keeps sizes and coordinates in the app's own coordinate system (nothing
+/// changes for DPI-aware apps).
 pub struct DpiScope(Option<isize>);
 
 impl DpiScope {
@@ -231,13 +234,13 @@ impl Drop for DpiScope {
     }
 }
 
-/// 창의 DPI 인식 방식: 0 = 모름(늘려 그림), 1 = 시스템, 2 = 모니터별
+/// A window's DPI awareness: 0 = unaware (stretched), 1 = system, 2 = per-monitor.
 pub fn dpi_awareness(h: Hwnd) -> i32 {
     use windows_sys::Win32::UI::HiDpi::{GetAwarenessFromDpiAwarenessContext, GetWindowDpiAwarenessContext};
     unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hw(h))) }
 }
 
-// ───────────────────────── 창 정보 ─────────────────────────
+// ---- window info ----
 
 pub fn is_window(h: Hwnd) -> bool {
     h != 0 && unsafe { wm::IsWindow(hw(h)) != 0 }
@@ -269,7 +272,8 @@ pub fn class_name(h: Hwnd) -> String {
     String::from_utf16_lossy(&b[..n.max(0) as usize])
 }
 
-/// 창 제목 (다른 프로세스의 창이면 메시지를 보내지 않고 시스템이 가진 글자를 읽는다)
+/// Window title (for other processes' windows, reads the text the system holds instead of
+/// sending a message).
 pub fn window_text(h: Hwnd) -> String {
     let mut b = vec![0u16; 512];
     let n = unsafe { wm::GetWindowTextW(hw(h), b.as_mut_ptr(), b.len() as i32) };
@@ -284,7 +288,8 @@ pub fn ex_style(h: Hwnd) -> u32 {
     unsafe { wm::GetWindowLongPtrW(hw(h), GWL_EXSTYLE) as u32 }
 }
 
-/// 확장 스타일을 바꾼다. **다른 스레드의 창이면 그 스레드가 메시지를 처리할 때까지 막힌다** — 작업용 스레드에서만 부를 것.
+/// Changes the extended style. **Blocks until the owning thread handles messages if the window
+/// belongs to another thread**, so only call it from a worker thread.
 pub fn set_ex_style_blocking(h: Hwnd, ex: u32) {
     unsafe {
         wm::SetWindowLongPtrW(hw(h), GWL_EXSTYLE, ex as i32 as isize);
@@ -311,7 +316,7 @@ pub fn root(h: Hwnd) -> Hwnd {
     unsafe { wm::GetAncestor(hw(h), GA_ROOT) as Hwnd }
 }
 
-/// 최상위 창인가 (데스크톱의 직접 자식, 메시지 전용 창 제외)
+/// Whether this is a top-level window (direct child of the desktop, not message-only).
 pub fn is_toplevel(h: Hwnd) -> bool {
     unsafe { style(h) & WS_CHILD == 0 && parent(h) == wm::GetDesktopWindow() as Hwnd }
 }
@@ -322,35 +327,36 @@ pub fn window_rect(h: Hwnd) -> (i32, i32, i32, i32) {
     (r.left, r.top, r.right, r.bottom)
 }
 
-/// 내용 영역 크기 (w, h)
+/// Client area size `(w, h)`.
 pub fn client_size(h: Hwnd) -> (i32, i32) {
     let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     unsafe { wm::GetClientRect(hw(h), &mut r) };
     (r.right - r.left, r.bottom - r.top)
 }
 
-/// 내용 영역 원점의 화면 좌표
+/// Screen coordinates of the client area origin.
 pub fn client_origin(h: Hwnd) -> (i32, i32) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { windows_sys::Win32::Graphics::Gdi::ClientToScreen(hw(h), &mut p) };
     (p.x, p.y)
 }
 
-/// 한 창의 내용 좌표를 다른 창의 내용 좌표로
+/// Converts client coordinates of one window into another's.
 pub fn map_point(from: Hwnd, to: Hwnd, p: (i32, i32)) -> (i32, i32) {
     let mut pt = POINT { x: p.0, y: p.1 };
     unsafe { windows_sys::Win32::Graphics::Gdi::MapWindowPoints(hw(from), hw(to), &mut pt, 1) };
     (pt.x, pt.y)
 }
 
-/// (스레드 id, 프로세스 id)
+/// `(thread id, process id)`.
 pub fn thread_pid(h: Hwnd) -> (u32, u32) {
     let mut pid = 0u32;
     let tid = unsafe { wm::GetWindowThreadProcessId(hw(h), &mut pid) };
     (tid, pid)
 }
 
-/// 그 스레드의 (활성 창, 포커스 창). 사용자 입력 상태가 아니라 **그 스레드 자신의** 상태다.
+/// That thread's `(active window, focus window)`. This is **the thread's own** state, not the
+/// user's input state.
 pub fn thread_focus(tid: u32) -> Option<(Hwnd, Hwnd)> {
     let mut g = wm::GUITHREADINFO { cbSize: std::mem::size_of::<wm::GUITHREADINFO>() as u32, ..Default::default() };
     if unsafe { wm::GetGUIThreadInfo(tid, &mut g) } == 0 {
@@ -359,7 +365,7 @@ pub fn thread_focus(tid: u32) -> Option<(Hwnd, Hwnd)> {
     Some((g.hwndActive as Hwnd, g.hwndFocus as Hwnd))
 }
 
-/// 자식 창 목록 (모든 깊이)
+/// Child windows (all depths).
 pub fn child_windows(parent: Hwnd) -> Vec<Hwnd> {
     unsafe extern "system" fn cb(h: HWND, l: isize) -> windows_sys::core::BOOL {
         let v = &mut *(l as *mut Vec<Hwnd>);
@@ -371,12 +377,13 @@ pub fn child_windows(parent: Hwnd) -> Vec<Hwnd> {
     v
 }
 
-/// 부모 내용 좌표의 점에 있는 (보이는) 바로 아래 자식. 그룹 상자처럼 투명한 컨트롤은 건너뛴다.
+/// The immediate (visible) child at a point in the parent's client coordinates. Transparent
+/// controls like group boxes are skipped.
 pub fn real_child_at(parent: Hwnd, p: (i32, i32)) -> Hwnd {
     unsafe { wm::RealChildWindowFromPoint(hw(parent), POINT { x: p.0, y: p.1 }) as Hwnd }
 }
 
-/// 스크롤 위치 (bar: 0 = 가로, 1 = 세로, 2 = 스크롤 막대 컨트롤 자체)
+/// Scroll position (`bar`: 0 = horizontal, 1 = vertical, 2 = the scroll bar control itself).
 pub fn scroll_pos(h: Hwnd, bar: i32) -> i32 {
     unsafe { wm::GetScrollPos(hw(h), bar) }
 }
@@ -385,24 +392,24 @@ pub fn menu_of(h: Hwnd) -> isize {
     unsafe { wm::GetMenu(hw(h)) as isize }
 }
 
-/// 그 클래스의 (첫) 최상위 창. 없으면 0.
+/// The (first) top-level window of a class, or 0.
 pub fn find_window_class(class: &str) -> Hwnd {
     let c: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { wm::FindWindowW(c.as_ptr(), std::ptr::null()) as Hwnd }
 }
 
-/// 셸의 바탕 화면 창 (Progman). 없으면 0.
+/// The shell's desktop window (Progman), or 0.
 pub fn shell_window() -> Hwnd {
     unsafe { wm::GetShellWindow() as Hwnd }
 }
 
-// ───────────────────────── 메시지 ─────────────────────────
+// ---- messages ----
 
 pub fn post(h: Hwnd, msg: u32, w: usize, l: isize) -> bool {
     unsafe { wm::PostMessageW(hw(h), msg, w, l) != 0 }
 }
 
-/// 시간 제한이 있는 동기 메시지. 시간 초과·실패면 None.
+/// Synchronous message with a timeout. `None` on timeout or failure.
 pub fn send_timeout(h: Hwnd, msg: u32, w: usize, l: isize, ms: u32) -> Option<usize> {
     let mut out = 0usize;
     let r = unsafe { wm::SendMessageTimeoutW(hw(h), msg, w, l, SMTO_ABORTIFHUNG | SMTO_BLOCK, ms, &mut out) };
@@ -413,7 +420,7 @@ pub fn send_timeout(h: Hwnd, msg: u32, w: usize, l: isize, ms: u32) -> Option<us
     }
 }
 
-/// WM_GETTEXT 로 컨트롤의 전체 글자 (시스템이 프로세스 사이에서 버퍼를 옮겨 준다)
+/// A control's full text via WM_GETTEXT (the system marshals the buffer across processes).
 pub fn control_text(h: Hwnd) -> Option<String> {
     let len = send_timeout(h, WM_GETTEXTLENGTH, 0, 0, 1000)?;
     let cap = len.min(4_000_000) + 2;
@@ -422,27 +429,30 @@ pub fn control_text(h: Hwnd) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n.min(cap)]))
 }
 
-/// WM_SETTEXT (시스템이 문자열을 옮겨 준다)
+/// WM_SETTEXT (the system marshals the string).
 pub fn set_control_text(h: Hwnd, s: &str) -> bool {
     let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     send_timeout(h, WM_SETTEXT, 0, w.as_ptr() as isize, 2000).map(|r| r != 0).unwrap_or(false)
 }
 
-/// 문자열 포인터를 lParam 으로 받는 표준 메시지(시스템이 프로세스 사이에서 옮겨 주는 것)만 쓸 것
+/// Only for standard messages taking a string pointer in lParam (ones the system marshals across
+/// processes).
 pub fn send_str(h: Hwnd, msg: u32, w: usize, s: &str, ms: u32) -> Option<usize> {
     let wz: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     send_timeout(h, msg, w, wz.as_ptr() as isize, ms)
 }
 
-/// 받아들이는 콤보 상자 항목 길이 (UTF-16 단위)
+/// Longest combo box item accepted (UTF-16 units).
 const COMBO_ITEM_MAX: usize = 4096;
 
-/// 콤보 상자 항목 글자 (CB_GETLBTEXT 는 시스템이 옮겨 준다). 순서(번호)는 CB_SETCURSEL 에 그대로 쓰이므로
-/// 읽지 못한 항목도 빈 글자로 자리를 지킨다.
+/// Combo box item texts (CB_GETLBTEXT is marshaled by the system). Indices are passed straight to
+/// CB_SETCURSEL, so unreadable items keep their slot as an empty string.
 ///
-/// CB_GETLBTEXT 에는 버퍼 크기 인자가 없다: 다른 프로세스의 콤보 상자면 시스템이 **보낼 때의** 항목 길이만큼 우리 버퍼에
-/// 써 넣는다. 앱이 그 사이에 항목을 길게 바꾸면 길이를 먼저 물어 맞춘 버퍼는 넘칠 수 있다. 그래서 받아들이는 길이의
-/// 두 배보다 큰 고정 버퍼를 쓰고, 읽은 뒤 길이를 다시 물어 달라졌으면(또는 오류·너무 길면) 그 항목을 버린다.
+/// CB_GETLBTEXT takes no buffer size: for another process's combo box the system writes the
+/// item's length **at send time** into our buffer. If the app makes the item longer in between,
+/// a buffer sized by asking first could overflow. So a fixed buffer more than twice the accepted
+/// length is used, and the length is asked again afterwards; if it changed (or on error, or when
+/// too long) the item is dropped.
 pub fn combo_items(h: Hwnd) -> Vec<String> {
     let n = send_timeout(h, CB_GETCOUNT, 0, 0, 1000).unwrap_or(0) as isize;
     let mut out = Vec::new();
@@ -460,19 +470,19 @@ pub fn combo_items(h: Hwnd) -> Vec<String> {
             Some(g) if g != CB_ERR_USIZE && g <= COMBO_ITEM_MAX && again == Some(len) => {
                 out.push(String::from_utf16_lossy(&buf[..g]));
             }
-            // 읽는 사이에 항목이 바뀌었거나 오류 — 버린다
+            // item changed while reading, or an error: drop it
             _ => out.push(String::new()),
         }
     }
     out
 }
 
-/// 콤보 상자가 확장 UI(위/아래 화살표로 목록이 열림)인가. 알 수 없으면 false.
+/// Whether the combo box uses the extended UI (arrow keys open the list). False if unknown.
 pub fn combo_extended_ui(h: Hwnd) -> bool {
     send_timeout(h, CB_GETEXTENDEDUI, 0, 0, 500).map(|r| r != 0).unwrap_or(false)
 }
 
-/// MAKELPARAM (부호 있는 16비트 좌표 두 개)
+/// MAKELPARAM (two signed 16-bit coordinates).
 pub fn make_lparam(x: i32, y: i32) -> isize {
     (((y as i16 as u16 as u32) << 16) | (x as i16 as u16 as u32)) as i32 as isize
 }
@@ -482,7 +492,7 @@ pub fn make_wparam(lo: u32, hi: u32) -> usize {
     ((hi & 0xFFFF) << 16 | (lo & 0xFFFF)) as usize
 }
 
-// ───────────────────────── 배치 (화면 밖으로 옮기기) ─────────────────────────
+// ---- placement (moving off-screen) ----
 
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
@@ -490,7 +500,7 @@ pub struct Placement {
     pub normal: (i32, i32, i32, i32),
     pub min_pos: (i32, i32),
     pub max_pos: (i32, i32),
-    /// WINDOWPLACEMENT.flags (WPF_RESTORETOMAXIMIZED: 최대화 상태에서 최소화된 창)
+    /// WINDOWPLACEMENT.flags (WPF_RESTORETOMAXIMIZED: a window minimized from maximized).
     pub flags: u32,
 }
 
@@ -509,8 +519,10 @@ pub fn get_placement(h: Hwnd) -> Option<Placement> {
     })
 }
 
-/// SetWindowPlacement 에 줄 flags: 비동기 + '복원하면 최대화'(WPF_RESTORETOMAXIMIZED).
-/// 그 플래그는 최소화하는 명령과 함께일 때만 넘긴다 — 보통·보이기 명령과 함께 넘기면 창이 (사용자 모니터에서) 최대화될 수 있다.
+/// Flags for SetWindowPlacement: async plus "restore to maximized" (WPF_RESTORETOMAXIMIZED).
+///
+/// That flag is only passed with a minimizing command; with a normal or show command the window
+/// may maximize (on the user's monitor).
 pub fn placement_flags(pl: &Placement) -> u32 {
     let minimizing = matches!(pl.show_cmd, SW_SHOWMINIMIZED | SW_MINIMIZE | SW_SHOWMINNOACTIVE);
     if minimizing {
@@ -520,7 +532,7 @@ pub fn placement_flags(pl: &Placement) -> u32 {
     }
 }
 
-/// 배치를 비동기로 바꾼다 (대상 스레드를 기다리지 않음)
+/// Changes the placement asynchronously (doesn't wait on the target thread).
 pub fn set_placement_async(h: Hwnd, pl: &Placement) -> bool {
     let p = wm::WINDOWPLACEMENT {
         length: std::mem::size_of::<wm::WINDOWPLACEMENT>() as u32,
@@ -533,7 +545,7 @@ pub fn set_placement_async(h: Hwnd, pl: &Placement) -> bool {
     unsafe { wm::SetWindowPlacement(hw(h), &p) != 0 }
 }
 
-/// 배치를 되돌릴 때 보임 상태를 지금 그대로 두는 showCmd (활성화하지 않음)
+/// A showCmd that keeps the current visibility when restoring a placement (without activating).
 pub fn keep_visibility_cmd(h: Hwnd) -> u32 {
     if !is_visible(h) {
         SW_HIDE as u32
@@ -544,8 +556,10 @@ pub fn keep_visibility_cmd(h: Hwnd) -> u32 {
     }
 }
 
-/// WINDOWPLACEMENT 의 보통 위치(rcNormalPosition) → 화면 좌표.
-/// 도구 창이 아닌 최상위 창의 배치 좌표는 '작업 영역 좌표'(그 모니터에서 작업 표시줄 등을 뺀 영역 기준)다.
+/// WINDOWPLACEMENT's normal position (rcNormalPosition) → screen coordinates.
+///
+/// Placement coordinates of non-tool top-level windows are workspace coordinates (relative to
+/// the monitor's area minus the taskbar and such).
 pub fn normal_to_screen(h: Hwnd, normal: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
     if ex_style(h) & WS_EX_TOOLWINDOW != 0 {
@@ -564,14 +578,18 @@ pub fn normal_to_screen(h: Hwnd, normal: (i32, i32, i32, i32)) -> (i32, i32, i32
     }
 }
 
-/// 보통 상태로 보이던 창의 실제 사각형이 배치의 보통 위치(화면 좌표)와 다른가 — Aero Snap·스냅 레이아웃으로 배치된 창.
-/// 그런 창은 SetWindowPlacement 만으로는 스냅 전 크기·위치로 돌아가므로 실제 사각형을 따로 기억해 되돌린다.
+/// Whether a normally shown window's actual rectangle differs from its placement's normal
+/// position (screen coordinates), i.e. it was arranged by Aero Snap or snap layouts.
+///
+/// SetWindowPlacement alone would put such a window back to its pre-snap size and position, so
+/// the actual rectangle is remembered separately and restored.
 pub fn arranged_rect_differs(normal_screen: (i32, i32, i32, i32), actual: (i32, i32, i32, i32)) -> bool {
     let d = |a: i32, b: i32| (a - b).abs() > 2;
     d(normal_screen.0, actual.0) || d(normal_screen.1, actual.1) || d(normal_screen.2, actual.2) || d(normal_screen.3, actual.3)
 }
 
-/// 창을 화면 사각형 (l, t, r, b) 로 — 활성화·Z 순서 변경 없이, 대상 스레드를 기다리지 않고
+/// Moves a window to the screen rectangle `(l, t, r, b)` without activating, changing z-order
+/// or waiting on the target thread.
 pub fn set_rect_async(h: Hwnd, r: (i32, i32, i32, i32)) -> bool {
     unsafe {
         wm::SetWindowPos(
@@ -586,7 +604,8 @@ pub fn set_rect_async(h: Hwnd, r: (i32, i32, i32, i32)) -> bool {
     }
 }
 
-/// 창을 (x, y) 로 옮긴다 — 활성화·Z 순서 변경 없이, 대상 스레드를 기다리지 않고
+/// Moves a window to `(x, y)` without activating, changing z-order or waiting on the target
+/// thread.
 pub fn move_async(h: Hwnd, x: i32, y: i32) -> bool {
     unsafe {
         wm::SetWindowPos(
@@ -601,7 +620,7 @@ pub fn move_async(h: Hwnd, x: i32, y: i32) -> bool {
     }
 }
 
-/// 스타일 변경을 반영 (프레임 다시 계산) — 비동기
+/// Applies style changes (recomputes the frame), asynchronously.
 pub fn frame_changed_async(h: Hwnd) {
     unsafe {
         wm::SetWindowPos(
@@ -624,19 +643,21 @@ pub fn foreground() -> Hwnd {
     unsafe { wm::GetForegroundWindow() as Hwnd }
 }
 
-/// 전경 창 전환 잠금 (LSFW_LOCK / LSFW_UNLOCK). 전경 권한이 있을 때만 성공한다.
+/// Foreground switch lock (LSFW_LOCK / LSFW_UNLOCK). Only succeeds with foreground rights.
 pub fn lock_foreground(lock: bool) -> bool {
     unsafe { wm::LockSetForegroundWindow(if lock { 1 } else { 2 }) != 0 }
 }
 
-/// (앱이 가져간) 전경을 원래 창에 되돌린다 — 우리 앱이 전경을 가로챘을 때만 부른다.
+/// Hands the foreground (taken by the app) back to the original window. Only call it when our
+/// app grabbed the foreground.
 pub fn restore_foreground(h: Hwnd) -> bool {
     is_window(h) && unsafe { wm::SetForegroundWindow(hw(h)) != 0 }
 }
 
-// ───────────────────────── 글자 ─────────────────────────
+// ---- text ----
 
-/// 메뉴·컨트롤 글자의 니모닉 표시('&') 제거: "&File" → "File", "&&" → "&". 단축키 부분('\t' 뒤)은 버린다.
+/// Strips mnemonic markers ('&') from menu and control text: "&File" → "File", "&&" → "&". The
+/// shortcut part (after '\t') is dropped.
 pub fn strip_mnemonic(s: &str) -> String {
     let s = s.split('\t').next().unwrap_or("");
     let mut out = String::with_capacity(s.len());
@@ -651,11 +672,11 @@ pub fn strip_mnemonic(s: &str) -> String {
         }
         out.push(c);
     }
-    // "열기(&O)" → "열기(O)" 처럼 남는 괄호 표기는 그대로 둔다 (앱이 보여 주는 이름)
+    // a leftover marker like "열기(&O)" → "열기(O)" is kept (that's the name the app shows)
     out.trim().to_string()
 }
 
-/// 니모닉 문자 ("&Save" → 's')
+/// The mnemonic character ("&Save" → 's').
 pub fn mnemonic_of(s: &str) -> Option<char> {
     let s = s.split('\t').next().unwrap_or("");
     let mut it = s.chars().peekable();
@@ -687,7 +708,7 @@ mod tests {
     #[test]
     fn lparam_and_text() {
         assert_eq!(make_lparam(10, 20), (20 << 16 | 10) as isize);
-        // 음수 좌표는 16비트 부호로
+        // negative coordinates as signed 16-bit
         let l = make_lparam(-5, 7) as u32;
         assert_eq!(l & 0xFFFF, 0xFFFB);
         assert_eq!(l >> 16, 7);
@@ -705,11 +726,12 @@ mod tests {
     fn placement_flags_keep_restore_to_maximized() {
         let mut pl = Placement { show_cmd: SW_SHOWMINIMIZED, normal: (0, 0, 10, 10), min_pos: (0, 0), max_pos: (0, 0), flags: 0 };
         assert_eq!(placement_flags(&pl), WPF_ASYNCWINDOWPLACEMENT);
-        pl.flags = WPF_RESTORETOMAXIMIZED | 0x1; // WPF_SETMINPOSITION 은 넘기지 않는다
+        pl.flags = WPF_RESTORETOMAXIMIZED | 0x1; // WPF_SETMINPOSITION isn't passed
         assert_eq!(placement_flags(&pl), WPF_RESTORETOMAXIMIZED | WPF_ASYNCWINDOWPLACEMENT);
         pl.show_cmd = SW_SHOWMINNOACTIVE;
         assert_eq!(placement_flags(&pl), WPF_RESTORETOMAXIMIZED | WPF_ASYNCWINDOWPLACEMENT);
-        // 보이기·보통 명령에는 넘기지 않는다 (화면 밖에서 되살릴 때 최대화되면 사용자 모니터에 붙는다)
+        // not passed with show/normal commands (maximizing while restoring off-screen would snap to the
+        // user's monitor)
         for c in [SW_SHOWNORMAL, SW_SHOWNOACTIVATE as u32, SW_SHOWMAXIMIZED, SW_HIDE as u32] {
             pl.show_cmd = c;
             assert_eq!(placement_flags(&pl), WPF_ASYNCWINDOWPLACEMENT, "{c}");
@@ -718,16 +740,16 @@ mod tests {
 
     #[test]
     fn arranged_rect() {
-        // 같은 사각형(±2px) = 스냅되지 않은 창
+        // same rectangle (±2 px) = not snapped
         assert!(!arranged_rect_differs((100, 100, 900, 700), (100, 100, 900, 700)));
         assert!(!arranged_rect_differs((100, 100, 900, 700), (101, 99, 902, 700)));
-        // 왼쪽 절반에 스냅된 창: 크기·위치가 다르다
+        // snapped to the left half: size and position differ
         assert!(arranged_rect_differs((100, 100, 900, 700), (-7, 0, 967, 1047)));
     }
 
     #[test]
     fn combo_items_on_missing_window() {
-        // 없는 창이면 빈 목록 (메시지 실패를 항목으로 만들지 않는다)
+        // a missing window gives an empty list (failed messages don't become items)
         assert!(combo_items(0).is_empty());
         assert!(!combo_extended_ui(0));
     }

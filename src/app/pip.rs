@@ -1,11 +1,12 @@
-//! PiP: 에이전트 화면을 늘 위에 뜨는 작은 창으로 띄운다.
+//! Picture-in-picture windows for agent screens.
 
 use super::*;
 use super::labels::{attention, status_text};
 
 impl GhostApp {
-    /// PiP: 에이전트 화면을 늘 위에 뜨는 작은 창으로 띄운다. 다른 일을 하면서 진행을 지켜보는 용도.
-    /// 끌면 창 이동, 누르면 본 창에서 그 에이전트를 연다, 마우스를 올리면 닫기 단추. 가장자리로 크기 조절.
+    /// Shows agent screens in small always-on-top windows, for keeping an eye on progress while
+    /// doing something else. Dragging moves the window, clicking opens that agent in the main
+    /// window, hovering reveals a close button, and the edges resize it.
     pub(super) fn pip_windows(&mut self, ctx: &egui::Context) {
         let mut open = None;
         for (i, a) in self.agents.iter_mut().enumerate() {
@@ -36,7 +37,7 @@ impl GhostApp {
                     }
                     clicked |= resp.clicked();
                     let p = ui.painter();
-                    // 화면 비율 그대로 가운데에 (남는 곳은 검게)
+                    // letterbox at the screen's aspect ratio
                     let fit = if aspect >= area.height() / area.width() {
                         Vec2::new(area.height() / aspect, area.height())
                     } else {
@@ -53,18 +54,18 @@ impl GhostApp {
                             pctx.request_repaint_after(std::time::Duration::from_millis(33));
                         }
                     }
-                    // 사람이 볼 일이 있으면(질문·오류·직접 조작) 그 색 테두리
+                    // colored border when a person is needed (question, error, takeover)
                     if let Some(c) = attention(&st, takeover) {
                         p.rect_stroke(area, 0, Stroke::new(3.0, c), StrokeKind::Inside);
                     }
                     if pctx.input(|i| i.pointer.hover_pos().is_some()) {
-                        // 이름표
+                        // name tag
                         let label = format!("{name}  ·  {}", crate::llm::short(&status_text(&st), 24));
                         let g = p.layout_no_wrap(label, egui::FontId::proportional(12.0), Color32::WHITE);
                         let at = area.left_top() + Vec2::new(10.0, 9.0);
                         p.rect_filled(egui::Rect::from_min_size(at, g.size()).expand2(Vec2::new(8.0, 4.0)), 255, Color32::from_black_alpha(170));
                         p.galley(at, g, Color32::WHITE);
-                        // 닫기
+                        // close button
                         let x = egui::Rect::from_min_size(egui::pos2(area.right() - 34.0, area.top() + 6.0), Vec2::splat(28.0));
                         let xr = ui.interact(x, ui.scope_id().with("pip_close"), egui::Sense::click()).on_hover_text(tr("PiP 닫기"));
                         let fill = if xr.hovered() { Color32::from_rgb(0xc4, 0x2b, 0x1c) } else { Color32::from_black_alpha(170) };

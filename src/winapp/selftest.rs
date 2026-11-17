@@ -1,15 +1,23 @@
 //! `ghostdesk --selftest-native [--out DIR] [--skip-refusals] [--skip-charmap] [--skip-target] [--skip-attach]`
 //!
-//! 이 PC 를 쓰는 사람을 방해하지 않는지 지켜보면서(25ms 마다: 앱 창이 어느 모니터에 보이는지, 실제 커서 위치,
-//! 전경 창, 시스템 클립보드 변경 번호) 다음을 시험한다.
-//! 1. 거부 규칙: 스토어 앱 실행 별칭(메모장)·스토어 앱 실행기(계산기)·콘솔·관리자 권한 앱 — 아무것도 띄우지 않고 거부.
-//! 2. 문자표(charmap.exe, 실제 Win32 앱): 숨김 실행, 스크린샷, ui_tree, 픽셀 클릭(문자 눈금·선택 단추), 한글+영문 입력,
-//!    Ctrl+A/C/V(내부 클립보드), 체크 상자 press, 콤보 상자 choose, 휠, 거부(오른쪽 클릭·복사/도움말 단추·Alt·Ctrl+S), 종료.
-//! 3. 시험 대상 창(이 실행 파일의 `--target`): 메뉴 가속기 흉내(Ctrl+S → 파일 > 저장), menus/menu, 차단 메뉴, 단추·체크·콤보,
-//!    메시지 상자(새 창 자동 전환·노출 측정·확인 누르기), "저장할까요?" 대화상자가 떠도 2초 뒤 강제 종료.
-//! 4. Mode B: 화면 밖에 이미 떠 있는 시험 대상에 동의 하에 붙어 입력하고, 끝나면 죽이지 않고 원래 자리로 되돌림.
+//! Tests the following while watching that the person using this PC isn't disturbed (every
+//! 25 ms: whether any app window is visible on a monitor, the real cursor position, the
+//! foreground window, and the system clipboard sequence number).
+//! 1. Refusal rules: Store app execution alias (Notepad), Store app launcher (Calculator),
+//!    console and elevated apps are refused without launching anything.
+//! 2. Character Map (charmap.exe, a real Win32 app): hidden launch, screenshot, ui_tree, pixel
+//!    clicks (character grid, Select button), Korean + English typing, Ctrl+A/C/V (internal
+//!    clipboard), check box press, combo box choose, wheel, refusals (right click, Copy/Help
+//!    buttons, Alt, Ctrl+S), shutdown.
+//! 3. Test target window (`--target` of this executable): menu accelerator emulation (Ctrl+S →
+//!    File > Save), menus/menu, blocked menus, buttons/checks/combos, message boxes (automatic
+//!    switch to the new window, exposure measurement, pressing OK), forced exit 2 s after a
+//!    "Save changes?" dialog.
+//! 4. Mode B: attaches with consent to a test target already running off-screen, types into it,
+//!    and when done puts it back in place instead of killing it.
 //!
-//! 내부 모드: `--target [--offscreen-visible]` = 시험 대상 창 (사용자 화면에는 나타나지 않는다).
+//! Internal mode: `--target [--offscreen-visible]` = the test target window (never appears on
+//! the user's screen).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,9 +56,9 @@ impl TestLog {
     }
 }
 
-// ───────────────────────── 사용자 보호 감시 (25ms) ─────────────────────────
+// ---- user protection monitor (25 ms) ----
 
-/// 시험 시작부터 지난 초 (단계·감시 기록을 맞춰 보려고)
+/// Seconds since the test started (to line up steps with the monitor log).
 fn ts() -> f64 {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     T0.get_or_init(Instant::now).elapsed().as_secs_f64()
@@ -62,10 +70,10 @@ fn step(s: &str) {
 
 #[derive(Default, Debug)]
 struct Report {
-    /// 1ms 간격 창 노출 검사 횟수 / 보인 횟수
+    /// Window exposure checks at 1 ms intervals / times something was visible.
     probes: u64,
     onscreen_probes: u64,
-    /// 25ms 간격 표본 (커서·전경·클립보드 + 창)
+    /// Samples at 25 ms intervals (cursor, foreground, clipboard, windows).
     samples: u64,
     onscreen_samples: u64,
     longest_run_ms: u64,
@@ -82,7 +90,7 @@ struct Sampler {
     handle: Option<std::thread::JoinHandle<Report>>,
 }
 
-/// 이 시험 프로세스가 띄운 자식 프로세스 (시험 대상 앱들)
+/// Child processes launched by this test process (the apps under test).
 fn child_pids() -> Vec<u32> {
     let me = std::process::id();
     pw::processes()
@@ -105,7 +113,7 @@ fn start_sampler() -> Sampler {
         let mut last_kids = Instant::now() - Duration::from_secs(1);
         let mut last_slow = Instant::now() - Duration::from_secs(1);
         while !s2.load(Ordering::SeqCst) {
-            // 앱 창 노출은 1ms 마다 (자식 프로세스 목록은 50ms 마다 갱신)
+            // app window exposure every 1 ms (child process list refreshed every 50 ms)
             if last_kids.elapsed() >= Duration::from_millis(50) {
                 kids = child_pids();
                 last_kids = Instant::now();
@@ -176,7 +184,7 @@ impl Sampler {
     }
 }
 
-// ───────────────────────── ui_tree 해석 ─────────────────────────
+// ---- ui_tree parsing ----
 
 #[derive(Clone, Debug)]
 struct El {
@@ -240,7 +248,8 @@ fn sys32(name: &str) -> PathBuf {
 }
 
 fn opts(app: &Path) -> NativeOptions {
-    // GHOSTDESK_SELFTEST_HOST=offscreen 이면 예전 방식(사용자 데스크톱의 화면 밖 창)으로 같은 시험을 돌린다
+    // GHOSTDESK_SELFTEST_HOST=offscreen runs the same tests the old way (off-screen windows on the
+    // user's desktop)
     let host = std::env::var("GHOSTDESK_SELFTEST_HOST").ok().and_then(|h| crate::native::NativeHost::parse(&h)).unwrap_or_default();
     NativeOptions { app: app.to_string_lossy().to_string(), new_instance: true, live_fps: 0.0, host, ..Default::default() }
 }
@@ -249,7 +258,7 @@ fn noop_sink() -> crate::browser::FrameSink {
     Arc::new(|_b: &[u8]| {})
 }
 
-// ───────────────────────── 진입점 ─────────────────────────
+// ---- entry point ----
 
 pub async fn selftest(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--target") {
@@ -257,7 +266,7 @@ pub async fn selftest(args: &[String]) -> Result<()> {
     }
     let _ = ts();
     pw::set_dpi_aware();
-    // 시험 대상(이 실행 파일, 콘솔 서브시스템)을 띄울 수 있게
+    // allow launching the test target (this executable, console subsystem)
     std::env::set_var("GHOSTDESK_WINAPP_SELFTEST", "1");
     let out_dir = PathBuf::from(
         arg_value(args, "--out").unwrap_or_else(|| std::env::temp_dir().join(format!("ghostdesk-winapp-selftest-{}", std::process::id())).to_string_lossy().to_string()),
@@ -267,7 +276,7 @@ pub async fn selftest(args: &[String]) -> Result<()> {
     std::fs::write(&login_fixture, "synthetic-session-state")?;
     std::env::set_var("GHOSTDESK_SELFTEST_LOGIN_STATE", &login_fixture);
     println!("출력 폴더: {}", out_dir.display());
-    // Mode B 복구 기록은 사용자 데이터 폴더가 아니라 시험 출력 폴더에
+    // mode B recovery records go to the test output folder, not the user's data folder
     std::env::set_var("GHOSTDESK_WINAPP_RECOVERY_DIR", &out_dir);
     let (vl, vt, vr, vb) = pw::virtual_screen();
     println!("가상 화면: ({vl},{vt})-({vr},{vb}), 화면 밖 주차 위치: {:?}", pw::offscreen_origin());
@@ -305,7 +314,7 @@ pub async fn selftest(args: &[String]) -> Result<()> {
         log.check("dialer-user-settings-restored", ok, keys.join(", "));
     }
 
-    // 남은 자식이 있으면 정리 (우리가 띄운 것만)
+    // clean up leftover children (only ones we launched)
     tokio::time::sleep(Duration::from_millis(300)).await;
     let left = child_pids();
     log.check("no-leftover-processes", left.is_empty(), format!("{left:?}"));
@@ -320,7 +329,7 @@ pub async fn selftest(args: &[String]) -> Result<()> {
     if rep.onscreen_probes == 0 {
         log.check("probe-no-app-window-on-screen", true, format!("1ms 검사 {}회 동안 앱 창이 어느 모니터에도 보인 적 없음", rep.probes));
     } else {
-        // 짧게라도 보였다. 길게(>=100ms) 남았으면 실패로 본다.
+        // visible even briefly; staying up long (>= 100 ms) counts as a failure
         let ok = rep.longest_run_ms < 100;
         log.check(
             "probe-app-window-on-screen",
@@ -358,7 +367,7 @@ pub async fn selftest(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────── 1. 거부 규칙 ─────────────────────────
+// ---- 1. refusal rules ----
 
 async fn refusals(log: &mut TestLog) {
     let win = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
@@ -367,7 +376,8 @@ async fn refusals(log: &mut TestLog) {
         (sys32("calc.exe"), "calc-store-stub", "계산기"),
         (sys32("cmd.exe"), "console-app", "콘솔"),
         (sys32("eudcedit.exe"), "elevation-required", "관리자 권한"),
-        // 셸: 새로 띄우면 실행 중인 셸이 탐색기 창을 사용자 화면에 열고, 붙으면 작업 표시줄·바탕 화면이 옮겨진다
+        // shell: launching it makes the running shell open an Explorer window on the user's screen, and
+        // attaching would move the taskbar and desktop
         (win.join("explorer.exe"), "shell-explorer", "셸"),
         (sys32("control.exe"), "shell-launcher-control", "셸"),
     ];
@@ -392,7 +402,7 @@ async fn refusals(log: &mut TestLog) {
     }
     let r = NativeAppWorkspace::launch(opts(Path::new("존재하지않는앱xyz")), noop_sink()).await;
     log.check("refuse-unknown-app", r.as_ref().err().map(|e| e.to_string().contains("찾지 못했습니다")).unwrap_or(false), r.err().map(|e| e.to_string()).unwrap_or_default());
-    // 이름으로 적은 'explorer' 도 (PATH 에서 찾은 뒤) 거부
+    // 'explorer' given by name (found on PATH) is refused too
     let before = child_pids();
     let r = NativeAppWorkspace::launch(opts(Path::new("explorer")), noop_sink()).await;
     let msg = r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_else(|| "실행되어 버림".into());
@@ -414,9 +424,10 @@ fn installed(log: &mut TestLog) {
     log.check("resolve-charmap", p.as_ref().map(|p| p.to_string_lossy().to_lowercase().ends_with("charmap.exe")).unwrap_or(false), format!("{p:?}"));
 }
 
-// ───────────────────────── 2. 문자표 ─────────────────────────
+// ---- 2. Character Map ----
 
-/// HKCU 키 하나의 값들을 시험 전 그대로 되돌리기 위한 스냅숏 (문자표는 닫을 때 글꼴·고급 보기 상태를 저장한다)
+/// Snapshot of one HKCU key's values to restore them after the test (Character Map saves its
+/// font and advanced view state on close).
 struct RegSnapshot {
     sub: Vec<u16>,
     existed: bool,
@@ -463,7 +474,7 @@ impl RegSnapshot {
         }
         unsafe {
             if !self.existed {
-                // 시험 전에 없던 키는 통째로 지운다
+                // a key that didn't exist before the test is deleted entirely
                 return RegDeleteTreeW(HKEY_CURRENT_USER, self.sub.as_ptr()) == 0;
             }
             let mut h: HKEY = std::ptr::null_mut();
@@ -544,9 +555,10 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     let (Some(grid), Some(edit), Some(adv)) = (grid, edit, adv) else {
         bail!("문자 눈금·입력 칸·고급 보기 체크 상자를 ui_tree 에서 찾지 못했습니다");
     };
-    // 주의: 문자표의 '선택' 단추·문자 더블클릭은 문자표가 스스로 시스템 클립보드를 거쳐 글자를 넣으므로 누르지 않는다.
+    // note: Character Map's Select button and double-clicking a character go through the system
+    // clipboard on its own, so they're never pressed
 
-    // a. 픽셀 클릭: 고급 보기 체크 상자 → 체크되고 요소가 늘어난다
+    // a. pixel click: the advanced view check box gets checked and more elements appear
     ws.click(Some(adv.center()), MouseButton::Left, 1, 0).await?;
     let _ = ws.screenshot().await?;
     let tree2 = ws.app_control(&json!({"action": "ui_tree"})).await?;
@@ -559,7 +571,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     );
     std::fs::write(out.join("charmap-2-advanced.png"), ws.screenshot().await?)?;
 
-    // b. 픽셀 클릭: 문자 눈금의 넷째 칸 → '선택한 문자' 설명(U+....)이 바뀐다
+    // b. pixel click: fourth cell of the character grid changes the selected-character text (U+....)
     let desc = |els: &[El]| els.iter().find(|e| e.name.starts_with("U+")).map(|e| e.name.clone()).unwrap_or_default();
     let before = desc(&els2);
     let cell = (grid.rect[0] + grid.rect[2] * 0.17, grid.rect[1] + grid.rect[3] * 0.06);
@@ -568,7 +580,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     let after = desc(&parse_tree(&tree3));
     log.check("charmap-pixel-click-grid", !after.is_empty() && after != before, format!("'{before}' → '{after}' {:?}", ws.take_notes()));
 
-    // c. 한글+영문 입력 (입력 칸 클릭 → End → type)
+    // c. Korean + English typing (click the edit box → End → type)
     ws.click(Some(edit.center()), MouseButton::Left, 1, 0).await?;
     ws.key("End", 1).await?;
     ws.type_text("한글 ABC 123").await?;
@@ -576,7 +588,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     let v = read_value(ws, &edit).await?;
     log.check("charmap-type-korean", v.contains("한글 ABC 123"), format!("{v:?}"));
 
-    // d. Ctrl+A / Ctrl+C / End / Ctrl+V (내부 클립보드) — macOS 식 cmd+a 도
+    // d. Ctrl+A / Ctrl+C / End / Ctrl+V (internal clipboard), and macOS-style cmd+a too
     let clip = w32::clipboard_sequence();
     ws.key("cmd+a", 1).await?;
     ws.key("ctrl+c", 1).await?;
@@ -593,7 +605,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     ws.key("ctrl+z", 1).await?;
     println!("  ctrl+z notes: {:?}", ws.take_notes());
 
-    // e. 글꼴 콤보 상자 choose (펼치지 않고)
+    // e. choose in the font combo box (without dropping it down)
     let _ = ws.screenshot().await?;
     let tree4 = ws.app_control(&json!({"action": "ui_tree"})).await?;
     let els4 = parse_tree(&tree4);
@@ -602,7 +614,8 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
         log.check("charmap-choose-font", r.as_ref().map(|s| s.contains("확인됨")).unwrap_or(false), format!("{r:?}"));
     }
 
-    // f. 거부: 오른쪽 클릭, 복사 단추, 도움말, Alt·F10·Shift+F10·Alt+Space, Ctrl+S(메뉴 없음), 끌기(끌어서 놓기 가능한 컨트롤)
+    // f. refused: right click, Copy button, Help, Alt/F10/Shift+F10/Alt+Space, Ctrl+S (no menu),
+    // dragging (controls that support drag and drop)
     let r = ws.click(Some(grid.center()), MouseButton::Right, 1, 0).await;
     log.check("charmap-refuse-right-click", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
     if let Some(copy) = find(&els4, "Button", &["복사", "copy"]) {
@@ -626,7 +639,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     let r = ws.drag((grid.rect[0] + 10.0, grid.rect[1] + 10.0), (grid.rect[0] + 60.0, grid.rect[1] + 40.0), 0).await;
     log.check("charmap-refuse-ole-drag", r.as_ref().err().map(|e| e.to_string().contains("끌기")).unwrap_or(false), format!("{:?}", r.err().map(|e| e.to_string())));
 
-    // g. 휠(문자 눈금은 휠을 처리하지 않아 옆의 스크롤 막대로 대체된다)·확대
+    // g. wheel (the grid doesn't handle it, so the scroll bar next to it is used) and zoom
     let shot0 = ws.screenshot().await?;
     let r = ws.scroll(Some(grid.center()), 0.0, 300.0, 0).await;
     let shot1 = ws.screenshot().await?;
@@ -636,7 +649,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
     std::fs::write(out.join("charmap-4-zoom.png"), &z)?;
     log.check("charmap-zoom", png_ok(&z).0, png_ok(&z).1);
 
-    // h. app_control press 로 고급 보기를 다시 끈다 (UI Automation 경로)
+    // h. turn advanced view back off with app_control press (UI Automation path)
     let tree5 = ws.app_control(&json!({"action": "ui_tree"})).await?;
     if let Some(cb) = find(&parse_tree(&tree5), "CheckBox", &[]) {
         let r = ws.app_control(&json!({"action": "press", "id": cb.id})).await;
@@ -646,7 +659,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
 }
 
 async fn read_value(ws: &NativeAppWorkspace, el: &El) -> Result<String> {
-    // ui_tree id 는 마지막 ui_tree 기준이므로 다시 찾는다
+    // ui_tree ids refer to the latest ui_tree, so look it up again
     let tree = ws.app_control(&json!({"action": "ui_tree"})).await?;
     let els = parse_tree(&tree);
     let e = els
@@ -657,7 +670,7 @@ async fn read_value(ws: &NativeAppWorkspace, el: &El) -> Result<String> {
     Ok(r.split_once("value:\n").map(|(_, v)| v.to_string()).unwrap_or(r))
 }
 
-// ───────────────────────── 3. 시험 대상 창 ─────────────────────────
+// ---- 3. test target window ----
 
 fn current_title(ws: &NativeAppWorkspace) -> String {
     let (v, c) = ws.views();
@@ -707,7 +720,7 @@ async fn target(log: &mut TestLog, out: &Path) -> Result<()> {
     }
     log.check("current-session-refuses-running-app", refusal.contains("current_session") && crate::platform::proc::pid_alive(pid), refusal);
     let r = target_steps(log, out, &ws).await;
-    // 저장하지 않은 변경 → 닫을 때 "저장할까요?" 대화상자가 떠도 2초 뒤 강제 종료
+    // unsaved changes: forced exit 2 s after the "Save changes?" dialog appears on close
     let _ = ws.screenshot().await;
     step("Mode A: 종료 시작 (저장 확인 대화상자)");
     let ts = Instant::now();
@@ -735,8 +748,9 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
         bail!("시험 대상의 입력 칸·단추를 찾지 못했습니다");
     };
 
-    // Mode A Job: 앱은 시스템 클립보드를 읽거나 쓸 수 없고(UI 제한), 오류 대화상자를 띄우지 않는다 (물려받은 오류 모드).
-    // 시험 대상이 자기 프로세스에서 잰 값을 창에 적어 둔다 — 사용자 클립보드를 실제로 건드려 보지 않고 확인한다.
+    // mode A Job: the app can't read or write the system clipboard (UI limits) and shows no error
+    // dialogs (inherited error mode). The test target writes values measured in its own process into
+    // its window, so this is checked without actually touching the user's clipboard.
     let env_node = els.iter().find(|e| e.name.starts_with("환경 job-ui=")).ok_or_else(|| anyhow!("환경 요소가 없음"))?;
     let env = ws.app_control(&json!({"action":"read", "id":env_node.id})).await?;
     let account = pw::current_user_sid()?;
@@ -757,18 +771,18 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
         format!("'{env}', GhostDesk {:#x} (기대 {quiet:#x} 포함)", super::launch::process_error_mode()),
     );
 
-    // 픽셀 클릭 → 단추 (BN_CLICKED)
+    // pixel click → button (BN_CLICKED)
     ws.click(Some(btn.center()), MouseButton::Left, 1, 0).await?;
     let tree = ws.app_control(&json!({"action": "ui_tree"})).await?;
     log.check("target-pixel-click-button", tree.contains("클릭 1"), format!("{:?}", ws.take_notes()));
 
-    // 입력 (여러 줄)
+    // typing (multi-line)
     ws.click(Some(edit.center()), MouseButton::Left, 1, 0).await?;
     ws.type_text("가나다 abc\n둘째 줄").await?;
     let v = read_value(ws, &edit).await?;
     log.check("target-type-multiline", v.contains("가나다 abc") && v.contains("둘째 줄"), format!("{v:?} {:?}", ws.take_notes()));
 
-    // 일반 입력 칸(끌어서 놓기 없음)에서는 끌기로 글자를 선택할 수 있다
+    // in a plain edit box (no drag and drop), dragging selects text
     let from = (edit.rect[0] + 3.0, edit.rect[1] + 6.0);
     let to = (edit.rect[0] + edit.rect[2] * 0.6, edit.rect[1] + 6.0);
     let r = ws.drag(from, to, 0).await;
@@ -778,7 +792,7 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     let sel = raw.lines().find(|l| l.starts_with("selected text:")).unwrap_or("").to_string();
     log.check("target-drag-select-in-edit", r.is_ok() && sel.contains("가나다"), format!("{r:?} {sel:?}"));
 
-    // Ctrl+S → 메뉴 '파일 > 저장' (가속기 글자 흉내), cmd+s 도 같은 뜻
+    // Ctrl+S → File > Save menu (accelerator emulation); cmd+s means the same
     ws.key("ctrl+s", 1).await?;
     let n1 = ws.take_notes();
     ws.key("cmd+s", 1).await?;
@@ -790,7 +804,8 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     let r = ws.key("ctrl+q", 1).await;
     log.check("target-unknown-shortcut-errors", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
 
-    // 편집 칸에서 Ctrl+C 는 앱의 '편집 > 복사'(시스템 클립보드)가 아니라 내부 클립보드로
+    // in an edit box Ctrl+C goes to the internal clipboard, not the app's Edit > Copy (system
+    // clipboard)
     ws.key("ctrl+a", 1).await?;
     ws.key("ctrl+c", 1).await?;
     let notes = ws.take_notes();
@@ -812,7 +827,7 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     let v = read_value(ws, &edit).await?;
     log.check("target-menu-new", r.is_ok() && v.is_empty() && current_title(ws) == "새 문서", format!("{r:?} 입력 칸 {v:?}"));
 
-    // 체크 상자 press, 콤보 상자 choose (펼치지 않고, CBN_SELCHANGE 알림)
+    // check box press, combo box choose (without dropping down; CBN_SELCHANGE notification)
     let _ = ws.screenshot().await?;
     let tree = ws.app_control(&json!({"action": "ui_tree"})).await?;
     let els = parse_tree(&tree);
@@ -829,11 +844,12 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     }
 
     step("Mode A: Ctrl+M (메시지 상자)");
-    // Ctrl+M → 메시지 상자 (새 창으로 자동 전환, 노출 측정) → 확인 누르기
+    // Ctrl+M → message box (automatic switch to the new window, exposure measured) → press OK
     ws.key("ctrl+m", 1).await?;
     step("Mode A: Ctrl+M 보냄");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // 컴퓨터가 바쁘면 메시지 상자가 늦게 뜬다 — 창 목록을 다시 보며(새 창 자동 전환) 최대 3초 기다린다
+    // on a busy machine the message box shows up late, so keep rereading the window list (automatic
+    // switch) for up to 3 s
     let t = Instant::now();
     while !ws.views().0.iter().any(|v| v.detail.starts_with("#32770")) && t.elapsed() < Duration::from_secs(3) {
         let _ = ws.app_control(&json!({"action": "list_windows"})).await;
@@ -848,7 +864,8 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
         format!("{:?} / {notes:?}", views.iter().map(|v| format!("{} [{}]", v.title, v.detail)).collect::<Vec<_>>()),
     );
     if dlg.is_some() {
-        // 모달 대화상자가 열린 동안: 본 창(비활성)의 메뉴·단축키는 실행하지 않는다 (실제 키보드와 같게)
+        // while a modal dialog is open, the main window's (disabled) menus and shortcuts don't run, as
+        // with a real keyboard
         let saved3 = |ws: &NativeAppWorkspace| ws.views().0.iter().any(|v| v.title == "저장됨 3");
         let r = ws.key("ctrl+s", 1).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -886,15 +903,16 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     step("Mode A: 메시지 상자 확인 끝");
     modal_alt_mnemonic(log, ws).await?;
     step("Mode A: 질문 상자 끝");
-    // 저장하지 않은 변경을 만든다 (종료 시험용)
+    // make unsaved changes (for the shutdown test)
     let _ = ws.screenshot().await?;
     ws.click(Some(edit.center()), MouseButton::Left, 1, 0).await?;
     ws.type_text("저장하지 않은 변경").await?;
     Ok(())
 }
 
-/// 모달 대화상자가 열린 동안 보기를 본 창(비활성)으로 바꿔도 요소 동작(press·choose)은 보내지 않는다 —
-/// 보내면 앱의 명령 처리가 대화상자의 모달 루프 안에서 다시 실행된다. 끝나면 대화상자로 돌아간다.
+/// While a modal dialog is open, switching the view to the (disabled) main window doesn't send
+/// element actions (press, choose); otherwise the app's command handling would re-enter inside
+/// the dialog's modal loop. Returns to the dialog afterwards.
 async fn modal_element_actions(log: &mut TestLog, ws: &NativeAppWorkspace) -> Result<()> {
     let (views, _) = ws.views();
     let (Some(mi), Some(di)) = (
@@ -935,14 +953,15 @@ async fn modal_element_actions(log: &mut TestLog, ws: &NativeAppWorkspace) -> Re
             rc.map_err(|e| e.to_string())
         ),
     );
-    // 대화상자로 돌아간다 (창 목록 순서가 바뀌었을 수 있어 다시 찾는다)
+    // back to the dialog (look it up again, the window order may have changed)
     let di = ws.views().0.iter().position(|v| v.detail.starts_with("#32770")).unwrap_or(di);
     ws.switch_view(di).await?;
     Ok(())
 }
 
-/// 질문 상자(예(&Y)/아니요(&N))가 열린 동안 Alt+Y: 본 창 메뉴에 같은 Alt+Y 단축키가 있어도
-/// 실제 키보드처럼 대화상자의 '예' 니모닉 단추가 눌려야 한다 (본 창 메뉴는 실행되지 않음).
+/// Alt+Y while a question box (&Yes / &No) is open: even though the main window's menu has the
+/// same Alt+Y shortcut, the dialog's Yes mnemonic button must be pressed, as with a real
+/// keyboard (the main menu doesn't run).
 async fn modal_alt_mnemonic(log: &mut TestLog, ws: &NativeAppWorkspace) -> Result<()> {
     let _ = ws.screenshot().await?;
     ws.key("ctrl+k", 1).await?;
@@ -978,7 +997,7 @@ async fn modal_alt_mnemonic(log: &mut TestLog, ws: &NativeAppWorkspace) -> Resul
         format!("{:?} {notes:?} / 창 {:?}", r.map_err(|e| e.to_string()), views.iter().map(|v| format!("{} [{}]", v.title, v.detail)).collect::<Vec<_>>()),
     );
     if dialog_left {
-        // 실패했으면 아니요로 닫아 둔다 (다음 시험이 본 창을 쓰도록)
+        // on failure close it with No (so the next test can use the main window)
         let tree = ws.app_control(&json!({"action": "ui_tree"})).await.unwrap_or_default();
         if let Some(no) = find(&parse_tree(&tree), "Button", &["아니요", "no"]) {
             let _ = ws.app_control(&json!({"action": "press", "id": no.id})).await;
@@ -988,8 +1007,9 @@ async fn modal_alt_mnemonic(log: &mut TestLog, ws: &NativeAppWorkspace) -> Resul
     Ok(())
 }
 
-/// 키보드로 콤보 상자에 포커스를 옮긴 뒤(확인 단추 클릭 → Tab → Tab): F4 와 확장 UI 의 아래 화살표는 목록을 사용자 화면에 열므로 거부,
-/// 확장 UI 가 아닌 콤보 상자의 아래 화살표는 목록을 열지 않고 다음 항목을 고른다 (허용).
+/// After moving focus to the combo box by keyboard (click OK → Tab → Tab): F4, and Down with the
+/// extended UI, open the list on the user's screen and are refused; Down on a non-extended combo
+/// box picks the next item without opening the list (allowed).
 async fn combo_keys(log: &mut TestLog, ws: &NativeAppWorkspace, btn: &El) -> Result<()> {
     let pid = ws.pid() as u32;
     let _ = pid;
@@ -999,7 +1019,8 @@ async fn combo_keys(log: &mut TestLog, ws: &NativeAppWorkspace, btn: &El) -> Res
         log.check("target-combo-keys", false, "콤보 상자 창을 찾지 못함");
         return Ok(());
     };
-    // 숨은 데스크톱의 포커스는 시험 대상 스레드에서 읽는다 (다른 데스크톱에서는 조회할 수 없음).
+    // focus on the hidden desktop is read on the test target's thread (it can't be queried from
+    // another desktop)
     let thread_focus = || w32::send_timeout(main, super::testapp::QUERY_FOCUS, 0, 0, 1000).unwrap_or(0) as w32::Hwnd;
     let _ = ws.screenshot().await?;
     ws.click(Some(btn.center()), MouseButton::Left, 1, 0).await?;
@@ -1013,7 +1034,7 @@ async fn combo_keys(log: &mut TestLog, ws: &NativeAppWorkspace, btn: &El) -> Res
         focused && r.as_ref().err().map(|e| e.to_string().contains("choose")).unwrap_or(false) && !list_open(),
         format!("콤보 상자 포커스 {focused}, {:?}", r.err().map(|e| e.to_string())),
     );
-    // 확장 UI (아래 화살표로 목록이 열림) → 거부
+    // extended UI (Down opens the list) → refused
     w32::send_timeout(combo, w32::CB_SETEXTENDEDUI, 1, 0, 1000);
     let ext = w32::combo_extended_ui(combo);
     let r = ws.key("Down", 1).await;
@@ -1021,7 +1042,8 @@ async fn combo_keys(log: &mut TestLog, ws: &NativeAppWorkspace, btn: &El) -> Res
     let refused = ext && r.as_ref().err().map(|e| e.to_string().contains("확장 UI")).unwrap_or(false) && !list_open();
     w32::send_timeout(combo, w32::CB_SETEXTENDEDUI, 0, 0, 1000);
     log.check("target-refuse-down-extended-ui-combo", refused, format!("확장 UI {ext}, {:?}", r.err().map(|e| e.to_string())));
-    // 보통 콤보 상자: 아래 화살표 = 다음 항목 (목록은 열리지 않음). 제목은 창 목록을 다시 볼 때 바뀌므로 최대 3초 기다린다.
+    // regular combo box: Down = next item (list stays closed). The title updates when the window
+    // list is reread, so wait up to 3 s.
     let r = ws.key("Down", 1).await;
     let t = Instant::now();
     let mut title = current_title(ws);
@@ -1038,10 +1060,13 @@ async fn combo_keys(log: &mut TestLog, ws: &NativeAppWorkspace, btn: &El) -> Res
     Ok(())
 }
 
-// ───────────────────────── (선택) 전화 걸기: 시작하자마자 대화상자를 띄우는 실제 앱 ─────────────────────────
+// ---- (optional) Phone Dialer: a real app that shows dialogs right at startup ----
 
-/// `--with-dialer`: 전화 걸기(dialer.exe)는 시작하자마자 "연결에 사용할 모뎀" 대화상자와 경고 메시지 상자를 띄운다.
-/// 실행 중 노출(가장 나쁜 경우)을 재고, 메시지 상자 자동 전환·확인 누르기·실제 앱의 메뉴 막대 읽기를 본다.
+/// `--with-dialer`: Phone Dialer (dialer.exe) shows a "modem to use" dialog and a warning message
+/// box right at startup.
+///
+/// Measures exposure during launch (the worst case) and checks automatic message box switching,
+/// pressing OK, and reading a real app's menu bar.
 async fn dialer(log: &mut TestLog, out: &Path) -> Result<()> {
     let exe = sys32("dialer.exe");
     if !exe.is_file() {
@@ -1058,7 +1083,7 @@ async fn dialer(log: &mut TestLog, out: &Path) -> Result<()> {
     println!("  dialer 창: {:?}", views.iter().map(|v| format!("{} [{}]", v.title, v.detail)).collect::<Vec<_>>());
     let r = async {
         std::fs::write(out.join("dialer-1.png"), ws.screenshot().await?)?;
-        // 열린 대화상자를 확인으로 닫아 가며 주 창까지 간다 (최대 3번)
+        // close open dialogs with OK until reaching the main window (at most 3)
         for _ in 0..3 {
             let tree = ws.app_control(&json!({"action": "ui_tree"})).await?;
             let els = parse_tree(&tree);
@@ -1088,7 +1113,7 @@ async fn dialer(log: &mut TestLog, out: &Path) -> Result<()> {
 async fn attach(log: &mut TestLog, out: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let exe = std::env::current_exe()?;
-    // 동의 없이 붙기 → 거부 (사용자 앱이 이미 실행 중)
+    // attaching without consent → refused (the user's app is already running)
     let mut child = std::process::Command::new(&exe)
         .args(["--selftest-native", "--target", "--offscreen-visible", "--minimized"])
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
@@ -1114,9 +1139,11 @@ async fn attach_steps(log: &mut TestLog, out: &Path, exe: &Path, pid: u32) -> Re
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    // 사용자의 앱이 최소화되어 있던 상황: 붙으면 화면 밖에서 원래 크기로 되돌려 조작하고, 끝나면 다시 최소화되어야 한다
+    // the user's app was minimized: attaching restores it to normal size off-screen to drive it, and
+    // it must be minimized again afterwards
     let before = (main.minimized, main.visible, w32::get_placement(main.hwnd).map(|p| p.normal));
-    // 시험 대상은 '최대화 상태에서 최소화된 창'처럼 '복원하면 최대화' 플래그를 갖고 시작한다
+    // the test target starts with the "restore to maximized" flag, like a window minimized from
+    // maximized
     let restore_max = |h: w32::Hwnd| w32::get_placement(h).map(|p| p.flags & w32::WPF_RESTORETOMAXIMIZED != 0).unwrap_or(false);
     let before_max = restore_max(main.hwnd);
     step("Mode B: 시험 대상 창 확인");
@@ -1158,14 +1185,15 @@ async fn attach_steps(log: &mut TestLog, out: &Path, exe: &Path, pid: u32) -> Re
     let rec = out.join("winapp-parked.json");
     log.check("attach-recovery-record-cleared", !rec.exists(), format!("{}", rec.display()));
 
-    // 비정상 종료 복구: 남은 기록의 '원래 배치'로 되돌린다 (화면 밖 위치끼리 옮기므로 사용자 화면에는 나타나지 않음)
+    // crash recovery: restore to the logged original placement (moves between off-screen spots, so
+    // nothing appears on the user's screen)
     if let Some(w) = pw::windows_of(&[pid]).into_iter().find(|w| w.title == super::testapp::TITLE) {
         if let Some(mut pl) = w32::get_placement(w.hwnd) {
             pl.normal = (pl.normal.0 + 100, pl.normal.1 + 100, pl.normal.2 + 100, pl.normal.3 + 100);
             pl.show_cmd = w32::SW_SHOWNORMAL;
             super::recovery::remember(pid, w.hwnd, &pl, true, None);
             let had = rec.exists();
-            // 살아 있는 작업공간의 창은 복구하지 않는다
+            // windows of a live workspace aren't recovered
             let n_live = crate::native::recover_parked_windows();
             log.check("live-parked-window-not-recovered", n_live == 0 && rec.exists(), format!("되돌림 {n_live}개"));
             super::recovery::simulate_crashed_record(w.hwnd);
@@ -1176,7 +1204,8 @@ async fn attach_steps(log: &mut TestLog, out: &Path, exe: &Path, pid: u32) -> Re
             let now = w32::get_placement(w.hwnd).map(|p| p.normal);
             log.check(
                 "crash-recovery-restores-placement",
-                // 시험 대상은 지금 최소화돼 있다: 복구는 되살리지 않고(포커스를 빼앗지 않게) 복원 위치만 고친다
+                // the test target is minimized now: recovery doesn't restore it (so focus isn't stolen), it only
+                // fixes the restore position
                 had && n == 1 && now.map(|r| (r.0 - pl.normal.0).abs() <= 2 && (r.1 - pl.normal.1).abs() <= 2 && (r.2 - pl.normal.2).abs() <= 2 && (r.3 - pl.normal.3).abs() <= 2).unwrap_or(false) && w32::is_iconic(w.hwnd) && !rec.exists(),
                 format!("기록 {had}, 되돌림 {n}개, 보통 위치 {now:?} (기대 {:?} ±2px — DPI 를 모르는 창은 논리↔실제 픽셀 변환에서 1px 반올림이 생김), 최소화 유지 {}", pl.normal, w32::is_iconic(w.hwnd)),
             );

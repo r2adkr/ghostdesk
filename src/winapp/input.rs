@@ -1,13 +1,15 @@
-//! 실제 마우스 커서·키보드 없이 창 메시지로 입력하기.
+//! Input through window messages, without the real mouse cursor or keyboard.
 //!
-//! - 마우스: 스크린샷 좌표 → 창 내용 좌표 → 그 점의 가장 깊은 (보이는) 자식 창 → 그 자식 기준 좌표로
-//!   WM_MOUSEMOVE / WM_LBUTTONDOWN / WM_LBUTTONUP (/ WM_LBUTTONDBLCLK) 를 PostMessage 한다.
-//!   사용자의 커서는 움직이지 않는다. 드래그 중 GetCursorPos 로 실제 커서를 읽는 앱은 따라오지 않을 수 있다.
-//! - 휠: WM_MOUSEWHEEL / WM_MOUSEHWHEEL (lParam 은 화면 좌표 = 화면 밖 좌표).
-//! - 글자: WM_CHAR (UTF-16 단위마다 하나, 입력기를 거치지 않으므로 한글도 그대로 들어간다).
-//! - 이름 있는 키: WM_KEYDOWN / WM_KEYUP (반복 1, 스캔 코드, 확장 키 비트, 전이 비트를 맞춘 lParam).
-//!   보낸 메시지는 앱의 GetKeyState 를 바꾸지 않으므로 Ctrl/Alt/Shift 조합은 키 메시지로 흉내 낼 수 없다
-//!   (단축키는 메뉴 가속기·편집 명령 흉내로 처리한다 — workspace 참고).
+//! - Mouse: screenshot coordinates → client coordinates → deepest visible child window at that
+//!   point → coordinates relative to that child, then PostMessage WM_MOUSEMOVE / WM_LBUTTONDOWN
+//!   / WM_LBUTTONUP (/ WM_LBUTTONDBLCLK). The user's cursor never moves. Apps that read the real
+//!   cursor with GetCursorPos while dragging may not follow.
+//! - Wheel: WM_MOUSEWHEEL / WM_MOUSEHWHEEL (lParam is in screen coordinates, i.e. off-screen).
+//! - Text: WM_CHAR, one per UTF-16 unit. It bypasses the IME, so Korean goes in as is.
+//! - Named keys: WM_KEYDOWN / WM_KEYUP with an lParam carrying repeat 1, scan code, extended-key
+//!   bit and transition bits. Posted messages don't change the app's GetKeyState, so Ctrl/Alt/
+//!   Shift combos can't be faked with key messages (shortcuts are emulated through menu
+//!   accelerators and edit commands instead; see `workspace`).
 
 use anyhow::{bail, Result};
 
@@ -15,7 +17,7 @@ use super::menu::{self, Accel};
 use super::w32::{self, Hwnd};
 use crate::keys::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
-/// 스크린샷 픽셀 ↔ 창 내용 좌표 (캡처 시점 기준)
+/// Screenshot pixels ↔ client coordinates, as of the capture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geom {
     pub hwnd: Hwnd,
@@ -32,14 +34,15 @@ impl Geom {
     pub fn sy(&self) -> f64 {
         self.client_h as f64 / self.shot_h.max(1) as f64
     }
-    /// 스크린샷 좌표 → 창 내용 좌표 (실제 픽셀)
+    /// Screenshot coordinates → client coordinates (physical pixels).
     pub fn to_client(&self, x: f64, y: f64) -> (i32, i32) {
         ((x * self.sx()).floor() as i32, (y * self.sy()).floor() as i32)
     }
     pub fn contains_shot(&self, x: f64, y: f64) -> bool {
         x >= 0.0 && y >= 0.0 && x < self.shot_w as f64 && y < self.shot_h as f64
     }
-    /// 화면 좌표 사각형(l,t,r,b) → 스크린샷 좌표 [x, y, w, h]. client_origin = 지금 내용 영역 원점의 화면 좌표.
+    /// Screen rectangle `(l, t, r, b)` → screenshot `[x, y, w, h]`. `client_origin` is the client
+    /// area's current origin in screen coordinates.
     pub fn rect_to_shot(&self, client_origin: (i32, i32), r: (i32, i32, i32, i32)) -> [i64; 4] {
         let (l, t, rr, b) = r;
         [
@@ -51,8 +54,11 @@ impl Geom {
     }
 }
 
-/// 점(top 의 내용 좌표) 아래의 가장 깊은 보이는 자식 창과 그 창 기준 좌표.
-/// 그룹 상자처럼 투명한 부분은 뒤의 컨트롤로 넘어간다 (RealChildWindowFromPoint).
+/// The deepest visible child window under a point (client coordinates of `top`), and the point
+/// relative to it.
+///
+/// Transparent parts like group boxes fall through to the control behind
+/// (RealChildWindowFromPoint).
 pub fn hit(top: Hwnd, p: (i32, i32)) -> (Hwnd, (i32, i32)) {
     let mut cur = top;
     let mut pt = p;
@@ -78,7 +84,7 @@ pub fn mk_flags(mods: i64) -> usize {
     f
 }
 
-/// 왼쪽 버튼 클릭 (count 2 = 더블클릭: 창 클래스가 CS_DBLCLKS 면 WM_LBUTTONDBLCLK)
+/// Left click (`count` 2 = double click: WM_LBUTTONDBLCLK if the class has CS_DBLCLKS).
 pub fn post_click(target: Hwnd, pt: (i32, i32), count: u32, mk: usize) {
     let l = w32::make_lparam(pt.0, pt.1);
     w32::post(target, w32::WM_MOUSEMOVE, mk, l);
@@ -103,14 +109,14 @@ pub fn post_button(target: Hwnd, pt: (i32, i32), down: bool, mk: usize) {
     }
 }
 
-/// 휠 (delta: 한 칸 = 120, 양수 = 위/오른쪽). screen_pt 는 화면 좌표.
+/// Wheel (`delta`: one notch = 120, positive = up/right). `screen_pt` is in screen coordinates.
 pub fn post_wheel(target: Hwnd, screen_pt: (i32, i32), delta: i32, horizontal: bool, mk: usize) {
     let msg = if horizontal { w32::WM_MOUSEHWHEEL } else { w32::WM_MOUSEWHEEL };
     let w = w32::make_wparam(mk as u32, delta as i16 as u16 as u32);
     w32::post(target, msg, w, w32::make_lparam(screen_pt.0, screen_pt.1));
 }
 
-/// 스크롤 픽셀(에이전트 단위: 한 번 = 100px) → 휠 칸 수 (부호 유지, 최소 1칸)
+/// Scroll pixels (agent units: one step = 100 px) → wheel notches (sign kept, at least one).
 pub fn wheel_notches(px: f64) -> i32 {
     if px.abs() < 1.0 {
         return 0;
@@ -123,13 +129,14 @@ pub fn wheel_notches(px: f64) -> i32 {
     }
 }
 
-// ───────────────────────── 키보드 ─────────────────────────
+// ---- keyboard ----
 
 pub fn is_extended_vk(vk: u32) -> bool {
     matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0x6F | 0x90 | 0xA3 | 0xA5)
 }
 
-/// WM_KEYDOWN/WM_KEYUP 의 lParam: 반복 1, 스캔 코드, 확장 키 비트(24), Alt 문맥(29), 이전 상태(30)·전이(31)
+/// lParam for WM_KEYDOWN/WM_KEYUP: repeat 1, scan code, extended-key bit (24), Alt context
+/// (29), previous state (30) and transition (31).
 pub fn key_lparam(scan: u32, extended: bool, up: bool, alt: bool) -> isize {
     let mut l: u32 = 1 | ((scan & 0xFF) << 16);
     if extended {
@@ -149,8 +156,10 @@ pub fn post_key(target: Hwnd, vk: u32, up: bool) {
     w32::post(target, if up { w32::WM_KEYUP } else { w32::WM_KEYDOWN }, vk as usize, l);
 }
 
-/// 입력에 넣으면 안 되는 제어 문자를 뺀다 (\x03·\x16·\x18 은 편집 컨트롤에서 복사·붙여넣기·잘라내기다).
-/// \r\n·\r 은 \n 으로. (정리한 글자, 뺀 글자 수)
+/// Strips control characters that must not be typed (\x03, \x16 and \x18 are copy, paste and
+/// cut in edit controls) and turns \r\n and \r into \n.
+///
+/// Returns `(cleaned text, number of characters removed)`.
 pub fn sanitize_text(text: &str) -> (String, usize) {
     let t = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut removed = 0;
@@ -167,10 +176,12 @@ pub fn sanitize_text(text: &str) -> (String, usize) {
     (s, removed)
 }
 
-/// 글자 입력: 줄바꿈·탭은 키(앱의 TranslateMessage 가 글자를 만든다), 나머지는 WM_CHAR. 보낸 글자 수.
+/// Types text: newlines and tabs as keys (the app's TranslateMessage makes the characters), the
+/// rest as WM_CHAR. Returns the number of characters sent.
 ///
-/// TranslateMessage 가 만든 WM_CHAR 는 대기열 **끝**에 붙으므로, Enter/Tab 뒤에는 `flush` 로 앱이 대기열을
-/// 비울 때까지 기다린 다음 나머지 글자를 보낸다 (안 그러면 줄바꿈이 뒤로 밀린다).
+/// WM_CHAR from TranslateMessage goes to the **end** of the queue, so after Enter/Tab, `flush`
+/// waits for the app to drain its queue before the rest is sent (otherwise the newline lands
+/// late).
 pub fn post_text(target: Hwnd, text: &str, flush: &dyn Fn()) -> usize {
     let mut n = 0;
     for c in text.chars() {
@@ -197,20 +208,22 @@ pub fn post_text(target: Hwnd, text: &str, flush: &dyn Fn()) -> usize {
     n
 }
 
-/// 키 조합을 어떻게 보낼지
+/// How to send a key combo.
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeyPlan {
-    /// 글자 (수정키 없음 / shift 만) → WM_CHAR
+    /// Characters (no modifiers, or shift only) → WM_CHAR.
     Text(String),
-    /// 이름 있는 키 (수정키 없음) → WM_KEYDOWN/UP. shift = 사용자가 shift 를 함께 지정함 (반영되지 않을 수 있음)
+    /// Named key (no modifiers) → WM_KEYDOWN/UP. `shift` means the caller also asked for shift
+    /// (which may not take effect).
     Key { vk: u32, shift: bool },
-    /// Ctrl/Alt 조합 → 흉내 (편집 명령·메뉴 가속기)
+    /// Ctrl/Alt combo → emulated (edit commands, menu accelerators).
     Shortcut(Accel),
-    /// 수정키 하나만 (ctrl·shift) → 아무 효과 없음
+    /// A lone modifier (ctrl, shift) → no effect.
     BareModifier,
 }
 
-/// 에이전트의 키 조합 → 보내는 방법. 사용자 화면에 메뉴·창을 띄우는 조합은 이유와 함께 거부한다.
+/// Agent key combo → how to send it. Combos that would open menus or windows on the user's
+/// screen are refused with a reason.
 pub fn plan_combo(combo: &str) -> Result<KeyPlan> {
     let localized = crate::platform::input::localize_combo(combo);
     let c = crate::keys::parse_combo(&localized)?;
@@ -219,11 +232,11 @@ pub fn plan_combo(combo: &str) -> Result<KeyPlan> {
     let vk = c.main.key_code as u32;
     let ctrl = c.mods & MOD_CTRL != 0;
     let alt = c.mods & MOD_ALT != 0;
-    // 0x5B/0x5C = 왼쪽/오른쪽 Windows 키
+    // 0x5B/0x5C = left/right Windows key
     if c.mods & MOD_META != 0 || vk == 0x5B || vk == 0x5C {
         bail!("Windows 키 조합은 앱에 보낼 수 없습니다 (시작 메뉴·시스템 단축키는 사용자 세션 전체에 작용)");
     }
-    // 메뉴 모드·시스템 메뉴·컨텍스트 메뉴는 사용자 화면에 팝업을 그린다
+    // menu mode, the system menu and context menus draw popups on the user's screen
     if vk == 18 || (alt && !ctrl && vk == 0x20) {
         bail!("Alt 키(메뉴 모드)와 Alt+Space(창 메뉴)는 메뉴를 사용자 화면에 띄우므로 보낼 수 없습니다 — 메뉴는 app_control menus / menu 를 쓰세요");
     }
@@ -239,11 +252,11 @@ pub fn plan_combo(combo: &str) -> Result<KeyPlan> {
     if vk == 17 || vk == 16 {
         return Ok(KeyPlan::BareModifier);
     }
-    // Shift+Insert / Shift+Delete 는 편집 컨트롤의 붙여넣기·잘라내기다 → 단축키 흉내로
+    // Shift+Insert / Shift+Delete are paste/cut in edit controls → emulate as shortcuts
     if ctrl || alt || (explicit_shift && matches!(vk, 0x2D | 0x2E)) {
         return Ok(KeyPlan::Shortcut(Accel { ctrl, alt, shift: explicit_shift, vk }));
     }
-    // 글자 키 (shift 만 붙은 경우 포함) → 글자로
+    // character keys (including with shift only) → text
     if let Some(t) = c.main.text.as_ref() {
         if vk != 13 && !t.is_empty() {
             return Ok(KeyPlan::Text(t.clone()));
@@ -266,7 +279,7 @@ mod tests {
         assert_eq!(g.to_client(999.9, 499.9), (1999, 999));
         assert!(g.contains_shot(0.0, 0.0));
         assert!(!g.contains_shot(1000.0, 10.0));
-        // 내용 원점 (5000, 3000) 에서 화면 사각형 (5100,3050)-(5300,3150) → 스크린샷 [50,25,100,50]
+        // client origin (5000, 3000), screen rect (5100,3050)-(5300,3150) → screenshot [50,25,100,50]
         assert_eq!(g.rect_to_shot((5000, 3000), (5100, 3050, 5300, 3150)), [50, 25, 100, 50]);
         assert_eq!(wheel_notches(300.0), 3);
         assert_eq!(wheel_notches(-100.0), -1);
@@ -276,11 +289,11 @@ mod tests {
 
     #[test]
     fn key_lparams() {
-        // 'A' 누름: 반복 1, 스캔 0x1E
+        // 'A' down: repeat 1, scan 0x1E
         assert_eq!(key_lparam(0x1E, false, false, false), 0x001E_0001);
-        // Delete 뗌: 확장 + 이전 상태 + 전이
+        // Delete up: extended + previous state + transition
         assert_eq!(key_lparam(0x53, true, true, false) as u32, 0xC153_0001);
-        // Alt 문맥
+        // Alt context
         assert_eq!(key_lparam(0x3E, false, false, true) as u32, 0x203E_0001);
         assert!(is_extended_vk(0x2E));
         assert!(is_extended_vk(0x25));
@@ -304,7 +317,7 @@ mod tests {
         assert_eq!(plan_combo("Return").unwrap(), KeyPlan::Key { vk: 13, shift: false });
         assert_eq!(plan_combo("Delete").unwrap(), KeyPlan::Key { vk: 46, shift: false });
         assert_eq!(plan_combo("ctrl+s").unwrap(), KeyPlan::Shortcut(Accel { ctrl: true, alt: false, shift: false, vk: 0x53 }));
-        // macOS 식 cmd 는 ctrl 로
+        // macOS-style cmd becomes ctrl
         assert_eq!(plan_combo("cmd+shift+s").unwrap(), KeyPlan::Shortcut(Accel { ctrl: true, alt: false, shift: true, vk: 0x53 }));
         assert_eq!(plan_combo("alt+F4").unwrap(), KeyPlan::Shortcut(Accel { ctrl: false, alt: true, shift: false, vk: 0x73 }));
         assert_eq!(plan_combo("ctrl").unwrap(), KeyPlan::BareModifier);

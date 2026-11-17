@@ -1,7 +1,7 @@
-//! 에이전트가 조작하는 "격리 화면"의 공통 인터페이스.
+//! Common interface for the isolated screens agents operate.
 //!
-//! 백엔드마다 같은 이름의 고유 메서드를 구현하고, 여기서는 enum 으로 분기만 한다.
-//! (async fn 을 가진 trait 은 dyn 으로 쓰기 불편하므로 enum dispatch 를 쓴다.)
+//! Each backend implements inherent methods with the same names, and this module just dispatches
+//! over an enum (traits with async fns are awkward to use as `dyn`).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -24,17 +24,17 @@ pub struct ViewInfo {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DeskKind {
-    /// 복제 프로필의 headless Chromium (탭 = 뷰)
+    /// Headless Chromium on a cloned profile (tab = view).
     Browser,
-    /// RFB(VNC)로 접속한 별도 데스크톱 세션 (VM, 다른 Mac, Linux Xvnc 등)
+    /// A separate desktop session over RFB (VNC): a VM, another Mac, Linux Xvnc, …
     Remote,
-    /// 숨김 실행한 Electron 앱 복제 인스턴스 (CDP)
+    /// A hidden clone instance of an Electron app (CDP).
     Electron,
-    /// 숨겨진 macOS 앱 창 (ScreenCaptureKit + 접근성)
+    /// Hidden macOS app windows (ScreenCaptureKit + Accessibility).
     Native,
-    /// 전용 에이전트 계정의 별도 로그인 세션 (RDP 방식, 세션 헬퍼)
+    /// A separate login session of a dedicated agent account (RDP-style, session helper).
     Session,
-    /// 실험: 가상 디스플레이 위의 macOS 앱 (실제 픽셀 입력)
+    /// Experimental: macOS apps on a virtual display (real pixel input).
     VDisplay,
 }
 
@@ -61,30 +61,34 @@ macro_rules! each {
     };
 }
 
-/// 시스템 클립보드에 닿는 키 조합인가 (복사·잘라내기·붙여넣기). shift 등 다른 수정키가 붙어도 해당한다.
-/// - cmd/ctrl + c·x·v (ctrl+shift+v 같은 '서식 없이 붙여넣기' 포함)
-/// - (macOS 제외) Windows·Chromium 의 옛 클립보드 키: ctrl+Insert(복사), shift+Insert(붙여넣기),
-///   shift+Delete(잘라내기). Insert 는 meta 가 붙어도 막는다. macOS 에는 이 바인딩이 없으므로 예전처럼 그대로 보낸다.
+/// Whether a key combo touches the system clipboard (copy, cut, paste), even with extra
+/// modifiers like shift.
+///
+/// - cmd/ctrl + c, x, v (including "paste without formatting" like ctrl+shift+v)
+/// - outside macOS, the legacy Windows/Chromium clipboard keys: ctrl+Insert (copy), shift+Insert
+///   (paste), shift+Delete (cut). Insert is blocked even with meta. macOS has no such bindings,
+///   so they pass through as before.
 pub fn is_clipboard_combo(combo: &str) -> bool {
     use crate::keys::{parse_combo, MOD_CTRL, MOD_META, MOD_SHIFT};
     let Ok(c) = parse_combo(combo) else { return false };
     match c.main.key.to_ascii_lowercase().as_str() {
         "c" | "x" | "v" => c.mods & (MOD_CTRL | MOD_META) != 0,
         "insert" if !cfg!(target_os = "macos") => c.mods & (MOD_CTRL | MOD_SHIFT | MOD_META) != 0,
-        // ctrl+Delete 는 '다음 단어 지우기' 라 그대로 둔다
+        // ctrl+Delete deletes the next word, let it through
         "delete" if !cfg!(target_os = "macos") => c.mods & MOD_SHIFT != 0 && c.mods & MOD_CTRL == 0,
         _ => false,
     }
 }
 
-/// 이 컴퓨터 안에서 도는 백엔드(헤드리스 브라우저·Electron·로컬 앱)인가.
-/// 이런 화면에서는 macOS 가 아니면 cmd → ctrl 로 바꿔 보낸다 (`platform::input`).
-/// 원격(VNC)·별도 세션·가상 디스플레이는 상대 화면의 OS 규칙을 따르므로 그대로 보낸다.
+/// Whether the backend runs on this machine (headless browser, Electron, local apps).
+///
+/// On those screens cmd is sent as ctrl outside macOS (`platform::input`). Remote (VNC),
+/// separate-session and virtual-display screens follow the other screen's OS and are sent as is.
 fn is_local_kind(kind: DeskKind) -> bool {
     matches!(kind, DeskKind::Browser | DeskKind::Electron | DeskKind::Native)
 }
 
-/// 화면 종류에 맞게 키 조합을 현지화한다 (macOS 에서는 항상 그대로).
+/// Localizes a key combo for the screen kind (always unchanged on macOS).
 fn localize_combo_for(kind: DeskKind, combo: &str) -> Cow<'_, str> {
     if is_local_kind(kind) {
         crate::platform::input::localize_combo(combo)
@@ -93,7 +97,7 @@ fn localize_combo_for(kind: DeskKind, combo: &str) -> Cow<'_, str> {
     }
 }
 
-/// 화면 종류에 맞게 마우스 수정키 비트를 현지화한다 (macOS 에서는 항상 그대로).
+/// Localizes mouse modifier bits for the screen kind (always unchanged on macOS).
 fn localize_mods_for(kind: DeskKind, mods: i64) -> i64 {
     if is_local_kind(kind) {
         crate::platform::input::localize_mods(mods)
@@ -142,7 +146,7 @@ impl Desk {
         }
     }
 
-    /// 스크린샷 픽셀 크기 (에이전트 좌표계)
+    /// Screenshot size in pixels (the agent's coordinate space).
     pub fn size(&self) -> (u32, u32) {
         each!(self, w => w.size())
     }
@@ -155,12 +159,12 @@ impl Desk {
         each!(self, w => w.zoom(region).await)
     }
 
-    /// 마우스 수정키 비트를 이 화면에 맞게 (로컬 백엔드 + macOS 아님: cmd → ctrl)
+    /// Mouse modifier bits adjusted for this screen (local backend outside macOS: cmd → ctrl).
     fn mods(&self, mods: i64) -> i64 {
         localize_mods_for(self.kind(), mods)
     }
 
-    /// 키 조합을 이 화면에 맞게 (로컬 백엔드 + macOS 아님: cmd → ctrl)
+    /// Key combo adjusted for this screen (local backend outside macOS: cmd → ctrl).
     fn combo<'a>(&self, combo: &'a str) -> Cow<'a, str> {
         localize_combo_for(self.kind(), combo)
     }
@@ -170,8 +174,11 @@ impl Desk {
         each!(self, w => w.mouse_move(x, y, mods).await)
     }
 
-    /// 현재 위치에서 (x, y) 까지 사람처럼 부드럽게 이동한다 (ease-in-out 경로의 mouseMoved 연속 전송).
-    /// 숨긴 로컬 앱(Native)은 포인터 개념이 없어(의미 기반 클릭·창 메시지) 이동만 기록한다.
+    /// Glides smoothly from the current position to `(x, y)` like a person (a stream of mouseMoved
+    /// events along an ease-in-out path).
+    ///
+    /// Hidden local apps (Native) have no pointer (clicks are semantic or window messages), so the
+    /// move is only recorded.
     pub async fn glide_to(&self, x: f64, y: f64, mods: i64) -> Result<()> {
         if self.kind() == DeskKind::Native {
             return Ok(());
@@ -219,15 +226,18 @@ impl Desk {
         each!(self, w => w.scroll(pos, dx, dy, mods).await)
     }
 
-    /// 에이전트(내부·외부)의 키 입력. Electron 화면은 사용자의 실제 시스템 클립보드를 공유하므로
-    /// 복사·잘라내기·붙여넣기 조합(`is_clipboard_combo`)은 거부한다 (사용자의 직접 조작은 `key_by_human` 을 쓴다).
+    /// Key input from an agent (internal or external).
+    ///
+    /// Electron screens share the user's real system clipboard, so copy/cut/paste combos
+    /// (`is_clipboard_combo`) are refused. The user's own takeover input uses `key_by_human`.
     pub async fn key(&self, combo: &str, repeat: u32) -> Result<()> {
         let combo = self.combo(combo);
         self.check_clipboard_combo(&combo)?;
         each!(self, w => w.key(&combo, repeat).await)
     }
 
-    /// 사용자가 '직접 조작'으로 누른 키. 사람이 직접 한 입력이므로 클립보드 조합도 그대로 전달한다.
+    /// A key the user pressed during takeover. It's the person's own input, so clipboard combos pass
+    /// through too.
     pub async fn key_by_human(&self, combo: &str, repeat: u32) -> Result<()> {
         let combo = self.combo(combo);
         each!(self, w => w.key(&combo, repeat).await)
@@ -263,7 +273,7 @@ impl Desk {
         each!(self, w => w.mouse_pos())
     }
 
-    /// 탭(브라우저) 또는 창(앱) 목록과 현재 뷰 id
+    /// Tabs (browser) or windows (app), plus the current view id.
     pub fn views(&self) -> (Vec<ViewInfo>, Option<String>) {
         each!(self, w => w.views())
     }
@@ -317,12 +327,13 @@ mod tests {
     fn clipboard_combos() {
         for c in [
             "cmd+c", "cmd+v", "cmd+x", "ctrl+c", "ctrl+V", "super+v", "cmd+shift+v", "command+x", "meta+c",
-            // 서식 없이 붙여넣기 등 수정키가 더 붙은 경우
+            // with extra modifiers, e.g. paste without formatting
             "ctrl+shift+v", "ctrl+shift+V", "ctrl+alt+v",
         ] {
             assert!(is_clipboard_combo(c), "{c}");
         }
-        // Windows·Chromium 의 Insert/Delete 클립보드 키: macOS 밖에서만 막는다 (macOS 는 예전처럼 그대로 보냄)
+        // Windows/Chromium Insert/Delete clipboard keys: blocked outside macOS only (macOS sends them
+        // as before)
         for c in [
             "ctrl+Insert", "shift+Insert", "Shift+insert", "ctrl+shift+Insert", "meta+Insert", "cmd+Insert",
             "shift+Delete", "shift+del", "shift+KP_Delete", "shift+alt+Delete",
@@ -351,13 +362,13 @@ mod tests {
             assert_eq!(m, if remap { MOD_CTRL | MOD_SHIFT } else { MOD_META | MOD_SHIFT }, "{k:?}");
             assert_eq!(localize_mods_for(k, MOD_ALT), MOD_ALT);
         }
-        // 원격·별도 세션·가상 디스플레이는 상대 화면의 OS 를 따르므로 그대로
+        // remote, separate-session and virtual-display screens follow the other side's OS, so unchanged
         for k in [DeskKind::Remote, DeskKind::Session, DeskKind::VDisplay] {
             assert!(!is_local_kind(k));
             assert_eq!(localize_combo_for(k, "cmd+c"), "cmd+c", "{k:?}");
             assert_eq!(localize_mods_for(k, MOD_META), MOD_META, "{k:?}");
         }
-        // 현지화한 조합도 클립보드 검사에 그대로 걸린다
+        // localized combos still hit the clipboard check
         assert!(is_clipboard_combo(&localize_combo_for(DeskKind::Electron, "cmd+v")));
         assert_eq!(is_clipboard_combo(&localize_combo_for(DeskKind::Electron, "cmd+Insert")), !cfg!(target_os = "macos"));
     }

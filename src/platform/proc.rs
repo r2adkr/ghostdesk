@@ -1,16 +1,19 @@
-//! 자식 프로세스 관리: 자손까지 한 번에 정리하기, 콘솔 창 숨기기, GUI 를 분리해서 띄우기.
+//! Child process management: cleaning up whole process trees, hiding console windows, and
+//! launching detached GUIs.
 //!
-//! - Unix: 새 프로세스 그룹(pgid == pid)으로 띄우고 `killpg` 로 정리한다 (기존 동작 그대로).
-//! - Windows: 프로세스 그룹 대신 **Job 객체**를 쓴다. 일시정지 상태로 띄워 Job 에 넣은 뒤 재개하므로
-//!   자식이 만드는 손자 프로세스(Chromium 렌더러·GPU 헬퍼, Electron 헬퍼 …)도 빠짐없이 같은 Job 에 들어간다.
-//!   Job 은 `KILL_ON_JOB_CLOSE` 로 만들어 GhostDesk 가 비정상 종료되어도 자손이 남지 않는다.
+//! - Unix: spawn in a new process group (pgid == pid) and clean up with `killpg`, as before.
+//! - Windows: a **Job object** instead of a process group. The child is created suspended, put in
+//!   the Job and then resumed, so every grandchild it spawns (Chromium renderers and GPU helpers,
+//!   Electron helpers, …) lands in the same Job. The Job is created with `KILL_ON_JOB_CLOSE`, so
+//!   no descendants survive even if GhostDesk crashes.
 
 use std::process::{Child, Command};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-/// 콘솔 프로그램(cmd·claude.cmd·taskkill …)을 띄울 때 검은 콘솔 창이 깜빡이지 않게 한다.
+/// Keeps a black console window from flashing when launching console programs (cmd,
+/// claude.cmd, taskkill, …).
 pub fn hide_console(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
@@ -19,13 +22,15 @@ pub fn hide_console(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// 자손까지 함께 정리할 수 있게 띄운다. `kill_group` 으로 정리한다.
-/// (Windows 에서는 creation_flags 를 덮어쓰므로, 다른 플래그가 필요하면 `spawn_group_with_flags` 를 쓴다.)
+/// Spawns so the child and its descendants can be cleaned up together with `kill_group`.
+///
+/// On Windows this overwrites `creation_flags`; use `spawn_group_with_flags` if other flags are
+/// needed.
 pub fn spawn_group(cmd: &mut Command) -> std::io::Result<Child> {
     spawn_group_with_flags(cmd, 0)
 }
 
-/// `spawn_group` 과 같되 Windows 생성 플래그를 더한다 (Unix 에서는 무시).
+/// Like `spawn_group`, with extra Windows creation flags (ignored on Unix).
 pub fn spawn_group_with_flags(cmd: &mut Command, extra_windows_flags: u32) -> std::io::Result<Child> {
     #[cfg(unix)]
     {
@@ -45,8 +50,9 @@ pub fn spawn_group_with_flags(cmd: &mut Command, extra_windows_flags: u32) -> st
     }
 }
 
-/// `spawn_group` 으로 띄운 자식을 자손까지 강제 종료하고 회수한다.
-/// 이미 회수한 자식이면(pid 재사용 위험) 그룹 신호는 보내지 않는다.
+/// Force-kills a child spawned with `spawn_group`, descendants included, and reaps it.
+///
+/// No group signal is sent if the child was already reaped (its pid may have been reused).
 pub fn kill_group(child: &mut Child) {
     let running = matches!(child.try_wait(), Ok(None));
     #[cfg(unix)]
@@ -57,15 +63,15 @@ pub fn kill_group(child: &mut Child) {
     }
     #[cfg(windows)]
     {
-        // 본 프로세스가 이미 끝났어도 Job 에 남은 자손(헬퍼)은 Job 을 닫으며 정리한다
+        // even if the main process is gone, helpers left in the Job die when the Job is closed
         win_job::terminate(child.id(), running);
     }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-/// 그룹(Windows: Job)에 속한 살아 있는 프로세스 pid 목록. Windows 에서만 Some.
-/// Unix 에서는 호출하는 쪽이 pgid·부모 관계로 직접 찾는다.
+/// Pids of live processes in the group (the Job on Windows). Only `Some` on Windows; on Unix the
+/// caller finds them through pgid and parent links.
 pub fn group_pids(pid: u32) -> Option<Vec<u32>> {
     #[cfg(windows)]
     {
@@ -78,8 +84,8 @@ pub fn group_pids(pid: u32) -> Option<Vec<u32>> {
     }
 }
 
-/// 자식을 회수하지 않고 끝났는지만 본다 (Windows: WaitForSingleObject(…, 0)).
-/// 끝났으면 Some(종료 코드).
+/// Checks whether the child has exited without reaping it (Windows: `WaitForSingleObject(…, 0)`).
+/// Returns `Some(exit code)` if it has.
 #[cfg(windows)]
 pub fn peek_exit(child: &Child) -> Option<i32> {
     use std::os::windows::io::AsRawHandle;
@@ -98,7 +104,7 @@ pub fn peek_exit(child: &Child) -> Option<i32> {
     }
 }
 
-/// 실행 중인 프로세스인가 (pid 기준, 대략적인 확인)
+/// Whether a process with this pid is running (a rough check).
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -111,7 +117,7 @@ pub fn pid_alive(pid: u32) -> bool {
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {
-                // 접근 거부면 (다른 사용자·보호 프로세스) 살아 있는 것으로 본다
+                // access denied (another user, protected process) counts as alive
                 return std::io::Error::last_os_error().raw_os_error() == Some(5);
             }
             let mut code = 0u32;
@@ -127,12 +133,14 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// 부모와 분리된 GUI 프로세스로 띄운다 (MCP 서버가 GhostDesk 창을 띄울 때).
+/// Launches a GUI process detached from the parent (used when the MCP server opens the GhostDesk
+/// window).
 ///
-/// Windows: 콘솔과 분리(DETACHED_PROCESS)하고, 호스트가 MCP 서버를 Job 에 넣어 두었더라도
-/// 창이 MCP 서버와 함께 죽지 않게 Job 에서 빠져나온다(CREATE_BREAKAWAY_FROM_JOB — 허용되지 않으면 없이 재시도).
-/// 환경변수는 MCP 호스트가 줄여 놓은 것이 아니라 **사용자의 기본 환경**(CreateEnvironmentBlock)을 쓴다:
-/// macOS 의 `open -g` 가 LaunchServices 환경으로 띄우는 것과 같은 효과다.
+/// Windows: detaches from the console (DETACHED_PROCESS) and breaks out of any Job the host put
+/// the MCP server in (CREATE_BREAKAWAY_FROM_JOB, retried without it if not allowed), so the
+/// window doesn't die with the MCP server. The environment is the **user's default environment**
+/// (CreateEnvironmentBlock) rather than the one the MCP host trimmed down, the same effect as
+/// `open -g` launching through LaunchServices on macOS.
 pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
     #[cfg(unix)]
     {
@@ -144,7 +152,7 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
     {
         use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
         if let Some(env) = super::win::user_environment() {
-            // GHOSTDESK_* 설정(클라이언트 이름 등)은 그대로 넘긴다
+            // pass GHOSTDESK_* settings (client name and such) through
             let keep: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
                 .filter(|(k, _)| k.to_string_lossy().to_ascii_uppercase().starts_with("GHOSTDESK_"))
                 .collect();
@@ -153,7 +161,7 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
         let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
         cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
         match cmd.spawn() {
-            // Job 이 breakaway 를 허용하지 않으면 접근 거부(5)
+            // access denied (5) when the Job doesn't allow breakaway
             Err(e) if e.raw_os_error() == Some(5) => {
                 cmd.creation_flags(base);
                 cmd.spawn()
@@ -190,12 +198,12 @@ mod win_job {
     };
 
     struct Job(HANDLE);
-    // 커널 핸들은 스레드 사이에서 옮겨도 안전하다
+    // kernel handles are safe to move between threads
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
     impl Drop for Job {
         fn drop(&mut self) {
-            // KILL_ON_JOB_CLOSE: 마지막 핸들이 닫히면 남은 프로세스가 모두 끝난다
+            // KILL_ON_JOB_CLOSE: closing the last handle ends every remaining process
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -227,7 +235,7 @@ mod win_job {
         }
     }
 
-    /// 일시정지 상태로 만든 새 프로세스의 (유일한) 스레드를 재개한다
+    /// Resumes the (only) thread of a process created suspended.
     fn resume_process(pid: u32) -> bool {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -286,14 +294,14 @@ mod win_job {
             if running {
                 unsafe { TerminateJobObject(job.0, 1) };
             }
-            // drop(job) → 핸들을 닫아 남은 자손도 정리
+            // drop(job) closes the handle and cleans up remaining descendants
         }
     }
 
     pub fn pids(pid: u32) -> Option<Vec<u32>> {
         let map = jobs().lock();
         let job = map.get(&pid)?;
-        // JOBOBJECT_BASIC_PROCESS_ID_LIST: u32 할당 수, u32 실제 수, usize[] pid
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST: u32 assigned count, u32 actual count, usize[] pids
         let mut buf = vec![0usize; 2 + 1024];
         unsafe {
             let hdr = buf.as_mut_ptr() as *mut u32;
@@ -309,7 +317,7 @@ mod win_job {
                 return None;
             }
             let n = *hdr.add(1) as usize;
-            // 헤더 두 u32 다음에 ULONG_PTR 배열이 온다 (64비트에서는 8바이트 정렬 = buf[1] 부터)
+            // the ULONG_PTR array follows the two u32 header fields (8-byte aligned on 64-bit, so from buf[1])
             let list = (buf.as_ptr() as *const u8).add(std::mem::size_of::<usize>().max(8)) as *const usize;
             Some((0..n.min(1024)).map(|i| *list.add(i) as u32).collect())
         }
@@ -322,16 +330,16 @@ mod tests {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    /// 자식이 손자를 띄운 뒤 kill_group 하면 손자까지 끝나야 한다
+    /// `kill_group` after the child spawned a grandchild must end the grandchild too.
     #[cfg(windows)]
     #[test]
     fn kill_group_kills_grandchildren() {
-        // cmd /c → ping (손자) 을 오래 돌린다
+        // cmd /c → a long-running ping (the grandchild)
         let mut cmd = Command::new("cmd.exe");
         cmd.args(["/c", "ping -n 30 127.0.0.1 >NUL"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let mut child = spawn_group(&mut cmd).expect("spawn");
         let pid = child.id();
-        // 손자가 생길 때까지 기다린다
+        // wait for the grandchild to appear
         let start = Instant::now();
         let mut pids = vec![];
         while start.elapsed() < Duration::from_secs(10) {

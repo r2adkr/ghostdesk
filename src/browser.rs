@@ -1,8 +1,8 @@
-//! 격리 브라우저 작업공간.
+//! Isolated browser workspace.
 //!
-//! 복제한 프로필로 별도의 Chromium 프로세스를 (기본: headless) 띄우고,
-//! 모든 입력/화면 캡처를 CDP 로만 처리한다. OS 의 마우스 커서·키보드 포커스·
-//! 사용자의 브라우저 창에는 전혀 손대지 않는다.
+//! Launches a separate Chromium process (headless by default) on a cloned profile and drives all
+//! input and screen capture through CDP alone. The OS mouse cursor, keyboard focus and the user's
+//! own browser windows are never touched.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -27,8 +27,11 @@ use crate::{
 
 pub type FrameSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// 끌 기능들. (`--disable-features` 는 여러 번 주면 마지막 것만 적용되므로 한 번에 모아 준다)
-/// Windows: 창 가림(occlusion) 계산을 꺼서, 창 표시 모드에서 다른 창에 가려져도 그리기를 멈추지 않게 한다.
+/// Features to disable. (`--disable-features` only honors the last occurrence, so they're passed
+/// together.)
+///
+/// Windows: turns off occlusion tracking so that in windowed mode, painting doesn't stop while
+/// other windows cover it.
 #[cfg(not(windows))]
 const DISABLE_FEATURES: &str = "--disable-features=Translate,MediaRouter,DialMediaRouteProvider";
 #[cfg(windows)]
@@ -84,23 +87,23 @@ struct State {
     sessions: HashMap<String, String>,
     mouse: (f64, f64),
     buttons: i64,
-    /// 에이전트에게 알려줄 사건 (새 탭 열림 등)
+    /// Events to tell the agent about (new tab opened, …).
     notes: Vec<String>,
-    /// (드래그 가로채기 모드) 가로챈 HTML5 드래그. 버튼을 뗄 때 페이지 안에서 끝낸다.
+    /// (Drag interception) The intercepted HTML5 drag, finished inside the page on button release.
     drag: Option<DragState>,
-    /// (드래그 가로채기 모드) 왼쪽 버튼을 누른 뒤 움직였는지 (드래그가 시작됐을 수 있음)
+    /// (Drag interception) Whether the mouse moved with the left button down (a drag may have started).
     moved_pressed: bool,
-    /// (드래그 가로채기 모드) Input.setInterceptDrags 를 켜지 못한 세션 (오래된 Electron 등)
+    /// (Drag interception) Sessions where Input.setInterceptDrags couldn't be enabled (old Electron, …).
     no_intercept: HashSet<String>,
 }
 
-/// 가로챈 HTML5 드래그 (Input.dragIntercepted)
+/// An intercepted HTML5 drag (Input.dragIntercepted).
 #[derive(Clone, Debug)]
 struct DragState {
     session: String,
-    /// Input.DragData (그대로 Input.dispatchDragEvent 에 넘긴다)
+    /// Input.DragData (passed to Input.dispatchDragEvent as is).
     data: Value,
-    /// dragEnter 를 이미 보냈는지
+    /// Whether dragEnter was already sent.
     entered: bool,
 }
 
@@ -110,9 +113,10 @@ pub struct BrowserWorkspace {
     pub width: u32,
     pub height: u32,
     user_agent: Option<String>,
-    /// Electron 앱 모드 (ConnectOptions::app_mode 참고)
+    /// Electron app mode (see ConnectOptions::app_mode).
     app_mode: bool,
-    /// HTML5 드래그를 OS 로 넘기지 않고 가로채 페이지 안에서 끝낸다 (ConnectOptions::intercept_drags 참고)
+    /// Intercepts HTML5 drags and finishes them inside the page instead of handing them to the OS
+    /// (see ConnectOptions::intercept_drags).
     intercept_drags: bool,
     state: Mutex<State>,
     ready: AtomicBool,
@@ -120,28 +124,33 @@ pub struct BrowserWorkspace {
     sink: FrameSink,
 }
 
-/// 이미 떠 있는 Chromium/Electron 의 CDP 엔드포인트에 붙을 때의 옵션.
+/// Options for attaching to the CDP endpoint of an already running Chromium/Electron.
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
     pub width: u32,
     pub height: u32,
-    /// Electron 앱 모드: 탭을 새로 만들지 않고(Target.createTarget 금지), 창을 앞으로
-    /// 가져오는 Target.activateTarget 도 보내지 않으며, devtools/확장 페이지는 뷰에서 제외한다.
+    /// Electron app mode: no new tabs (no Target.createTarget), no Target.activateTarget (it brings
+    /// windows to the front), and devtools/extension pages are left out of the views.
     pub app_mode: bool,
-    /// headless UA 의 "HeadlessChrome" 을 "Chrome" 으로 바꿔 보낼지 (브라우저 headless 전용)
+    /// Whether to send the headless UA with "HeadlessChrome" replaced by "Chrome" (headless browser
+    /// only).
     pub fix_headless_ua: bool,
-    /// 연결 직후 이동할 주소 (비어 있으면 이동하지 않음)
+    /// URL to navigate to right after connecting (empty = don't navigate).
     pub start_url: String,
-    /// 페이지 타깃(창)이 나타날 때까지 기다릴 최대 시간 (app_mode 에서만 의미 있음)
+    /// How long to wait for a page target (window) to appear (only meaningful in app_mode).
     pub page_wait: Duration,
-    /// HTML5 드래그 가로채기: 붙는 모든 페이지 세션에 Input.setInterceptDrags 를 켜고, 에이전트의 드래그가
-    /// 시작한 끌어 놓기를 Input.dispatchDragEvent(dragEnter·dragOver·drop)로 페이지 안에서 끝낸다.
-    /// 창이 있는(headful) 앱에서는 이렇게 하지 않으면 Chromium 이 OS 끌어 놓기(Windows: OLE DoDragDrop)를
-    /// 시작하고, 그 놓기는 사용자의 실제 커서 아래 창에서 일어난다. (Windows Electron 작업공간 전용)
+    /// HTML5 drag interception: enables Input.setInterceptDrags on every attached page session and
+    /// finishes drags started by the agent inside the page with Input.dispatchDragEvent (dragEnter,
+    /// dragOver, drop).
+    ///
+    /// Without it, a windowed (headful) app makes Chromium start an OS drag and drop (Windows: OLE
+    /// DoDragDrop), and the drop lands on whatever window is under the user's real cursor. (Windows
+    /// Electron workspaces only.)
     pub intercept_drags: bool,
 }
 
-/// 뷰(탭/창)로 취급할 타깃인지. devtools·확장·서비스워커 등은 제외한다.
+/// Whether the target counts as a view (tab/window). devtools, extensions, service workers, …
+/// are excluded.
 pub fn is_view_target(info: &Value, app_mode: bool) -> bool {
     if info["type"] != "page" {
         return false;
@@ -158,7 +167,7 @@ pub fn is_view_target(info: &Value, app_mode: bool) -> bool {
 
 impl BrowserWorkspace {
     pub async fn launch(opts: LaunchOptions, sink: FrameSink) -> Result<Arc<Self>> {
-        // 시작 주소도 navigate 와 같은 규칙으로 확인한다 (브라우저를 띄우기 전에)
+        // check the start URL with the same rules as navigate (before launching the browser)
         #[cfg(windows)]
         if !opts.start_url.trim().is_empty() {
             if let Some(why) = remote_file_refusal(&opts.start_url, &normalize_url(&opts.start_url)) {
@@ -183,7 +192,7 @@ impl BrowserWorkspace {
         .await
     }
 
-    /// Chromium 을 띄우고 DevToolsActivePort 로 브라우저 웹소켓 주소를 얻는다.
+    /// Launches Chromium and reads the browser websocket URL from DevToolsActivePort.
     pub async fn spawn(opts: &LaunchOptions) -> Result<(Child, String)> {
         std::fs::create_dir_all(&opts.user_data_dir)?;
         let port_file = opts.user_data_dir.join("DevToolsActivePort");
@@ -209,8 +218,8 @@ impl BrowserWorkspace {
         if opts.headless {
             cmd.arg("--headless=new");
         }
-        // Windows: 복제한 프로필에 '닫아도 백그라운드 앱 계속 실행'이 켜져 있어도 알림 영역(트레이) 아이콘을
-        // 만들거나 Browser.close 뒤에 남아 있지 않게 한다
+        // Windows: even if the cloned profile has "continue running background apps when closed" on,
+        // don't create a tray icon or linger after Browser.close
         #[cfg(windows)]
         cmd.arg("--disable-background-mode");
         cmd.arg("about:blank");
@@ -219,11 +228,11 @@ impl BrowserWorkspace {
             Some(f) => cmd.stderr(f),
             None => cmd.stderr(Stdio::null()),
         };
-        // 자체 프로세스 그룹(Unix: pgid, Windows: Job 객체)으로 띄워, 준비 도중 취소되면
-        // 렌더러·GPU 헬퍼까지 한 번에 정리한다. Windows 의 Job 은 KILL_ON_JOB_CLOSE 라
-        // GhostDesk 가 비정상 종료돼도 보이지 않는 Chromium 이 남지 않는다.
-        // 준비가 끝나 작업공간이 소유권을 가져가기 전까지는 가드가 쥔다:
-        // 이 future 가 abort(에이전트 제거)되거나 오류로 끝나면 Drop 에서 Chromium 을 죽인다.
+        // launch in its own process group (Unix: pgid, Windows: Job object) so that cancelling during
+        // startup also cleans up renderer and GPU helpers. The Windows Job is KILL_ON_JOB_CLOSE, so no
+        // invisible Chromium is left behind even if GhostDesk crashes.
+        // The guard holds it until startup finishes and the workspace takes ownership: if this future is
+        // aborted (agent removed) or errors out, Drop kills Chromium.
         let mut guard = ChildGuard::new(
             crate::platform::proc::spawn_group(&mut cmd)
                 .with_context(|| format!("브라우저 실행 실패: {}", opts.exe.display()))?,
@@ -232,15 +241,16 @@ impl BrowserWorkspace {
         tests_support::record_spawn(&opts.user_data_dir, guard.get().id());
         let child = guard.get();
 
-        // DevToolsActivePort 파일이 생길 때까지 대기
+        // wait for the DevToolsActivePort file to appear
         let start = Instant::now();
         let ws_url = loop {
             if let Some(u) = read_devtools_port_file(&port_file) {
                 break u;
             }
             if let Ok(Some(status)) = child.try_wait() {
-                // Windows: 일부 브라우저(네이버 웨일 등)는 실행 파일이 런처라, 실제 브라우저를 자식으로 띄우고
-                // 바로 끝난다. 그 자식은 같은 Job 안에 있으므로, Job 에 살아 있는 프로세스가 있으면 계속 기다린다.
+                // Windows: some browsers (Naver Whale, …) ship a launcher executable that starts the real browser
+                // as a child and exits right away. The child stays in the same Job, so keep waiting while the Job
+                // has live processes.
                 #[cfg(windows)]
                 let handed_off = launcher_handed_off(child);
                 #[cfg(not(windows))]
@@ -254,7 +264,7 @@ impl BrowserWorkspace {
                 }
             }
             if start.elapsed() > Duration::from_secs(40) {
-                // 가드가 Drop 에서 프로세스 그룹을 죽이고 회수한다
+                // the guard kills and reaps the process group on drop
                 #[cfg(windows)]
                 bail!(
                     "브라우저 디버깅 포트를 40초 안에 찾지 못했습니다. 회사·학교 관리 정책(RemoteDebuggingAllowed, \
@@ -268,8 +278,10 @@ impl BrowserWorkspace {
         Ok((guard.release(), ws_url))
     }
 
-    /// 이미 실행 중인 Chromium/Electron 의 브라우저 웹소켓(`ws://…/devtools/browser/…`)에 붙는다.
-    /// `child` 를 주면 종료 시 함께 정리한다 (Electron 처럼 바깥에서 프로세스를 관리하면 None).
+    /// Attaches to the browser websocket (`ws://…/devtools/browser/…`) of a running Chromium/Electron.
+    ///
+    /// If `child` is given it's cleaned up on shutdown (None when the process is managed elsewhere,
+    /// as with Electron).
     pub async fn connect(ws_url: &str, child: Option<Child>, opts: ConnectOptions, sink: FrameSink) -> Result<Arc<Self>> {
         let cdp = Cdp::connect(ws_url).await?;
         let user_agent = if opts.fix_headless_ua && !opts.app_mode {
@@ -298,8 +310,8 @@ impl BrowserWorkspace {
             sink,
         });
 
-        // 준비(ready) 전에 취소·오류로 빠져나가면 event_loop 가 Arc 를 쥐고 있어 Drop 이 돌지 않는다.
-        // 그 경우에도 우리가 띄운 Chromium 은 직접 죽인다 (child 가 없으면 아무것도 하지 않음).
+        // if we bail out (cancelled or errored) before ready, event_loop still holds the Arc and Drop
+        // won't run, so kill the Chromium we launched ourselves (no-op without a child)
         let mut pre_ready = CloseOnDrop(Some(ws.clone()));
         let rx = cdp.subscribe();
         tokio::spawn(ws.clone().event_loop(rx));
@@ -329,7 +341,7 @@ impl BrowserWorkspace {
                     first.get_or_insert(id);
                 }
             }
-            // 앱 모드에서는 about:blank 스플래시보다 실제 내용이 있는 창을 고른다
+            // in app mode, prefer a window with real content over the about:blank splash
             let pick = if opts.app_mode { first_nonblank.or(first) } else { first };
             if pick.is_some() || !opts.app_mode || start.elapsed() > opts.page_wait {
                 break pick;
@@ -355,7 +367,7 @@ impl BrowserWorkspace {
         Ok(ws)
     }
 
-    // ───────────────────────── 이벤트 처리 ─────────────────────────
+    // ---- events ----
 
     async fn event_loop(self: Arc<Self>, mut rx: tokio::sync::broadcast::Receiver<CdpEvent>) {
         loop {
@@ -416,7 +428,7 @@ impl BrowserWorkspace {
                         true
                     }
                 };
-                // 페이지가 연 팝업/새 탭이면 자동으로 그쪽으로 전환
+                // popups and new tabs opened by the page are switched to automatically
                 if is_new && has_opener && self.ready.load(Ordering::SeqCst) && !self.app_mode {
                     self.state
                         .lock()
@@ -424,7 +436,7 @@ impl BrowserWorkspace {
                         .push("페이지가 새 탭을 열어 그 탭으로 전환했습니다.".into());
                     self.activate(&id).await?;
                 }
-                // 앱 모드: 새 창이 열리면 (보이지 않게 숨겨진 상태로) 그 창으로 전환
+                // app mode: switch to a new window when it opens (kept hidden)
                 if is_new && self.app_mode && self.ready.load(Ordering::SeqCst) {
                     self.state
                         .lock()
@@ -487,7 +499,7 @@ impl BrowserWorkspace {
                 }
             }
             "Page.javascriptDialogOpening" => {
-                // alert/confirm 이 열리면 페이지가 멈추므로 자동으로 수락하고 기록한다.
+                // alert/confirm blocks the page, so accept it automatically and record it
                 let msg = ev.params["message"].as_str().unwrap_or_default().to_string();
                 let kind = ev.params["type"].as_str().unwrap_or("dialog").to_string();
                 self.state
@@ -500,9 +512,10 @@ impl BrowserWorkspace {
                     .await;
             }
             "Input.dragIntercepted" if self.intercept_drags => {
-                // 페이지가 HTML5 드래그를 시작했다 (OS 로는 넘어가지 않음). 에이전트가 왼쪽 버튼을 누르고 있는
-                // 활성 세션이면 기억해 두었다가 이동·버튼 떼기에서 페이지 안에서 끝내고, 그 밖의 경우
-                // (버튼을 이미 뗀 뒤 늦게 도착 등)는 바로 취소해 페이지가 드래그 상태로 남지 않게 한다.
+                // the page started an HTML5 drag (it doesn't reach the OS). If it's the active session and the
+                // agent is holding the left button, remember it and finish it inside the page on move/release;
+                // otherwise (e.g. it arrived after the button was already released) cancel it right away so the
+                // page isn't left mid-drag.
                 let Some(sid) = ev.session_id.clone() else { return Ok(()) };
                 let data = ev.params["data"].clone();
                 let keep = {
@@ -536,7 +549,7 @@ impl BrowserWorkspace {
 
     async fn activate(&self, target_id: &str) -> Result<()> {
         if self.intercept_drags {
-            // 다른 뷰로 바꾸기 전에 끝나지 않은 드래그는 원래 페이지 안에서 취소한다
+            // cancel any unfinished drag inside its original page before switching views
             self.cancel_drag().await;
         }
         if let Some(prev) = self.active_session() {
@@ -564,7 +577,7 @@ impl BrowserWorkspace {
             }
         };
         if !self.app_mode {
-            // Electron 에서는 activateTarget 이 실제 창을 앞으로 가져올 수 있으므로 보내지 않는다
+            // in Electron, activateTarget can bring the real window to the front, so it isn't sent
             let _ = self
                 .cdp
                 .call("Target.activateTarget", json!({ "targetId": target_id }), None)
@@ -597,7 +610,7 @@ impl BrowserWorkspace {
             Some(s),
         )
         .await?;
-        // 백그라운드/headless 에서도 입력창 focus/blur 가 정상 동작하도록
+        // so input focus/blur works in the background and headless too
         let _ = c
             .call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }), Some(s))
             .await;
@@ -607,8 +620,9 @@ impl BrowserWorkspace {
                 .await;
         }
         if self.intercept_drags {
-            // 세션(=페이지 타깃)마다 켜야 한다. 탐색해도 유지된다. 켜지 못하면(오래된 Chromium) 이 세션에서는
-            // 드래그가 시작되지 않는 기존 방식으로 마우스를 보낸다 (mouse_move_intercepting 참고).
+            // has to be enabled per session (= page target) and survives navigation. If it can't be (old
+            // Chromium), this session falls back to sending mouse events that never start a drag (see
+            // mouse_move_intercepting).
             if let Err(e) = c.call("Input.setInterceptDrags", json!({ "enabled": true }), Some(s)).await {
                 eprintln!("[ghostdesk] 드래그 가로채기를 켜지 못했습니다: {e:#}");
                 let mut st = self.state.lock();
@@ -623,7 +637,7 @@ impl BrowserWorkspace {
         Ok(())
     }
 
-    /// Target.getTargets 로 뷰 목록의 제목/주소를 다시 읽는다 (새 뷰 타깃도 추가).
+    /// Rereads view titles and URLs with Target.getTargets (adding new view targets too).
     pub async fn refresh_targets(&self) -> Result<()> {
         let targets = self.cdp.call("Target.getTargets", json!({}), None).await?;
         let mut st = self.state.lock();
@@ -644,7 +658,7 @@ impl BrowserWorkspace {
         Ok(())
     }
 
-    // ───────────────────────── 조회 ─────────────────────────
+    // ---- queries ----
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
@@ -686,9 +700,9 @@ impl BrowserWorkspace {
         self.state.lock().mouse
     }
 
-    // ───────────────────────── 화면 ─────────────────────────
+    // ---- screen ----
 
-    /// 현재 뷰포트의 PNG 스크린샷 (정확히 width x height).
+    /// PNG screenshot of the current viewport (exactly width x height).
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         let s = self.session()?;
         let r = self
@@ -700,7 +714,7 @@ impl BrowserWorkspace {
             )
             .await?;
         let bytes = B64.decode(r["data"].as_str().unwrap_or_default())?;
-        // PNG 헤더(IHDR)로 크기만 확인하고, 다를 때만 디코딩해서 맞춘다
+        // check the size from the PNG header (IHDR) and only decode to resize when it differs
         let bytes = if png_size(&bytes) == Some((self.width, self.height)) {
             bytes
         } else {
@@ -712,7 +726,7 @@ impl BrowserWorkspace {
         Ok(bytes)
     }
 
-    /// 화면의 한 영역을 확대한 PNG.
+    /// Zoomed-in PNG of a screen region.
     pub async fn zoom(&self, region: [f64; 4]) -> Result<Vec<u8>> {
         let s = self.session()?;
         let (x0, y0) = (region[0].min(region[2]), region[1].min(region[3]));
@@ -733,7 +747,7 @@ impl BrowserWorkspace {
         Ok(B64.decode(r["data"].as_str().unwrap_or_default())?)
     }
 
-    // ───────────────────────── 마우스 ─────────────────────────
+    // ---- mouse ----
 
     async fn mouse_event(
         &self,
@@ -772,7 +786,7 @@ impl BrowserWorkspace {
     pub async fn mouse_down(&self, button: MouseButton, count: i64, mods: i64) -> Result<()> {
         let (x, y) = self.mouse_pos();
         if self.intercept_drags && button == MouseButton::Left {
-            // 이전 드래그가 남아 있으면 (이론상 없음) 페이지 안에서 취소하고 새로 시작한다
+            // a leftover drag (shouldn't happen) is cancelled inside the page before starting over
             self.cancel_drag().await;
             self.state.lock().moved_pressed = false;
         }
@@ -783,9 +797,10 @@ impl BrowserWorkspace {
     pub async fn mouse_up(&self, button: MouseButton, count: i64, mods: i64) -> Result<()> {
         let (x, y) = self.mouse_pos();
         if self.intercept_drags && button == MouseButton::Left {
-            // 누른 채 움직였다면 페이지가 드래그를 시작했을 수 있다. Input.dragIntercepted 가 조금 늦게
-            // 도착할 수 있으므로 잠시 기다린다. 드래그 중이면 mouseReleased 대신 페이지 안에서 놓는다
-            // (실제 OS 끌어 놓기에서도 버튼 떼기는 페이지로 가지 않는다).
+            // moving with the button held may have started a drag in the page. Input.dragIntercepted can
+            // arrive a little late, so wait briefly. If a drag is in progress, drop inside the page instead
+            // of sending mouseReleased (in a real OS drag and drop, the release doesn't reach the page
+            // either).
             let moved = std::mem::take(&mut self.state.lock().moved_pressed);
             if moved {
                 self.wait_drag(Duration::from_millis(250)).await;
@@ -804,13 +819,16 @@ impl BrowserWorkspace {
         self.mouse_event("mouseReleased", x, y, button.name(), count, mods, json!({})).await
     }
 
-    // ───────── HTML5 드래그 가로채기 (ConnectOptions::intercept_drags) ─────────
+    // ---- HTML5 drag interception (ConnectOptions::intercept_drags) ----
 
-    /// 드래그 가로채기 모드의 마우스 이동.
-    /// Blink 는 `button` 이 left 인 mouseMoved 에서만 HTML5 드래그(dragstart)를 시작한다 (기본 경로처럼 "none" 이면
-    /// 페이지의 끌어 놓기가 아예 동작하지 않음). 가로채기가 켜진 세션에서만 left 로 보내 앱 안의 끌어 놓기
-    /// (VS Code 탐색기·편집기 탭 등)가 동작하게 하고, 드래그가 시작되면 mouseMoved 대신 dragOver 를 보낸다.
-    /// 가로채기를 켜지 못한 세션은 기존처럼 "none" 으로 보내 드래그가 시작되지 않게 한다 (OS 로 넘어갈 일이 없음).
+    /// Mouse move in drag interception mode.
+    ///
+    /// Blink only starts an HTML5 drag (dragstart) on a mouseMoved whose `button` is left (with
+    /// "none", as on the default path, in-page drag and drop never works). Only sessions with
+    /// interception enabled get left, so in-app drag and drop works (VS Code explorer, editor tabs,
+    /// …), and once a drag starts, dragOver is sent instead of mouseMoved. Sessions where
+    /// interception couldn't be enabled keep sending "none" so no drag ever starts (and nothing can
+    /// leak to the OS).
     async fn mouse_move_intercepting(&self, x: f64, y: f64, mods: i64) -> Result<()> {
         let (pressed, guarded) = {
             let st = self.state.lock();
@@ -827,13 +845,14 @@ impl BrowserWorkspace {
         self.mouse_event("mouseMoved", x, y, button, 0, mods, json!({})).await?;
         if pressed && guarded {
             self.state.lock().moved_pressed = true;
-            // 이 이동으로 드래그가 시작됐으면 (이벤트가 이미 도착한 경우) 바로 이 위치로 끌어 들인다
+            // if this move started a drag (and the event already arrived), drag it in to this position now
             self.drag_over(x, y, mods).await?;
         }
         Ok(())
     }
 
-    /// 가로챈 드래그가 있으면 (x, y) 로 dragEnter(처음 한 번)·dragOver 를 보내고 true.
+    /// If there's an intercepted drag, sends dragEnter (first time only) and dragOver at (x, y) and
+    /// returns true.
     async fn drag_over(&self, x: f64, y: f64, mods: i64) -> Result<bool> {
         let Some(d) = self.state.lock().drag.clone() else { return Ok(false) };
         let mut r = Ok(());
@@ -855,7 +874,8 @@ impl BrowserWorkspace {
         Ok(true)
     }
 
-    /// 버튼을 뗀 위치 (x, y) 에서 가로챈 드래그를 놓는다: dragEnter(아직이면) → dragOver → drop.
+    /// Drops the intercepted drag where the button was released: dragEnter (if not yet sent) →
+    /// dragOver → drop.
     async fn finish_drag(&self, d: DragState, x: f64, y: f64, mods: i64) -> Result<()> {
         let mut r = Ok(());
         if !d.entered {
@@ -874,7 +894,7 @@ impl BrowserWorkspace {
         Ok(())
     }
 
-    /// 끝나지 않은 가로챈 드래그를 페이지 안에서 취소한다 (없으면 아무것도 하지 않음).
+    /// Cancels an unfinished intercepted drag inside the page (no-op if there is none).
     async fn cancel_drag(&self) {
         let d = self.state.lock().drag.take();
         if let Some(d) = d {
@@ -883,7 +903,7 @@ impl BrowserWorkspace {
         }
     }
 
-    /// Input.dragIntercepted 가 도착할 때까지 최대 `max` 기다린다.
+    /// Waits up to `max` for Input.dragIntercepted to arrive.
     async fn wait_drag(&self, max: Duration) {
         let start = Instant::now();
         while start.elapsed() < max {
@@ -910,7 +930,8 @@ impl BrowserWorkspace {
         if let Some((x, y)) = pos {
             self.mouse_move(x, y, mods).await?;
         }
-        // 사람처럼 누르고 잠깐 뒤 뗀다 (눌림 상태를 보고 반응하는 페이지가 있고, 화면의 클릭 표시와도 맞는다)
+        // press, then release a moment later like a person would (some pages react to the pressed state,
+        // and it matches the on-screen click indicator)
         for i in 1..=count.max(1) as i64 {
             self.mouse_down(button, i, mods).await?;
             tokio::time::sleep(Duration::from_millis(crate::cursor::PRESS_MS)).await;
@@ -926,7 +947,8 @@ impl BrowserWorkspace {
         self.mouse_move(from.0, from.1, mods).await?;
         self.mouse_down(MouseButton::Left, 1, mods).await?;
         tokio::time::sleep(Duration::from_millis(crate::cursor::PRESS_MS)).await;
-        // 거리에 맞는 시간 동안 천천히 출발해 천천히 멈추는 경로로 끈다 (화면 표시의 미끄러짐과 같은 곡선)
+        // drag along an ease-in/ease-out path over a time matched to the distance (the same curve as the
+        // on-screen glide)
         let dist = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
         let steps = crate::cursor::frames(crate::cursor::glide_duration(dist));
         for i in 1..=steps {
@@ -945,7 +967,7 @@ impl BrowserWorkspace {
             }
             None => self.mouse_pos(),
         };
-        // 한 번에 크게 건너뛰지 않고 여러 번의 작은 휠 이벤트로 나눠, 빠르게 시작해 천천히 멈추게 굴린다
+        // split into several small wheel events instead of one big jump, starting fast and easing out
         let parts = crate::cursor::scroll_parts(dx.abs().max(dy.abs()));
         let n = parts.len();
         for (i, f) in parts.into_iter().enumerate() {
@@ -964,7 +986,7 @@ impl BrowserWorkspace {
         )
     }
 
-    // ───────────────────────── 키보드 ─────────────────────────
+    // ---- keyboard ----
 
     async fn key_event(&self, typ: &str, k: &keys::KeyDef, mods: i64, with_text: bool, commands: &[&str]) -> Result<()> {
         let s = self.session()?;
@@ -1024,7 +1046,7 @@ impl BrowserWorkspace {
         self.combo_up(&c).await
     }
 
-    /// 텍스트 입력. ASCII 는 실제 키 이벤트로, 한글 등은 insertText 로 넣는다.
+    /// Types text: ASCII as real key events, Korean and other text via insertText.
     pub async fn type_text(&self, text: &str) -> Result<()> {
         let s = self.session()?;
         let mut buf = String::new();
@@ -1059,11 +1081,11 @@ impl BrowserWorkspace {
         Ok(())
     }
 
-    // ───────────────────────── 탐색/탭 ─────────────────────────
+    // ---- navigation / tabs ----
 
     pub async fn navigate(&self, raw: &str) -> Result<()> {
         let url = normalize_url(raw);
-        // Windows: file://서버/공유 주소는 SMB 로 그 서버에 사용자 자격 증명(NTLM)을 보낸다
+        // Windows: file://server/share URLs make SMB send the user's credentials (NTLM) to that server
         #[cfg(windows)]
         if let Some(why) = remote_file_refusal(raw, &url) {
             bail!("{why}");
@@ -1181,7 +1203,7 @@ impl BrowserWorkspace {
         out
     }
 
-    /// 페이지에서 JS 를 평가한다 (셀프 테스트용).
+    /// Evaluates JS in the page (for self-tests).
     pub async fn eval(&self, expr: &str) -> Result<Value> {
         let s = self.session()?;
         let r = self
@@ -1191,12 +1213,12 @@ impl BrowserWorkspace {
         Ok(r["result"]["value"].clone())
     }
 
-    // ───────────────────────── 종료 ─────────────────────────
+    // ---- shutdown ----
 
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         if self.app_mode && self.child.lock().is_none() {
-            // Electron 앱은 바깥(electron.rs)에서 인스펙터로 정상 종료시킨다
+            // Electron apps are shut down gracefully from outside (electron.rs) through the inspector
             return;
         }
         let _ = self
@@ -1210,8 +1232,9 @@ impl BrowserWorkspace {
                 if let Ok(Some(_)) = c.try_wait() {
                     return;
                 }
-                // Windows: 본 프로세스(런처일 수 있음)뿐 아니라 Job 안의 브라우저까지 끝났을 때 정상 종료로 보고,
-                // 남은 헬퍼(crashpad 등)를 정리하며 Job 핸들을 닫는다
+                // Windows: it only counts as a clean exit once the browser inside the Job has ended too, not
+                // just the main process (which may be a launcher). Clean up leftover helpers (crashpad, …) and
+                // close the Job handle.
                 #[cfg(windows)]
                 if let Ok(Some(_)) = c.try_wait() {
                     if !launcher_handed_off(&c) {
@@ -1225,15 +1248,16 @@ impl BrowserWorkspace {
         }
     }
 
-    /// 이 작업공간이 띄운 브라우저 본 프로세스의 pid (바깥에서 관리하는 Electron 이면 None)
+    /// pid of the browser main process this workspace launched (None for externally managed
+    /// Electron).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn browser_pid(&self) -> Option<u32> {
         self.child.lock().as_ref().map(|c| c.id())
     }
 }
 
-/// 띄운 Chromium 을 소유권이 작업공간으로 넘어가기 전까지 쥐고 있다가, 그 전에 버려지면
-/// (future abort, 오류) 프로세스 그룹째 죽이고 회수한다.
+/// Holds the launched Chromium until the workspace takes ownership; if dropped before that
+/// (future aborted, error), kills and reaps the whole process group.
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
@@ -1243,7 +1267,7 @@ impl ChildGuard {
     fn get(&mut self) -> &mut Child {
         self.0.as_mut().expect("ChildGuard 는 release 전까지 Child 를 가진다")
     }
-    /// 소유권을 넘긴다 (이후 Drop 은 아무것도 하지 않음)
+    /// Hands over ownership (Drop does nothing afterwards).
     fn release(mut self) -> Child {
         self.0.take().expect("ChildGuard 는 release 전까지 Child 를 가진다")
     }
@@ -1257,23 +1281,31 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 아직 회수하지 않은 자식만(= pid/pgid 재사용 불가) 프로세스 그룹째 죽이고 회수한다.
-/// (spawn_group 으로 띄웠으므로 Unix: pgid == pid 에 SIGKILL, Windows: Job 객체째 종료)
+/// Kills and reaps the whole process group, only for children not yet reaped (so the pid/pgid
+/// can't have been reused).
+///
+/// Launched with spawn_group, so on Unix it's SIGKILL to pgid == pid, and on Windows the whole Job
+/// object is terminated.
 fn kill_child_group(mut c: Child) {
     crate::platform::proc::kill_group(&mut c);
 }
 
-/// (Windows) 본 프로세스는 끝났지만 같은 Job 에 실제 브라우저 등 살아 있는 프로세스가 남아 있는가.
-/// 런처형 실행 파일(네이버 웨일의 Application\whale.exe 등)이 실제 브라우저를 넘겨받게 한 경우다.
-/// (같은 user-data-dir 을 쓰는 브라우저가 이미 있어 명령줄만 넘기고 끝난 경우에는 Job 이 비어 있다)
+/// (Windows) Whether the main process has exited but live processes, like the real browser,
+/// remain in the same Job.
+///
+/// This happens when a launcher executable (Naver Whale's Application\whale.exe, …) hands off to
+/// the real browser. (If a browser using the same user-data-dir was already running and only got
+/// the command line, the Job is empty.)
 #[cfg(windows)]
 fn launcher_handed_off(c: &Child) -> bool {
     crate::platform::proc::group_pids(c.id()).is_some_and(|p| !p.is_empty())
 }
 
-/// 정상 종료 경로(shutdown 유예 시간 초과·Drop)에서 남은 브라우저를 정리한다.
-/// Unix: 기존대로 본 프로세스만 죽인다 (헬퍼는 스스로 끝난다).
-/// Windows: Job 째로 정리해 GPU·렌더러·crashpad 헬퍼가 작업공간 폴더의 파일을 쥔 채 남지 않게 한다.
+/// Cleans up the remaining browser on the normal exit path (shutdown grace period expired, Drop).
+///
+/// Unix: kills only the main process, as before (helpers exit on their own).
+/// Windows: tears down the whole Job so GPU, renderer and crashpad helpers don't linger holding
+/// files in the workspace folder.
 fn kill_child(mut c: Child) {
     #[cfg(windows)]
     crate::platform::proc::kill_group(&mut c);
@@ -1284,7 +1316,8 @@ fn kill_child(mut c: Child) {
     }
 }
 
-/// connect() 가 ready 전에 끝나면(취소·오류) 작업공간이 쥔 Chromium 을 죽이고 닫힘으로 표시한다.
+/// If connect() ends before ready (cancelled, error), kills the Chromium the workspace holds and
+/// marks it closed.
 struct CloseOnDrop(Option<Arc<BrowserWorkspace>>);
 
 impl Drop for CloseOnDrop {
@@ -1307,7 +1340,8 @@ impl Drop for BrowserWorkspace {
     }
 }
 
-/// `DevToolsActivePort` 파일(첫 줄 포트, 둘째 줄 경로)을 브라우저 웹소켓 주소로 바꾼다.
+/// Turns a `DevToolsActivePort` file (port on the first line, path on the second) into the
+/// browser websocket URL.
 pub fn read_devtools_port_file(path: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let mut lines = s.lines();
@@ -1321,7 +1355,7 @@ pub fn encode_png(img: &image::DynamicImage) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
-/// PNG 의 IHDR 에서 (너비, 높이)를 읽는다 (디코딩 없음).
+/// Reads (width, height) from a PNG's IHDR (no decoding).
 pub fn png_size(b: &[u8]) -> Option<(u32, u32)> {
     if b.len() < 24 || &b[..8] != b"\x89PNG\r\n\x1a\n" || &b[12..16] != b"IHDR" {
         return None;
@@ -1350,15 +1384,18 @@ pub fn normalize_url(raw: &str) -> String {
     format!("https://www.google.com/search?q={q}")
 }
 
-/// (Windows) 다른 컴퓨터를 가리키는 file: 주소나 UNC 경로면 거부 이유.
-/// Windows 의 Chromium 은 `file://서버/공유/x` 를 `\\서버\공유\x` 로 열고, 그러면 SMB(WebDAV) 리디렉터가
-/// 그 서버에 사용자의 Windows 자격 증명(NTLM)으로 인증한다. `raw` 는 에이전트가 준 값, `url` 은 normalize_url 결과.
-/// (macOS 에서는 file://호스트 가 SMB 접근이 아니므로 쓰지 않는다)
+/// (Windows) Reason to refuse a file: URL or UNC path pointing at another computer.
+///
+/// Chromium on Windows opens `file://server/share/x` as `\\server\share\x`, and the SMB (WebDAV)
+/// redirector then authenticates to that server with the user's Windows credentials (NTLM).
+/// `raw` is what the agent gave, `url` is the normalize_url result. (Not used on macOS, where
+/// file://host isn't SMB access.)
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn remote_file_refusal(raw: &str, url: &str) -> Option<String> {
     let t = raw.trim();
     let unc = ["\\\\", "//", "\\/", "/\\"].iter().any(|p| t.starts_with(p));
-    // 실제로 보낼 주소와 함께 원래 입력도 본다 (normalize_url 이 `file:\\서버` 같은 입력을 https 로 바꾸더라도 거부)
+    // check the original input as well as the URL actually sent (refuse even if normalize_url turned
+    // input like `file:\\server` into https)
     let host = if unc { None } else { file_url_remote_host(url).or_else(|| file_url_remote_host(t)) };
     if !unc && host.is_none() {
         return None;
@@ -1376,15 +1413,18 @@ pub fn remote_file_refusal(raw: &str, url: &str) -> Option<String> {
     ))
 }
 
-/// file: 주소가 가리키는 원격 호스트 (로컬 파일이면 None). Windows Chromium 의 해석을 따른다:
-/// 역슬래시는 슬래시로 보고, 슬래시 3개(`file:///`)나 드라이브 문자(`file:C:/`, `file:////C:/`)는 로컬,
-/// 그 밖의 슬래시 수는 UNC(첫 경로 조각이 호스트)로 본다. 호스트가 비었거나 localhost 여도 경로가 `//` 로
-/// 시작하면(`file://localhost//서버/공유`) UNC 로 바뀔 수 있으므로 원격으로 본다.
+/// The remote host a file: URL points at (None for local files), following Windows Chromium's
+/// parsing.
+///
+/// Backslashes count as slashes; three slashes (`file:///`) or a drive letter (`file:C:/`,
+/// `file:////C:/`) are local, and any other slash count is UNC (the first path segment is the
+/// host). Even with an empty host or localhost, a path starting with `//`
+/// (`file://localhost//server/share`) can turn into UNC, so it counts as remote.
 fn file_url_remote_host(url: &str) -> Option<String> {
-    // Chromium 처럼 탭·줄바꿈은 지우고 앞뒤 공백·제어 문자는 무시한다
+    // like Chromium, strip tabs and newlines and ignore surrounding whitespace and control characters
     let s: String = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
     let mut s = s.trim_matches(|c: char| c <= ' ');
-    // view-source: 는 안쪽 주소를 연다
+    // view-source: opens the inner URL
     while let Some(p) = s.get(..12) {
         if !p.eq_ignore_ascii_case("view-source:") {
             break;
@@ -1409,7 +1449,7 @@ fn file_url_remote_host(url: &str) -> Option<String> {
     if !host.is_empty() && host != "localhost" {
         return Some(host);
     }
-    // 호스트가 없거나 localhost: 경로가 다시 // 로 시작하면 UNC 경로가 될 수 있다
+    // no host or localhost: a path starting with // again can become a UNC path
     let path = &after[end..];
     let path_slashes = path.chars().take_while(|&c| c == '/').count();
     if path_slashes >= 2 && !is_drive(&path[path_slashes..]) {
@@ -1420,7 +1460,7 @@ fn file_url_remote_host(url: &str) -> Option<String> {
     None
 }
 
-/// `%XX` 를 바이트로 되돌린다 (잘못된 것은 그대로, UTF-8 이 아니면 손실 변환)
+/// Decodes `%XX` back to bytes (invalid ones stay as is; non-UTF-8 is converted lossily).
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -1438,7 +1478,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 테스트에서 spawn() 이 띄운 본 프로세스 pid 를 찾기 위한 기록 (user-data-dir → pid)
+/// Record for tests to find the main process pid launched by spawn() (user-data-dir → pid).
 #[cfg(test)]
 mod tests_support {
     use std::path::{Path, PathBuf};
@@ -1474,14 +1514,17 @@ mod win_tests {
         false
     }
 
-    /// 준비(DevToolsActivePort 대기) 도중 에이전트가 제거(abort)되면 브라우저와 그 자손이 남지 않아야 한다.
-    /// (Unix 판의 abort_during_spawn_kills_browser_group 과 같은 시나리오: Job 객체로 정리되는지 본다)
+    /// If the agent is removed (aborted) during startup (waiting for DevToolsActivePort), the browser
+    /// and its descendants must not be left behind.
+    ///
+    /// Same scenario as the Unix abort_during_spawn_kills_browser_group: checks the Job object cleans
+    /// up.
     #[tokio::test]
     async fn abort_during_spawn_kills_browser_job() {
         let dir = std::env::temp_dir().join(format!("ghostdesk-spawn-abort-{}", std::process::id()));
         let _ = remove_dir_all_retry(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 가짜 브라우저: 손자 프로세스(ping)를 띄워 오래 기다린다. 포트 파일은 만들지 않는다.
+        // fake browser: starts a grandchild (ping) and waits a long time, never writing the port file
         let exe = dir.join("fake-browser.cmd");
         std::fs::write(&exe, "@echo off\r\nping -n 120 127.0.0.1 >NUL\r\n").unwrap();
         let data = dir.join("data");
@@ -1535,8 +1578,8 @@ mod win_tests {
         }
     }
 
-    /// 실행 파일이 아무것도 남기지 않고 바로 끝나면 (예: 같은 작업공간을 쓰는 브라우저에 명령줄만 넘김)
-    /// 40초를 기다리지 않고 바로 알린다
+    /// If the executable exits right away leaving nothing behind (e.g. it only handed the command
+    /// line to a browser using the same workspace), report it immediately instead of waiting 40 s.
     #[tokio::test]
     async fn immediate_exit_is_reported() {
         let dir = std::env::temp_dir().join(format!("ghostdesk-spawn-exit-{}", std::process::id()));
@@ -1548,12 +1591,12 @@ mod win_tests {
         remove_dir_all_retry(&dir).unwrap();
     }
 
-    /// 런처형 실행 파일(본 프로세스는 바로 끝나고 실제 브라우저는 자식으로 남음)이면 계속 기다리고,
-    /// 취소되면 남은 자식까지 정리한다
+    /// A launcher executable (main process exits right away, the real browser stays as a child) keeps
+    /// the wait going, and cancelling also cleans up the remaining child.
     #[tokio::test]
     async fn launcher_handoff_keeps_waiting_and_cleans_up() {
         let dir = std::env::temp_dir().join(format!("ghostdesk-spawn-launcher-{}", std::process::id()));
-        // start /b: 기다리지 않고 ping 을 띄운 뒤 cmd 는 끝난다
+        // start /b: launch ping without waiting, then cmd exits
         let opts = fake_opts(&dir, "@echo off\r\nstart \"\" /b ping -n 120 127.0.0.1 >NUL\r\nexit /b 0\r\n");
         let data = opts.user_data_dir.clone();
         let task = tokio::spawn(async move { BrowserWorkspace::spawn(&opts).await.map(|_| ()) });
@@ -1565,7 +1608,7 @@ mod win_tests {
             }
             if let Some(m) = main {
                 pids = group_pids(m).unwrap_or_default();
-                // 런처(cmd)는 끝나고 자식만 Job 에 남은 상태
+                // the launcher (cmd) has exited and only the child is left in the Job
                 if !pids.is_empty() && !pids.contains(&m) {
                     break;
                 }
@@ -1583,11 +1626,12 @@ mod win_tests {
         remove_dir_all_retry(&dir).unwrap();
     }
 
-    /// 실제 Chrome/Edge (빈 임시 프로필, headless): 공백·한글 경로에서 실행·연결되고,
-    /// shutdown 뒤에는 헬퍼 프로세스까지 모두 끝나 작업공간 폴더를 지울 수 있어야 한다.
+    /// Real Chrome/Edge (empty temp profile, headless): launches and connects from paths with spaces
+    /// and Korean characters, and after shutdown every helper process has exited so the workspace
+    /// folder can be deleted.
     #[tokio::test]
     async fn real_browser_shutdown_leaves_nothing() {
-        // 실행 파일 위치만 찾는다 (사용자 프로필은 읽지 않는다)
+        // only look up the executable location (the user's profile isn't read)
         let Some(exe) = ["chrome.exe", "msedge.exe"].iter().find_map(|e| crate::platform::win::app_path(e)) else {
             eprintln!("Chrome/Edge 가 없어 건너뜀");
             return;
@@ -1616,7 +1660,7 @@ mod win_tests {
         let pids = group_pids(pid).expect("Job 이 있어야 함");
         assert!(pids.contains(&pid) && pids.len() >= 2, "헬퍼까지 Job 에 있어야 함: {pids:?}");
         assert_eq!(ws.eval("document.getElementById('p').textContent").await.unwrap(), "안녕");
-        // 내부 단축키는 Windows 에서 ctrl 로 동작해야 한다
+        // internal shortcuts must use ctrl on Windows
         ws.click(Some((20.0, 10.0)), MouseButton::Left, 1, 0).await.unwrap();
         ws.type_text("abc 가나").await.unwrap();
         ws.key("ctrl+a", 1).await.unwrap();
@@ -1629,9 +1673,10 @@ mod win_tests {
         assert!(!dir.exists());
     }
 
-    /// 드래그 가로채기 모드 (Windows Electron 작업공간이 쓰는 것): 실제 Chrome(빈 임시 프로필, headless)에서
-    /// HTML5 드래그가 Input.dragIntercepted 로 잡히고, 페이지 안에서 올바른 데이터로 놓이며, 그 뒤의 입력·
-    /// 스크린샷이 멈추지 않아야 한다. 원격 file:// 주소는 거부해야 한다.
+    /// Drag interception mode (what Windows Electron workspaces use) on real Chrome (empty temp
+    /// profile, headless): HTML5 drags are caught by Input.dragIntercepted and dropped inside the page
+    /// with the right data, and later input and screenshots don't hang. Remote file:// URLs must be
+    /// refused.
     #[tokio::test]
     async fn real_browser_intercepted_drag_drops_in_page() {
         let Some(exe) = ["chrome.exe", "msedge.exe"].iter().find_map(|e| crate::platform::win::app_path(e)) else {
@@ -1683,15 +1728,15 @@ mod win_tests {
         }
         let log = || async { ws.eval("JSON.stringify(log)").await.unwrap().as_str().unwrap_or_default().to_string() };
 
-        // 1) 한 번에 끌기 (drag): 놓는 곳에서 드롭되고 데이터가 그대로 전달된다
+        // 1) one-shot drag: dropped at the target with the data intact
         to(ws.drag((70.0, 45.0), (375.0, 95.0), 0)).await.expect("drag 가 멈춤").unwrap();
         let l = log().await;
         assert!(l.contains("\"dragstart\"") && l.contains("\"dragenter\"") && l.contains("drop:hello-drag:custom"), "{l}");
-        // 드래그 뒤에도 클릭이 정상 동작한다 (마우스 상태가 꼬이지 않음)
+        // clicks still work after the drag (mouse state isn't stuck)
         to(ws.click(Some((70.0, 270.0)), MouseButton::Left, 1, 0)).await.unwrap().unwrap();
         assert_eq!(ws.eval("clicks").await.unwrap(), json!(1));
 
-        // 2) 나눠서: 누르기 → 이동 → (드래그 중) 스크린샷 → 떼기
+        // 2) step by step: press → move → (mid-drag) screenshot → release
         ws.eval("log.length = 0").await.unwrap();
         to(ws.mouse_move(70.0, 45.0, 0)).await.unwrap().unwrap();
         to(ws.mouse_down(MouseButton::Left, 1, 0)).await.unwrap().unwrap();
@@ -1705,7 +1750,7 @@ mod win_tests {
         let l = log().await;
         assert!(l.contains("drop:hello-drag:custom"), "{l}");
 
-        // 3) 놓을 수 없는 곳에서 떼면 드롭 없이 끝나고(dragend: none), 다음 클릭이 정상
+        // 3) releasing over a non-drop target ends without a drop (dragend: none) and the next click works
         ws.eval("log.length = 0").await.unwrap();
         to(ws.drag((70.0, 45.0), (560.0, 340.0), 0)).await.unwrap().unwrap();
         let l = log().await;
@@ -1713,12 +1758,12 @@ mod win_tests {
         to(ws.click(Some((70.0, 270.0)), MouseButton::Left, 1, 0)).await.unwrap().unwrap();
         assert_eq!(ws.eval("clicks").await.unwrap(), json!(2));
 
-        // 4) 드래그가 아닌 누른 채 이동(빈 곳)은 평소처럼 mouseReleased 가 전달된다
+        // 4) a press-and-move that isn't a drag (empty area) delivers mouseReleased as usual
         let ups = ws.eval("ups").await.unwrap().as_i64().unwrap();
         to(ws.drag((560.0, 300.0), (600.0, 360.0), 0)).await.unwrap().unwrap();
         assert_eq!(ws.eval("ups").await.unwrap().as_i64().unwrap(), ups + 1);
 
-        // 5) 원격 file:// 주소·UNC 경로는 열지 않는다
+        // 5) remote file:// URLs and UNC paths aren't opened
         for u in ["file://example.invalid/share/x.png", r"\\example.invalid\share\x.png"] {
             let e = ws.navigate(u).await.expect_err(u);
             assert!(e.to_string().contains("NTLM"), "{e:#}");
@@ -1726,7 +1771,8 @@ mod win_tests {
         ws.shutdown().await;
         let _ = remove_dir_all_retry(&dir);
         eprintln!("드래그 가로채기 테스트: {:?}", t0.elapsed());
-        // (혼자 돌리면 4~7초. 동작마다 10초 제한으로 멈춤을 잡으므로, 여기서는 다른 테스트와 함께 돌 때의 여유만 둔다)
+        // (4-7 s on its own. Each action has a 10 s limit to catch hangs, so this only leaves slack for
+        // running alongside other tests)
         assert!(t0.elapsed() < Duration::from_secs(60), "너무 오래 걸림: {:?}", t0.elapsed());
     }
 }
@@ -1793,13 +1839,15 @@ mod tests {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
-    /// 준비(DevToolsActivePort 대기) 도중 에이전트가 제거(abort)되면 Chromium 과 그 자식이 남지 않아야 한다.
+    /// If the agent is removed (aborted) during startup (waiting for DevToolsActivePort), Chromium and
+    /// its children must not be left behind.
     #[tokio::test]
     async fn abort_during_spawn_kills_browser_group() {
         let dir = std::env::temp_dir().join(format!("ghostdesk-spawn-abort-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 가짜 브라우저: 자식 하나를 띄우고 두 pid 를 적은 뒤, 포트 파일은 만들지 않고 계속 기다린다
+        // fake browser: starts one child, writes both pids, then waits forever without writing the port
+        // file
         let exe = dir.join("fake-browser.sh");
         let pids = dir.join("pids");
         std::fs::write(

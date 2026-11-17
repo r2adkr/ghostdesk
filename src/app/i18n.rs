@@ -1,8 +1,9 @@
-//! 화면 언어: 한국어(원문) · English · 日本語 · 中文.
+//! UI language: Korean (source), English, Japanese, Chinese.
 //!
-//! 화면 글은 코드에 한국어 원문 그대로 적고 `tr("…")` 로 감싼다. 다른 언어는 `table.rs` 의 표에서 찾고,
-//! 표에 없으면 원문이 그대로 보인다 (빠뜨린 글은 `every_ui_string_is_translated` 테스트가 잡는다).
-//! 값을 끼워 넣는 글은 `trf("… {} …", &[&값])` — 자리표시 `{}` 는 언어마다 순서대로 채운다.
+//! UI text is written in the code in Korean and wrapped in `tr("…")`. Other languages are
+//! looked up in the table in `table.rs`; anything missing shows the source text (the
+//! `every_ui_string_is_translated` test catches omissions). Text with values in it uses
+//! `trf("… {} …", &[&value])`, and each language fills the `{}` placeholders in order.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -23,7 +24,7 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Lang; 4] = [Lang::Ko, Lang::En, Lang::Ja, Lang::Zh];
 
-    /// 설정 파일에 적는 코드
+    /// Code stored in the settings file.
     pub fn code(self) -> &'static str {
         ["ko", "en", "ja", "zh"][self as usize]
     }
@@ -32,19 +33,20 @@ impl Lang {
         Self::ALL.into_iter().find(|l| l.code() == c).unwrap_or_default()
     }
 
-    /// 그 언어로 쓴 이름. 언어 목록은 지금 언어와 상관없이 늘 이 이름으로 보인다
-    /// (중국어는 한국어 글꼴에도 있는 두 글자만 써서, 중국어 글꼴을 불러오기 전에도 깨지지 않게).
+    /// The language's own name. The language list always shows these, whatever the current
+    /// language (Chinese uses two characters the Korean font also has, so it renders before the
+    /// Chinese font is loaded).
     pub fn native_name(self) -> &'static str {
         ["한국어", "English", "日本語", "中文"][self as usize]
     }
 
-    /// 에이전트에게 '이 언어로 답하라' 고 알릴 때의 영어 이름
+    /// English name, used when telling the agent which language to answer in.
     pub fn english_name(self) -> &'static str {
         ["Korean", "English", "Japanese", "Simplified Chinese"][self as usize]
     }
 }
 
-/// 지금 화면 언어 (설정에서 바꾸면 다음 프레임부터 모든 글이 바뀐다)
+/// Current UI language. Changing it in Settings switches all text from the next frame.
 static LANG: AtomicU8 = AtomicU8::new(0);
 
 pub fn set(l: Lang) {
@@ -55,11 +57,11 @@ pub fn current() -> Lang {
     Lang::ALL[LANG.load(Ordering::Relaxed) as usize]
 }
 
-/// 한국어 원문 → [영어, 일본어, 중국어]
+/// Korean source → [English, Japanese, Chinese].
 static INDEX: LazyLock<HashMap<&'static str, [&'static str; 3]>> =
     LazyLock::new(|| table::TABLE.iter().map(|[ko, en, ja, zh]| (*ko, [*en, *ja, *zh])).collect());
 
-/// `ko` 를 `l` 로 옮긴 글. 표에 없으면 원문 그대로.
+/// `ko` translated to `l`, or the source if it's not in the table.
 pub fn t_in(l: Lang, ko: &str) -> &str {
     if l == Lang::Ko {
         return ko;
@@ -67,12 +69,12 @@ pub fn t_in(l: Lang, ko: &str) -> &str {
     INDEX.get(ko).map_or(ko, |row| row[l as usize - 1])
 }
 
-/// 한국어 원문을 지금 언어로
+/// Korean source text in the current language.
 pub fn tr(ko: &str) -> &str {
     t_in(current(), ko)
 }
 
-/// 값을 끼워 넣는 글: 옮긴 글의 `{}` 를 `args` 로 차례대로 채운다
+/// Text with values: fills the translation's `{}` placeholders with `args` in order.
 pub fn trf(ko: &str, args: &[&dyn Display]) -> String {
     fill(tr(ko), args)
 }
@@ -108,7 +110,8 @@ mod tests {
         assert_eq!(Lang::from_code("fr"), Lang::Ko);
     }
 
-    /// 표의 모든 줄: 원문이 겹치지 않고, 빈 번역이 없고, 자리표시 `{}` 수가 언어마다 같다
+    /// Every table row: no duplicate sources, no empty translations, and the same number of `{}`
+    /// placeholders in each language.
     #[test]
     fn table_rows_are_consistent() {
         let mut seen = std::collections::HashSet::new();
@@ -122,8 +125,9 @@ mod tests {
         }
     }
 
-    /// 화면 코드(src/app)의 한국어 글은 모두 표에 있어야 한다 (새 글을 넣고 번역을 빠뜨리지 않게).
-    /// 원문 그대로 비교하는 글(상태 글의 앞머리 등)과 테스트 안의 글은 뺀다.
+    /// All Korean UI text in the UI code (src/app) must be in the table, so new text can't ship
+    /// untranslated. Text compared verbatim (status prefixes and the like) and text inside tests is
+    /// excluded.
     #[test]
     fn every_ui_string_is_translated() {
         const SOURCES: &[(&str, &str)] = &[
@@ -150,13 +154,13 @@ mod tests {
                 }
             }
         }
-        // 에이전트가 상태에 넣는 이유 글도 화면에 보이므로 표에 있어야 한다
+        // reason strings the agent puts in its status show up in the UI too, so they must be in the table
         for s in super::super::labels::AGENT_REASONS {
             if !INDEX.contains_key(s) {
                 missing.push(format!("agent: {s}"));
             }
         }
-        // 다른 모듈에서 가져와 tr() 로 감싸 보이는 글: AI 회사 이름 · 키 안내 · 로컬 앱 카드 제목
+        // text from other modules shown through tr(): provider names, key hints, local-app card titles
         let dynamic = crate::llm::Provider::ALL.iter().flat_map(|p| [p.label(), p.key_hint()]).chain([crate::platform::text::LOCAL_APPS]);
         for s in dynamic.filter(|s| s.chars().any(|c| ('가'..='힣').contains(&c))) {
             if !INDEX.contains_key(s) {
@@ -166,14 +170,15 @@ mod tests {
         assert!(missing.is_empty(), "번역이 없는 글 {}개:\n{}", missing.len(), missing.join("\n"));
     }
 
-    /// 화면에 보이지 않고 원문 그대로 비교하는 데 쓰는 글
-    // "앱" · " 앱": 자동 모드가 할 일 문장에서 '날씨 앱' 처럼 앱을 가리키는 말을 찾을 때 쓰는 낱말 (wizard.rs auto_app)
+    /// Strings never shown in the UI, only compared verbatim.
+    // "앱" / " 앱": words auto mode uses to spot an app named in the task, as in "날씨 앱" (wizard.rs auto_app)
     const NOT_UI: &[&str] = &["오류", "연결 실패", "앱", " 앱"];
 
-    /// 소스에서 한국어가 든 문자열 리터럴의 값 (주석과 맨 아래 테스트 모듈은 뺀다). `format!` 의
-    /// 자리표시는 `trf` 와 같은 `{}` 로 맞춰 둔 코드만 있으므로 값 그대로 비교한다.
+    /// Values of string literals containing Korean in a source file (comments and the trailing test
+    /// module excluded). `format!` placeholders are only ever `{}`, matching `trf`, so values are
+    /// compared as is.
     fn korean_literals(src: &str) -> Vec<String> {
-        // 줄바꿈이 CRLF 인 파일도 있어 `mod tests {` 만으로 자른다
+        // some files use CRLF, so split on `mod tests {` alone
         let src = src.split("mod tests {").next().unwrap_or(src);
         let b: Vec<char> = src.chars().collect();
         let mut out = Vec::new();
@@ -186,7 +191,7 @@ mod tests {
                     }
                 }
                 '\'' => {
-                    // 글자 리터럴('"', '\'') 은 건너뛰고, 수명('a) 은 그대로 지나간다
+                    // skip char literals ('"', '\'') and pass over lifetimes ('a)
                     let end = if b.get(i + 1) == Some(&'\\') { i + 3 } else { i + 2 };
                     i = if b.get(end) == Some(&'\'') { end + 1 } else { i + 1 };
                     continue;
@@ -200,7 +205,7 @@ mod tests {
                             match b.get(i) {
                                 Some('n') => s.push('\n'),
                                 Some('t') => s.push('\t'),
-                                // 줄 끝의 `\` : 다음 줄 앞 공백까지 건너뛴다
+                                // `\` at end of line: skip the next line's leading whitespace
                                 Some('\r' | '\n') => {
                                     while b.get(i + 1).is_some_and(|c| c.is_whitespace()) {
                                         i += 1;

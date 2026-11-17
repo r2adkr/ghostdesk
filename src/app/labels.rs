@@ -1,8 +1,9 @@
-//! 화면에 보일 짧은 글과 색: 에이전트 상태·오류 문구·생각 깊이·프로필 이름.
+//! Short labels and colors for the UI: agent status, error messages, thinking depth, profile
+//! names.
 
 use super::*;
 
-/// 오류로 멈춘 상태인가 (AI API 오류 뒤에는 '오류 — …' 로 대기 상태가 된다)
+/// Whether the agent stopped on an error (after an API error it waits with "Error — …").
 pub(super) fn is_error(st: &AgentStatus) -> bool {
     match st {
         AgentStatus::Error(_) => true,
@@ -11,7 +12,8 @@ pub(super) fn is_error(st: &AgentStatus) -> bool {
     }
 }
 
-/// 사람이 볼 일이 있으면 그 표시 색: 직접 조작 중 = 주황, 질문 = 노랑, 오류 = 빨강
+/// The color to flag an agent that needs a person: orange while taken over, yellow for a
+/// question, red for an error.
 pub(super) fn attention(st: &AgentStatus, takeover: bool) -> Option<Color32> {
     if takeover {
         Some(theme::takeover())
@@ -24,7 +26,8 @@ pub(super) fn attention(st: &AgentStatus, takeover: bool) -> Option<Color32> {
     }
 }
 
-/// 상태 표시 색 (테마 색): 일하는 중 = 초록, 사람 응답 대기 = 노랑, 오류 = 빨강, 쉬는 중 = 회색
+/// Status color: green while working, yellow while waiting for the user, red on error, gray
+/// when idle.
 pub(super) fn status_color(st: &AgentStatus) -> Color32 {
     match st {
         _ if is_error(st) => theme::danger(),
@@ -36,13 +39,14 @@ pub(super) fn status_color(st: &AgentStatus) -> Color32 {
     }
 }
 
-/// 상태 표시 글 (화면용으로 짧게)
+/// Status text, kept short for the UI.
 pub(super) fn status_text(st: &AgentStatus) -> String {
     match st {
         AgentStatus::Thinking => tr("생각 중").into(),
         AgentStatus::Acting(s) => trf("실행 중: {}", &[&s]),
         AgentStatus::Idle(s) if s.starts_with("오류") => tr("오류 — 지시하면 다시 시도").into(),
-        // 에이전트가 보낸 이유 글은 표에 있으면 옮기고, 이름·숫자가 든 글은 그대로 보인다
+        // reasons sent by the agent are translated when they're in the table; ones with names or
+        // numbers in them are shown as is
         AgentStatus::Preparing(s) => trf("준비 중: {}", &[&tr(s)]),
         AgentStatus::WaitingUser(_) => tr("사용자 응답 대기").into(),
         AgentStatus::Idle(s) => trf("대기: {}", &[&tr(s)]),
@@ -50,7 +54,8 @@ pub(super) fn status_text(st: &AgentStatus) -> String {
     }
 }
 
-/// 에이전트(agent.rs · agent/workspace.rs)가 상태에 넣는 이유 글. 표에 있어야 화면 언어로 보인다.
+/// Reason strings the agent (`agent.rs`, `agent/workspace.rs`) puts into its status. They must
+/// be in the translation table to show up in the UI language.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) const AGENT_REASONS: &[&str] = &[
     "시작",
@@ -67,10 +72,11 @@ pub(super) const AGENT_REASONS: &[&str] = &[
     "브라우저 실행 중",
 ];
 
-/// 오류 기록을 알아보기 쉬운 짧은 말로 (전체 글은 마우스를 올리면 보인다)
+/// Turns an error into a short, readable message. The full text is shown on hover.
 pub(super) fn humanize_error(s: &str) -> String {
     let l = s.to_lowercase();
-    // 제공자마다 문구가 달라 상태 코드와 흔한 낱말로 본다 (Gemini 는 잘못된 키에 400 "API key not valid")
+    // providers word these differently, so match on status codes and common words
+    // (Gemini answers a bad key with 400 "API key not valid")
     if l.contains("401") || l.contains("invalid x-api-key") || l.contains("authentication") || l.contains("api key") || l.contains("api_key") {
         tr("API 키를 확인하세요").into()
     } else if l.contains("429") || l.contains("rate limit") || l.contains("rate_limit") {
@@ -84,7 +90,7 @@ pub(super) fn humanize_error(s: &str) -> String {
     }
 }
 
-/// 생각 깊이의 짧은 이름 (모델 단추처럼 좁은 곳)
+/// Short name for a thinking depth, for tight spots like the model button.
 pub(super) fn effort_short(e: &str) -> String {
     match e {
         "low" => tr("낮음"),
@@ -97,7 +103,7 @@ pub(super) fn effort_short(e: &str) -> String {
     .to_string()
 }
 
-/// 생각 깊이 표시 (API 값은 그대로 괄호 안에)
+/// Thinking depth label, with the raw API value in parentheses.
 pub(super) fn effort_label(e: &str) -> String {
     let short = effort_short(e);
     if short == e {
@@ -107,7 +113,7 @@ pub(super) fn effort_label(e: &str) -> String {
     }
 }
 
-/// 브라우저 프로필 표시 이름에서 계정 주소 부분 '(…@…)' 을 뗀다
+/// Strips the account part "(…@…)" from a browser profile's display name.
 pub(super) fn profile_short(name: &str) -> String {
     match name.rfind(" (") {
         Some(i) if name.ends_with(')') && name[i..].contains('@') => name[..i].to_string(),

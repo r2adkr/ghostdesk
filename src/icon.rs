@@ -1,12 +1,15 @@
-//! Lucide 아이콘 (https://lucide.dev, ISC 라이선스 — assets/lucide/LICENSE).
+//! Lucide icons (https://lucide.dev, ISC license — see assets/lucide/LICENSE).
 //!
-//! lucide-static 의 아이콘 글꼴을 본문 글꼴 맨 앞에 넣어 두었으므로(app::setup_fonts),
-//! 아래 글자를 아무 글(RichText·버튼·painter.text)에 섞어 쓰면 그 자리에 아이콘이 그려진다.
-//! 새 아이콘은 lucide-static 의 font/codepoints.json 에서 이름으로 번호를 찾아 추가한다.
+//! The lucide-static icon font is placed first in the proportional font family
+//! (`app::setup_fonts`), so these characters can be mixed into any text (`RichText`,
+//! buttons, `painter.text`) and render as icons. To add an icon, look up its codepoint by
+//! name in lucide-static's `font/codepoints.json`.
 
-/// 글꼴 파일 (lucide-static 1.73.0 의 lucide.ttf 에서 아이콘 글자(U+E000~F8FF)만 남긴 것).
-/// 원본은 영문 소문자·숫자 글자도 들어 있어, 맨 앞에 두면 보통 글자가 깨진다 ("GhostDesk" → "GD").
-/// 다시 만들기: pyftsubset lucide.ttf --unicodes="U+E000-F8FF" --layout-features='' --output-file=lucide.ttf
+/// The icon font: `lucide.ttf` from lucide-static 1.73.0, subset to the Private Use Area
+/// (U+E000..F8FF). The original also maps ASCII letters and digits, which would hijack regular
+/// text when the font comes first ("GhostDesk" renders as "GD").
+///
+/// To regenerate: `pyftsubset lucide.ttf --unicodes="U+E000-F8FF" --layout-features='' --output-file=lucide.ttf`
 pub const FONT: &[u8] = include_bytes!("../assets/lucide/lucide.ttf");
 
 pub const APP_WINDOW: &str = "\u{e426}";

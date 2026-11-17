@@ -1,4 +1,5 @@
-//! 앱 실행·연결·종료: 숨김 상태로 CreateProcessW + Job 객체, 실행 전 거부 규칙(스토어 앱·실행 별칭·콘솔·관리자 권한).
+//! Launching, attaching and terminating apps: hidden CreateProcessW + Job objects, and pre-launch
+//! refusal rules (Store apps, execution aliases, console apps, elevated apps).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,15 +24,21 @@ use crate::platform::paths;
 use crate::platform::win as pw;
 
 const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
-/// 앱이 뜨는 동안 사용자의 마우스 커서가 "작업 중" 모양으로 바뀌지 않게
+/// Keeps the user's mouse cursor from switching to "working" while the app starts.
 const STARTF_FORCEOFFFEEDBACK: u32 = 0x0000_0080;
 const ERROR_ELEVATION_REQUIRED: u32 = 740;
 const STILL_ACTIVE: u32 = 259;
 
-/// Mode A Job 의 UI 제한: Job 안의 프로세스(앱과 자손)만 막고 사용자·GhostDesk 는 그대로다.
-/// - 시스템 클립보드 읽기·쓰기 (앱 자체의 복사·붙여넣기·툴바 단추가 사용자의 클립보드를 읽거나 바꾸지 못하게)
-/// - 시스템 설정(SystemParametersInfo)·화면 설정(ChangeDisplaySettings)·로그오프/종료(ExitWindows)·데스크톱 전환
-/// 핸들(UILIMIT_HANDLES)·전역 아톰(UILIMIT_GLOBALATOMS) 제한은 DDE·공용 대화상자를 깨뜨릴 수 있어 쓰지 않는다.
+/// UI limits for the mode A Job. They only affect processes inside the Job (the app and its
+/// descendants); the user and GhostDesk are untouched.
+///
+/// - reading and writing the system clipboard (so the app's own copy/paste and toolbar buttons
+///   can't read or change the user's clipboard)
+/// - system settings (SystemParametersInfo), display settings (ChangeDisplaySettings), logoff
+///   and shutdown (ExitWindows), desktop switching
+///
+/// Handle (UILIMIT_HANDLES) and global atom (UILIMIT_GLOBALATOMS) limits can break DDE and
+/// common dialogs, so they aren't used.
 pub const JOB_UI_LIMITS: u32 = JOB_OBJECT_UILIMIT_READCLIPBOARD
     | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
     | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
@@ -42,26 +49,30 @@ pub const JOB_UI_LIMITS: u32 = JOB_OBJECT_UILIMIT_READCLIPBOARD
 const SEM_FAILCRITICALERRORS: u32 = 0x0001;
 const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
 const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
-/// 숨김 실행하는 앱이 물려받을 오류 모드: 로더 오류(DLL 없음 등)·치명적 오류·충돌 대화상자를 띄우지 않는다
+/// Error mode inherited by hidden-launched apps: no loader error (missing DLL, …), critical
+/// error or crash dialogs.
 pub const QUIET_ERROR_MODE: u32 = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
 
-// windows-sys 기능 목록(Win32_System_Diagnostics_Debug)에 없는 함수 — Cargo.toml 을 건드리지 않으려고 직접 선언
+// not in windows-sys's feature list (Win32_System_Diagnostics_Debug); declared here to avoid
+// touching Cargo.toml
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
     fn SetErrorMode(mode: u32) -> u32;
     fn GetErrorMode() -> u32;
 }
 
-/// 이 프로세스의 오류 모드 (자식 프로세스는 CreateProcess 때 이것을 물려받는다)
+/// This process's error mode (children inherit it at CreateProcess).
 pub fn process_error_mode() -> u32 {
     unsafe { GetErrorMode() }
 }
 
-/// 숨김 실행 전에 한 번: 프로세스 전체 오류 모드에 [`QUIET_ERROR_MODE`] 를 더한다.
+/// Once before a hidden launch: adds [`QUIET_ERROR_MODE`] to the process-wide error mode.
 ///
-/// 오류 대화상자(로더의 "시스템 오류", 충돌 창)는 앱 프로세스가 아니라 csrss·WER 가 사용자 화면에 띄우므로 감시기가
-/// 화면 밖으로 옮길 수 없다. CreateProcess 는 부모의 오류 모드를 물려주므로(CREATE_DEFAULT_ERROR_MODE 를 쓰지 않을 때)
-/// 여기서 켜 두면 앱과 그 자손에서 그런 대화상자가 뜨지 않는다. 실패는 종료 코드와 err_exit_message 로 알린다.
+/// Error dialogs (the loader's "System Error", crash windows) are shown on the user's screen by
+/// csrss and WER, not the app process, so the guard can't move them off-screen. CreateProcess
+/// passes the parent's error mode on (unless CREATE_DEFAULT_ERROR_MODE is used), so turning it on
+/// here keeps those dialogs away from the app and its descendants. Failures are reported through
+/// the exit code and `err_exit_message`.
 fn quiet_error_mode_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
@@ -69,11 +80,12 @@ fn quiet_error_mode_once() {
     });
 }
 
-/// 우리가 띄운(또는 붙은) 프로세스
+/// A process we launched (or attached to).
 pub struct Proc {
     pub pid: u32,
     pub process: Handle,
-    /// Mode A: 앱과 자손을 담은 Job (KILL_ON_JOB_CLOSE — GhostDesk 가 죽어도 앱이 남지 않는다)
+    /// Mode A: Job holding the app and its descendants (KILL_ON_JOB_CLOSE, so the app doesn't
+    /// outlive GhostDesk).
     pub job: Option<Arc<Handle>>,
 }
 
@@ -90,19 +102,20 @@ impl Proc {
         Some(c)
     }
 
-    /// 앱이 받은 입력을 다 처리하고 다음 입력을 기다릴 때까지 (최대 ms). 붙은 앱(권한 부족)이면 바로 돌아온다.
+    /// Waits (up to `ms`) until the app has processed its input and is waiting for more. Returns
+    /// immediately for attached apps (insufficient rights).
     pub fn wait_idle(&self, ms: u32) {
         unsafe {
             WaitForInputIdle(self.process.0, ms);
         }
     }
 
-    /// 끝날 때까지 최대 ms 기다린다. 끝났으면 true.
+    /// Waits up to `ms` for the process to exit. Returns true if it did.
     pub fn wait_exit(&self, ms: u32) -> bool {
         unsafe { WaitForSingleObject(self.process.0, ms) == WAIT_OBJECT_0 }
     }
 
-    /// 앱 프로세스 목록 (Job 이 있으면 Job 의 모든 프로세스)
+    /// The app's processes (every process in the Job, if there is one).
     pub fn pids(&self) -> Vec<u32> {
         match &self.job {
             Some(j) => {
@@ -123,7 +136,7 @@ impl Proc {
         }
     }
 
-    /// Job 째로 강제 종료 (Mode A 전용)
+    /// Kills the whole Job (mode A only).
     pub fn terminate(&self) {
         match &self.job {
             Some(j) => unsafe {
@@ -137,7 +150,7 @@ impl Proc {
 }
 
 pub fn job_pids(job: HANDLE) -> Vec<u32> {
-    // JOBOBJECT_BASIC_PROCESS_ID_LIST: u32 할당 수, u32 실제 수, ULONG_PTR[] pid
+    // JOBOBJECT_BASIC_PROCESS_ID_LIST: u32 assigned count, u32 actual count, ULONG_PTR[] pids
     let mut buf = vec![0usize; 2 + 512];
     unsafe {
         let hdr = buf.as_mut_ptr() as *mut u32;
@@ -175,7 +188,8 @@ fn new_job(ui_limits: u32) -> Option<Handle> {
         {
             return None;
         }
-        // 실패해도 Job(종료 시 정리)은 그대로 쓴다 — 이름 기반 차단(복사·붙여넣기 단추·메뉴)은 남아 있다
+        // on failure the Job still does cleanup on exit, and the name-based blocks (copy/paste buttons,
+        // menus) still apply
         if ui_limits == 0 {
             return Some(job);
         }
@@ -196,7 +210,8 @@ fn new_job(ui_limits: u32) -> Option<Handle> {
     }
 }
 
-/// Job 의 UI 제한 (JOB_OBJECT_UILIMIT_*). job 이 null 이면 이 프로세스가 속한 (가장 안쪽) Job. 알 수 없으면 None.
+/// UI limits of a Job (JOB_OBJECT_UILIMIT_*). A null `job` means the innermost Job this process
+/// belongs to. `None` if unknown.
 pub fn job_ui_limits(job: HANDLE) -> Option<u32> {
     let mut ui = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: 0 };
     let ok = unsafe {
@@ -211,7 +226,7 @@ pub fn job_ui_limits(job: HANDLE) -> Option<u32> {
     (ok != 0).then_some(ui.UIRestrictionsClass)
 }
 
-/// MSVC 명령줄 규칙에 맞게 인자 하나를 따옴표 처리한다
+/// Quotes one argument per the MSVC command-line rules.
 pub fn quote_arg(a: &str) -> String {
     if !a.is_empty() && !a.contains([' ', '\t', '"', '\n']) {
         return a.to_string();
@@ -245,12 +260,14 @@ pub fn command_line(exe: &Path, args: &[String], files: &[PathBuf]) -> String {
     parts.join(" ")
 }
 
-/// 숨김(SW_HIDE) 상태로, 일시정지한 채 새 Job 에 넣어 띄운다. 돌려준 스레드 핸들을 [`resume`] 해야 실행된다.
+/// Launches hidden (SW_HIDE) and suspended in a new Job. Nothing runs until the returned thread
+/// handle is passed to [`resume`].
 pub fn spawn_suspended_hidden(exe: &Path, args: &[String], files: &[PathBuf]) -> Result<(Proc, Handle)> {
     spawn_suspended(exe, args, files, None, job_ui_limits_for(exe))
 }
 
-/// 실행 파일에 맞는 Job UI 제한: Chromium 계열은 UI 제한이 하나라도 있으면 렌더러가 뜨지 않아 0
+/// Job UI limits for an executable: 0 for Chromium-based ones, whose renderers don't start under
+/// any UI limit.
 pub fn job_ui_limits_for(exe: &Path) -> u32 {
     if super::hdesk::is_chromium_family(exe) {
         0
@@ -259,8 +276,10 @@ pub fn job_ui_limits_for(exe: &Path) -> u32 {
     }
 }
 
-/// 일시정지한 채 새 Job 에 넣어 띄운다. `desktop` 이 있으면 그 숨은 데스크톱에서 보통 창으로(SW_SHOWNORMAL),
-/// 없으면 사용자 데스크톱에서 숨김(SW_HIDE)으로 시작한다. 돌려준 스레드 핸들을 [`resume`] 해야 실행된다.
+/// Launches suspended in a new Job. With a `desktop` it starts as a normal window
+/// (SW_SHOWNORMAL) on that hidden desktop, otherwise hidden (SW_HIDE) on the user's desktop.
+///
+/// Nothing runs until the returned thread handle is passed to [`resume`].
 pub fn spawn_suspended(
     exe: &Path,
     args: &[String],
@@ -268,20 +287,21 @@ pub fn spawn_suspended(
     desktop: Option<&super::hdesk::HiddenDesktop>,
     ui_limits: u32,
 ) -> Result<(Proc, Handle)> {
-    // 콘솔 서브시스템 실행 파일(자체 시험 대상만 통과)은 콘솔 창 없이
+    // console-subsystem executables (only the self-test target gets through) run without a console
+    // window
     quiet_error_mode_once();
     let console_flags = if read_head(exe, 4096).as_deref().and_then(pe_subsystem) == Some(3) { CREATE_NO_WINDOW } else { 0 };
     let mut cmd: Vec<u16> = command_line(exe, args, files).encode_utf16().chain(std::iter::once(0)).collect();
     let app = pw::wide(exe);
-    // 오래된 앱은 작업 폴더가 실행 파일 폴더라고 가정하는 경우가 많다
+    // old apps often assume the working directory is the executable's folder
     let cwd = exe.parent().map(pw::wide);
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_FORCEOFFFEEDBACK;
-    si.wShowWindow = 0; // SW_HIDE: 앱의 첫 ShowWindow(및 WinMain 의 nCmdShow)가 '숨김'이 된다
+    si.wShowWindow = 0; // SW_HIDE: the app's first ShowWindow (and WinMain's nCmdShow) becomes "hide"
     let mut desk_path = desktop.map(|d| d.startup_path());
     if let Some(p) = desk_path.as_mut() {
-        // 숨은 데스크톱은 사용자에게 보이지 않으므로 평소처럼 띄운다 (화면 밖으로 옮길 필요도 없다)
+        // the hidden desktop is invisible to the user, so launch normally (no need to move off-screen)
         si.lpDesktop = p.as_mut_ptr();
         si.wShowWindow = 1; // SW_SHOWNORMAL
     }
@@ -293,7 +313,7 @@ pub fn spawn_suspended(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            // CREATE_DEFAULT_ERROR_MODE 는 쓰지 않는다: 위에서 켠 조용한 오류 모드를 앱이 물려받게
+            // no CREATE_DEFAULT_ERROR_MODE, so the app inherits the quiet error mode set above
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | console_flags,
             std::ptr::null(),
             cwd.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
@@ -331,7 +351,7 @@ pub fn resume(thread: &Handle) {
     }
 }
 
-/// 실행 중인 다른 프로세스를 (SYNCHRONIZE | 조회) 권한으로 연다 — 붙기(Mode B) 용
+/// Opens another running process with SYNCHRONIZE | query rights, for attaching (mode B).
 pub fn open_process(pid: u32) -> Option<Handle> {
     let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if h.is_null() {
@@ -341,7 +361,7 @@ pub fn open_process(pid: u32) -> Option<Handle> {
     }
 }
 
-/// 같은 실행 파일로 실행 중인 프로세스 (사용자의 인스턴스)
+/// Running processes of the same executable (the user's instances).
 pub fn running_instances(exe: &Path) -> Vec<u32> {
     let Some(name) = exe.file_name().map(|n| n.to_string_lossy().to_lowercase()) else { return vec![] };
     let me = std::process::id();
@@ -353,7 +373,7 @@ pub fn running_instances(exe: &Path) -> Vec<u32> {
         .collect()
 }
 
-/// 프로세스가 관리자 권한(높은 무결성)으로 실행 중인가. 알 수 없으면 None.
+/// Whether a process runs elevated (high integrity). `None` if unknown.
 pub fn is_elevated(pid: u32) -> Option<bool> {
     use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
     use windows_sys::Win32::System::Threading::OpenProcessToken;
@@ -365,7 +385,7 @@ pub fn is_elevated(pid: u32) -> Option<bool> {
         let p = Handle(p);
         let mut t: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(p.0, TOKEN_QUERY, &mut t) == 0 {
-            // 일반 권한에서 관리자 프로세스의 토큰은 열 수 없다
+            // an elevated process's token can't be opened without elevation
             return Some(true);
         }
         let t = Handle(t);
@@ -378,9 +398,9 @@ pub fn is_elevated(pid: u32) -> Option<bool> {
     }
 }
 
-// ───────────────────────── 실행 전 거부 규칙 ─────────────────────────
+// ---- pre-launch refusal rules ----
 
-/// 스토어(패키지) 앱을 띄우는 System32 의 실행기들 (Windows 11)
+/// System32 launchers that start Store (packaged) apps (Windows 11).
 const PACKAGED_STUBS: [(&str, &str); 5] = [
     ("calc.exe", "계산기"),
     ("mspaint.exe", "그림판"),
@@ -400,8 +420,8 @@ fn reg_dword(root: windows_sys::Win32::System::Registry::HKEY, sub: &str, value:
     (r == 0).then_some(out)
 }
 
-/// Image File Execution Options 의 "실행 별칭 리디렉션" 필터에 걸린 경로인가 (Win11 의 notepad.exe 처럼
-/// 실행하면 스토어 앱으로 넘어가는 실행 파일)
+/// Whether a path is caught by the "execution alias redirect" filter in Image File Execution
+/// Options (executables that hand off to a Store app, like notepad.exe on Win11).
 pub fn is_alias_redirect(exe: &Path) -> bool {
     let Some(name) = exe.file_name().map(|n| n.to_string_lossy().to_string()) else { return false };
     let base = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{name}");
@@ -415,7 +435,7 @@ pub fn is_alias_redirect(exe: &Path) -> bool {
     false
 }
 
-/// PE 헤더의 서브시스템 (2 = GUI, 3 = 콘솔). 실행 파일이 아니면 None.
+/// Subsystem from the PE header (2 = GUI, 3 = console). `None` if not an executable.
 pub fn pe_subsystem(bytes: &[u8]) -> Option<u16> {
     if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
         return None;
@@ -424,7 +444,7 @@ pub fn pe_subsystem(bytes: &[u8]) -> Option<u16> {
     if bytes.len() < pe + 24 + 70 || &bytes[pe..pe + 4] != b"PE\0\0" {
         return None;
     }
-    // 선택적 헤더의 Subsystem 은 PE32/PE32+ 모두 오프셋 68
+    // the optional header's Subsystem is at offset 68 in both PE32 and PE32+
     let opt = pe + 24;
     Some(u16::from_le_bytes(bytes[opt + 68..opt + 70].try_into().ok()?))
 }
@@ -443,13 +463,14 @@ fn system_dirs() -> Vec<PathBuf> {
     vec![win.join("System32"), win.join("SysWOW64"), win.clone()]
 }
 
-/// 자체 시험(`--selftest-native`)이 띄우는 시험 대상: GhostDesk 자신 + 시험 환경 변수일 때만
+/// The self-test (`--selftest-native`) target: GhostDesk itself, only with the test environment
+/// variable set.
 fn is_selftest_target(exe: &Path) -> bool {
     std::env::var_os("GHOSTDESK_WINAPP_SELFTEST").is_some()
         && std::env::current_exe().map(|c| paths::same_path(&c, exe)).unwrap_or(false)
 }
 
-/// 실행하면 안 되는 대상이면 사용자에게 보여 줄 이유와 함께 오류
+/// Errors with a user-facing reason if the target must not be launched.
 pub fn preflight(exe: &Path) -> Result<()> {
     let lower = exe.to_string_lossy().to_lowercase().replace('/', "\\");
     if lower.contains("\\windowsapps\\") {
@@ -500,8 +521,11 @@ pub fn preflight(exe: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows 셸·시스템 실행기([`super::apps::SHELL_LAUNCHERS`])면 그 이름. Windows 폴더 안의 그 이름이거나,
-/// 다른 곳에 복사·이름을 바꾼 것이라도 VERSIONINFO 의 원래 파일 이름이 그것인 Microsoft 실행 파일이면 해당한다.
+/// The launcher's name if `exe` is a Windows shell or system launcher
+/// ([`super::apps::SHELL_LAUNCHERS`]).
+///
+/// Matches that name inside the Windows folder, and also Microsoft executables copied or renamed
+/// elsewhere whose VERSIONINFO original file name is one of them.
 pub fn shell_launcher_name(exe: &Path) -> Option<String> {
     let launchers = &super::apps::SHELL_LAUNCHERS;
     let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -515,7 +539,7 @@ pub fn shell_launcher_name(exe: &Path) -> Option<String> {
     (microsoft && launchers.contains(&orig.as_str())).then_some(orig)
 }
 
-/// Windows 셸(작업 표시줄·바탕 화면) 프로세스들 — 붙으면 안 된다
+/// Windows shell (taskbar, desktop) processes, which must never be attached to.
 pub fn shell_pids() -> Vec<u32> {
     let mut v = Vec::new();
     for h in [w32::find_window_class("Shell_TrayWnd"), w32::shell_window()] {
@@ -529,7 +553,7 @@ pub fn shell_pids() -> Vec<u32> {
     v
 }
 
-/// 실행 중 프로세스가 GhostDesk 보다 높은 권한이면 조작할 수 없다 (UIPI)
+/// A running process with higher rights than GhostDesk can't be driven (UIPI).
 pub fn check_attachable(pid: u32) -> Result<()> {
     if shell_pids().contains(&pid) {
         bail!(
@@ -594,24 +618,24 @@ mod tests {
     #[test]
     fn preflight_rules() {
         let sys = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
-        // 콘솔 프로그램 거부
+        // console programs are refused
         assert!(preflight(&sys.join(r"System32\cmd.exe")).is_err());
-        // 스토어 앱 실행기 거부
+        // Store app launchers are refused
         if sys.join(r"System32\calc.exe").is_file() {
             let e = preflight(&sys.join(r"System32\calc.exe")).unwrap_err().to_string();
             assert!(e.contains("계산기"), "{e}");
         }
-        // 실행 별칭 리디렉션 (이 PC 처럼 IFEO 필터가 있을 때만)
+        // execution alias redirects (only when the IFEO filter exists, as on this PC)
         if is_alias_redirect(&sys.join(r"System32\notepad.exe")) {
             assert!(preflight(&sys.join(r"System32\notepad.exe")).is_err());
         }
         assert!(preflight(Path::new(r"C:\Program Files\WindowsApps\x\y.exe")).is_err());
-        // 일반 Win32 앱은 통과
+        // regular Win32 apps pass
         if sys.join(r"System32\charmap.exe").is_file() {
             preflight(&sys.join(r"System32\charmap.exe")).unwrap();
             assert_eq!(shell_launcher_name(&sys.join(r"System32\charmap.exe")), None);
         }
-        // Windows 셸·시스템 실행기 거부
+        // Windows shell and system launchers are refused
         for p in [r"explorer.exe", r"System32\control.exe", r"System32\mmc.exe", r"System32\rundll32.exe", r"System32\mshta.exe", r"regedit.exe"] {
             let p = sys.join(p);
             if p.is_file() {
@@ -623,7 +647,7 @@ mod tests {
 
     #[test]
     fn shell_launcher_copy_is_recognized() {
-        // 다른 폴더로 복사하고 이름을 바꾼 explorer.exe 도 VERSIONINFO 로 알아본다
+        // explorer.exe copied to another folder and renamed is still recognized through VERSIONINFO
         let sys = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
         let src = sys.join("explorer.exe");
         if !src.is_file() || pw::version_info(&src).and_then(|v| v.original_filename).is_none() {

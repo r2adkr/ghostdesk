@@ -1,18 +1,18 @@
-//! 에이전트 하나의 상세 보기: 라이브 화면·직접 조작·기록·지시.
+//! Detail view for one agent: live screen, takeover, log and instructions.
 
 use super::*;
 use super::labels::{status_color, status_text};
 
-/// 사용자의 직접 조작 입력 하나 (에이전트 좌표)
+/// One takeover input from the user, in agent coordinates.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum TakeoverInput {
-    /// 드래그 시작: 그 지점으로 이동한 뒤 버튼 누름
+    /// Drag start: move to the point, then press the button.
     DragStart(f64, f64),
     MouseMove(f64, f64),
     MouseUp,
     Click { pos: (f64, f64), button: MouseButton, count: u32 },
     Type(String),
-    /// 사람이 누른 키 조합 (클립보드 조합도 그대로 전달)
+    /// A key combo pressed by a person (clipboard combos pass through too).
     Key(String),
     Scroll { pos: Option<(f64, f64)>, dx: f64, dy: f64 },
 }
@@ -35,12 +35,13 @@ impl TakeoverInput {
 }
 
 impl GhostApp {
-    /// 상세 보기 오른쪽 패널: 이름·상태 → 제어 → (질문/외부 안내) → 기록 → 아래쪽 지시 입력
+    /// Right panel of the detail view: name/status → controls → (question / external notice) → log
+    /// → instruction box at the bottom.
     pub(super) fn detail_side(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
         let a = &mut self.agents[idx];
         let st = a.shared.status();
         let mut remove = false;
-        // 1줄: ● 이름 ……… ⋯ (제거는 메뉴 안에: 실수로 누르지 않게)
+        // row 1: ● name ……… ⋯ (remove lives in the menu so it isn't hit by accident)
         ui.horizontal(|ui| {
             theme::dot(ui, crate::cursor::agent_color(a.shared.id), 5.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -64,7 +65,7 @@ impl GhostApp {
         let tokens = *a.shared.tokens.lock();
         let paused = a.shared.paused.load(Ordering::Relaxed);
         let info = trf("단계 {} · 토큰 {} / {} · 작업공간 {}", &[&a.shared.steps.load(Ordering::Relaxed), &tokens.0, &tokens.1, &a.shared.workspace_name]);
-        // 일하는 중이면 도는 표시 + 반짝이는 상태 글, 멈춰 있으면 색 칩
+        // spinner plus shimmering status text while working, a colored chip when stopped
         if is_working(&st) && !paused {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -76,7 +77,7 @@ impl GhostApp {
         } else {
             theme::chip(ui, status_color(&st), &status_text(&st)).on_hover_text(info);
         }
-        // 단계: 마지막 지시 뒤로 몇 번 움직였는지 (최대 단계가 있으면 막대로)
+        // steps: how many moves since the last instruction (a bar when there's a step limit)
         let run = a.shared.run_steps.load(Ordering::Relaxed);
         if run > 0 {
             ui.horizontal(|ui| {
@@ -119,7 +120,7 @@ impl GhostApp {
             theme::tinted(theme::warn()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(tr("에이전트의 질문")).strong().color(theme::warn()));
-                // 긴 질문도 아래 답변 칸을 밀어내지 않게 높이를 제한한다
+                // cap the height so a long question doesn't push the answer box away
                 egui::ScrollArea::vertical().id_salt("question").max_height(160.0).show(ui, |ui| {
                     ui.label(q);
                 });
@@ -136,9 +137,9 @@ impl GhostApp {
         }
         ui.add_space(6.0);
 
-        // 가운데: 기록, 아래: 지시 입력 (GhostDesk 안의 에이전트만).
-        // 입력칸 높이는 지난 프레임에 잰 값으로 기록 영역을 남겨 두고, 높이가 바뀌면 한 번 더 그려 맞춘다.
-        // 자리가 모자라면 기록을 줄인다 (입력칸과 보내기 단추는 늘 보이게).
+        // middle: the log; bottom: the instruction box (only for agents inside GhostDesk).
+        // reserve the log area using the composer height measured last frame, and redraw once more if
+        // it changed. When space runs short the log shrinks; the box and send button always stay visible.
         let has_composer = external.is_none();
         let composer_id = egui::Id::unique(("composer_h", a.shared.id));
         let composer_h: f32 = ui.data(|d| d.get_temp(composer_id)).unwrap_or(150.0);
@@ -153,14 +154,14 @@ impl GhostApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 7.0;
                         let log = a.shared.log.lock();
-                        // 마지막 동작 줄은 그 동작이 아직 진행 중이면 도는 표시로
+                        // the last action row gets a spinner while that action is still running
                         let acting = matches!(st, AgentStatus::Acting(_)) && !paused;
                         let last_action = log.iter().rposition(|l| l.kind == LogKind::Action);
                         let n = log.len();
                         for (i, l) in log.iter().enumerate() {
                             let live = acting && Some(i) == last_action;
                             if i + 1 == n {
-                                // 새로 들어온 줄은 서서히 나타난다
+                                // new rows fade in
                                 let t = theme::appear(ui.ctx(), egui::Id::unique(("log_in", a.shared.id)), n as u64, 0.25);
                                 ui.scope(|ui| {
                                     ui.multiply_opacity(t);
@@ -245,7 +246,8 @@ impl GhostApp {
         let ws_opt = self.agents[idx].shared.workspace();
         let browser = ws_opt.as_ref().and_then(|w| w.as_browser().cloned());
         let (views, active) = ws_opt.as_ref().map(|w| w.views()).unwrap_or_default();
-        // 1줄: ‹ 모두 보기 · (브라우저: ◀ ▶ ⟳ + 주소 / 앱: 지금 창 제목) · 오른쪽 끝 가상 마우스
+        // row 1: ‹ all agents · (browser: ◀ ▶ ⟳ + address / app: current window title) · virtual
+        // mouse at the far right
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(RichText::new(tr("‹  모두 보기")).color(theme::text())).frame_when_inactive(false).min_size(Vec2::new(0.0, 32.0)))
@@ -295,7 +297,7 @@ impl GhostApp {
                 });
             });
         });
-        // 2줄: 탭/창이 둘 이상일 때만 (넘치면 다음 줄로)
+        // row 2: only with two or more tabs/windows (wraps when it overflows)
         if views.len() > 1 {
             ui.horizontal_wrapped(|ui| {
                 for (i, t) in views.iter().enumerate() {
@@ -317,7 +319,7 @@ impl GhostApp {
         };
         ui.add_space(6.0);
 
-        // 라이브 화면 (가운데 정렬, 비율 유지)
+        // live screen (centered, aspect ratio kept)
         let avail = ui.available_size();
         let (sw, sh) = ws.size();
         let scale = (avail.x / sw.max(1) as f32).min(avail.y / sh.max(1) as f32).max(0.05);
@@ -339,10 +341,11 @@ impl GhostApp {
             .inner;
         let rect = resp.rect;
         if !a.takeover {
-            // 검은 페이지도 바탕과 구분되게 얇은 테두리
+            // thin border so black pages stand apart from the background
             ui.painter().rect_stroke(rect, 10, Stroke::new(1.0, theme::border()), StrokeKind::Outside);
         }
-        // 가상 마우스: 격리 화면에는 실제 커서가 없으므로 에이전트 동작을 기록해 그린다.
+        // virtual mouse: isolated screens have no real cursor, so draw one from the agent's recorded
+        // actions
         if self.show_cursor && a.texture.is_some() {
             let mut st = a.shared.cursor.lock();
             let again = crate::cursor::paint(
@@ -358,7 +361,7 @@ impl GhostApp {
             shared.cursor.lock().record(name, &input, pos, true);
         };
         if a.takeover {
-            // 직접 조작 중: 주황 테두리 + 왼쪽 위 표시
+            // during takeover: orange border plus a badge at the top left
             let p = ui.painter();
             p.rect_stroke(rect, 10, egui::Stroke::new(2.0, theme::takeover()), egui::StrokeKind::Outside);
             let at = rect.left_top() + Vec2::new(12.0, 10.0);
@@ -375,7 +378,7 @@ impl GhostApp {
         if hovered || resp.has_focus() {
             resp.request_focus();
         }
-        // 모든 입력은 에이전트별 큐 하나로 보내 순서대로 적용한다
+        // all input goes through one queue per agent and is applied in order
         let input = a.input_tx.clone();
         let send = move |ev: TakeoverInput| {
             let _ = input.send(ev);
@@ -415,12 +418,13 @@ impl GhostApp {
             }
         }
         if !hovered {
-            // 화면 밖으로 나가면 입력기가 꺼지므로 조합 중이던 글자 표시도 지운다
+            // leaving the screen turns the IME off, so clear any in-progress composition too
             a.preedit.clear();
             return;
         }
-        // Windows: 직접 조작 중에는 입력기(IME)를 켜 둔다. egui 는 글 입력칸에 포커스가 없으면 IME 를 꺼 버려
-        // (ImmAssociateContextEx) 한글 자판이 영문 글자로 들어온다. 조합이 확정되면(Commit) Type 으로 보낸다.
+        // Windows: keep the IME on during takeover. egui turns it off when no text field has focus
+        // (ImmAssociateContextEx), which makes a Korean layout type Latin letters. Committed text is
+        // sent as Type.
         if cfg!(windows) {
             let at = resp.hover_pos().unwrap_or(rect.left_top());
             ui.ctx().output_mut(|o| {
@@ -435,20 +439,22 @@ impl GhostApp {
         let events = ui.input(|i| i.events.clone());
         for ev in events {
             match ev {
-                // 붙여넣기: 사람이 직접 한 조작이므로 사용자의 클립보드 글자를 그대로 입력한다
+                // paste: it's the person's own action, so type the user's clipboard text as is
                 egui::Event::Text(t) | egui::Event::Paste(t) => {
                     rec("type", serde_json::json!({ "text": t }), ws.mouse_pos());
                     send(TakeoverInput::Type(t));
                 }
-                // egui 는 cmd+C / cmd+X (Windows: ctrl+C·ctrl+Insert / ctrl+X·shift+Delete) 를 Key 대신
-                // Copy / Cut 으로 바꾸므로 격리 화면에 그 OS 의 키 조합으로 전달한다. Windows 의 Insert/Delete 는
-                // 누른 조합 그대로 (그 화면 안에서 복사·잘라내기가 일어난다. Electron 의 클립보드 차단은 에이전트에게만 적용)
+                // egui turns cmd+C / cmd+X (Windows: ctrl+C, ctrl+Insert / ctrl+X, shift+Delete) into Copy /
+                // Cut instead of Key events, so forward them as that OS's combos. On Windows, Insert/Delete stay
+                // as pressed (the copy/cut happens inside that screen; Electron's clipboard block only applies
+                // to agents)
                 egui::Event::Copy | egui::Event::Cut => {
                     let combo = crate::platform::input::takeover_clipboard_combo(matches!(ev, egui::Event::Copy), ui.input(|i| i.modifiers));
                     rec("key", serde_json::json!({ "text": combo }), ws.mouse_pos());
                     send(TakeoverInput::Key(combo));
                 }
-                // 조합 중인 글자는 화면에만 보여 준다 (Windows 에서만 IME 를 켜므로 그때만 온다)
+                // in-progress composition is only shown on screen (it only arrives on Windows, where the IME
+                // is kept on)
                 egui::Event::Ime(egui::ImeEvent::Preedit { text: t, .. }) if cfg!(windows) => {
                     a.preedit = t;
                 }
@@ -491,7 +497,8 @@ impl GhostApp {
     }
 }
 
-/// 직접 조작 입력 큐와 그것을 순서대로 적용하는 task 하나. 보내는 쪽(AgentHandle)이 사라지면 task 도 끝난다.
+/// The takeover input queue and one task applying it in order. The task ends when the sender
+/// (`AgentHandle`) goes away.
 pub(super) fn spawn_input_queue(rt: &Handle, shared: Arc<AgentShared>) -> mpsc::UnboundedSender<TakeoverInput> {
     let (tx, mut rx) = mpsc::unbounded_channel::<TakeoverInput>();
     rt.spawn(async move {
@@ -507,7 +514,7 @@ pub(super) fn spawn_input_queue(rt: &Handle, shared: Arc<AgentShared>) -> mpsc::
     tx
 }
 
-/// 아직 첫 화면이 오지 않은 자리: 카드 바탕 + 가운데 도는 표시 + 글
+/// Placeholder before the first frame arrives: card background, centered spinner and text.
 pub(super) fn preparing(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     let p = ui.painter();
     p.rect_filled(rect, theme::CARD_RADIUS, theme::card());
@@ -516,13 +523,15 @@ pub(super) fn preparing(ui: &egui::Ui, rect: egui::Rect, text: &str) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }
 
-/// 지금 일하는 중인 상태인가 (준비 · 생각 · 실행)
+/// Whether the agent is working (preparing, thinking, acting).
 pub(super) fn is_working(st: &AgentStatus) -> bool {
     matches!(st, AgentStatus::Preparing(_) | AgentStatus::Thinking | AgentStatus::Acting(_))
 }
 
-/// 기록 한 줄: 종류 표시 + 글 (줄바꿈하면 표시 오른쪽으로 들여 씀). 시각은 마우스를 올리면.
-/// 동작 줄은 단계처럼 보인다: 끝난 동작은 ✓, 진행 중인 동작(`live`)은 도는 표시.
+/// One log row: kind marker plus text (wrapped lines indent past the marker). The time shows on
+/// hover.
+///
+/// Action rows look like steps: finished ones get ✓, the running one (`live`) a spinner.
 pub(super) fn log_row(ui: &mut egui::Ui, l: &crate::agent::LogEntry, live: bool) {
     let (dot, color) = match l.kind {
         LogKind::User => (theme::info_text(), theme::text()),
@@ -560,7 +569,8 @@ pub(super) fn log_row(ui: &mut egui::Ui, l: &crate::agent::LogEntry, live: bool)
     row.response.on_hover_text(trf("{}초", &[&format!("{:.1}", l.secs)]));
 }
 
-/// egui 키 이벤트 → xdotool 스타일 조합. 일반 글자는 Text 이벤트로 오므로 수정키가 있을 때만 처리.
+/// egui key event → xdotool-style combo. Plain characters arrive as Text events, so only combos
+/// with modifiers are handled.
 pub(super) fn egui_key_combo(key: egui::Key, m: egui::Modifiers) -> Option<String> {
     use egui::Key::*;
     let base = match key {

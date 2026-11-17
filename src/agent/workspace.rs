@@ -1,4 +1,5 @@
-//! 격리 화면 준비: 화면 종류(DeskTarget)별로 띄우거나 접속해 `Desk` 를 만든다.
+//! Sets up isolated screens: launches or connects whatever a `DeskTarget` describes and builds
+//! the `Desk`.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -15,10 +16,12 @@ pub(crate) async fn prepare_workspace(shared: &Arc<AgentShared>, workspace: &str
     prepare_workspace_with(shared, workspace, target, None).await
 }
 
-/// `prepare_workspace` 와 같되, 원격 대상(kind=remote)에 실제로 접속한 주소가 이 컴퓨터 자신일 때
-/// 허용할지를 호출한 쪽이 정한다 (macOS 밖에서만 쓴다. macOS 에서는 무시).
-/// `None` 이면 대상의 `dedicated_ack` 를 따른다 (GUI·자체 점검). MCP 요청(control.rs)은 사람이 승인 창에서
-/// '이 컴퓨터 자신의 VNC 서버' 경고를 본 경우에만 `Some(true)` 를 넘겨, 승인한 대상과 실제로 접속한 주소를 묶는다.
+/// Like `prepare_workspace`, but the caller decides whether a remote target (kind=remote) may
+/// end up connected to this machine itself (outside macOS only; ignored on macOS).
+///
+/// `None` follows the target's `dedicated_ack` (GUI, self-test). MCP requests (control.rs)
+/// pass `Some(true)` only when a person saw the "this computer's own VNC server" warning in the
+/// approval dialog, tying the approved target to the address actually connected.
 pub(crate) async fn prepare_workspace_with(
     shared: &Arc<AgentShared>,
     workspace: &str,
@@ -105,10 +108,12 @@ async fn prepare_native(shared: &Arc<AgentShared>, opts: &crate::native::NativeO
     Ok(Desk::Native(ws))
 }
 
-/// 이 컴퓨터 자신의 VNC 서버에 확인 없이 접속하려 할 때의 오류 (macOS 밖).
-/// 그런 서버는 대개 지금 사용자가 보고 있는 실제 화면을 내보내므로, 에이전트가 사용자의 화면·마우스·키보드를
-/// 직접 조작하게 된다. WSL·Hyper-V 처럼 이 컴퓨터 주소로 전달되는 별도 데스크톱은 확인 후 허용한다.
-/// (MCP 요청은 control.rs 가 사람에게 묻기 전에 같은 문구로 거절한다)
+/// Error for connecting to this machine's own VNC server without confirmation (outside macOS).
+///
+/// Such a server usually exports the real screen the user is looking at, so the agent would be
+/// driving the user's screen, mouse and keyboard directly. Separate desktops forwarded to this
+/// machine's address (WSL, Hyper-V) are allowed after confirmation. MCP requests are refused
+/// with the same message by control.rs before asking anyone.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn local_vnc_refusal(host: &str, port: u16) -> String {
     use crate::platform::text::THIS_COMPUTER;
@@ -119,9 +124,11 @@ pub(crate) fn local_vnc_refusal(host: &str, port: u16) -> String {
     )
 }
 
-/// 원격 대상이 승인할 때는 이 컴퓨터가 아닌 것으로 보였는데 실제로 접속한 주소는 이 컴퓨터 자신일 때의 오류 (macOS 밖).
-/// (에이전트 전용 머신 확인은 있었지만 사람이 '이 컴퓨터 자신' 경고를 보지 못했다: DNS 응답이 바뀌었거나
-/// 이 컴퓨터를 가리키는 다른 이름을 썼다)
+/// Error for a remote target that looked like another machine at approval time but actually
+/// connected to this one (outside macOS).
+///
+/// The dedicated-machine confirmation was given, but nobody saw the "this computer itself"
+/// warning: the DNS answer changed, or another name pointing here was used.
 #[cfg(not(target_os = "macos"))]
 fn local_vnc_mismatch(host: &str, port: u16) -> String {
     use crate::platform::text::THIS_COMPUTER;
@@ -132,8 +139,9 @@ fn local_vnc_mismatch(host: &str, port: u16) -> String {
     )
 }
 
-/// `local_ok`: 실제로 접속한 주소가 이 컴퓨터 자신이어도 접속할지 (macOS 밖에서만 쓴다).
-/// 보통은 `t.dedicated_ack` 와 같고, MCP 요청은 사람이 '이 컴퓨터 자신' 경고를 본 경우에만 true.
+/// `local_ok`: whether to connect even if the address actually reached is this machine
+/// (outside macOS only). Usually equal to `t.dedicated_ack`; MCP requests set it only when a
+/// person saw the "this computer itself" warning.
 async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: bool) -> Result<Desk> {
     #[cfg(target_os = "macos")]
     let _ = local_ok;
@@ -143,8 +151,8 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
     let types: Vec<&str> = g.security_types.iter().map(|x| rfb::security_type_name(*x)).collect();
     shared.log(LogKind::Info, format!("{}:{} — {} / 보안 방식: {}", t.host, t.port, g.server_version, types.join(", ")));
     let apple = g.server_version.contains("003.889");
-    // 이 Mac 자신의 화면 공유(Apple 서버)는 확인과 상관없이 항상 거부한다 (macOS 전용 규칙:
-    // 다른 OS 에서 루프백의 Apple 서버는 다른 Mac 으로 가는 터널일 뿐이다).
+    // this Mac's own Screen Sharing (Apple server) is always refused, confirmation or not. That's a
+    // macOS-only rule: on other OSes an Apple server on loopback is just a tunnel to another Mac.
     #[cfg(target_os = "macos")]
     if apple && rfb::is_local_host(&t.host, t.port).await {
         return Err(anyhow!(
@@ -159,11 +167,12 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
              대상이 에이전트 전용 Mac/VM 이라면 '에이전트 전용 머신' 확인란을 켜고 다시 시작하세요."
         ));
     }
-    // macOS 밖: 이 컴퓨터 자신의 VNC 서버(TightVNC·UltraVNC·RealVNC 등)는 사용자의 실제 화면일 수 있으므로
-    // '에이전트 전용 머신' 확인이 있어야만 접속한다.
-    // 판단은 이름을 다시 푼 결과뿐 아니라 실제로 접속한 주소(탐지 연결의 상대 주소)로도 하고,
-    // 본 접속에서도 접속한 소켓으로 다시 확인한다 (DNS 응답이 바뀌는 사이에 빠져나가지 못하게).
-    // (확인이 있었는데도 허용하지 않는 경우는 승인 창에서 '이 컴퓨터 자신' 경고를 보지 못한 MCP 요청이다)
+    // outside macOS: this machine's own VNC server (TightVNC, UltraVNC, RealVNC, …) may be the
+    // user's real screen, so only connect with the dedicated-machine confirmation.
+    // decide on the address actually reached (the probe connection's peer), not just a fresh name
+    // lookup, and check again on the real connection's socket so a changing DNS answer can't slip
+    // through. (Refused despite confirmation means an MCP request whose approver never saw the
+    // "this computer itself" warning.)
     #[cfg(not(target_os = "macos"))]
     let refuse_local = (!local_ok).then(|| {
         if t.dedicated_ack {
@@ -194,7 +203,7 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
         LogKind::Info,
         format!("원격 데스크톱 접속됨: '{}' ({fw}x{fh}, 에이전트 좌표 {:?})", desk.desktop_name(), desk.size()),
     );
-    // 라이브 화면: 프레임버퍼가 바뀔 때마다(최대 10fps) UI 로 올린다.
+    // live screen: push to the UI whenever the framebuffer changes (at most 10 fps)
     let (sh, weak) = (shared.clone(), Arc::downgrade(&desk));
     tokio::spawn(async move {
         let mut last = u64::MAX;
@@ -226,13 +235,15 @@ async fn prepare_browser(
     let dir: PathBuf = profiles::workspaces_root().join(profiles::slug(workspace));
     let (exe, profile_dir) = match source {
         ProfileSource::Clone { browser, profile_dir, refresh } => {
-            // 복제 도중 종료(앱 종료 시 런타임 shutdown_timeout 등)되면 표시 파일이 남는다: 그 복제본은 다시 만든다
+            // a marker file is left behind if we exit mid-clone (runtime shutdown_timeout on quit, etc.);
+            // that clone gets rebuilt
             let cloning_mark = dir.join(".ghostdesk-cloning");
             let has = dir.join(profile_dir).is_dir() && !cloning_mark.exists();
             if *refresh || !has {
                 if dir.exists() {
-                    // Windows 는 파일 잠금이 강제라, 방금 끝난 브라우저·백신이 쥔 파일 때문에 지우기가 잠깐 실패할 수 있다:
-                    // 몇 번 다시 시도하고, 그래도 안 되면 반쯤 남은 폴더 위에 복제하지 않고 알린다.
+                    // Windows file locks are mandatory, so deletion can briefly fail on files held by a browser or
+                    // antivirus that just exited. Retry a few times, and if it still fails, report it rather than
+                    // cloning over a half-deleted folder.
                     let r = crate::platform::fsx::remove_dir_all_retry(&dir);
                     if cfg!(windows) {
                         if let Err(e) = r {
@@ -311,10 +322,12 @@ mod tests {
     use super::*;
     use eframe::egui;
 
-    /// 이 컴퓨터의 VNC 서버: macOS 밖에서는 '에이전트 전용 머신' 확인이 있어야 하고, Apple 서버 자신은 macOS 에서만 항상 거부
+    /// This machine's VNC server needs the dedicated-machine confirmation outside macOS; the Apple
+    /// server itself is always refused, but only on macOS.
     #[tokio::test]
     async fn local_vnc_server_needs_ack() {
-        // 버전과 보안 방식(None)만 알려 주고 끊는 가짜 RFB 서버 (접속 단계는 항상 실패)
+        // fake RFB server that sends a version and security type (None), then hangs up (connecting
+        // always fails)
         async fn fake(version: &'static [u8]) -> u16 {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
@@ -349,7 +362,8 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(e.contains("이 Mac 자신의 화면 공유 서버"), "{e}");
         } else {
-            // 다른 OS 에서 루프백의 Apple 서버는 다른 Mac 으로 가는 터널이다: 확인했으면 거부하지 않음
+            // on other OSes an Apple server on loopback is a tunnel to another Mac: not refused once
+            // confirmed
             assert!(!e.contains("이 Mac 자신의") && !e.contains("자신에서 실행 중인 VNC 서버"), "{e}");
         }
         let e = err(prepare_remote(&shared, &target(port, false), false).await);
@@ -359,8 +373,9 @@ mod tests {
             assert!(e.contains("대상이 macOS 화면 공유 서버입니다"), "{e}");
         }
 
-        // macOS 밖: 확인은 있었지만 사람이 승인할 때 '이 컴퓨터 자신' 경고를 보지 못한 MCP 요청(local_ok=false)은
-        // 실제로 접속한 주소가 이 컴퓨터면 거절한다 (Apple 서버든 아니든)
+        // outside macOS: an MCP request that was confirmed but whose approver never saw the "this
+        // computer itself" warning (local_ok=false) is refused if it actually reached this machine,
+        // Apple server or not
         #[cfg(not(target_os = "macos"))]
         for v in [&b"RFB 003.008\n"[..], &b"RFB 003.889\n"[..]] {
             let port = fake(v).await;
@@ -368,7 +383,7 @@ mod tests {
             assert_eq!(e, local_vnc_mismatch("127.0.0.1", port), "{}", String::from_utf8_lossy(v));
             let e = err(prepare_workspace_with(&shared, "t", &DeskTarget::Remote(target(port, true)), Some(false)).await);
             assert_eq!(e, local_vnc_mismatch("127.0.0.1", port));
-            // 넘겨주지 않으면 확인(dedicated_ack)을 따른다
+            // when not passed, the confirmation (dedicated_ack) decides
             let e = err(prepare_workspace(&shared, "t", &DeskTarget::Remote(target(port, true))).await);
             assert!(!e.contains("자신에서 실행 중인") && !e.contains("실제로 접속한 주소는"), "{e}");
         }

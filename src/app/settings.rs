@@ -1,14 +1,15 @@
-//! 설정 창(언어 · AI 연결 목록 · 지금 쓰는 AI · 화면 · 작업)과 홈 화면의 모델 고르기.
-//! 새 에이전트 창도 지금 연결의 키·주소 칸을 같이 쓴다.
+//! Settings window (language, AI connections, current AI, display, work) and the model picker
+//! on the home screen. The new-agent window reuses the current connection's key and URL fields.
 //!
-//! AI 연결 하나의 규칙(이름·주소·빠진 설정)은 `ai.rs` 에 있고, 여기는 그것을 그리고 고치는 화면만 맡는다.
+//! The rules for one connection (name, URL, missing setup) live in `ai.rs`; this module only
+//! draws and edits them.
 
 use super::ai::{self, AiConn};
 use super::labels::{effort_label, effort_short};
 use super::*;
 
 impl GhostApp {
-    /// 지금 쓰는 연결
+    /// The current connection.
     pub(super) fn cur(&self) -> Option<&AiConn> {
         self.ai.iter().find(|c| c.id == self.ai_current)
     }
@@ -17,7 +18,7 @@ impl GhostApp {
         self.ai.iter().position(|c| c.id == id)
     }
 
-    /// 지금 연결로 일을 시작하기에 빠진 설정. 다 있으면 None
+    /// What the current connection still needs before it can start work. `None` when ready.
     pub(super) fn missing_setup(&self) -> Option<String> {
         match self.cur() {
             None => Some(tr("설정에서 쓸 AI 를 추가해 주세요.").to_string()),
@@ -25,7 +26,8 @@ impl GhostApp {
         }
     }
 
-    /// 홈 메뉴에 보일 만큼 준비된 연결인가. 아무것도 필요 없는 Ollama 는 지금 쓰고 있을 때만 (켜 두지 않은 PC 가 많다)
+    /// Whether a connection is ready enough to show in the home menu. Ollama needs nothing, so it
+    /// only shows while in use (many PCs don't have it running).
     fn ready(&self, c: &AiConn) -> bool {
         if c.provider.needs_key() || c.provider.needs_url() {
             c.configured()
@@ -34,7 +36,8 @@ impl GhostApp {
         }
     }
 
-    /// 연결의 모델 목록을 아직 안 불러왔으면 API 에서 불러오기 시작한다 (주소·필수 키가 없으면 하지 않음).
+    /// Starts fetching a connection's model list from the API if not done yet (skipped without a
+    /// URL or required key).
     fn fetch_models(&mut self, ctx: &egui::Context, id: u64) -> ModelFetch {
         let Some(c) = self.ai.iter().find(|c| c.id == id) else { return ModelFetch::Idle };
         let state = self.model_fetch.lock().get(&id).cloned().unwrap_or_default();
@@ -51,13 +54,13 @@ impl GhostApp {
         ModelFetch::Loading
     }
 
-    /// 키·주소가 바뀌었으니 그 연결의 모델 목록을 다음에 새로 불러온다
+    /// The key or URL changed, so refetch that connection's model list next time.
     fn refetch(&self, id: u64) {
         self.model_fetch.lock().remove(&id);
     }
 
-    /// 연결에서 고를 수 있는 모델: API 에서 불러온 전체 목록 (불러오기 전·실패 때는 기본 목록).
-    /// 지금 고른 모델은 목록에 없어도(이름을 직접 적었어도) 맨 앞에 넣는다.
+    /// Models a connection can pick: the full list from the API (defaults before fetching or on
+    /// failure). The current model is put first even if it's not in the list (typed by hand).
     fn models_for(c: &AiConn, state: &ModelFetch) -> Vec<String> {
         let mut list: Vec<String> = match state {
             ModelFetch::Done(Ok(list)) if !list.is_empty() => list.clone(),
@@ -70,7 +73,8 @@ impl GhostApp {
         list
     }
 
-    /// 불러오는 중이면 작은 표시. 실패했으면 무슨 일인지와 '다시 시도' (API 원문 오류는 글에 마우스를 올리면).
+    /// A small indicator while loading. On failure, what went wrong plus "Retry" (the raw API error
+    /// shows on hover).
     fn fetch_status(&self, ui: &mut egui::Ui, id: u64, state: &ModelFetch) {
         match state {
             ModelFetch::Loading => {
@@ -92,9 +96,9 @@ impl GhostApp {
         }
     }
 
-    // ── 입력 칸 (설정 창·새 에이전트 창이 같이 쓴다) ──
+    // ---- input fields (shared by Settings and the new-agent window) ----
 
-    /// `i` 번째 연결의 API 키 칸. 키가 바뀌면 그 연결의 모델 목록을 새 키로 다시 불러온다.
+    /// API key field of connection `i`. A changed key refetches that connection's model list.
     pub(super) fn key_field(&mut self, ui: &mut egui::Ui, i: usize, width: f32, id: egui::Id) -> egui::Response {
         let c = &mut self.ai[i];
         let r = ui.add(
@@ -111,7 +115,7 @@ impl GhostApp {
         r
     }
 
-    /// `i` 번째(OpenAI 호환) 연결의 주소 칸. 바뀌면 모델 목록을 다시 불러온다.
+    /// URL field of (OpenAI-compatible) connection `i`. A change refetches the model list.
     pub(super) fn url_field(&mut self, ui: &mut egui::Ui, i: usize, width: f32) -> egui::Response {
         let r = ui.add(
             egui::TextEdit::singleline(&mut self.ai[i].url)
@@ -125,8 +129,8 @@ impl GhostApp {
         r
     }
 
-    /// 새 에이전트 창: 지금 연결에 빠진 키·주소를 바로 넣는 칸 (연결이 없으면 설정을 여는 단추).
-    /// 칸이 바뀌면 true.
+    /// New-agent window: fields to fill in the current connection's missing key or URL right there
+    /// (or a button opening Settings when there's no connection). Returns true if a field changed.
     pub(super) fn setup_fields(&mut self, ui: &mut egui::Ui, width: f32, focus_key: bool) -> bool {
         let Some(i) = self.conn_index(self.ai_current) else {
             if theme::secondary(ui, trf("{}  AI 추가", &[&icon::PLUS])).clicked() {
@@ -149,7 +153,7 @@ impl GhostApp {
         changed
     }
 
-    /// 지금 연결의 모델 이름 칸 + ▾ 목록 (설정 창)
+    /// Current connection's model name field plus the ▾ list (Settings).
     fn model_field(&mut self, ui: &mut egui::Ui, width: f32) {
         let Some(i) = self.conn_index(self.ai_current) else { return };
         let id = self.ai[i].id;
@@ -175,7 +179,7 @@ impl GhostApp {
         });
     }
 
-    /// 생각 깊이 슬라이더 (낮음 … 최대). 바뀌면 true
+    /// Thinking depth slider (low … max). Returns true if changed.
     fn effort_slider(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
         let label_w = 96.0;
         ui.horizontal(|ui| {
@@ -189,11 +193,13 @@ impl GhostApp {
         .inner
     }
 
-    // ── 홈 화면의 모델 단추 ──
+    // ---- model button on the home screen ----
 
-    /// 홈 입력 상자 아래의 모델 단추: 준비된 모든 연결의 모델을 한 목록에서 골라 바로 바꾼다.
+    /// Model button under the home input box: pick from every ready connection's models in one list
+    /// and switch right away.
     pub(super) fn model_picker(&mut self, ui: &mut egui::Ui) {
-        // 연결 이름(흐리게) · 모델 이름 · 생각 깊이 · ▾ 를 한 줄 가운데에 맞춰 놓는다 (아이콘 글꼴은 기준선이 달라 가운데 정렬이 필요)
+        // connection name (dimmed), model name, thinking depth and ▾ vertically centered on one line
+        // (the icon font has a different baseline, so centering is needed)
         let mut label = egui::text::LayoutJob::default();
         let part = |size: f32, color: Color32| egui::TextFormat {
             font_id: egui::FontId::proportional(size),
@@ -215,10 +221,12 @@ impl GhostApp {
         let button = egui::Button::new(label).frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
         let hover = self.cur().map(|c| tr(c.provider.label()).to_string()).unwrap_or_default();
         let (r, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-            // 폭을 고정한다 (검색 칸이 남는 폭을 다 차지하려 해서 메뉴가 화면만큼 넓어지지 않게)
+            // fixed width, otherwise the search field grabs all remaining width and the menu grows as wide
+            // as the screen
             ui.set_width(340.0);
-            // 머리글·검색 글·모델 이름을 모두 메뉴 줄의 글 시작점(단추 안쪽 여백)에 맞춘다
-            // (메뉴는 기본 안쪽 여백이 2px 라 선택 배경 끝에 글이 붙으므로 넓힌다)
+            // align headers, search text and model names to the menu rows' text start (button padding).
+            // Menus default to 2 px padding, which puts text against the selection background's edge, so
+            // widen it.
             ui.spacing_mut().button_padding.x = 10.0;
             let pad = ui.spacing().button_padding.x;
             let indent = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
@@ -228,7 +236,7 @@ impl GhostApp {
                 });
             };
             let mut chosen: Option<(u64, String)> = None;
-            // 검색 칸에서 Enter: 맨 위에 보이는 모델을 고른다 (칸이 Enter 를 가져가기 전에 본다)
+            // Enter in the search field picks the top visible model (checked before the field eats Enter)
             let qid = ui.make_persistent_id("model_query");
             let enter = ui.ctx().memory(|m| m.has_focus(qid)) && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let q = ui.add(
@@ -238,7 +246,7 @@ impl GhostApp {
                     .margin(Margin::symmetric(pad as i8, 6))
                     .hint_text(tr("모델 검색")),
             );
-            // 목록을 열면 바로 칠 수 있게 (다른 칸에 입력 중이 아닐 때)
+            // ready to type as soon as the list opens (unless typing in another field)
             if ui.ctx().memory(|m| m.focused().is_none()) {
                 q.request_focus();
             }
@@ -330,7 +338,7 @@ impl GhostApp {
         }
     }
 
-    /// 키를 어디서 받는지 · 어디에 두는지 한 줄로 (새 에이전트 창)
+    /// One line on where to get the key and where it's kept (new-agent window).
     pub(super) fn key_help(&self, ui: &mut egui::Ui) {
         let Some(c) = self.cur() else { return };
         let p = c.provider;
@@ -357,9 +365,9 @@ impl GhostApp {
         }
     }
 
-    // ── 설정 창 ──
+    // ---- settings window ----
 
-    /// ⚙ 설정: 언어 · AI 연결 · 지금 쓰는 AI · 화면 · 작업
+    /// ⚙ Settings: language, AI connections, current AI, display, work.
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -381,7 +389,7 @@ impl GhostApp {
                 ui.set_width(W);
                 egui::Grid::new("settings_lang").num_columns(2).min_col_width(LABEL).spacing([14.0, 10.0]).show(ui, |ui| {
                     ui.label(tr("언어"));
-                    // 언어 이름은 늘 그 언어로 (지금 언어를 못 읽어도 찾을 수 있게)
+                    // language names always in their own language (findable even if you can't read the current one)
                     egui::ComboBox::from_id_salt("lang").width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
                         for l in Lang::ALL {
                             ui.selectable_value(&mut lang, l, l.native_name());
@@ -390,7 +398,8 @@ impl GhostApp {
                     ui.end_row();
                 });
 
-                // 권한이 꺼져 있으면 찾기 쉽게 맨 위에 (다 켜지면 아래 원래 자리로)
+                // with a permission off, show this section at the top where it's easy to find (back to its
+                // usual spot once everything is on)
                 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
                 let perm_first = !self.permissions_ok(ctx);
                 #[cfg(target_os = "macos")]
@@ -490,8 +499,11 @@ impl GhostApp {
         }
     }
 
-    /// macOS 권한 상태. 매 프레임 묻지 않고 1초에 한 번만 다시 확인한다 (사이드바·설정·사용 설명이 같이 쓴다).
-    /// 시스템 설정에서 바꾼 것이 곧바로 보이게 1초 뒤 다시 그리게 한다 (손쉬운 사용은 바로 반영된다).
+    /// macOS permission state, rechecked at most once a second rather than every frame (shared by
+    /// the sidebar, Settings and the guide).
+    ///
+    /// Requests a repaint a second later so changes made in System Settings show up quickly
+    /// (Accessibility applies immediately).
     #[cfg(target_os = "macos")]
     pub(super) fn permissions(&mut self, ctx: &egui::Context) -> crate::macos::TccStatus {
         const EVERY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -508,7 +520,7 @@ impl GhostApp {
         t
     }
 
-    /// Mac 앱 조작에 필요한 권한이 다 켜져 있는가 (macOS 밖은 늘 그렇다)
+    /// Whether every permission needed to drive Mac apps is on (always true outside macOS).
     pub(super) fn permissions_ok(&mut self, ctx: &egui::Context) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -522,12 +534,14 @@ impl GhostApp {
         }
     }
 
-    /// macOS 권한 (Mac 앱 조작에 필요): 켜졌으면 ✓, 아니면 권한마다 '허용' (macOS 요청 창 하나만 띄운다)
+    /// macOS permissions needed to drive Mac apps: ✓ when on, otherwise "Allow" per permission (it
+    /// shows a single macOS prompt).
     #[cfg(target_os = "macos")]
     pub(super) fn permission_rows(&mut self, ui: &mut egui::Ui) {
         let t = self.permissions(ui.ctx());
         let restart = crate::macos::screen_capture_needs_restart();
-        // 한 줄에 권한 하나: 켜졌으면 ✓, 아니면 '허용' (macOS 요청 창 하나만 뜬다). 화면 기록은 손쉬운 사용을 켠 뒤에 묻는다
+        // one permission per row: ✓ when on, otherwise "Allow" (one macOS prompt). Screen recording is
+        // asked for after Accessibility is on
         let rows: [(bool, &str, fn()); 2] = [
             (t.accessibility, tr("손쉬운 사용"), crate::macos::request_accessibility),
             (t.screen_capture, tr("화면 기록"), crate::macos::request_screen_capture),
@@ -547,7 +561,7 @@ impl GhostApp {
                         let btn = ui.add_enabled_ui(!earlier_missing, |ui| theme::secondary(ui, tr("허용"))).inner;
                         if btn.on_hover_text(tr("macOS 의 요청 창이 떠요. 그 창의 '시스템 설정 열기'에서 GhostDesk 스위치를 켜세요.")).clicked() {
                             request();
-                            // 누른 뒤 바로 다시 확인한다
+                            // check again right after a click
                             self.perm_cache = None;
                         }
                     });
@@ -571,7 +585,8 @@ impl GhostApp {
         ui.label(theme::hint(tr("스위치가 이미 켜져 있는데 여기서 꺼짐으로 보이면 업데이트로 앱 서명이 바뀐 거예요. '허용'을 누르면 옛 항목을 지우고 새로 요청해요.")));
     }
 
-    /// 연결마다 카드 하나: 이름(OpenAI 호환은 고칠 수 있음) · 회사 · ✕, 그 아래 주소 · 키 칸
+    /// One card per connection: name (editable for OpenAI-compatible) · provider · ✕, with URL and
+    /// key fields below.
     fn conn_cards(&mut self, ui: &mut egui::Ui, width: f32) {
         let mut remove = None;
         for i in 0..self.ai.len() {
@@ -630,7 +645,8 @@ impl GhostApp {
         }
     }
 
-    /// '+ AI 추가' — 아직 없는 회사와 OpenAI 호환(여러 개 가능) 중에서 골라 새 연결을 만든다
+    /// "+ Add AI": creates a connection from providers not added yet or OpenAI-compatible (any
+    /// number).
     fn add_conn_button(&mut self, ui: &mut egui::Ui) {
         let choices = ai::addable(&self.ai);
         ui.menu_button(format!("{}  {}", icon::PLUS, tr("AI 추가")), |ui| {
@@ -639,7 +655,7 @@ impl GhostApp {
                 if ui.button(tr(p.label())).clicked() {
                     self.ai_next_id += 1;
                     let c = AiConn::new(self.ai_next_id, p);
-                    // 처음 추가한 연결이면 바로 그것을 쓴다
+                    // the first connection added becomes the current one
                     if self.ai.is_empty() {
                         self.ai_current = c.id;
                     }

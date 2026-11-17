@@ -1,22 +1,24 @@
-//! Windows 일반 앱 백엔드 (native.rs 의 Windows 구현).
+//! Windows backend for regular desktop apps (the Windows side of `native.rs`).
 //!
-//! 앱 창을 모든 모니터 바깥(화면 밖)에 두고, PrintWindow 로 캡처하고, 창 메시지·UI Automation 으로 조작한다.
-//! 사용자의 마우스 커서·키보드 포커스·화면·시스템 클립보드는 건드리지 않는다. Mode A(숨김 실행)에서는 Job 의 UI 제한으로
-//! 앱 자신도 시스템 클립보드를 읽거나 쓸 수 없고, Mode B(사용자 앱에 붙기)에서는 복사·붙여넣기 단추·메뉴를 이름으로 막는다.
+//! App windows are parked outside every monitor, captured with PrintWindow and driven through
+//! window messages and UI Automation. The user's cursor, keyboard focus, screen and system
+//! clipboard are left alone. In mode A (hidden launch) the Job's UI restrictions keep the app
+//! itself from reading or writing the system clipboard; in mode B (attaching to a user's app)
+//! copy/paste buttons and menu items are blocked by name.
 //!
-//! | 모듈 | 하는 일 |
+//! | Module | Purpose |
 //! |---|---|
-//! | `launch` | 숨김(SW_HIDE)·일시정지로 CreateProcessW + Job(KILL_ON_JOB_CLOSE + 클립보드·시스템 설정 UI 제한), 오류 대화상자 끄기, 스토어 앱·실행 별칭·콘솔·관리자 앱·셸 거부 |
-//! | `guard` | 노출 감시: WinEvent 훅 + 8ms 검사로 화면에 걸친 창을 즉시 화면 밖으로, 전경·클립보드 감시 |
-//! | `capture` | PrintWindow(PW_RENDERFULLCONTENT) → 내용 영역 → 축소 → PNG/JPEG |
-//! | `input` | 스크린샷 좌표 → 자식 창 좌표, WM_MOUSE*/WM_KEY*/WM_CHAR 보내기 |
-//! | `menu` | HMENU 읽기, 가속기 글자("Ctrl+S") 해석, WM_COMMAND, 차단 규칙 |
-//! | `uia` | UI Automation 요소 목록·Invoke/Toggle/Select/Value |
-//! | `apps` | 시작 메뉴 .lnk·App Paths 로 설치된 앱 찾기 |
-//! | `recovery` | Mode B 에서 옮긴 사용자 창 기록 (비정상 종료 뒤 되돌리기) |
-//! | `workspace` | 위를 묶은 NativeAppWorkspace |
-//! | `child` | 자식 세션(PiP): RDP 컨트롤로 같은 계정의 별도 세션 연결 + 그 안의 화면 캡처·SendInput 헬퍼 |
-//! | `selftest` | `--selftest-native` (`testapp`: 시험용 Win32 창) |
+//! | `launch` | Hidden (SW_HIDE), suspended CreateProcessW + Job (KILL_ON_JOB_CLOSE plus clipboard and system-settings UI limits); disables error dialogs; refuses Store apps, execution aliases, console, elevated and shell apps |
+//! | `guard` | Exposure watch: a WinEvent hook plus an 8 ms check move any window touching the screen back off it; watches the foreground and clipboard |
+//! | `capture` | PrintWindow(PW_RENDERFULLCONTENT) → client area → downscale → PNG/JPEG |
+//! | `input` | Screenshot coordinates → child window coordinates; sends WM_MOUSE*/WM_KEY*/WM_CHAR |
+//! | `menu` | Reads HMENUs, parses accelerator text ("Ctrl+S"), sends WM_COMMAND, block rules |
+//! | `uia` | UI Automation element listing and Invoke/Toggle/Select/Value |
+//! | `apps` | Finds installed apps via Start menu .lnk files and App Paths |
+//! | `recovery` | Records user windows moved in mode B, to restore them after a crash |
+//! | `workspace` | `NativeAppWorkspace`, tying the above together |
+//! | `child` | Child session (PiP): connects a separate session of the same account through the RDP control, plus capture and SendInput helpers inside it |
+//! | `selftest` | `--selftest-native` (`testapp`: a Win32 test window) |
 
 #![allow(dead_code)]
 
@@ -41,7 +43,7 @@ pub use recovery::recover as recover_parked_windows;
 pub use selftest::selftest;
 pub use workspace::NativeAppWorkspace;
 
-/// 에이전트 시스템 프롬프트의 환경 설명 (agent.rs 의 ENV_NATIVE 대신)
+/// Environment description for the agent's system prompt (replaces `ENV_NATIVE`).
 pub const ENV_PROMPT: Option<&'static str> = Some(ENV_WINDOWS);
 
 const ENV_WINDOWS: &str = r#"Environment
@@ -53,7 +55,7 @@ const ENV_WINDOWS: &str = r#"Environment
 - Clipboard: when GhostDesk launched the app itself (the usual case), the app cannot read or write the human's clipboard at all, so any Copy/Paste feature of its own (toolbar icons and the like) silently does nothing; use ctrl+c/x/v. When attached to the human's already-running app, only the named Copy/Cut/Paste buttons and menu items are refused and the app can still write the clipboard on its own (e.g. Character Map's Select button); Events reports it, so tell the human when that happens.
 - New windows and dialogs (message boxes, Save As) open off-screen too, are switched to automatically and reported in Events; take a screenshot before clicking in them. If Events says the human brought the app back to the screen, stop and ask the human via `ask_user`."#;
 
-/// app_control 도구 설명 (Windows)
+/// `app_control` tool description (Windows).
 pub const APP_CONTROL_DESCRIPTION: &str = "Semantic control of the Windows desktop app window you are operating. The app runs off-screen (outside every monitor), so clicks and keys are window messages; use this tool for menus, for elements a click cannot reach, to set or read text exactly, and to pick combo-box options without opening the drop-down.\n\
 Actions:\n\
 - list_windows: list the app's windows (index, title, disabled while a dialog is open).\n\

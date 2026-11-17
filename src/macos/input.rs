@@ -1,13 +1,14 @@
-//! CGEvent 입력 합성.
+//! CGEvent input synthesis.
 //!
-//! 두 부류가 있다:
-//! 1. `pid_*` — `CGEventPostToPid` 로 **특정 프로세스에만** 이벤트를 보낸다. 전역 커서·포커스·
-//!    다른 앱에는 영향이 없다. 우리가 띄운(또는 사용자가 동의한) 대상 pid 에만 쓸 것.
-//!    숨겨진 비활성 앱에도 유니코드 글자(한글 포함)와 특수키(방향키·Return 등)는 전달된다.
-//!    Cmd 단축키와 마우스 클릭은 앱 내부 키 창 상태가 없으면 조용히 무시된다.
-//! 2. `global::*` — `CGEventPost(kCGHIDEventTap)` 로 **현재 로그인 세션 전체**에 이벤트를 보낸다.
-//!    실제 마우스 커서를 움직이고 front 앱에 키를 보낸다.
-//!    **전용 에이전트 로그인 세션(세션 헬퍼) 안에서만 쓸 것. 사용자의 세션에서는 절대 부르지 말 것.**
+//! Two kinds:
+//! 1. `pid_*`: `CGEventPostToPid` sends events to **one process only**. The global cursor, focus
+//!    and other apps are unaffected. Only use on target pids we launched (or the user consented
+//!    to). Unicode text (Korean included) and special keys (arrows, Return, …) reach even hidden,
+//!    inactive apps; Cmd shortcuts and mouse clicks are silently ignored unless the app has
+//!    internal key-window state.
+//! 2. `global::*`: `CGEventPost(kCGHIDEventTap)` sends events to **the whole login session**,
+//!    moving the real mouse cursor and typing into the front app. **Only inside the dedicated
+//!    agent login session (session helper). Never call these in the user's session.**
 
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use objc2_core_graphics::{
 
 use crate::keys::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
-// ───────────────────────── 키 코드 ─────────────────────────
+// ---- key codes ----
 
 pub const KC_RETURN: u16 = 36;
 pub const KC_TAB: u16 = 48;
@@ -33,7 +34,7 @@ pub const KC_OPTION: u16 = 58;
 pub const KC_CONTROL: u16 = 59;
 pub const KC_FORWARD_DELETE: u16 = 117;
 
-/// ANSI 배열 기준 글자 → 가상 키코드 (shift 필요 여부 포함)
+/// Character → virtual key code on the ANSI layout, plus whether shift is needed.
 pub fn char_keycode(c: char) -> Option<(u16, bool)> {
     let lower = c.to_ascii_lowercase();
     let shift_letter = c.is_ascii_uppercase();
@@ -64,8 +65,8 @@ pub fn char_keycode(c: char) -> Option<(u16, bool)> {
     Some(r)
 }
 
-/// 이름 붙은 특수키 → 키코드. xdotool/CDP(keys.rs) 와 같은 의미로: "BackSpace" = 51 (mac delete),
-/// "Delete"/"KP_Delete"/"ForwardDelete" = 117 (앞으로 지우기).
+/// Named special key → key code, with the same meaning as xdotool/CDP (keys.rs): "BackSpace" =
+/// 51 (mac delete), "Delete"/"KP_Delete"/"ForwardDelete" = 117 (forward delete).
 pub fn named_keycode(name: &str) -> Option<u16> {
     let n = name.to_ascii_lowercase();
     let k = match n.as_str() {
@@ -121,14 +122,14 @@ pub fn mods_to_flags(mods: i64) -> CGEventFlags {
     CGEventFlags(f)
 }
 
-/// 파싱된 mac 키 조합
+/// A parsed mac key combo.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacCombo {
-    /// 주 키코드 (수정키만 누르는 조합이면 해당 수정키 코드)
+    /// Main key code (the modifier's own code for modifier-only combos).
     pub keycode: u16,
-    /// 주 키가 출력 가능한 글자라면 그 글자 (수정키 없는 상태 기준)
+    /// The character the main key types, if printable (without modifiers).
     pub ch: Option<char>,
-    /// MOD_* 비트
+    /// MOD_* bits.
     pub mods: i64,
 }
 
@@ -136,13 +137,13 @@ impl MacCombo {
     pub fn flags(&self) -> CGEventFlags {
         mods_to_flags(self.mods)
     }
-    /// Cmd/Ctrl/Alt 가 붙은 "단축키"인가
+    /// Whether this is a "shortcut" with Cmd/Ctrl/Alt.
     pub fn is_shortcut(&self) -> bool {
         self.mods & (MOD_META | MOD_CTRL | MOD_ALT) != 0
     }
 }
 
-/// xdotool 스타일 조합("ctrl+a", "cmd+shift+z", "Return", "F5", "ctrl++")을 mac 키코드로.
+/// xdotool-style combo ("ctrl+a", "cmd+shift+z", "Return", "F5", "ctrl++") → mac key codes.
 pub fn parse_combo(combo: &str) -> Result<MacCombo> {
     let combo = combo.trim();
     let parts: Vec<String> = if combo == "+" {
@@ -162,7 +163,7 @@ pub fn parse_combo(combo: &str) -> Result<MacCombo> {
     for m in rest {
         mods |= modifier_bit(m).ok_or_else(|| anyhow!("알 수 없는 수정키: {m}"))?;
     }
-    // 수정키만 누르는 경우 ("shift", "cmd")
+    // modifier only ("shift", "cmd")
     if let Some(bit) = modifier_bit(last) {
         let kc = match bit {
             MOD_META => KC_COMMAND,
@@ -181,7 +182,7 @@ pub fn parse_combo(combo: &str) -> Result<MacCombo> {
             let ch = if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c };
             return Ok(MacCombo { keycode: kc, ch: Some(ch), mods });
         }
-        // ANSI 표에 없는 글자 (한글 등) → 키코드 0 + 유니코드
+        // characters missing from the ANSI table (Korean, …) → key code 0 + Unicode
         return Ok(MacCombo { keycode: 0, ch: Some(c), mods });
     }
     if let Some(kc) = named_keycode(last) {
@@ -194,7 +195,7 @@ pub fn parse_combo(combo: &str) -> Result<MacCombo> {
     Err(anyhow!("알 수 없는 키 이름: {last}"))
 }
 
-// ───────────────────────── 대상 pid 로 보내기 ─────────────────────────
+// ---- posting to a target pid ----
 
 fn source() -> Option<CFRetained<CGEventSource>> {
     CGEventSource::new(CGEventSourceStateID::Private)
@@ -208,8 +209,9 @@ fn set_unicode(ev: &CGEvent, units: &[u16]) {
     unsafe { CGEvent::keyboard_set_unicode_string(Some(ev), units.len() as _, units.as_ptr()) };
 }
 
-/// 텍스트를 유니코드 키 이벤트로 대상 pid 에 보낸다 (이벤트당 최대 20 UTF-16 단위).
-/// '\n' 은 Return, '\t' 는 Tab 키코드로 보낸다. 한글도 IME 를 거치지 않고 그대로 들어간다.
+/// Sends text to the target pid as Unicode key events (at most 20 UTF-16 units per event).
+///
+/// '\n' is sent as Return and '\t' as Tab. Korean goes in directly, bypassing the IME.
 pub fn pid_type_text(pid: i32, text: &str) -> Result<()> {
     let src = source();
     let mut chunk: Vec<u16> = Vec::new();
@@ -249,7 +251,7 @@ pub fn pid_type_text(pid: i32, text: &str) -> Result<()> {
     flush(&mut chunk)
 }
 
-/// 키 하나 down 또는 up
+/// One key down or up.
 pub fn pid_key(pid: i32, keycode: u16, flags: CGEventFlags, ch: Option<char>, down: bool) -> Result<()> {
     let ev = CGEvent::new_keyboard_event(source().as_deref(), keycode, down).ok_or_else(|| anyhow!("키 이벤트 생성 실패"))?;
     CGEvent::set_flags(Some(&ev), flags);
@@ -287,7 +289,7 @@ fn pid_flags_changed(pid: i32, keycode: u16, mods_after: i64) -> Result<()> {
     Ok(())
 }
 
-/// 조합 누르기: 수정키 down → 주 키 down → (hold) → 주 키 up → 수정키 up
+/// Presses a combo: modifiers down → main key down → (hold) → main key up → modifiers up.
 pub fn pid_combo(pid: i32, c: &MacCombo, hold: Duration) -> Result<()> {
     let mod_keys = modifier_keys(c.mods);
     let main_is_modifier = matches!(c.keycode, KC_COMMAND | KC_SHIFT | KC_OPTION | KC_CONTROL);
@@ -305,7 +307,8 @@ pub fn pid_combo(pid: i32, c: &MacCombo, hold: Duration) -> Result<()> {
         std::thread::sleep(hold.max(Duration::from_millis(15)));
         pid_flags_changed(pid, c.keycode, cur)?;
     } else {
-        // 글자 키는 단축키가 아니면 유니코드 문자열도 실어 보내 입력기(한글 자판 등)와 무관하게 만든다
+        // non-shortcut character keys also carry the Unicode string, so the input source (Korean layout
+        // etc.) doesn't matter
         let ch = c.ch.map(|ch| if c.mods & MOD_SHIFT != 0 { shifted(ch) } else { ch });
         pid_key(pid, c.keycode, c.flags(), ch, true)?;
         std::thread::sleep(hold.max(Duration::from_millis(15)));
@@ -335,12 +338,12 @@ fn shifted(c: char) -> char {
     pairs.iter().find(|(a, _)| *a == c).map(|(_, b)| *b).unwrap_or(c)
 }
 
-/// (실험적) 창-로컬 좌표를 실은 마우스 클릭을 대상 pid 에 보낸다.
+/// (Experimental) Sends a mouse click carrying window-local coordinates to the target pid.
 ///
-/// macOS 27 에서는 mouseMoved 프라이머 + 필드(1,3,7,40,51,58,91,92) + 비공개
-/// `CGEventSetWindowLocation`(창 기준 포인트 좌표)이 있어야 하고, 앱 내부 키 창 상태가
-/// SkyLight 레코드로 설정되어 있어야 동작한다. **숨겨진(ordered-out) 창에는 동작하지 않는다.**
-/// global = 전역 포인트 좌표, local = 창 좌상단 기준 포인트 좌표.
+/// On macOS 27 this needs a mouseMoved primer, fields (1, 3, 7, 40, 51, 58, 91, 92), the private
+/// `CGEventSetWindowLocation` (window-relative points), and the app's internal key-window state
+/// set via SkyLight records. **Doesn't work on hidden (ordered-out) windows.** `global` is in
+/// global points, `local` in points from the window's top-left.
 pub fn pid_click_window(pid: i32, wid: u32, global: CGPoint, local: CGPoint, right: bool, count: i64) -> Result<()> {
     type SetWinLoc = unsafe extern "C" fn(*const CGEvent, CGPoint);
     let setloc = super::skylight::sym("CGEventSetWindowLocation");
@@ -372,10 +375,11 @@ pub fn pid_click_window(pid: i32, wid: u32, global: CGPoint, local: CGPoint, rig
     Ok(())
 }
 
-// ───────────────────────── 세션 전역 (헬퍼 전용) ─────────────────────────
+// ---- session-wide (helper only) ----
 
-/// **전용 에이전트 로그인 세션(세션 헬퍼) 안에서만 쓸 것. 사용자의 세션에서 부르면
-/// 사용자의 실제 커서를 움직이고 사용자가 보고 있는 앱에 입력이 들어간다.**
+/// **Only inside the dedicated agent login session (session helper). Called in the user's
+/// session these move the user's real cursor and type into whatever app the user is looking
+/// at.**
 pub mod global {
     use super::*;
 
@@ -387,7 +391,7 @@ pub mod global {
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
     }
 
-    /// 마우스 버튼 종류: 0=왼쪽, 1=오른쪽, 2=가운데
+    /// Mouse button: 0 = left, 1 = right, 2 = middle.
     fn button_types(button: u8, dragging: bool) -> (CGEventType, CGEventType, CGEventType, CGMouseButton) {
         match button {
             1 => (CGEventType::RightMouseDown, CGEventType::RightMouseUp, CGEventType::RightMouseDragged, CGMouseButton::Right),
@@ -399,7 +403,7 @@ pub mod global {
         }
     }
 
-    /// 커서 이동 (전역 포인트 좌표). pressed = 누르고 있는 버튼 (드래그)
+    /// Moves the cursor (global points). `pressed` is the held button, for drags.
     pub fn post_mouse_move(x: f64, y: f64, pressed: Option<u8>, mods: i64) -> Result<()> {
         let p = CGPoint { x, y };
         let (t, btn) = match pressed {
@@ -415,7 +419,7 @@ pub mod global {
         Ok(())
     }
 
-    /// 버튼 down/up (click_count = 1,2,3)
+    /// Button down/up (`click_count` = 1, 2, 3).
     pub fn post_mouse_button(x: f64, y: f64, button: u8, down: bool, click_count: i64, mods: i64) -> Result<()> {
         let p = CGPoint { x, y };
         let (dt, ut, _, btn) = button_types(button, false);
@@ -427,7 +431,7 @@ pub mod global {
         Ok(())
     }
 
-    /// 클릭 (count 회)
+    /// Clicks `count` times.
     pub fn post_click(x: f64, y: f64, button: u8, count: i64, mods: i64) -> Result<()> {
         post_mouse_move(x, y, None, mods)?;
         sleep_ms(20);
@@ -440,7 +444,7 @@ pub mod global {
         Ok(())
     }
 
-    /// 스크롤 (픽셀 단위, dy>0 = 아래로)
+    /// Scrolls in pixels (`dy > 0` = down).
     pub fn post_scroll(dx: f64, dy: f64) -> Result<()> {
         let ev = CGEvent::new_scroll_wheel_event2(src().as_deref(), CGScrollEventUnit::Pixel, 2, (-dy) as i32, (-dx) as i32, 0)
             .ok_or_else(|| anyhow!("스크롤 이벤트 생성 실패"))?;
@@ -448,7 +452,7 @@ pub mod global {
         Ok(())
     }
 
-    /// 키 하나 down/up
+    /// One key down/up.
     pub fn post_key(keycode: u16, down: bool, mods: i64) -> Result<()> {
         let ev = CGEvent::new_keyboard_event(src().as_deref(), keycode, down).ok_or_else(|| anyhow!("키 이벤트 생성 실패"))?;
         CGEvent::set_flags(Some(&ev), mods_to_flags(mods));
@@ -456,7 +460,7 @@ pub mod global {
         Ok(())
     }
 
-    /// 조합 키 ("cmd+shift+z")
+    /// A key combo ("cmd+shift+z").
     pub fn post_combo(combo: &str, hold: Duration, check: &dyn Fn() -> Result<()>) -> Result<()> {
         let c = parse_combo(combo)?;
         let mod_keys = modifier_keys(c.mods);
@@ -490,7 +494,7 @@ pub mod global {
         result
     }
 
-    /// 유니코드 텍스트 (이벤트당 최대 20 UTF-16 단위, 한글 포함)
+    /// Unicode text (at most 20 UTF-16 units per event, Korean included).
     pub fn post_unicode(text: &str, check: &dyn Fn() -> Result<()>) -> Result<()> {
         let s = src();
         let units: Vec<u16> = text.encode_utf16().collect();
@@ -498,7 +502,7 @@ pub mod global {
         while i < units.len() {
             check()?;
             let mut end = (i + 20).min(units.len());
-            // 서로게이트 쌍을 자르지 않는다
+            // don't split a surrogate pair
             if end < units.len() && (0xD800..0xDC00).contains(&units[end - 1]) {
                 end -= 1;
             }

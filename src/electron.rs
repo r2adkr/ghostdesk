@@ -1,28 +1,36 @@
-//! Electron 앱 복제 백엔드.
+//! Electron app clone backend.
 //!
-//! 설치된 Electron 앱(VS Code 등)을 사용자 화면에 창을 전혀 띄우지 않는 "숨김 모드"로 따로 실행하고,
-//! 화면 캡처·마우스·키보드는 모두 CDP(Chrome DevTools Protocol)로 처리한다. OS 커서·키보드 포커스·
-//! 사용자의 앱 창에는 손대지 않는다.
+//! Runs an installed Electron app (VS Code, …) separately in a "hidden mode" that never shows a
+//! window on the user's screen, and handles screen capture, mouse and keyboard entirely through
+//! CDP (Chrome DevTools Protocol). The OS cursor, keyboard focus and the user's app windows are
+//! never touched.
 //!
-//! 숨김 원리: 앱 실행 파일을 `--inspect-brk=0` 으로 직접 실행하면 메인 프로세스가 앱 메인 스크립트
-//! 첫 줄에서 멈춘다. Node 인스펙터로 붙어 앱 코드가 돌기 전에 electron 모듈을 패치한다
-//! (활성화 정책 prohibited, 창 show/focus/크기·투명도 변경 무력화, 네이티브 대화상자·외부 링크·
-//! 알림·트레이·전역 단축키·재시작·개발자도구 차단). 창은 생성 즉시(BaseWindow._init, show 처리 전)
-//! alpha 0·클릭통과·포커스불가가 되고, 화면 밖 좌표(-30000,-30000; macOS 가 왼쪽 끝 40px 정도로
-//! 제한함)에 비활성으로만 표시된다. 완전히 hide() 하면 Chromium 이 렌더링을 멈춰
-//! Page.captureScreenshot 이 응답하지 않으므로(실측), "투명하게 표시" 방식(ghost)을 기본으로 쓴다.
-//! (환경 변수 GHOSTDESK_ELECTRON_MODE=hide 는 실험용: 창이 onscreen 목록에도 없지만 스크린샷 불가) 이 방식은 `EnableNodeCliInspectArguments` 퓨즈가 켜진 앱에서만
-//! 가능하다. 퓨즈가 꺼진 앱(Discord, Claude, Unity Hub 등)은 숨길 방법이 없으므로 지원하지 않는다.
+//! How hiding works: launching the app executable directly with `--inspect-brk=0` pauses the main
+//! process on the first line of the app's main script. We attach with the Node inspector and patch
+//! the electron module before any app code runs (activation policy prohibited; window
+//! show/focus/resize/opacity changes neutralized; native dialogs, external links, notifications,
+//! tray, global shortcuts, relaunch and devtools blocked). Windows become alpha 0, click-through
+//! and unfocusable the moment they're created (BaseWindow._init, before show is handled), and are
+//! only shown inactive at off-screen coordinates (-30000,-30000; macOS clamps to about 40px past
+//! the left edge). A full hide() makes Chromium stop rendering so Page.captureScreenshot never
+//! answers (measured), hence "shown but transparent" (ghost) is the default. (The environment
+//! variable GHOSTDESK_ELECTRON_MODE=hide is experimental: the window isn't even in the onscreen
+//! list, but screenshots don't work.) This only works for apps with the
+//! `EnableNodeCliInspectArguments` fuse on. Apps with it off (Discord, Claude, Unity Hub, …) can't
+//! be hidden, so they aren't supported.
 //!
-//! 안전장치: 감시자(watchdog)가 250ms 마다 CGWindowList 와 WindowServer 의 front 프로세스를 확인해,
-//! 우리 프로세스 그룹의 창이 보이거나(alpha>0, onscreen) 앞으로 나오면 즉시 인스펙터로 다시 숨기고,
-//! 1초 넘게 계속되면 프로세스 그룹 전체를 강제 종료한다.
+//! Safeguard: a watchdog checks CGWindowList and WindowServer's front process every 250 ms. If a
+//! window of our process group becomes visible (alpha>0, onscreen) or comes to the front, it's
+//! re-hidden through the inspector right away, and if that lasts over a second the whole process
+//! group is killed.
 //!
-//! Windows: 같은 원리(인스펙터 주입 + CDP)다. 앱은 Job 객체 안에서 띄우고(일시정지 → Job 배정 → 재개,
-//! 자손까지 한 번에 정리), 창은 모든 모니터 밖(DPI 를 감안한 DIP 좌표)에 alpha 0·클릭통과·활성화 불가
-//! (WS_EX_NOACTIVATE)·작업 표시줄 제외로 둔다. 숨은 인스턴스는 고유한 AppUserModelID 를 써서 사용자의
-//! 실제 앱의 작업 표시줄 그룹·점프 목록을 건드리지 않는다. 감시자는 Job 의 프로세스 목록으로 최상위 창
-//! (보임·DWM 숨김·투명도·모니터 겹침·작업 표시줄 노출)과 전경 창을 확인한다.
+//! Windows: same principle (inspector injection + CDP). The app runs inside a Job object (suspend
+//! → assign to Job → resume, so descendants are cleaned up together), and windows sit outside
+//! every monitor (DIP coordinates accounting for DPI) at alpha 0, click-through, non-activating
+//! (WS_EX_NOACTIVATE) and off the taskbar. Hidden instances use their own AppUserModelID so they
+//! don't touch the taskbar group or jump list of the user's real app. The watchdog checks
+//! top-level windows of the Job's processes (visible, DWM-cloaked, opacity, monitor overlap,
+//! taskbar exposure) and the foreground window.
 #![allow(dead_code)]
 
 #[cfg(any(target_os = "macos", windows))]
@@ -50,14 +58,12 @@ use crate::{
     profiles::{self, CloneStats},
 };
 
-// ═════════════════════════════════════════════════════════════════════
-// 퓨즈 (Electron Fuses)
-// ═════════════════════════════════════════════════════════════════════
+// ---- fuses (Electron Fuses) ----
 
-/// Electron 퓨즈 센티넬. 바로 뒤에 버전 바이트, 길이 바이트, 퓨즈별 '0'/'1'/'r' 가 이어진다.
+/// Electron fuse sentinel. Followed by a version byte, a length byte, then '0'/'1'/'r' per fuse.
 pub const FUSE_SENTINEL: &[u8] = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
 
-/// 퓨즈 순서 (Electron 의 fuses.json5 정의 순서)
+/// Fuse order (as defined in Electron's fuses.json5).
 pub const FUSE_NAMES: [&str; 9] = [
     "RunAsNode",
     "EnableCookieEncryption",
@@ -92,7 +98,7 @@ impl FuseState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ElectronFuses {
     pub version: u8,
-    /// 원본 퓨즈 문자열 (예: "101100011")
+    /// Raw fuse string (e.g. "101100011").
     pub wire: String,
     pub fuses: Vec<(String, FuseState)>,
 }
@@ -106,7 +112,7 @@ impl ElectronFuses {
         self.get(name) == Some(FuseState::Enabled)
     }
 
-    /// Node 인스펙터 인자(--inspect-brk)를 받아들이는지 = 숨김 모드 가능 여부
+    /// Whether Node inspector arguments (--inspect-brk) are accepted = whether hidden mode is possible.
     pub fn inspect_allowed(&self) -> bool {
         self.is_on("EnableNodeCliInspectArguments")
     }
@@ -128,14 +134,15 @@ impl ElectronFuses {
     }
 }
 
-/// 바이트 버퍼에서 첫 퓨즈 블록을 파싱한다.
+/// Parses the first fuse block in a byte buffer.
 pub fn parse_fuses(buf: &[u8]) -> Option<ElectronFuses> {
     let off = find_sentinel(buf)?;
     parse_fuse_block(&buf[off + FUSE_SENTINEL.len()..])
 }
 
-/// 버퍼에서 센티넬의 첫 위치. Boyer–Moore–Horspool 이라 평균적으로 32바이트씩 건너뛰므로
-/// 수백 MB 짜리 Windows 실행 파일도 (디버그 빌드에서도) 빨리 훑는다. 결과는 단순 탐색과 같다.
+/// First position of the sentinel in the buffer. Boyer–Moore–Horspool skips about 32 bytes at a
+/// time on average, so even Windows executables of several hundred MB scan quickly (debug builds
+/// included). Same result as a naive search.
 fn find_sentinel(hay: &[u8]) -> Option<usize> {
     let pat = FUSE_SENTINEL;
     let n = pat.len();
@@ -157,7 +164,7 @@ fn find_sentinel(hay: &[u8]) -> Option<usize> {
     None
 }
 
-/// 센티넬 바로 뒤의 [버전][길이][퓨즈...] 블록을 파싱한다.
+/// Parses the [version][length][fuses...] block right after the sentinel.
 fn parse_fuse_block(b: &[u8]) -> Option<ElectronFuses> {
     let version = *b.first()?;
     let len = *b.get(1)? as usize;
@@ -173,7 +180,8 @@ fn parse_fuse_block(b: &[u8]) -> Option<ElectronFuses> {
     Some(ElectronFuses { version, wire: String::from_utf8_lossy(wire).into_owned(), fuses })
 }
 
-/// 현재 아키텍처(arm64/x86_64)의 Mach-O 슬라이스 (offset, size). fat 이 아니면 파일 전체.
+/// Mach-O slice (offset, size) for the current architecture (arm64/x86_64). The whole file if not
+/// fat.
 fn macho_slice(f: &mut fs::File) -> Result<(u64, u64)> {
     let len = f.metadata()?.len();
     let mut hdr = [0u8; 8];
@@ -209,7 +217,7 @@ fn macho_slice(f: &mut fs::File) -> Result<(u64, u64)> {
     Ok((0, len))
 }
 
-/// 슬라이스 안에서 (__TEXT,__const) 섹션 범위를 찾는다 (센티넬은 보통 여기 있다).
+/// Finds the (__TEXT,__const) section range within the slice (where the sentinel usually lives).
 fn macho_text_const(f: &mut fs::File, slice_off: u64) -> Option<(u64, u64)> {
     let mut h = [0u8; 32];
     f.seek(SeekFrom::Start(slice_off)).ok()?;
@@ -226,7 +234,7 @@ fn macho_text_const(f: &mut fs::File, slice_off: u64) -> Option<(u64, u64)> {
         let cmd = u32::from_le_bytes(cmds.get(p..p + 4)?.try_into().ok()?);
         let size = u32::from_le_bytes(cmds.get(p + 4..p + 8)?.try_into().ok()?) as usize;
         if cmd == 0x19 {
-            // LC_SEGMENT_64: segname(16) ... nsects at +64, sections from +72 (각 80바이트)
+            // LC_SEGMENT_64: segname(16) ... nsects at +64, sections from +72 (80 bytes each)
             let nsects = u32::from_le_bytes(cmds.get(p + 64..p + 68)?.try_into().ok()?) as usize;
             for s in 0..nsects {
                 let b = p + 72 + s * 80;
@@ -245,7 +253,7 @@ fn macho_text_const(f: &mut fs::File, slice_off: u64) -> Option<(u64, u64)> {
     None
 }
 
-/// 파일의 [start, start+len) 범위에서 센티넬을 찾아 퓨즈를 파싱한다 (청크 단위로 읽음).
+/// Scans the file range [start, start+len) for the sentinel and parses the fuses (read in chunks).
 fn scan_range_for_fuses(f: &mut fs::File, start: u64, len: u64) -> Result<Option<ElectronFuses>> {
     const CHUNK: usize = 8 << 20;
     let overlap = FUSE_SENTINEL.len() + 64;
@@ -264,7 +272,7 @@ fn scan_range_for_fuses(f: &mut fs::File, start: u64, len: u64) -> Result<Option
             got += n;
         }
         if let Some(i) = find_sentinel(&buf[..got]) {
-            // 블록 전체를 확실히 읽기 위해 해당 위치부터 다시 읽는다
+            // reread from that position to be sure the whole block is read
             let mut blk = [0u8; 64];
             f.seek(SeekFrom::Start(pos + (i + FUSE_SENTINEL.len()) as u64))?;
             let n = f.read(&mut blk)?;
@@ -278,8 +286,10 @@ fn scan_range_for_fuses(f: &mut fs::File, start: u64, len: u64) -> Result<Option
     Ok(None)
 }
 
-/// PE(.exe) 파일에서 이름이 `name` 인 섹션의 파일 범위 (offset, size). PE 가 아니면 None.
-/// Windows 의 Electron 실행 파일은 퓨즈 센티넬을 `.rdata` 에 둔다 (실측: Discord.exe 235MB 중 .rdata 41MB).
+/// File range (offset, size) of the section named `name` in a PE (.exe) file. None if not PE.
+///
+/// Windows Electron executables keep the fuse sentinel in `.rdata` (measured: 41 MB of .rdata in
+/// a 235 MB Discord.exe).
 fn pe_section(f: &mut fs::File, name: &[u8]) -> Option<(u64, u64)> {
     let mut mz = [0u8; 64];
     f.seek(SeekFrom::Start(0)).ok()?;
@@ -312,8 +322,10 @@ fn pe_section(f: &mut fs::File, name: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
-/// 실행 파일(또는 macOS 의 Electron Framework)에서 퓨즈를 읽는다 (읽기 전용).
-/// Mach-O 면 (__TEXT,__const), PE 면 .rdata 를 먼저 보고, 없으면 파일(슬라이스) 전체를 훑는다.
+/// Reads the fuses from an executable (or macOS's Electron Framework), read only.
+///
+/// Looks at (__TEXT,__const) for Mach-O or .rdata for PE first, then falls back to scanning the
+/// whole file (slice).
 pub fn read_fuses_file(path: &Path) -> Result<ElectronFuses> {
     let mut f = fs::File::open(path).with_context(|| format!("{} 열기 실패", path.display()))?;
     let (off, size) = macho_slice(&mut f)?;
@@ -330,8 +342,10 @@ pub fn read_fuses_file(path: &Path) -> Result<ElectronFuses> {
     scan_range_for_fuses(&mut f, off, size)?.ok_or_else(|| anyhow!("퓨즈 센티넬을 찾지 못했습니다: {}", path.display()))
 }
 
-/// 앱의 Electron 바이너리에서 퓨즈를 읽는다 (읽기 전용).
-/// macOS: 앱 번들(…/Foo.app)의 Electron Framework. Windows: 설치 폴더(또는 .exe)의 앱 실행 파일.
+/// Reads the fuses from the app's Electron binary (read only).
+///
+/// macOS: the app bundle's (…/Foo.app) Electron Framework. Windows: the app executable in the
+/// install folder (or the .exe itself).
 pub fn read_fuses(bundle: &Path) -> Result<ElectronFuses> {
     #[cfg(windows)]
     {
@@ -345,11 +359,10 @@ pub fn read_fuses(bundle: &Path) -> Result<ElectronFuses> {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// ASAR (앱 패키지) 읽기
-// ═════════════════════════════════════════════════════════════════════
+// ---- ASAR (app package) reading ----
 
-/// app.asar 안의 파일 하나를 읽는다. (헤더: [u32 4][u32 헤더피클크기][u32][u32 json길이][json])
+/// Reads one file from app.asar. (Header: [u32 4][u32 header pickle size][u32][u32 json
+/// length][json])
 pub fn asar_read(asar: &Path, rel: &str) -> Option<Vec<u8>> {
     let mut f = fs::File::open(asar).ok()?;
     let mut h = [0u8; 16];
@@ -386,8 +399,8 @@ pub fn asar_read(asar: &Path, rel: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 앱 리소스 폴더(`res`: macOS Contents/Resources, Windows <앱 폴더>\resources)의
-/// app 폴더 또는 app.asar 에서 파일을 읽는다.
+/// Reads a file from the app folder or app.asar in the app's resources folder (`res`: macOS
+/// Contents/Resources, Windows <app folder>\resources).
 fn read_res_file(res: &Path, rel: &str) -> Option<Vec<u8>> {
     if let Ok(b) = fs::read(res.join("app").join(rel)) {
         return Some(b);
@@ -396,11 +409,11 @@ fn read_res_file(res: &Path, rel: &str) -> Option<Vec<u8>> {
 }
 
 fn read_res_json(res: &Path, rel: &str) -> Option<Value> {
-    // Windows 에서 손으로 고친 JSON 에는 UTF-8 BOM 이 붙어 있을 수 있다
+    // hand-edited JSON on Windows may carry a UTF-8 BOM
     read_res_file(res, rel).and_then(|b| serde_json::from_slice(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b)).ok())
 }
 
-/// 앱 번들의 리소스(Contents/Resources/app 폴더 또는 app.asar)에서 파일을 읽는다.
+/// Reads a file from the app bundle's resources (Contents/Resources/app folder or app.asar).
 fn read_app_file(bundle: &Path, rel: &str) -> Option<Vec<u8>> {
     read_res_file(&bundle.join("Contents/Resources"), rel)
 }
@@ -409,17 +422,15 @@ fn read_app_json(bundle: &Path, rel: &str) -> Option<Value> {
     read_app_file(bundle, rel).and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// 앱 감지
-// ═════════════════════════════════════════════════════════════════════
+// ---- app detection ----
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppFamily {
-    /// VS Code 계열 (product.json 에 dataFolderName 이 있는 앱: VS Code, Antigravity, Cursor …)
+    /// VS Code family (apps with dataFolderName in product.json: VS Code, Antigravity, Cursor, …).
     VsCode,
-    /// OpenCode 데스크톱 (XDG_* 경로도 작업공간 안으로 돌려야 함)
+    /// OpenCode desktop (XDG_* paths must be redirected into the workspace too).
     OpenCode,
-    /// 일반 Electron 앱 (userData 경로만 작업공간으로)
+    /// Generic Electron app (only the userData path is redirected to the workspace).
     Generic,
 }
 
@@ -432,29 +443,30 @@ pub struct ElectronApp {
     pub app_version: Option<String>,
     pub electron_version: Option<String>,
     pub fuses: Option<ElectronFuses>,
-    /// 숨김 모드 실행 가능 (= EnableNodeCliInspectArguments 퓨즈 ON, 차단 목록 아님)
+    /// Can run in hidden mode (= EnableNodeCliInspectArguments fuse on, not on the deny list).
     pub hideable: bool,
-    /// 지원하지 않는 이유 (hideable=false 일 때)
+    /// Why it isn't supported (when hideable=false).
     pub reason: Option<String>,
     pub family: AppFamily,
-    /// 원본 userData 폴더 추정 (~/Library/Application Support/<이름>) — 존재할 때만
+    /// Guessed original userData folder (~/Library/Application Support/<name>), only if it exists.
     pub user_data_guess: Option<PathBuf>,
-    /// package.json 의 main (예: "out/main.js")
+    /// package.json main (e.g. "out/main.js").
     pub main_script: Option<String>,
-    /// 지금 사용자가 실행 중인지 (정보용)
+    /// Whether the user is running it right now (informational).
     pub running: bool,
-    /// 실행 방식 설명 (UI 표시용)
+    /// Description of how it launches (for the UI).
     pub launch_profile: String,
 }
 
-/// 절대 실행하지 않는 앱 (디버깅 스위치를 보면 종료하거나 숨길 수 없음)
+/// Apps never launched (they exit or can't be hidden once they see debugging switches).
 const NEVER_LAUNCH: &[(&str, &str)] = &[
     ("com.anthropic.claudefordesktop", "Claude 는 디버깅 스위치를 감지하면 종료하며 숨김 모드를 지원하지 않습니다"),
     ("com.hnc.Discord", "Discord 는 Node 인스펙터 퓨즈가 꺼져 있어 창을 숨길 수 없습니다"),
     ("com.unity3d.unityhub", "Unity Hub 는 Node 인스펙터 퓨즈가 꺼져 있어 창을 숨길 수 없습니다"),
 ];
 
-/// Windows: 실행 파일 이름(소문자)으로 막는 앱. Windows 에는 번들 ID 가 없어 위 목록이 맞지 않는다.
+/// Windows: apps blocked by executable name (lowercase). Windows has no bundle IDs, so the list
+/// above doesn't apply.
 #[cfg(windows)]
 const NEVER_LAUNCH_WIN_EXE: &[(&str, &str)] = &[
     ("claude.exe", "Claude 는 디버깅 스위치를 감지하면 종료하며 숨김 모드를 지원하지 않습니다"),
@@ -464,7 +476,7 @@ const NEVER_LAUNCH_WIN_EXE: &[(&str, &str)] = &[
     ("unity hub.exe", "Unity Hub 는 Node 인스펙터 퓨즈가 꺼져 있어 창을 숨길 수 없습니다"),
 ];
 
-/// 차단 목록에 있으면 그 이유 (macOS: 번들 ID, Windows: 번들 ID 또는 실행 파일 이름)
+/// Reason if it's on the deny list (macOS: bundle ID; Windows: bundle ID or executable name).
 fn blocked_reason(bundle_id: &str, exe: &Path) -> Option<&'static str> {
     if let Some((_, why)) = NEVER_LAUNCH.iter().find(|(id, _)| *id == bundle_id) {
         return Some(why);
@@ -480,9 +492,11 @@ fn blocked_reason(bundle_id: &str, exe: &Path) -> Option<&'static str> {
     None
 }
 
-/// 설치된 Electron 앱 목록 (읽기 전용).
-/// macOS: /Applications 와 ~/Applications 의 .app. Windows: 설치 프로그램 목록(Uninstall 레지스트리)·
-/// App Paths·%LOCALAPPDATA%\Programs·%LOCALAPPDATA%(Squirrel)·Program Files.
+/// Installed Electron apps (read only).
+///
+/// macOS: .app in /Applications and ~/Applications. Windows: the installed programs list
+/// (Uninstall registry), App Paths, %LOCALAPPDATA%\Programs, %LOCALAPPDATA% (Squirrel) and
+/// Program Files.
 pub fn detect_apps() -> Vec<ElectronApp> {
     #[cfg(windows)]
     {
@@ -494,8 +508,10 @@ pub fn detect_apps() -> Vec<ElectronApp> {
     }
 }
 
-/// 앱 하나를 검사한다. Electron 앱이 아니면 None.
-/// macOS: .app 번들 경로. Windows: 설치 폴더(Squirrel 루트 포함) 또는 앱 실행 파일(.exe) 경로.
+/// Inspects one app. None if it isn't an Electron app.
+///
+/// macOS: a .app bundle path. Windows: an install folder (Squirrel root included) or the app
+/// executable (.exe) path.
 pub fn inspect_app(bundle: &Path) -> Option<ElectronApp> {
     #[cfg(windows)]
     {
@@ -507,7 +523,7 @@ pub fn inspect_app(bundle: &Path) -> Option<ElectronApp> {
     }
 }
 
-/// /Applications 와 ~/Applications 의 Electron 앱 목록 (읽기 전용).
+/// Electron apps in /Applications and ~/Applications (read only).
 #[cfg(not(windows))]
 fn detect_bundles() -> Vec<ElectronApp> {
     let mut dirs_ = vec![PathBuf::from("/Applications")];
@@ -533,7 +549,7 @@ fn detect_bundles() -> Vec<ElectronApp> {
     out
 }
 
-/// 앱 번들 하나를 검사한다. Electron 앱이 아니면 None.
+/// Inspects one app bundle. None if it isn't an Electron app.
 #[cfg(not(windows))]
 fn inspect_bundle(bundle: &Path) -> Option<ElectronApp> {
     let fw = bundle.join("Contents/Frameworks/Electron Framework.framework");
@@ -570,7 +586,7 @@ fn inspect_bundle(bundle: &Path) -> Option<ElectronApp> {
         AppFamily::Generic
     };
 
-    // userData 추정: Electron 기본값은 appData/<productName|name>
+    // guess userData: Electron's default is appData/<productName|name>
     let sup = dirs::data_dir().unwrap_or_default();
     let mut cands: Vec<String> = Vec::new();
     if let Some(p) = &product {
@@ -637,7 +653,7 @@ fn inspect_bundle(bundle: &Path) -> Option<ElectronApp> {
     })
 }
 
-/// package.json main 을 "out/main.js" 형태로 정규화
+/// Normalizes package.json main to the "out/main.js" form.
 fn normalize_main(m: &str) -> String {
     let mut s = m.trim().trim_start_matches("./").to_string();
     if s.is_empty() {
@@ -662,12 +678,13 @@ fn regex_escape(s: &str) -> String {
     o
 }
 
-/// 메인 스크립트 중단점용 URL 정규식 (CDP Debugger.setBreakpointByUrl 의 urlRegex).
-/// macOS: 기존과 같은 `Resources/app(\.asar)?/<main>$`.
-/// Windows: 폴더 이름이 소문자 `resources` 이고, 파일 시스템이 대소문자를 가리지 않으며, 예전 Node 는
-/// `C:\…\resources\app\out\main.js` 처럼 `\` 경로를 보고하므로 대소문자·구분자를 가리지 않는다.
-/// urlRegex 에는 플래그를 줄 수 없어 문자 클래스로 쓴다. file:// URL 에서 퍼센트 인코딩되는 글자(공백 등)는
-/// 원래 글자와 인코딩 둘 다 허용한다.
+/// URL regex for the main script breakpoint (urlRegex of CDP Debugger.setBreakpointByUrl).
+///
+/// macOS: the same `Resources/app(\.asar)?/<main>$` as before. Windows: the folder is lowercase
+/// `resources`, the file system is case-insensitive, and older Node reports `\` paths like
+/// `C:\…\resources\app\out\main.js`, so case and separators are ignored. urlRegex takes no flags,
+/// so this is done with character classes. Characters percent-encoded in file:// URLs (spaces, …)
+/// match both as is and encoded.
 fn main_url_regex(main: &str, windows: bool) -> String {
     if !windows {
         return format!("Resources/app(\\.asar)?/{}$", regex_escape(main));
@@ -695,14 +712,16 @@ fn main_url_regex(main: &str, windows: bool) -> String {
     format!("{}{SEP}{}(\\.{})?{SEP}{}$", ci("resources"), ci("app"), ci("asar"), parts.join(SEP))
 }
 
-/// `url` 이 `/<main>` 으로 끝나는가 (대소문자·`\`/`/` 무시: Windows 용)
+/// Whether `url` ends with `/<main>` (ignoring case and `\` vs `/`; for Windows).
 fn url_ends_with_ci(url: &str, main: &str) -> bool {
     let u = url.replace('\\', "/").to_lowercase();
     u.ends_with(&format!("/{}", main.replace('\\', "/").to_lowercase()))
 }
 
-/// 숨은 인스턴스의 AppUserModelID (Windows): 사용자의 실제 앱과 작업 표시줄 그룹·점프 목록을 공유하지 않게
-/// 작업공간마다 다른 값. AUMID 는 128자 이하, 공백 없이 써야 하므로 ASCII 로 줄이고 해시를 붙인다.
+/// AppUserModelID of a hidden instance (Windows): differs per workspace so it doesn't share the
+/// taskbar group or jump list with the user's real app.
+///
+/// AUMIDs must be at most 128 chars with no spaces, so it's squeezed to ASCII with a hash appended.
 fn hidden_aumid(workspace: &str) -> String {
     let mut s: String = workspace
         .chars()
@@ -720,12 +739,15 @@ fn hidden_aumid(workspace: &str) -> String {
     format!("GhostDesk.Hidden.{s}-{:06x}", h & 0xff_ffff)
 }
 
-/// Windows Electron 화면에서 거부하는 키 조합이면 그 이유.
-/// 단독 Alt·F10·Alt+글자(다른 수정키 없이)·Shift+F10·Alt+Space·컨텍스트 메뉴 키는 앱의 네이티브 메뉴
-/// (메뉴 막대 니모닉·시스템 메뉴·컨텍스트 메뉴)를 열 수 있고, 그 메뉴 창은 부모 창이 화면 밖에 있어도
-/// 모니터 안(현재 커서 근처)으로 끌려와 사용자 화면에 나타날 수 있다. `combo` 는 cmd→ctrl 현지화 후의 값.
-/// Shift/Win+Alt+글자(VS Code 의 Shift+Alt+F 문서 서식 등)는 허용한다: Electron(views RootView)은 수정키가
-/// 정확히 Alt 하나일 때만 메뉴 막대 니모닉을 열고, CDP 키 입력은 Win32 WM_SYSKEYDOWN 메뉴 경로를 거치지 않는다.
+/// Reason if the key combo is refused on Windows Electron screens.
+///
+/// Alt alone, F10, Alt+letter (no other modifiers), Shift+F10, Alt+Space and the context menu key
+/// can open the app's native menus (menu bar mnemonics, system menu, context menu), and those menu
+/// windows can get pulled into a monitor (near the current cursor) and show on the user's screen
+/// even when the parent window is off-screen. `combo` is the value after cmd→ctrl localization.
+/// Shift/Win+Alt+letter (VS Code's Shift+Alt+F format document, …) is allowed: Electron (views
+/// RootView) only opens menu bar mnemonics when the modifiers are exactly Alt, and CDP key input
+/// doesn't go through the Win32 WM_SYSKEYDOWN menu path.
 fn menu_key_refusal(combo: &str) -> Option<String> {
     use crate::keys::{MOD_ALT, MOD_CTRL};
     let lc = combo.trim().to_ascii_lowercase();
@@ -735,17 +757,18 @@ fn menu_key_refusal(combo: &str) -> Option<String> {
         .any(|t| matches!(t, "menu" | "apps" | "application" | "contextmenu" | "context_menu" | "compose"));
     let refuse = menu_key
         || match crate::keys::parse_combo(combo) {
-            Err(_) => false, // 해석할 수 없는 키는 아래에서 원래 오류로 알려 준다
+            Err(_) => false, // unparseable keys are reported with the original error below
             Ok(c) => {
                 let ctrl = c.mods & MOD_CTRL != 0;
                 let alt = c.mods & MOD_ALT != 0;
                 let k = c.main.key.as_str();
                 if c.main.modifier_bit == MOD_ALT {
-                    true // Alt 를 마지막에 누르는 조합 (단독 Alt 등): 떼는 순간 메뉴 막대로 포커스가 간다
+                    true // combos where Alt is pressed last (Alt alone, …): focus goes to the menu bar on release
                 } else if k == "F10" {
                     !ctrl
                 } else if alt && !ctrl {
-                    // Alt+Space(시스템 메뉴)는 다른 수정키가 있어도, Alt+글자(니모닉)는 Alt 만 눌렀을 때 거부
+                    // Alt+Space (system menu) is refused even with other modifiers; Alt+letter (mnemonic) only with
+                    // Alt alone
                     k == " " || (c.mods == MOD_ALT && k.chars().count() == 1 && k.chars().all(|ch| ch.is_ascii_alphabetic()))
                 } else {
                     false
@@ -765,9 +788,12 @@ fn menu_key_refusal(combo: &str) -> Option<String> {
     })
 }
 
-/// 화면 밖 좌표 계산 (Windows): 모든 모니터 밖의 실제 픽셀 좌표 `px` → Electron setPosition 에 줄 DIP.
-/// 주 모니터 배율로 나누고, 어떤 모니터 배율로 다시 픽셀로 바꿔도 Win32 16비트 좌표 한계(±32767)와
-/// 최소화 표식(-32000)에서 멀도록 |DIP| × 최대 배율 ≤ 24000 으로 제한한다.
+/// Off-screen coordinate math (Windows): real pixel coordinates `px` outside every monitor → DIP
+/// for Electron's setPosition.
+///
+/// Divides by the primary monitor's scale, and caps |DIP| × max scale ≤ 24000 so that converting
+/// back to pixels at any monitor's scale stays well away from the Win32 16-bit coordinate limit
+/// (±32767) and the minimized marker (-32000).
 fn offscreen_dip_math(px: (i32, i32), primary_scale: f64, max_scale: f64) -> (i32, i32) {
     let p = if primary_scale.is_finite() && primary_scale >= 0.5 { primary_scale } else { 1.0 };
     let m = if max_scale.is_finite() { max_scale.max(p).max(1.0) } else { p.max(1.0) };
@@ -803,7 +829,7 @@ fn read_plist_strings(_path: &Path, _keys: &[&str]) -> HashMap<String, String> {
     HashMap::new()
 }
 
-/// 실행 중인 모든 프로세스의 실행 파일 경로
+/// Executable paths of all running processes.
 #[cfg(not(windows))]
 #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
 fn running_exes() -> HashSet<PathBuf> {
@@ -817,9 +843,9 @@ fn running_exes() -> HashSet<PathBuf> {
     out
 }
 
-// ── Windows 앱 감지에 쓰는 순수 함수 (모든 OS 에서 컴파일·테스트) ──
+// ---- pure functions for Windows app detection (compiled and tested on every OS) ----
 
-/// Squirrel 버전 폴더 이름("app-1.0.9266", 소문자)의 버전 숫자들
+/// Version numbers of a Squirrel version folder name ("app-1.0.9266", lowercase).
 fn squirrel_version(name: &str) -> Option<Vec<u64>> {
     let v = name.strip_prefix("app-")?;
     let core = v.split(['-', '+']).next()?;
@@ -827,14 +853,15 @@ fn squirrel_version(name: &str) -> Option<Vec<u64>> {
     parts.filter(|p| !p.is_empty())
 }
 
-/// 앱 파일을 담는 하위 폴더일 수 있는 이름인가 (Velopack "current", 버전 "1.2.3", 커밋 해시)
+/// Whether a name could be a subfolder holding the app files (Velopack "current", version
+/// "1.2.3", commit hash).
 fn looks_versioned(name: &str) -> bool {
     name == "current"
         || (name.len() >= 7 && name.chars().all(|c| c.is_ascii_hexdigit()))
         || (name.chars().any(|c| c.is_ascii_digit()) && name.trim_start_matches('v').chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
-/// 앱 본체가 아닌 도우미 실행 파일 (소문자 파일 이름)
+/// Helper executables that aren't the app itself (lowercase file names).
 fn is_helper_exe(name: &str) -> bool {
     const EXACT: &[&str] = &[
         "update.exe",
@@ -850,7 +877,7 @@ fn is_helper_exe(name: &str) -> bool {
     EXACT.contains(&name) || name.starts_with("unins") || name.starts_with("uninstall") || name.ends_with("_helper.exe")
 }
 
-/// Windows 폴더 이름으로 쓸 수 있는가 (userData 추정용)
+/// Whether it's usable as a Windows folder name (for guessing userData).
 fn dir_name_ok(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -862,9 +889,12 @@ fn dir_name_ok(s: &str) -> bool {
         && !crate::platform::paths::is_reserved_name(t)
 }
 
-/// Windows 앱의 번들 ID 대용. 작업공간 표식(다른 앱과 섞임 방지)과 차단 목록·셀프 테스트가 쓰므로 비지 않아야 한다.
-/// 순서: product.json darwinBundleIdentifier(VS Code 계열은 macOS 와 같은 ID) → win32AppUserModelId →
-/// package.json build.appId → Squirrel AUMID(com.squirrel.<루트>.<실행 파일>) → win.<실행 파일>.
+/// Stand-in for a bundle ID on Windows. Used by the workspace marker (to keep apps from mixing),
+/// the deny list and the self-test, so it must not be empty.
+///
+/// Order: product.json darwinBundleIdentifier (the VS Code family uses the same ID as on macOS) →
+/// win32AppUserModelId → package.json build.appId → Squirrel AUMID
+/// (com.squirrel.<root>.<executable>) → win.<executable>.
 fn win_bundle_id(product: Option<&Value>, pkg: Option<&Value>, squirrel_root: Option<&str>, exe_stem: &str) -> String {
     let s = |v: Option<&Value>| v.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     s(product.map(|p| &p["darwinBundleIdentifier"]))
@@ -874,7 +904,7 @@ fn win_bundle_id(product: Option<&Value>, pkg: Option<&Value>, squirrel_root: Op
         .unwrap_or_else(|| format!("win.{}", exe_stem.to_lowercase()))
 }
 
-/// 경로 비교 키 (Windows: 대소문자 무시, 끝의 구분자 무시)
+/// Path comparison key (Windows: case-insensitive, trailing separator ignored).
 fn path_key(p: &Path) -> String {
     let c: PathBuf = p.components().collect();
     if cfg!(windows) {
@@ -886,10 +916,11 @@ fn path_key(p: &Path) -> String {
 
 #[cfg(windows)]
 mod win_apps {
-    //! Windows 의 Electron 앱 찾기·검사 (읽기 전용).
+    //! Finding and inspecting Electron apps on Windows (read only).
     //!
-    //! Electron 앱 = `<폴더>\resources\app.asar`(또는 `resources\app\package.json`)와 Chromium 런타임 파일이
-    //! 있는 폴더 안의 실행 파일. 퓨즈는 그 실행 파일(.exe)에 들어 있다.
+    //! Electron app = an executable in a folder that has `<folder>\resources\app.asar` (or
+    //! `resources\app\package.json`) and the Chromium runtime files. The fuses live in that
+    //! executable (.exe).
     use super::*;
     use crate::platform::win;
     use std::sync::OnceLock;
@@ -897,7 +928,7 @@ mod win_apps {
 
     const RUNTIME_MARKERS: &[&str] = &["icudtl.dat", "v8_context_snapshot.bin", "snapshot_blob.bin", "chrome_100_percent.pak"];
 
-    /// %LOCALAPPDATA% 아래에서 앱이 아닌 것이 확실한 큰 폴더 (훑지 않음)
+    /// Large folders under %LOCALAPPDATA% that are definitely not apps (not scanned).
     const LOCAL_SKIP: &[&str] = &[
         "temp",
         "packages",
@@ -922,7 +953,7 @@ mod win_apps {
         "ghostdesk",
     ];
 
-    /// Program Files 아래에서 한 단계 더 내려가지 않는 폴더
+    /// Folders under Program Files not descended into further.
     fn skip_program_child(name: &str) -> bool {
         name.starts_with("windows")
             || matches!(
@@ -946,14 +977,16 @@ mod win_apps {
         p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
     }
 
-    /// Microsoft Store(MSIX) 패키지 안의 파일인가 (…\WindowsApps\<패키지>\…).
-    /// 패키지 앱을 경로로 직접 실행하면 패키지 ID·가상화 없이 돌아 동작이 달라지고(사용자 실제 폴더에 쓰기 등),
-    /// 앱이 스스로 패키지로 다시 실행하면 숨김 처리가 풀릴 수 있다.
+    /// Whether the file is inside a Microsoft Store (MSIX) package (…\WindowsApps\<package>\…).
+    ///
+    /// Running a packaged app directly by path runs it without package identity or virtualization,
+    /// changing its behavior (writing to the user's real folders, …), and if the app relaunches itself
+    /// as a package, hiding can be lost.
     pub(super) fn is_msix_path(p: &Path) -> bool {
         p.components().any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("WindowsApps"))
     }
 
-    /// `d` 가 Electron 앱 실행 파일이 있는 폴더인가
+    /// Whether `d` is a folder holding an Electron app executable.
     pub(super) fn is_app_dir(d: &Path) -> bool {
         let res = d.join("resources");
         if !res.is_dir() {
@@ -963,12 +996,14 @@ mod win_apps {
             && RUNTIME_MARKERS.iter().any(|m| d.join(m).is_file())
     }
 
-    /// 후보 폴더 → (설치 루트, 실행 파일 폴더).
-    /// Squirrel(`<루트>\app-<버전>\`)은 가장 높은 버전, 그 밖의 한 단계 아래 폴더(Velopack `current`,
-    /// 버전·커밋 이름)는 가장 최근에 바뀐 것을 고른다. 설치 루트는 업데이트해도 바뀌지 않는 폴더다.
+    /// Candidate folder → (install root, executable folder).
+    ///
+    /// For Squirrel (`<root>\app-<version>\`) picks the highest version; for other one-level-down
+    /// folders (Velopack `current`, version or commit names) picks the most recently modified. The
+    /// install root is the folder that doesn't change across updates.
     pub(super) fn resolve_layout(dir: &Path) -> Option<(PathBuf, PathBuf)> {
         if lower_name(dir) == "windowsapps" {
-            return None; // 패키지 폴더 목록 자체 (훑지 않음)
+            return None; // the package folder listing itself (not scanned)
         }
         if is_app_dir(dir) {
             let name = lower_name(dir);
@@ -1007,7 +1042,8 @@ mod win_apps {
         best.map(|(_, p)| p).or(other.map(|(_, p)| p)).map(|p| (dir.to_path_buf(), p))
     }
 
-    /// 앱 폴더의 본체 실행 파일: 도우미를 뺀 .exe 중 가장 큰 것 (Electron 본체는 보통 100MB 이상)
+    /// The app folder's main executable: the largest .exe excluding helpers (Electron binaries are
+    /// usually over 100 MB).
     pub(super) fn main_exe(appdir: &Path) -> Option<PathBuf> {
         let mut best: Option<(u64, PathBuf)> = None;
         for e in fs::read_dir(appdir).ok()?.flatten() {
@@ -1027,7 +1063,7 @@ mod win_apps {
         best.map(|(_, p)| p)
     }
 
-    /// 설치 폴더나 .exe 경로 → 퓨즈를 읽을 실행 파일
+    /// Install folder or .exe path → the executable to read fuses from.
     pub(super) fn exe_for(p: &Path) -> Option<PathBuf> {
         if p.is_file() {
             return Some(p.to_path_buf());
@@ -1036,7 +1072,8 @@ mod win_apps {
         main_exe(&appdir)
     }
 
-    /// 퓨즈 검사 결과 캐시 (경로·크기·수정 시각이 같으면 다시 읽지 않음: 실행 파일이 수백 MB 라서)
+    /// Fuse inspection cache (not reread if path, size and mtime match, since executables are hundreds
+    /// of MB).
     fn cached_fuses(exe: &Path) -> Option<ElectronFuses> {
         type Entry = (u64, Option<SystemTime>, Option<ElectronFuses>);
         static CACHE: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -1054,7 +1091,7 @@ mod win_apps {
         f
     }
 
-    /// 설치 루트와 앱 폴더(실행 파일 폴더)로 ElectronApp 을 만든다.
+    /// Builds an ElectronApp from the install root and app folder (executable folder).
     pub(super) fn inspect_dirs(root: &Path, appdir: &Path, exe: Option<PathBuf>) -> Option<ElectronApp> {
         let exe = match exe {
             Some(e) => e,
@@ -1103,7 +1140,8 @@ mod win_apps {
             AppFamily::Generic
         };
 
-        // userData 추정: Electron 기본값은 %APPDATA%\<productName|name> (VS Code: product.json nameShort = "Code")
+        // guess userData: Electron's default is %APPDATA%\<productName|name> (VS Code: product.json
+        // nameShort = "Code")
         let appdata = dirs::data_dir().unwrap_or_default();
         let mut cands: Vec<String> = Vec::new();
         for k in ["nameShort", "nameLong"] {
@@ -1163,14 +1201,15 @@ mod win_apps {
         })
     }
 
-    /// 설치 폴더(또는 Squirrel 루트)나 .exe 하나를 검사한다.
+    /// Inspects an install folder (or Squirrel root) or a single .exe.
     pub(super) fn inspect(path: &Path) -> Option<ElectronApp> {
         let path = crate::platform::paths::simplify(path);
         let mut a = if path.is_file() {
             let dir = path.parent()?;
             let (root, appdir) = resolve_layout(dir)?;
             let name = lower_name(&path);
-            // Squirrel 루트의 실행기(Discord.exe 같은 작은 stub)나 도우미를 고르면 실제 앱 실행 파일로 바꾼다
+            // if the Squirrel root's launcher (a small stub like Discord.exe) or a helper was picked, switch
+            // to the real app executable
             let exe = if appdir == dir && name.ends_with(".exe") && !is_helper_exe(&name) {
                 Some(path.clone())
             } else {
@@ -1186,7 +1225,7 @@ mod win_apps {
         Some(a)
     }
 
-    /// 앱이 있을 만한 폴더들 (중복 가능)
+    /// Folders likely to contain apps (may have duplicates).
     fn candidate_dirs() -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = Vec::new();
         for (_, loc, icon) in win::installed_programs() {
@@ -1229,7 +1268,8 @@ mod win_apps {
         v
     }
 
-    /// 실행 중인 앱 실행 파일 (path_key). 이름이 같은 프로세스만 경로를 조회한다.
+    /// Running app executables (path_key). Only processes with matching names have their paths looked
+    /// up.
     fn running_exes(apps: &[ElectronApp]) -> HashSet<String> {
         let names: HashSet<String> =
             apps.iter().filter_map(|a| a.exe.file_name()).map(|n| n.to_string_lossy().to_lowercase()).collect();
@@ -1268,24 +1308,24 @@ mod win_apps {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// 작업공간 준비
-// ═════════════════════════════════════════════════════════════════════
+// ---- workspace preparation ----
 
 #[derive(Clone, Debug)]
 pub enum ElectronProfile {
-    /// 빈 프로필 (작업공간이 이미 있으면 그대로 이어서 사용)
+    /// Empty profile (an existing workspace is reused as is).
     Empty,
-    /// 원본 userData 를 복제 (로그인 상태 유지). UI 에서 사용자 동의를 받은 뒤에만 사용할 것.
-    /// `refresh` 면 기존 작업공간의 user-data 를 지우고 다시 복제한다.
+    /// Clones the original userData (keeps the login state). Only use after getting the user's consent
+    /// in the UI.
+    ///
+    /// With `refresh`, the existing workspace's user-data is wiped and cloned again.
     Clone { source: PathBuf, refresh: bool },
 }
 
 #[derive(Clone, Debug)]
 pub struct WorkspacePaths {
-    /// 실제 작업공간 폴더 (~/Library/Application Support/GhostDesk/workspaces/<slug>)
+    /// Real workspace folder (~/Library/Application Support/GhostDesk/workspaces/<slug>).
     pub real_root: PathBuf,
-    /// 짧은 심볼릭 링크 (/tmp/gd/<slug>) — 앱에 넘기는 모든 경로는 이것 기준
+    /// Short symlink (/tmp/gd/<slug>); every path handed to the app is based on it.
     pub root: PathBuf,
     pub user_data: PathBuf,
     pub extensions: PathBuf,
@@ -1298,19 +1338,20 @@ pub struct WorkspacePaths {
 #[derive(Clone)]
 pub struct ElectronLaunch {
     pub app: ElectronApp,
-    /// 작업공간 이름 (profiles::slug 로 정리됨)
+    /// Workspace name (normalized by profiles::slug).
     pub workspace: String,
     pub width: u32,
     pub height: u32,
     pub profile: ElectronProfile,
-    /// VS Code 계열: 열 폴더/파일 (작업공간 밖의 사용자 폴더를 열면 에이전트가 수정할 수 있으니 주의)
+    /// VS Code family: folder/file to open (careful: opening a user folder outside the workspace lets
+    /// the agent modify it).
     pub open_path: Option<PathBuf>,
     pub extra_args: Vec<String>,
-    /// VS Code 계열: User/settings.json 에 덮어쓸 설정
+    /// VS Code family: settings to overwrite in User/settings.json.
     pub vscode_settings: Map<String, Value>,
-    /// 작업공간 루트 변경 (기본: profiles::workspaces_root())
+    /// Overrides the workspaces root (default: profiles::workspaces_root()).
     pub workspaces_root: Option<PathBuf>,
-    /// 복제 진행 상황 (파일 수, 바이트)
+    /// Clone progress (files, bytes).
     pub progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 }
 
@@ -1331,8 +1372,8 @@ impl ElectronLaunch {
     }
 }
 
-/// VS Code 계열 기본 설정: 업데이트·텔레메트리 끔, 대화상자/메뉴를 창 안(HTML)으로 그려
-/// 네이티브 창이 뜨지 않고 스크린샷에 보이게 한다.
+/// Default settings for the VS Code family: updates and telemetry off, and dialogs/menus drawn
+/// inside the window (HTML) so no native window appears and they show up in screenshots.
 pub fn vscode_default_settings() -> Map<String, Value> {
     let v = json!({
         "update.mode": "none",
@@ -1354,8 +1395,9 @@ pub fn vscode_default_settings() -> Map<String, Value> {
     });
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut m = v.as_object().cloned().unwrap_or_default();
-    // Windows: 터미널 우클릭 기본값(copyPaste)은 선택이 없으면 사용자의 실제 클립보드를 붙여 넣고, 선택이 있으면
-    // 복사해 사용자 클립보드를 덮어쓴다. 에이전트의 우클릭이 컨텍스트 메뉴만 열게 하고, 선택 시 자동 복사도 끈다.
+    // Windows: the terminal's default right click (copyPaste) pastes the user's real clipboard with no
+    // selection and copies over it with one. Make the agent's right click only open the context menu,
+    // and turn off copy-on-select too.
     #[cfg(windows)]
     {
         m.insert("terminal.integrated.rightClickBehavior".into(), json!("default"));
@@ -1364,7 +1406,7 @@ pub fn vscode_default_settings() -> Map<String, Value> {
     m
 }
 
-/// Electron userData 복제 시 제외할 항목 (캐시·잠금·로그)
+/// Entries skipped when cloning Electron userData (caches, locks, logs).
 const CLONE_EXCLUDE_NAMES: &[&str] = &[
     "Cache",
     "Code Cache",
@@ -1393,20 +1435,22 @@ const CLONE_EXCLUDE_NAMES: &[&str] = &[
     "logs",
     ".DS_Store",
 ];
-/// userData 루트 기준으로 제외할 항목 (VS Code: 저장 안 된 버퍼 백업·폴더별 상태)
+/// Entries skipped relative to the userData root (VS Code: unsaved buffer backups, per-folder
+/// state).
 const CLONE_EXCLUDE_REL: &[&str] = &["Backups", "User/workspaceStorage", "User/History"];
 
-/// 원본 Electron userData 폴더를 복제한다 (원본은 읽기만 함).
+/// Clones the original Electron userData folder (the original is only read).
 pub fn clone_user_data(src: &Path, dest: &Path, progress: &dyn Fn(u64, u64)) -> Result<CloneStats> {
     profiles::clone_dir(src, dest, CLONE_EXCLUDE_REL, CLONE_EXCLUDE_NAMES, progress)
 }
 
-/// unix 소켓 sun_path 한계 (macOS 104바이트, NUL 포함)
+/// Unix socket sun_path limit (104 bytes on macOS, NUL included).
 const SUN_PATH_MAX: usize = 104;
 
-/// Windows: 짧은 링크가 필요 없다. VS Code·Chromium 의 IPC 는 유닉스 소켓이 아니라 명명 파이프
-/// (`\\.\pipe\<해시>-<버전>-main-sock`)라 경로 길이 한계(sun_path)가 없으므로 실제 폴더를 그대로 쓴다.
-/// (심볼릭 링크는 관리자 권한·개발자 모드가 필요해서도 쓰지 않는다.)
+/// Windows: no short link needed. VS Code/Chromium IPC uses named pipes
+/// (`\\.\pipe\<hash>-<version>-main-sock`) rather than Unix sockets, so there's no path length
+/// limit (sun_path) and the real folder is used as is. (Symlinks also need admin rights or
+/// developer mode, another reason not to use them.)
 #[cfg(windows)]
 fn short_link(real: &Path, _slug: &str) -> Result<PathBuf> {
     Ok(real.to_path_buf())
@@ -1417,7 +1461,7 @@ fn short_link(_real: &Path, _slug: &str) -> Result<PathBuf> {
     bail!("Electron 작업공간은 macOS·Windows 에서만 지원합니다")
 }
 
-/// `/tmp/gd/<slug>` → 실제 작업공간 심볼릭 링크를 만든다.
+/// Creates the `/tmp/gd/<slug>` → real workspace symlink.
 #[cfg(unix)]
 fn short_link(real: &Path, slug: &str) -> Result<PathBuf> {
     let uid = unsafe { libc::getuid() };
@@ -1442,7 +1486,7 @@ fn short_link(real: &Path, slug: &str) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
     }
-    // 한글 등 멀티바이트 이름도 소켓 경로 한계(104바이트)를 넘지 않게 바이트 기준으로 자른다
+    // truncate by bytes so multibyte names (Korean, …) stay within the socket path limit (104 bytes)
     let mut name = String::new();
     for c in slug.chars() {
         if name.len() + c.len_utf8() > 24 {
@@ -1470,16 +1514,16 @@ fn short_link(real: &Path, slug: &str) -> Result<PathBuf> {
     Ok(link)
 }
 
-/// 작업공간 폴더·짧은 링크·(복제/빈) 프로필·앱별 초기 설정을 준비한다.
+/// Prepares the workspace folder, short link, (cloned/empty) profile and per-app initial settings.
 pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
-    // (Windows 에서는 CON·NUL·COM1 같은 장치 이름과 너무 긴 이름을 slug 가 이미 피한다)
+    // (on Windows, slug already avoids device names like CON, NUL, COM1 and overly long names)
     let slug = profiles::slug(&opts.workspace);
-    // (macOS 에서는 profiles::workspaces_root 와 같은 위치, Windows 에서는 로밍이 아닌 %LOCALAPPDATA%)
+    // (same location as profiles::workspaces_root on macOS; non-roaming %LOCALAPPDATA% on Windows)
     let root_dir = opts.workspaces_root.clone().unwrap_or_else(crate::platform::paths::workspaces_root);
     let real_root = root_dir.join(&slug);
     fs::create_dir_all(&real_root).with_context(|| format!("{} 생성 실패", real_root.display()))?;
 
-    // 다른 앱이 쓰던 작업공간이면 섞이지 않게 막는다
+    // refuse a workspace another app was using, so they don't mix
     let marker = real_root.join("ghostdesk-electron.json");
     if let Ok(s) = fs::read_to_string(&marker) {
         if let Ok(v) = serde_json::from_str::<Value>(&s) {
@@ -1506,7 +1550,8 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
         real_root: real_root.clone(),
         root,
     };
-    // VS Code 메인 IPC 소켓: <user-data>/<버전4자>-main.sock (Windows 는 명명 파이프라 한계 없음)
+    // VS Code main IPC socket: <user-data>/<4-char version>-main.sock (no limit on Windows, which uses
+    // named pipes)
     #[cfg(unix)]
     {
         let sock_len = p.user_data.as_os_str().len() + "/1.99-main.sock".len();
@@ -1520,9 +1565,10 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
         ElectronProfile::Empty => {}
         ElectronProfile::Clone { source, refresh } => {
             let real_ud = real_root.join("user-data");
-            // Windows: 복제 중 표시 파일 (user-data 밖에 두어 복제본에 섞이지 않게). 복제가 끝나지 않은 채
-            // (잠긴 쿠키로 실패했는데 지우기도 실패, 복사 오류, 강제 종료 등) 남은 user-data 를 다음 실행이
-            // 완성된 복제본으로 착각해 로그아웃된 반쪽 복사본으로 실행하지 않게 한다 (agent.rs 의 브라우저 복제와 같은 방식).
+            // Windows: clone-in-progress marker (outside user-data so it doesn't end up in the clone). Keeps
+            // the next run from mistaking user-data left by an unfinished clone (failed on locked cookies and
+            // then failed to delete, copy error, forced exit, …) for a complete one and launching a
+            // logged-out half copy (same approach as the browser clone in agent.rs).
             let mark = real_root.join(".ghostdesk-cloning");
             let unfinished = cfg!(windows) && mark.exists();
             let has = !unfinished && real_ud.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
@@ -1531,7 +1577,7 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
                     fs::write(&mark, b"").with_context(|| format!("{} 생성 실패", mark.display()))?;
                 }
                 if real_ud.exists() {
-                    // Windows: 방금 끝난 앱이 쥐고 있던 파일은 잠시 뒤 풀리므로 재시도한다 (macOS 는 한 번)
+                    // Windows: files held by an app that just exited are released shortly, so retry (once on macOS)
                     let r = crate::platform::fsx::remove_dir_all_retry(&real_ud);
                     #[cfg(windows)]
                     r.with_context(|| {
@@ -1551,7 +1597,7 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
                 };
                 clone_user_data(source, &real_ud, prog)?;
                 if cfg!(windows) {
-                    // 끝까지 복제했을 때만 지운다 (지우지 못하면 다음 실행에서 다시 복제할 뿐이다)
+                    // only removed once the clone completes (if removal fails, the next run just clones again)
                     let _ = fs::remove_file(&mark);
                 }
             }
@@ -1566,7 +1612,7 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
         }
     }
     if opts.app.family == AppFamily::VsCode {
-        // 포터블 argv.json: 크래시 리포터(별도 crashpad 프로세스) 끔
+        // portable argv.json: crash reporter (a separate crashpad process) off
         let argv = p.root.join("argv.json");
         if !argv.exists() {
             fs::write(&argv, "{\n  \"enable-crash-reporter\": false\n}\n")?;
@@ -1576,8 +1622,9 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
     Ok(p)
 }
 
-/// settings.json 에 설정을 병합한다. 엄격한 JSON 이면 키 단위로 덮어쓰고, 주석 등으로 파싱이 안 되면
-/// 여는 중괄호 바로 뒤에 넣는다 (그러면 사용자의 기존 값이 우선).
+/// Merges settings into settings.json. Strict JSON is overwritten key by key; if it can't be
+/// parsed (comments, …), the settings are inserted right after the opening brace (so the user's
+/// existing values win).
 fn write_vscode_settings(path: &Path, set: &Map<String, Value>) -> Result<()> {
     if set.is_empty() {
         return Ok(());
@@ -1604,14 +1651,15 @@ fn write_vscode_settings(path: &Path, set: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-/// 앱 종류별 실행 인자와 환경 변수
+/// Launch arguments and environment variables per app kind.
 fn launch_plan(opts: &ElectronLaunch, p: &WorkspacePaths) -> (Vec<String>, Vec<(String, String)>) {
     let d = |x: &Path| x.display().to_string();
     let mut args = vec![
         format!("--user-data-dir={}", d(&p.user_data)),
         "--remote-debugging-port=0".into(),
-        // --remote-allow-origins 는 주지 않는다: GhostDesk 의 CDP 클라이언트는 Origin 헤더를 보내지 않으므로
-        // 필요 없고, 주면 사용자의 실제 브라우저에 열린 웹 페이지가 이 앱(복제된 로그인 상태)에 붙을 수 있다.
+        // --remote-allow-origins isn't passed: GhostDesk's CDP client sends no Origin header so it isn't
+        // needed, and passing it would let web pages open in the user's real browser attach to this app
+        // (with its cloned login state)
         "--inspect-brk=0".into(),
         "--disable-renderer-backgrounding".into(),
         "--disable-backgrounding-occluded-windows".into(),
@@ -1619,10 +1667,11 @@ fn launch_plan(opts: &ElectronLaunch, p: &WorkspacePaths) -> (Vec<String>, Vec<(
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
     ];
-    // Windows: Chromium 의 네이티브 창 가림 추적이 화면 밖·투명 창을 "가려짐"으로 보고 렌더링을 멈추면
-    // Page.captureScreenshot 이 응답하지 않는다 (VS Code 도 스스로 같은 기능을 끈다).
-    // 같은 스위치를 여러 번 주면 마지막 값만 쓰이므로, extra_args 의 --disable-features 값은 여기로 합친다
-    // (앱이 실행 중에 app.commandLine.appendSwitch 로 바꾸는 경우는 PATCH_JS 가 합친다).
+    // Windows: when Chromium's native occlusion tracking reports off-screen/transparent windows as
+    // "occluded" and stops rendering, Page.captureScreenshot never answers (VS Code turns the same
+    // feature off itself). Only the last occurrence of a switch counts, so --disable-features values
+    // from extra_args are merged here (PATCH_JS merges values the app appends at runtime with
+    // app.commandLine.appendSwitch).
     let mut extra = opts.extra_args.clone();
     if cfg!(windows) {
         let (features, rest) = split_disable_features(&extra);
@@ -1643,8 +1692,8 @@ fn launch_plan(opts: &ElectronLaunch, p: &WorkspacePaths) -> (Vec<String>, Vec<(
                 "--skip-release-notes".into(),
                 "--new-window".into(),
             ]);
-            // VSCODE_PORTABLE 은 --user-data-dir 보다 우선하므로 user-data 가 <root>/user-data 가 되게 맞춘다.
-            // (argv.json·extensions·shared-data·agent-plugins 도 모두 <root> 아래로 간다)
+            // VSCODE_PORTABLE takes precedence over --user-data-dir, so set it so user-data ends up at
+            // <root>/user-data (argv.json, extensions, shared-data and agent-plugins all go under <root> too)
             env.push(("VSCODE_PORTABLE".into(), d(&p.root)));
         }
         AppFamily::OpenCode => {
@@ -1661,8 +1710,9 @@ fn launch_plan(opts: &ElectronLaunch, p: &WorkspacePaths) -> (Vec<String>, Vec<(
     (args, env)
 }
 
-/// 인자 목록에서 `--disable-features=…` (Windows Chromium 은 `-`·`/` 접두와 대소문자 다른 이름도 같은 스위치로
-/// 본다) 를 빼내 그 값들과 나머지 인자로 나눈다. `--` 뒤(스위치 끝 표시)는 건드리지 않는다.
+/// Pulls `--disable-features=…` out of an argument list (Windows Chromium also treats `-`/`/`
+/// prefixes and differently cased names as the same switch), splitting into those values and the
+/// remaining arguments. Anything after `--` (end of switches) is left alone.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn split_disable_features(args: &[String]) -> (Vec<String>, Vec<String>) {
     let mut values = Vec::new();
@@ -1681,7 +1731,7 @@ fn split_disable_features(args: &[String]) -> (Vec<String>, Vec<String>) {
     (values, rest)
 }
 
-/// 쉼표로 나눈 기능 목록들을 합치고 `must` 를 더한다 (순서 유지, 중복 제거)
+/// Merges comma-separated feature lists and adds `must` (order kept, duplicates removed).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn merge_features(lists: &[String], must: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
@@ -1694,11 +1744,9 @@ fn merge_features(lists: &[String], must: &str) -> String {
     out.join(",")
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// 메인 프로세스 주입 스크립트
-// ═════════════════════════════════════════════════════════════════════
+// ---- main process injection script ----
 
-/// 앱 메인 스크립트 첫 줄에서 평가된다. `__CFG__` 는 JSON 으로 치환된다.
+/// Evaluated on the first line of the app's main script. `__CFG__` is replaced with JSON.
 const PATCH_JS: &str = r#"(() => {
   if (globalThis.__ghostdesk) return 'already';
   const R = (typeof process.getBuiltinModule === 'function')
@@ -1716,15 +1764,15 @@ const PATCH_JS: &str = r#"(() => {
   const short = (v) => { try { return (typeof v === 'string' ? v : JSON.stringify(v)).slice(0, 300); } catch (e) { return String(v); } };
   G.note = note;
   G.exit = app.exit.bind(app);
-  // GhostDesk 가 비정상 종료되면(감시자가 사라지면) 숨은 앱도 스스로 종료한다
+  // if GhostDesk dies abnormally (the watchdog is gone), the hidden app exits on its own
   if (CFG.parentPid > 1) {
     const t = setInterval(() => { try { process.kill(CFG.parentPid, 0); } catch (e) { if (e && e.code === 'ESRCH') G.exit(0); } }, 2000);
     if (t && t.unref) t.unref();
   }
 
   safe('userData', () => { if (CFG.userData) app.setPath('userData', CFG.userData); });
-  // 원래 함수는 G.setPolicy 로 보관: macOS(LaunchServices)가 Dock 클릭 등으로 숨은 인스턴스를 Foreground 로
-  // 바꿔 활성화하면 감시자가 rehide(true) 에서 다시 prohibited 로 되돌린다.
+  // the original function is kept as G.setPolicy: if macOS (LaunchServices) switches the hidden
+  // instance to Foreground on a Dock click or the like, the watchdog's rehide(true) sets it back to prohibited.
   safe('policy', () => { if (app.setActivationPolicy) { G.setPolicy = app.setActivationPolicy.bind(app); G.setPolicy('prohibited'); app.setActivationPolicy = noop; } });
   safe('app', () => {
     app.focus = noop;
@@ -1739,8 +1787,8 @@ const PATCH_JS: &str = r#"(() => {
     app.hideOthers = noop;
     if (app.dock) { app.dock.show = function () { return Promise.resolve(); }; app.dock.bounce = function () { return -1; }; app.dock.downloadFinished = noop; }
   });
-  // Windows: 숨은 인스턴스만의 AppUserModelID 를 써서 작업 표시줄 그룹·점프 목록·최근 항목이 사용자의
-  // 실제 앱(같은 AUMID)과 섞이거나 덮어써지지 않게 하고, 작업 표시줄·점프 목록 API 는 막는다.
+  // Windows: give the hidden instance its own AppUserModelID so its taskbar group, jump list and recent items
+  // don't mix with or overwrite the user's real app (same AUMID), and block the taskbar/jump list APIs.
   if (W32) safe('win-shell', () => {
     const oAumid = app.setAppUserModelId;
     if (typeof oAumid === 'function' && CFG.aumid) {
@@ -1754,9 +1802,9 @@ const PATCH_JS: &str = r#"(() => {
     app.setBadgeCount = function () { return false; };
   });
   /*<gd-win-helpers>*/
-  // Windows: Node 의 child_process 는 windowsHide 기본값이 false 라, 콘솔 프로그램(git·python·cmd …)을 띄우면
-  // 사용자 화면에 콘솔 창(또는 Windows Terminal 창)이 새로 열린다. windowsHide 를 따로 정하지 않았으면 true 로 한다.
-  // a: 인자 배열, hasArgs: 두 번째 인자가 args 배열일 수 있는 함수, nullOk: options 자리의 null 을 "없음"으로 보는 함수
+  // Windows: Node's child_process defaults windowsHide to false, so launching a console program (git, python,
+  // cmd, …) opens a new console (or Windows Terminal) window on the user's screen. Default windowsHide to true.
+  // a: args array, hasArgs: functions whose second arg may be an args array, nullOk: functions treating null options as absent
   const gdHideOpts = (a, hasArgs, nullOk) => {
     a = Array.prototype.slice.call(a);
     const k = hasArgs && (Array.isArray(a[1]) || a[1] == null) ? 2 : 1;
@@ -1778,7 +1826,7 @@ const PATCH_JS: &str = r#"(() => {
         if (key === 'length' || key === 'prototype' || key === P) continue;
         try { Object.defineProperty(w, key, Object.getOwnPropertyDescriptor(orig, key)); } catch (e) {}
       }
-      // util.promisify(exec/execFile) 는 { stdout, stderr } 를 돌려주는 전용 버전을 쓴다: 감싼 함수를 거치게 다시 만든다
+      // util.promisify(exec/execFile) uses a dedicated version returning { stdout, stderr }: rebuild it through the wrapper
       if (orig[P]) {
         Object.defineProperty(w, P, { enumerable: false, value: (...a) => {
           let child;
@@ -1792,19 +1840,19 @@ const PATCH_JS: &str = r#"(() => {
     }
     return cp;
   };
-  // Windows: --disable-features 는 마지막 값만 쓰이므로, 앱이 바꿔도 CalculateNativeWinOcclusion 이 남게 합친다
+  // Windows: only the last --disable-features counts, so merge to keep CalculateNativeWinOcclusion even if the app changes it
   const gdMergeFeatures = (v) => {
     const out = [];
     for (const f of String(v == null ? '' : v).split(',').concat(['CalculateNativeWinOcclusion'])) { const t = f.trim(); if (t && !out.includes(t)) out.push(t); }
     return out.join(',');
   };
-  // Windows: 숨은 앱의 드래그가 OS 드래그(OLE DoDragDrop)로 넘어가면 사용자의 실제 커서 아래 창에 떨어진다
-  // (실제 마우스 단추는 눌려 있지 않으므로 곧바로 놓기로 끝남). GhostDesk 는 앱 창의 CDP 세션에서
-  // Input.setInterceptDrags 로 페이지 안의 드래그를 가로채지만, 다음 두 경로는 그 가로채기가 닿지 않는다.
-  //  (a) webContents.startDrag({file, icon}) — 렌더러의 dragstart 에서 IPC 로 부르는 네이티브 파일 드래그: 막는다.
-  //  (b) <webview> 게스트 — 별도 프레임 트리라 GhostDesk 세션의 가로채기가 적용되지 않는다: 앱 안의 debugger 로
-  //      게스트에도 가로채기를 켜고, 가로챈 드래그는 취소한다 (게스트 안의 끌어다 놓기는 동작하지 않음).
-  //      가로채기를 켤 수 없으면 게스트 문서의 dragstart 를 막는다.
+  // Windows: a drag from the hidden app that becomes an OS drag (OLE DoDragDrop) drops onto the window under the user's
+  // real cursor (the real mouse button isn't down, so it ends in an immediate drop). GhostDesk intercepts in-page drags
+  // with Input.setInterceptDrags on the app window's CDP session, but these two paths are out of its reach:
+  //  (a) webContents.startDrag({file, icon}): native file drags invoked over IPC from the renderer's dragstart. Blocked.
+  //  (b) <webview> guests: a separate frame tree, so GhostDesk's session interception doesn't apply. The in-app debugger
+  //      enables interception in the guest too and cancels intercepted drags (drag and drop inside the guest won't work).
+  //      If interception can't be enabled, dragstart is blocked in the guest document.
   const gdGuardDrag = (wc, note, log) => {
     const blocked = function () { note('앱의 OS 드래그(webContents.startDrag)를 막았습니다 — 숨은 데스크에서는 사용자 화면으로 끌어다 놓을 수 없습니다. 파일은 앱 안에서 다른 방법(복사·저장)으로 옮기세요.'); };
     wc.startDrag = blocked;
@@ -1836,7 +1884,7 @@ const PATCH_JS: &str = r#"(() => {
         const data = (params && params.data) || { items: [], dragOperationsMask: 1 };
         try { Promise.resolve(d.sendCommand('Input.dispatchDragEvent', { type: 'dragCancel', x: 0, y: 0, data })).catch(() => {}); } catch (e) {}
       });
-      // 게스트가 살아 있는데 떨어지면 다시 붙인다 (한 번 실패하면 dragstart 차단으로)
+      // reattach if detached while the guest is still alive (after one failure, fall back to blocking dragstart)
       d.on('detach', (_e, reason) => {
         try { if (reason === 'target closed' || wc.isDestroyed()) return; } catch (e) { return; }
         try { enable().catch(() => {}); } catch (e) { useFallback('detach ' + reason + ': ' + e); }
@@ -1850,7 +1898,7 @@ const PATCH_JS: &str = r#"(() => {
   /*</gd-win-helpers>*/
   if (W32) safe('child-process', () => {
     gdWrapCp(R('child_process'));
-    // ESM 의 import { spawn } from 'child_process' 에도 반영
+    // also applies to ESM's import { spawn } from 'child_process'
     try { R('module').syncBuiltinESMExports(); } catch (e) {}
   });
   if (W32) safe('features', () => {
@@ -1866,9 +1914,9 @@ const PATCH_JS: &str = r#"(() => {
       return r;
     };
   });
-  // 숨은 앱은 사용자의 앱과 번들 ID 가 같아서, 사용자가 Finder/Dock 에서 파일·URL 을 이 앱으로 열면
-  // macOS 가 숨은 인스턴스로 보낼 수 있다 (실측: Dock 클릭이 숨은 인스턴스를 활성화함).
-  // 사용자의 파일이 에이전트 화면에 열리지 않도록 open-file/open-url 이벤트는 앱에 전달하지 않는다.
+  // the hidden app shares the user's app bundle ID, so when the user opens a file/URL with this app from Finder/Dock,
+  // macOS may route it to the hidden instance (measured: a Dock click activated the hidden instance).
+  // open-file/open-url events aren't passed to the app, so the user's files never open on the agent's screen.
   safe('open-events', () => {
     const oEmit = app.emit;
     app.emit = function (ev, ...a) {
@@ -1881,7 +1929,7 @@ const PATCH_JS: &str = r#"(() => {
     };
   });
 
-  // ── 창: show/focus 계열 무력화, 생성 즉시 투명·클릭통과·포커스불가·숨김 ──
+  // ---- windows: neutralize show/focus, transparent, click-through, unfocusable and hidden from creation ----
   const BaseW = electron.BaseWindow, BW = electron.BrowserWindow;
   const BP = (BaseW && BaseW.prototype) || BW.prototype;
   const pick = (m) => (BW.prototype[m] || BP[m]);
@@ -1895,7 +1943,7 @@ const PATCH_JS: &str = r#"(() => {
       'setSimpleFullScreen', 'setKiosk', 'flashFrame', 'setAlwaysOnTop', 'setVisibleOnAllWorkspaces', 'focusOnWebView',
       'setBounds', 'setSize', 'setContentSize', 'setContentBounds', 'setPosition', 'center',
       'setOpacity', 'setIgnoreMouseEvents', 'setFocusable', 'moveAbove', 'setParentWindow'];
-    // Windows: 작업 표시줄 단추·미리보기·진행률·겹침 아이콘·창별 AUMID, 메뉴 막대 다시 켜기
+    // Windows: taskbar buttons, thumbnails, progress, overlay icons, per-window AUMID, re-enabling the menu bar
     if (W32) block.push('setSkipTaskbar', 'setMenuBarVisibility', 'setAutoHideMenuBar', 'setThumbarButtons', 'setOverlayIcon',
       'setProgressBar', 'setAppDetails', 'setThumbnailClip', 'setThumbnailToolTip');
     for (const P of [BP, BW.prototype]) for (const m of block) {
@@ -1907,15 +1955,15 @@ const PATCH_JS: &str = r#"(() => {
     try { orig.setIgnoreMouseEvents.call(w, true); } catch (e) {}
     try { if (orig.setFocusable) orig.setFocusable.call(w, false); } catch (e) {}
     if (W32) {
-      // 작업 표시줄·Alt+Tab 에서 빼고(포커스 불가 = WS_EX_NOACTIVATE 와 함께), 창 안 메뉴 막대를 숨긴다.
-      // 자동 숨김을 끄면 Alt 단독 입력으로 메뉴 막대가 켜지지 않는다 (메뉴는 app_menu 도구로 쓴다).
+      // off the taskbar and Alt+Tab (along with unfocusable = WS_EX_NOACTIVATE), and the in-window menu bar hidden.
+      // with auto-hide off, pressing Alt alone doesn't bring up the menu bar (menus go through the app_menu tool).
       try { if (orig.setSkipTaskbar) orig.setSkipTaskbar.call(w, true); } catch (e) {}
       try { if (orig.setAutoHideMenuBar) orig.setAutoHideMenuBar.call(w, false); } catch (e) {}
       try { if (orig.setMenuBarVisibility) orig.setMenuBarVisibility.call(w, false); } catch (e) {}
     }
     if (CFG.mode === 'hide') { try { orig.hide.call(w); } catch (e) {} }
     else {
-      // ghost: 화면 밖 좌표에 투명(alpha 0)·클릭통과·비활성 상태로 "표시"해 렌더링이 계속되게 한다
+      // ghost: "show" it at off-screen coordinates, transparent (alpha 0), click-through and inactive, so rendering continues
       try { orig.setPosition.call(w, CFG.offX, CFG.offY); } catch (e) {}
       try { if (!orig.isVisible.call(w)) orig.showInactive.call(w); } catch (e) {}
     }
@@ -1932,11 +1980,11 @@ const PATCH_JS: &str = r#"(() => {
     if (wc) {
       try { wc.setBackgroundThrottling(false); } catch (e) {}
     }
-    // show 직후 macOS 가 위치를 화면 안으로 되돌리므로 잠시 뒤 한 번 더 화면 밖으로 보낸다
+    // macOS moves the position back on screen right after show, so send it off-screen once more a moment later
     w.on('show', () => { ghost(w); log('show-event'); for (const t of [30, 150, 400]) setTimeout(() => { try { if (!w.isDestroyed()) ghost(w); } catch (e) {} }, t); });
   };
-  // BaseWindow.prototype._init 은 네이티브 생성자 안에서 InitFromOptions(show 처리)보다 먼저 불린다.
-  // 여기서 투명·클릭통과·포커스불가를 걸어 두면 show:true 로 만든 창도 처음부터 보이지 않는다.
+  // BaseWindow.prototype._init is called inside the native constructor before InitFromOptions (which handles show).
+  // setting transparent/click-through/unfocusable here keeps even windows created with show:true invisible from the start.
   safe('init-hook', () => {
     const oInit = BP._init;
     if (typeof oInit === 'function') BP._init = function (...a) { const r = oInit.apply(this, a); try { setup(this); } catch (e) { log('init setup ' + e); } return r; };
@@ -1946,12 +1994,12 @@ const PATCH_JS: &str = r#"(() => {
     let n = 0;
     for (const w of AllW()) { try { if (!w.isDestroyed()) { ghost(w); n++; } } catch (e) {} }
     if (deactivate) { try { if (G.setPolicy) G.setPolicy('prohibited'); } catch (e) {} }
-    // Windows: 우리 창이 전경이 되면 포커스를 내려놓는다 (Z 순서상 다음 창 = 직전 사용자 창이 다시 활성화됨)
+    // Windows: if our window takes the foreground, give up focus (the next window in Z order = the user's previous window is reactivated)
     if (deactivate && W32) { for (const w of AllW()) { try { if (!w.isDestroyed() && w.isFocused()) w.blur(); } catch (e) {} } }
     if (deactivate || CFG.mode === 'hide') { try { app.hide(); } catch (e) {} }
     return n;
   };
-  // Windows 는 DIP ↔ 실제 픽셀 변환에서 1px 정도 어긋날 수 있다
+  // Windows can be off by about 1px converting between DIP and real pixels
   const offPos = (a, t) => W32 ? Math.abs(a - t) > 2 : a !== t;
   G.maintain = () => {
     const out = { wins: 0, visible: 0, resized: 0, notes: G.notes.splice(0) };
@@ -1974,17 +2022,17 @@ const PATCH_JS: &str = r#"(() => {
     return out;
   };
 
-  // Windows: 네이티브 메뉴(메뉴 막대 니모닉·F10·컨텍스트 메뉴 키)를 여는 키는 앱에 전달하지 않는다.
-  // 메뉴 팝업 창은 부모 창이 화면 밖이어도 모니터 안으로 끌려와 사용자 화면에 나타날 수 있다.
-  // (GhostDesk 쪽에서도 이런 키 조합을 거부한다. 여기는 이중 안전장치.)
-  // 니모닉은 수정키가 정확히 Alt 하나일 때만 열리므로 Shift/Win+Alt+글자(Shift+Alt+F 등 단축키)는 통과시킨다.
+  // Windows: keys that open native menus (menu bar mnemonics, F10, the context menu key) aren't passed to the app.
+  // menu popup windows can get pulled into a monitor and show on the user's screen even when the parent is off-screen.
+  // (GhostDesk refuses these combos too; this is a second line of defense.)
+  // mnemonics only open when the modifiers are exactly Alt, so Shift/Win+Alt+letter shortcuts (Shift+Alt+F, …) pass through.
   const menuKey = (i) => {
     if (!i || i.control) return false;
     const k = String(i.key || ''), c = String(i.code || '');
     if (k === 'Alt' || k === 'F10' || k === 'ContextMenu' || c === 'ContextMenu') return true;
     return !!i.alt && ((!i.shift && !i.meta && /^Key[A-Z]$/.test(c)) || c === 'Space');
   };
-  // ── webContents: 개발자 도구 창 금지 ──
+  // ---- webContents: no devtools windows ----
   app.on('web-contents-created', (_e, wc) => safe('wc', () => {
     wc.openDevTools = function () { note('개발자 도구 창 열기를 막았습니다.'); };
     wc.toggleDevTools = function () { note('개발자 도구 창 열기를 막았습니다.'); };
@@ -1993,7 +2041,7 @@ const PATCH_JS: &str = r#"(() => {
     if (W32) gdGuardDrag(wc, note, log).then((r) => log('drag-guard ' + r), (e) => log('FAIL drag-guard ' + e));
   }));
 
-  // ── 세션 권한: 알림·카메라/마이크·위치·화면공유·외부 프로토콜 거부 (TCC 대화상자/배너 방지) ──
+  // ---- session permissions: deny notifications, camera/mic, location, screen sharing, external protocols (no TCC dialogs/banners) ----
   const BLOCK = new Set(['notifications', 'media', 'geolocation', 'midi', 'midiSysex', 'openExternal', 'display-capture', 'idle-detection']);
   const wrapSession = (s) => safe('session', () => {
     const SP = Object.getPrototypeOf(s);
@@ -2025,7 +2073,7 @@ const PATCH_JS: &str = r#"(() => {
   app.on('session-created', wrapSession);
   app.whenReady().then(() => { try { wrapSession(electron.session.defaultSession); } catch (e) {} });
 
-  // ── 네이티브 대화상자: 띄우지 않고 기록 ──
+  // ---- native dialogs: recorded, never shown ----
   safe('dialog', () => {
     const D = electron.dialog;
     const opt = (a) => { for (let i = a.length - 1; i >= 0; i--) { const x = a[i]; if (x && typeof x === 'object' && typeof x.getBounds !== 'function') return x; } return {}; };
@@ -2045,7 +2093,7 @@ const PATCH_JS: &str = r#"(() => {
     D.showSaveDialogSync = function () { note('파일 저장 대화상자(동기)를 막았습니다.'); return undefined; };
     D.showCertificateTrustDialog = function () { note('인증서 신뢰 대화상자를 막았습니다.'); return never(); };
   });
-  // ── 외부 앱/브라우저 열기 차단 ──
+  // ---- block opening external apps/browsers ----
   safe('shell', () => {
     const S = electron.shell;
     S.openExternal = function (url) { note('외부 링크 열기를 막았습니다 (사용자의 실제 브라우저가 열리기 때문): ' + short(url)); return Promise.resolve(); };
@@ -2054,7 +2102,7 @@ const PATCH_JS: &str = r#"(() => {
     S.beep = noop;
     if (W32) S.writeShortcutLink = function (p) { note('바로 가기(.lnk) 만들기를 막았습니다: ' + short(p)); return false; };
   });
-  // ── 네이티브 컨텍스트 메뉴: 표시하지 않고 보관 (electron_menu 로 선택) ──
+  // ---- native context menus: kept, not shown (pick with electron_menu) ----
   safe('menu', () => {
     const M = electron.Menu;
     M.prototype.popup = function (o) {
@@ -2079,7 +2127,7 @@ const PATCH_JS: &str = r#"(() => {
   });
   safe('inAppPurchase', () => { const p = electron.inAppPurchase; if (p) { p.purchaseProduct = function () { note('앱 내 구매 시도를 막았습니다.'); return Promise.resolve(false); }; } });
   safe('desktopCapturer', () => { electron.desktopCapturer.getSources = function () { note('화면 캡처 소스 요청을 거부했습니다.'); return Promise.resolve([]); }; });
-  // ── 트레이(메뉴 막대 아이콘): 첫 호출에서 바로 제거 ──
+  // ---- tray (menu bar icon): removed on the first call ----
   safe('tray', () => {
     const T = electron.Tray, P = T.prototype;
     const destroy = P.destroy;
@@ -2094,7 +2142,7 @@ const PATCH_JS: &str = r#"(() => {
   return G.log.filter(l => l.startsWith('FAIL')).join('; ') || 'ok';
 })()"#;
 
-/// 메뉴 목록/클릭 스크립트 (인스펙터에서 평가)
+/// Menu list/click script (evaluated in the inspector).
 const MENU_JS: &str = r#"((src, path, targetId, allowed) => {
   const G = globalThis.__ghostdesk; const e = G.electron;
   let m = src === 'context' ? G.popup : e.Menu.getApplicationMenu();
@@ -2125,7 +2173,8 @@ const MENU_JS: &str = r#"((src, path, targetId, allowed) => {
   return { clicked: lab(item) || role };
 })"#;
 
-/// 메뉴 클릭으로 실행을 허용하는 역할 (나머지 역할은 화면·다른 앱에 영향을 줄 수 있어 거부)
+/// Roles allowed to run through a menu click (other roles could affect the screen or other apps,
+/// so they're refused).
 const ALLOWED_MENU_ROLES: &[&str] = &[
     "undo", "redo", "cut", "copy", "paste", "pasteandmatchstyle", "delete", "selectall", "reload", "forcereload",
     "resetzoom", "zoomin", "zoomout", "close", "quit",
@@ -2133,15 +2182,13 @@ const ALLOWED_MENU_ROLES: &[&str] = &[
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuSource {
-    /// 앱 메뉴 막대 (Menu.getApplicationMenu)
+    /// The app menu bar (Menu.getApplicationMenu).
     App,
-    /// 앱이 마지막으로 열려고 한 컨텍스트 메뉴
+    /// The context menu the app last tried to open.
     Context,
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// 작업공간
-// ═════════════════════════════════════════════════════════════════════
+// ---- workspace ----
 
 #[derive(Clone, Debug, Default)]
 pub struct WatchStats {
@@ -2150,7 +2197,7 @@ pub struct WatchStats {
     pub rehides: u64,
     pub killed: bool,
     pub last_violation: Option<String>,
-    /// 인스펙터 maintain 이 발견해 다시 숨긴 창 수
+    /// Number of windows the inspector maintain loop found and re-hid.
     pub maintain_rehidden: u64,
 }
 
@@ -2170,7 +2217,7 @@ pub struct ElectronWorkspace {
     pub height: u32,
 }
 
-/// 실패 시 프로세스 그룹을 정리하고 자식을 회수하는 가드
+/// Guard that cleans up the process group and reaps the child on failure.
 struct GroupGuard {
     pgid: i32,
     main_pid: i32,
@@ -2186,7 +2233,7 @@ impl Drop for GroupGuard {
     }
 }
 
-/// 사전 감시자를 멈추는 플래그 (함수가 어떤 경로로 끝나든 멈추게 Drop 에서 설정)
+/// Flag stopping the pre-watcher (set in Drop so it stops however the function exits).
 struct StopFlag(Arc<AtomicBool>);
 
 impl Drop for StopFlag {
@@ -2195,9 +2242,11 @@ impl Drop for StopFlag {
     }
 }
 
-/// 자식 프로세스가 끝났는지 확인한다. **회수(reap)하지 않는다**: 좀비로 남아 있는 동안에는 pid 와
-/// pgid 가 다른 프로세스에 재사용되지 않으므로, 나중에 kill_tree 가 엉뚱한 사용자 프로세스를 죽일 위험이 없다.
-/// 회수는 kill_tree 뒤 `terminate_and_reap` 에서만 한다.
+/// Checks whether the child process has exited **without reaping it**: while it's a zombie, its
+/// pid and pgid can't be reused by another process, so a later kill_tree can't hit some unrelated
+/// user process.
+///
+/// Reaping only happens in `terminate_and_reap`, after kill_tree.
 fn peek_exit(c: &Child) -> Option<String> {
     #[cfg(unix)]
     {
@@ -2220,7 +2269,8 @@ fn peek_exit(c: &Child) -> Option<String> {
             format!("signal: {}", info.si_status)
         })
     }
-    // Windows: Child 가 프로세스 핸들을 쥐고 있는 동안에는 pid 가 재사용되지 않으므로 같은 불변식이 성립한다
+    // Windows: the pid can't be reused while Child holds the process handle, so the same invariant
+    // holds
     #[cfg(windows)]
     {
         crate::platform::proc::peek_exit(c).map(|code| {
@@ -2238,13 +2288,16 @@ fn peek_exit(c: &Child) -> Option<String> {
     }
 }
 
-/// 아직 회수하지 않은 자식이 살아 있는지
+/// Whether the not-yet-reaped child is alive.
 fn child_alive(child: &Mutex<Option<Child>>) -> bool {
     child.lock().as_ref().map(|c| peek_exit(c).is_none()).unwrap_or(false)
 }
 
-/// 자식을 아직 회수하지 않았을 때만(= pid/pgid 재사용 불가) 프로세스 그룹/자손을 죽인다.
-/// (Windows: Job 객체로 자손까지 종료. Child 를 Option 에 남겨 두므로 핸들도 그대로 유지된다.)
+/// Kills the process group/descendants only if the child hasn't been reaped yet (= the pid/pgid
+/// can't have been reused).
+///
+/// (Windows: ends descendants through the Job object. Child stays in the Option, so its handle is
+/// kept too.)
 fn kill_group_if_held(main_pid: i32, pgid: i32, child: &Mutex<Option<Child>>) {
     #[cfg(not(windows))]
     {
@@ -2262,8 +2315,8 @@ fn kill_group_if_held(main_pid: i32, pgid: i32, child: &Mutex<Option<Child>>) {
     }
 }
 
-/// 프로세스 그룹/자손을 죽인 뒤 자식을 회수한다. 이미 회수했으면 아무것도 하지 않는다
-/// (회수 후에는 main_pid/pgid 가 다른 프로세스에 재사용됐을 수 있으므로 절대 kill 하지 않음).
+/// Kills the process group/descendants, then reaps the child. Does nothing if already reaped
+/// (after reaping, main_pid/pgid may have been reused by other processes, so never kill then).
 fn terminate_and_reap(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>, child: &Mutex<Option<Child>>) {
     let mut g = child.lock();
     if let Some(mut c) = g.take() {
@@ -2273,7 +2326,8 @@ fn terminate_and_reap(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>, ch
             let _ = c.kill();
             let _ = c.wait();
         }
-        // Windows: Job 종료(TerminateJobObject + 핸들 닫기 = KILL_ON_JOB_CLOSE) → 본 프로세스 kill → 회수
+        // Windows: end the Job (TerminateJobObject + close handle = KILL_ON_JOB_CLOSE) → kill the main
+        // process → reap
         #[cfg(windows)]
         {
             let _ = (main_pid, pgid, extra);
@@ -2282,9 +2336,12 @@ fn terminate_and_reap(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>, ch
     }
 }
 
-/// 사전 감시자: 패치 주입 전에는 창을 다시 숨길 수단이 없으므로, 우리 프로세스의 보이는 창(alpha>0,
-/// onscreen)이나 front 가 한 번이라도 잡히면 즉시 프로세스 그룹을 종료한다 (40ms 간격).
-/// (퓨즈 오판 등으로 인스펙터가 안 열리거나 메인 스크립트에서 멈추지 못해 앱이 패치 없이 돌 때의 안전망)
+/// Pre-watcher: before the patch is injected there's no way to re-hide windows, so the moment a
+/// visible window of our process (alpha>0, onscreen) or a front state is seen, the process group is
+/// killed (40 ms interval).
+///
+/// A safety net for when the app runs unpatched because the inspector didn't open or couldn't pause
+/// on the main script (a misread fuse, …).
 fn spawn_prewatch(
     main_pid: i32,
     pgid: i32,
@@ -2312,7 +2369,7 @@ struct Endpoints {
     devtools: Option<String>,
 }
 
-/// 숨김 모드로 Electron 앱을 실행하고 CDP 에 연결한다.
+/// Launches the Electron app in hidden mode and connects over CDP.
 pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<ElectronWorkspace>> {
     ensure!(cfg!(any(target_os = "macos", windows)), "Electron 숨김 실행은 macOS·Windows 에서만 지원합니다");
     let app = opts.app.clone();
@@ -2341,10 +2398,11 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
     let _ = writeln!(log, "\n===== GhostDesk Electron 실행: {} {:?}", app.exe.display(), args);
     let mut cmd = Command::new(&app.exe);
     cmd.args(&args);
-    // 사용자의 다른 VS Code/Electron 인스턴스에 붙지 않도록 상속된 관련 환경 변수를 지운다
+    // clear inherited environment variables that could attach to the user's other VS Code/Electron
+    // instances
     for (k, _) in std::env::vars_os() {
         let ks = k.to_string_lossy();
-        // Windows 환경 변수 이름은 대소문자를 가리지 않는다 (Node_Options 도 NODE_OPTIONS 로 읽힘)
+        // Windows environment variable names are case-insensitive (Node_Options is read as NODE_OPTIONS)
         #[cfg(windows)]
         let ks = std::borrow::Cow::<str>::Owned(ks.to_ascii_uppercase());
         if ks.starts_with("VSCODE_") || ks.starts_with("ELECTRON_") || ks.starts_with("NODE_") || ks == "CHROME_DESKTOP" {
@@ -2363,13 +2421,14 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
     cmd.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::piped());
     #[cfg(not(windows))]
     let mut child = cmd.spawn().with_context(|| format!("앱 실행 실패: {}", app.exe.display()))?;
-    // Windows: 일시정지 상태로 띄워 Job 객체에 넣은 뒤 재개한다 (Chromium·Node 자손이 빠짐없이 같은 Job 에 들어감)
+    // Windows: start suspended, put it in the Job object, then resume (so every Chromium/Node
+    // descendant lands in the same Job)
     #[cfg(windows)]
     let mut child =
         crate::platform::proc::spawn_group(&mut cmd).with_context(|| format!("앱 실행 실패: {}", app.exe.display()))?;
     let main_pid = child.id() as i32;
     let pgid = main_pid;
-    // Job 이 없으면 자손 프로세스의 창을 감시하거나 한 번에 정리할 수 없으므로 실행하지 않는다
+    // without a Job, descendant windows can't be watched or cleaned up together, so don't launch
     #[cfg(windows)]
     if crate::platform::proc::group_pids(main_pid as u32).is_none() {
         crate::platform::proc::kill_group(&mut child);
@@ -2378,16 +2437,18 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
     let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(Some(child)));
     let mut guard = GroupGuard { pgid, main_pid, child: child.clone(), armed: true };
-    // 패치·주 감시자가 준비되기 전의 노출을 막는 사전 감시자 (launch 가 끝나면 멈춤)
+    // pre-watcher guarding against exposure before the patch and main watchdog are ready (stops when
+    // launch finishes)
     let prewatch_tripped: Arc<Mutex<Option<String>>> = Default::default();
     let prewatch_stop = StopFlag(Arc::new(AtomicBool::new(false)));
-    // 감시자가 에이전트에게 알릴 일 (Windows: 숨긴 콘솔 창·새 Windows Terminal 창) — 작업공간 메모와 같은 통로
+    // things the watchdog tells the agent (Windows: hidden console windows, new Windows Terminal
+    // windows), through the same channel as workspace notes
     let notes: Arc<Mutex<Vec<String>>> = Default::default();
     let side = WatchSide::new(notes.clone());
     spawn_prewatch(main_pid, pgid, child.clone(), prewatch_stop.0.clone(), prewatch_tripped.clone(), side.clone());
     let tripped = || prewatch_tripped.lock().clone();
 
-    // stderr → 로그 파일, 디버거/DevTools 주소 추출
+    // stderr → log file, extracting debugger/DevTools addresses
     let eps: Arc<Mutex<Endpoints>> = Default::default();
     if let Some(err) = stderr {
         let eps2 = eps.clone();
@@ -2413,10 +2474,10 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
         let s = fs::read_to_string(p).unwrap_or_default();
         s.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
     };
-    // 회수하지 않고 종료 여부만 본다 (peek_exit 참고)
+    // only checks for exit without reaping (see peek_exit)
     let exited = |c: &Arc<Mutex<Option<Child>>>| -> Option<String> { c.lock().as_ref().and_then(peek_exit) };
 
-    // 1) Node 인스펙터 주소
+    // 1) Node inspector address
     let start = Instant::now();
     let node_url = loop {
         if let Some(d) = tripped() {
@@ -2434,10 +2495,11 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    // 2) 메인 스크립트 첫 줄에서 패치 주입
+    // 2) inject the patch on the first line of the main script
     let insp = Cdp::connect(&node_url).await.context("Node 인스펙터 연결 실패")?;
-    // 화면 밖 좌표 (DIP). macOS 는 -30000 (macOS 가 왼쪽 끝 40px 정도로 제한함).
-    // Windows 는 모든 모니터의 오른쪽 아래 바깥을 DPI 배율로 환산하고 16비트 좌표 한계(±32767) 안에 둔다.
+    // off-screen coordinates (DIP). -30000 on macOS (which clamps to about 40px past the left edge).
+    // On Windows, the area beyond the bottom-right of all monitors converted by DPI scale and kept
+    // within the 16-bit coordinate limit (±32767).
     #[cfg(not(windows))]
     let (off_x, off_y) = (-30000, -30000);
     #[cfg(windows)]
@@ -2468,7 +2530,7 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
         eprintln!("[ghostdesk] Electron 패치 일부 실패: {inject_res}");
     }
 
-    // 3) 브라우저 CDP 주소 (stderr 또는 DevToolsActivePort)
+    // 3) browser CDP address (stderr or DevToolsActivePort)
     let start = Instant::now();
     let port_file = paths.user_data.join("DevToolsActivePort");
     let ws_url = loop {
@@ -2493,7 +2555,8 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
     let closed = Arc::new(AtomicBool::new(false));
     let stats: Arc<Mutex<WatchStats>> = Default::default();
 
-    // 감시자는 CDP 연결 전부터 돈다 (창 생성 직후의 노출도 잡기 위해)
+    // the watchdog runs from before the CDP connection (to catch exposure right after window creation
+    // too)
     let mut tasks = vec![tokio::spawn(watchdog(
         insp.clone(),
         main_pid,
@@ -2515,8 +2578,9 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
             fix_headless_ua: false,
             start_url: String::new(),
             page_wait: Duration::from_secs(45),
-            // Windows: 창이 있는 앱이라 HTML5 드래그가 OLE DoDragDrop 으로 넘어가면 사용자의 실제 커서 아래
-            // 창(사용자의 탐색기·문서 등)에 놓인다. 가로채서 앱 페이지 안에서 끝낸다. (macOS 는 기존대로)
+            // Windows: these apps have windows, so an HTML5 drag handed to OLE DoDragDrop would drop onto
+            // whatever is under the user's real cursor (their Explorer, documents, …). Intercept it and
+            // finish it inside the app's page. (macOS unchanged.)
             intercept_drags: cfg!(windows),
         },
         sink,
@@ -2566,7 +2630,8 @@ pub async fn launch(opts: ElectronLaunch, sink: FrameSink) -> Result<Arc<Electro
     }))
 }
 
-/// `--inspect-brk` 로 멈춘 메인 프로세스에서 앱 메인 스크립트 첫 줄을 기다려 패치를 평가한다.
+/// Waits for the first line of the app's main script in the main process paused by
+/// `--inspect-brk` and evaluates the patch.
 async fn inject_patch(insp: &Arc<Cdp>, main_script: Option<&str>, patch: &str) -> Result<String> {
     let mut ev = insp.subscribe();
     insp.call("Runtime.enable", json!({}), None).await?;
@@ -2657,7 +2722,8 @@ fn push_note(notes: &Mutex<Vec<String>>, n: String) {
     }
 }
 
-/// 250ms 마다: 우리 프로세스(그룹/자손)의 보이는 창(alpha>0, onscreen) 또는 front 여부를 확인.
+/// Every 250 ms: checks whether our processes (group/descendants) have a visible window (alpha>0,
+/// onscreen) or are frontmost.
 async fn watchdog(
     insp: Arc<Cdp>,
     main_pid: i32,
@@ -2703,7 +2769,7 @@ async fn watchdog(
                     push_note(&notes, "앱 창이 화면에 나타나려 해서 즉시 다시 숨겼습니다.".into());
                 }
                 if consecutive >= 4 {
-                    // 1초 넘게 숨겨지지 않으면 사용자 보호를 위해 강제 종료
+                    // not hidden for over a second: kill it to protect the user
                     kill_group_if_held(main_pid, pgid, &child);
                     stats.lock().killed = true;
                     push_note(&notes, "앱 창을 숨길 수 없어 사용자 화면 보호를 위해 앱을 강제 종료했습니다.".into());
@@ -2716,8 +2782,10 @@ async fn watchdog(
     }
 }
 
-/// 감시 중 생긴 일을 에이전트에게 알리는 통로와 (Windows) 콘솔 창·Windows Terminal 감시 상태.
-/// macOS 에서는 쓰지 않는다 (scan 이 scan_violation 을 그대로 부른다).
+/// Channel for telling the agent what happened during watching, plus (Windows) console window and
+/// Windows Terminal watch state.
+///
+/// Unused on macOS (scan calls scan_violation directly).
 #[derive(Clone)]
 struct WatchSide {
     notes: Arc<Mutex<Vec<String>>>,
@@ -2735,7 +2803,7 @@ impl WatchSide {
     }
 }
 
-/// 감시 1회 (사전 감시자·주 감시자 공통). 위반이 있으면 그 설명.
+/// One watch pass (shared by the pre-watcher and main watchdog). The violation description, if any.
 fn scan(main_pid: i32, pgid: i32, side: &WatchSide) -> Option<String> {
     #[cfg(windows)]
     {
@@ -2775,15 +2843,16 @@ fn scan_violation(main_pid: i32, pgid: i32) -> Option<String> {
     }
 }
 
-/// Windows: Job 에 속한 프로세스들의 최상위 창 중 사용자 화면(모니터·작업 표시줄)에 보일 수 있는 것,
-/// 또는 우리 프로세스가 전경(키보드 포커스)인지.
+/// Windows: top-level windows of the Job's processes that could show on the user's screen
+/// (monitors, taskbar), or whether our process is in the foreground (keyboard focus).
 #[cfg(windows)]
 fn scan_violation(main_pid: i32, _pgid: i32) -> Option<String> {
     scan_violation_with(main_pid, None)
 }
 
-/// `side` 가 있으면(감시자) 먼저 우리 프로세스의 콘솔 창을 숨기고(앱을 죽이는 대신, plan_console_hide)
-/// 새로 나타난 Windows Terminal 창을 기록한다. 숨기는 중인 콘솔 창은 위반에서 뺀다.
+/// With `side` (the watchdog), first hides our processes' console windows (instead of killing the
+/// app, plan_console_hide) and records newly appeared Windows Terminal windows. Console windows
+/// being hidden are excluded from violations.
 #[cfg(windows)]
 fn scan_violation_with(main_pid: i32, side: Option<&WatchSide>) -> Option<String> {
     let pids = win_screen::our_pids(main_pid);
@@ -2810,7 +2879,8 @@ fn scan_violation_with(main_pid: i32, side: Option<&WatchSide>) -> Option<String
         skip = s;
         wins.retain(|w| !skip.contains(&w.hwnd));
     }
-    // 숨기는 중인 콘솔 창이 전경이면 (숨기면 전경도 사용자 창으로 돌아간다) 전경 위반으로 보지 않는다
+    // a console window being hidden that holds the foreground isn't a foreground violation (hiding it
+    // returns the foreground to the user's window too)
     let fg = win_screen::foreground_hwnd();
     let front = if fg.is_some_and(|h| skip.contains(&h)) {
         None
@@ -2820,18 +2890,24 @@ fn scan_violation_with(main_pid: i32, side: Option<&WatchSide>) -> Option<String
     describe_violations(&wins, front)
 }
 
-/// 콘솔 창 클래스 (conhost). Windows Terminal 로 넘겨진 콘솔은 이 창 대신 CASCADIA_HOSTING_WINDOW_CLASS 창에 그려진다.
+/// Console window class (conhost). Consoles handed to Windows Terminal are drawn in a
+/// CASCADIA_HOSTING_WINDOW_CLASS window instead.
 const CONSOLE_CLASS: &str = "ConsoleWindowClass";
 const WT_CLASS: &str = "CASCADIA_HOSTING_WINDOW_CLASS";
-/// 같은 콘솔 창을 처음 숨기려 한 뒤 이만큼 지나도 계속 보이면 숨기기를 포기하고 위반(→ 강제 종료)으로 본다.
-/// 횟수가 아니라 시간으로 센다: 사전 감시자(40ms)와 주 감시자(250ms)가 같은 기록을 쓰므로, 횟수로 세면
-/// 사전 감시 중에는 콘솔 호스트가 SW_HIDE 를 처리하기도 전에 (~160ms) 다 써 버린다.
+/// If the same console window is still visible this long after we first tried to hide it, give up
+/// hiding and treat it as a violation (→ kill).
+///
+/// Counted in time, not attempts: the pre-watcher (40 ms) and main watchdog (250 ms) share the same
+/// record, so counting attempts would use them all up during pre-watching (~160 ms) before the
+/// console host even processes SW_HIDE.
 const CONSOLE_HIDE_GRACE: Duration = Duration::from_millis(1500);
 
-/// Windows 감시자: 우리(Job) 프로세스의 보일 수 있는 콘솔 창은 앱을 강제 종료하는 대신 숨긴다.
-/// (Electron 의 확장 호스트·유틸리티 프로세스처럼 PATCH_JS 의 windowsHide 기본값이 닿지 않는 프로세스가
-/// 띄운 git·python·cmd 등의 콘솔 창) 반환: (숨길 창, 위반 판정에서 뺄 창).
-/// `first_hidden`: 창마다 처음 숨기려 한 시각.
+/// Windows watchdog: visible console windows of our (Job) processes are hidden instead of killing
+/// the app (console windows of git, python, cmd, … launched by processes PATCH_JS's windowsHide
+/// default doesn't reach, like Electron's extension host and utility processes).
+///
+/// Returns (windows to hide, windows to exclude from the violation check). `first_hidden`: when we
+/// first tried to hide each window.
 fn plan_console_hide(
     wins: &[WinState],
     first_hidden: &HashMap<isize, Instant>,
@@ -2856,7 +2932,7 @@ fn scan_violation(_main_pid: i32, _pgid: i32) -> Option<String> {
     None
 }
 
-/// 최상위 창 하나의 판정용 상태 (Windows 감시자·샘플러)
+/// Per-window state for decisions (Windows watchdog and sampler).
 #[derive(Clone, Debug)]
 struct WinState {
     pid: u32,
@@ -2864,13 +2940,14 @@ struct WinState {
     class: String,
     rect: (i32, i32, i32, i32),
     alpha: Option<u8>,
-    /// 모니터와 겹치고 보이며 불투명 (TopWindow::shows_on_screen)
+    /// Overlaps a monitor, visible and opaque (TopWindow::shows_on_screen).
     on_screen: bool,
-    /// 화면 밖·투명이어도 작업 표시줄 단추·Alt+Tab 항목이 생기는 창
+    /// A window that gets a taskbar button or Alt+Tab entry even when off-screen or transparent.
     taskbar: bool,
 }
 
-/// 위반 설명 (없으면 None). 전경 위반은 감시자가 rehide(true) 를 부르도록 "front" 를 넣는다.
+/// Violation description (None if none). Foreground violations include "front" so the watchdog
+/// calls rehide(true).
 fn describe_violations(wins: &[WinState], front: Option<u32>) -> Option<String> {
     let mut out = Vec::new();
     for w in wins {
@@ -2895,12 +2972,13 @@ fn describe_violations(wins: &[WinState], front: Option<u32>) -> Option<String> 
 
 #[cfg(windows)]
 mod win_screen {
-    //! Windows 화면·창 조회 (읽기 전용): 화면 밖 좌표, 우리 창 상태, 커서 모양.
+    //! Windows screen and window queries (read only): off-screen coordinates, our window state, cursor
+    //! shape.
     use super::WinState;
     use crate::platform::win;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 
-    /// 감시 대상 프로세스: Job 의 pid 목록 (Job 이 없으면 본 프로세스만)
+    /// Processes to watch: the Job's pid list (just the main process without a Job).
     pub fn our_pids(main_pid: i32) -> Vec<u32> {
         if main_pid <= 0 {
             return vec![];
@@ -2908,8 +2986,9 @@ mod win_screen {
         crate::platform::proc::group_pids(main_pid as u32).unwrap_or_else(|| vec![main_pid as u32])
     }
 
-    /// 작업 표시줄·Alt+Tab 에 나타나는 창인가: 보임 + DWM 숨김 아님 + (WS_EX_APPWINDOW, 또는
-    /// 도구 창·활성화 불가가 아니고 소유자 없음). 화면 밖·alpha 0 이어도 단추는 생긴다.
+    /// Whether the window appears on the taskbar and Alt+Tab: visible + not DWM-cloaked +
+    /// (WS_EX_APPWINDOW, or not a tool window, not non-activating and unowned). The button appears
+    /// even off-screen at alpha 0.
     pub fn taskbar_eligible(t: &win::TopWindow) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetWindow, GetWindowLongPtrW, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -2940,7 +3019,7 @@ mod win_screen {
         }
     }
 
-    /// 모니터별 (사각형, 배율). 배율은 유효 DPI / 96 (DPI 를 인식하지 않는 프로세스면 1).
+    /// Per-monitor (rect, scale). Scale is effective DPI / 96 (1 for DPI-unaware processes).
     pub fn monitors() -> Vec<((i32, i32, i32, i32), f64)> {
         use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
         use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -2965,8 +3044,9 @@ mod win_screen {
             .collect()
     }
 
-    /// 숨은 창을 둘 DIP 좌표: 모든 모니터의 오른쪽 아래 바깥 (platform::win::offscreen_origin, 실제 픽셀)을
-    /// 주 모니터(원점을 포함한 모니터) 배율로 환산한다.
+    /// DIP coordinates to put hidden windows at: the area beyond the bottom-right of all monitors
+    /// (platform::win::offscreen_origin, real pixels) converted at the primary monitor's (the one
+    /// containing the origin) scale.
     pub fn offscreen_dip() -> (i32, i32) {
         let px = win::offscreen_origin();
         let mons = monitors();
@@ -2979,7 +3059,7 @@ mod win_screen {
         super::offscreen_dip_math(px, primary, max)
     }
 
-    /// 커서 모양 식별값 (모양이 바뀌면 달라짐, 조회만 함)
+    /// Cursor shape identifier (changes when the shape changes; query only).
     pub fn cursor_shape() -> i64 {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO};
         let mut ci: CURSORINFO = unsafe { std::mem::zeroed() };
@@ -2990,7 +3070,7 @@ mod win_screen {
         ((ci.hCursor as isize as i64) << 1) | (ci.flags as i64 & 1)
     }
 
-    /// 프로세스 실행 파일 이름 (보고용)
+    /// Process executable name (for reporting).
     pub fn proc_name(pid: u32) -> String {
         win::process_path(pid)
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -3010,7 +3090,7 @@ mod win_screen {
         String::from_utf16_lossy(&b[..n.max(0) as usize])
     }
 
-    /// Windows Terminal 최상위 창 (보이는 것만 또는 전부)
+    /// Windows Terminal top-level windows (visible only, or all).
     pub fn wt_windows(visible_only: bool) -> Vec<isize> {
         use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
         win::top_level_hwnds()
@@ -3020,11 +3100,11 @@ mod win_screen {
             .collect()
     }
 
-    /// 감시자의 콘솔 창·Windows Terminal 상태
+    /// Watchdog state for console windows and Windows Terminal.
     pub struct ConsoleWatch {
-        /// 숨기려고 한 우리 콘솔 창 → 처음 숨기려 한 시각
+        /// Our console windows we tried to hide → when we first tried.
         pub first_hidden: std::collections::HashMap<isize, std::time::Instant>,
-        /// 이미 아는 Windows Terminal 창 (실행 전부터 있던 것 + 이미 알린 것)
+        /// Windows Terminal windows already known (present before launch + already reported).
         pub wt_known: std::collections::HashSet<isize>,
     }
 
@@ -3033,8 +3113,10 @@ mod win_screen {
             ConsoleWatch { first_hidden: Default::default(), wt_known: wt_windows(false).into_iter().collect() }
         }
 
-        /// 우리 콘솔 창 하나를 숨긴다 (비동기: 콘솔 호스트가 멈춰 있어도 감시자가 막히지 않게).
-        /// 처음 숨길 때만 알릴 메모를 돌려준다. 앱은 죽이지 않는다.
+        /// Hides one of our console windows (asynchronously, so the watchdog doesn't block even if the
+        /// console host is stuck).
+        ///
+        /// Returns a note to report only the first time it's hidden. The app isn't killed.
         pub fn hide(&mut self, h: isize, wins: &[WinState]) -> Option<String> {
             use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE};
             unsafe { ShowWindowAsync(h as HWND, SW_HIDE) };
@@ -3050,9 +3132,10 @@ mod win_screen {
             ))
         }
 
-        /// 새로 보이는 Windows Terminal 창을 찾아 알린다. 기본 터미널이 Windows Terminal 이면 콘솔 프로그램의 창이
-        /// GhostDesk 의 Job 밖(WindowsTerminal.exe)에 열려 숨기거나 닫을 수 없다. 사용자가 직접 연 창일 수도 있으므로
-        /// 건드리지 않고 기록만 한다.
+        /// Finds and reports newly visible Windows Terminal windows. When Windows Terminal is the default
+        /// terminal, console programs' windows open outside GhostDesk's Job (WindowsTerminal.exe) and can't
+        /// be hidden or closed. They may also be windows the user opened, so they're only recorded, never
+        /// touched.
         pub fn wt_pass(&mut self) -> Vec<String> {
             let mut out = Vec::new();
             for h in wt_windows(true) {
@@ -3069,7 +3152,8 @@ mod win_screen {
     }
 }
 
-/// 500ms 마다: 주입된 메모 수거, 창 크기/투명도 유지, 프로세스 종료 감지, 창이 모두 닫히면 새 창 요청.
+/// Every 500 ms: collects injected notes, maintains window size/opacity, detects process exit, and
+/// requests a new window when all windows are closed.
 async fn maintain_loop(
     insp: Arc<Cdp>,
     inner: Arc<BrowserWorkspace>,
@@ -3086,13 +3170,13 @@ async fn maintain_loop(
         tokio::time::sleep(Duration::from_millis(500)).await;
         tick += 1;
         if tick % 4 == 1 {
-            // Electron 은 제목 변경 이벤트(targetInfoChanged)를 잘 보내지 않으므로 주기적으로 갱신
+            // Electron rarely sends title change events (targetInfoChanged), so refresh periodically
             let _ = inner.refresh_targets().await;
         }
         if closed.load(Ordering::SeqCst) {
             break;
         }
-        // 회수하지 않고 확인 (shutdown/Drop 에서 그룹 kill 뒤에 회수)
+        // check without reaping (reaped after the group kill in shutdown/Drop)
         let gone = !child_alive(&child);
         if gone {
             push_note(&notes, "앱 프로세스가 종료되었습니다.".into());
@@ -3150,7 +3234,7 @@ impl ElectronWorkspace {
         self.stats.lock().clone()
     }
 
-    /// 우리가 띄운 모든 프로세스 (그룹 + 자손)
+    /// Every process we launched (group + descendants).
     pub fn pids(&self) -> Vec<i32> {
         #[cfg(target_os = "macos")]
         {
@@ -3158,7 +3242,7 @@ impl ElectronWorkspace {
             v.sort();
             v
         }
-        // Windows: Job 객체의 프로세스 목록
+        // Windows: the Job object's process list
         #[cfg(windows)]
         {
             let mut v: Vec<i32> = win_screen::our_pids(self.main_pid).into_iter().map(|p| p as i32).collect();
@@ -3171,7 +3255,7 @@ impl ElectronWorkspace {
         }
     }
 
-    // ───────── 백엔드 계약 (BrowserWorkspace 와 같은 이름/시그니처) ─────────
+    // ---- backend contract (same names/signatures as BrowserWorkspace) ----
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -3185,7 +3269,8 @@ impl ElectronWorkspace {
         self.inner.zoom(region).await
     }
 
-    // 수정키·키 조합은 이 컴퓨터의 OS 에 맞춘다 (macOS 가 아니면 cmd → ctrl; macOS 에서는 그대로).
+    // modifiers and key combos follow this computer's OS (cmd → ctrl outside macOS; unchanged on
+    // macOS)
 
     pub async fn mouse_move(&self, x: f64, y: f64, mods: i64) -> Result<()> {
         self.inner.mouse_move(x, y, crate::platform::input::localize_mods(mods)).await
@@ -3211,7 +3296,8 @@ impl ElectronWorkspace {
         self.inner.scroll(pos, dx, dy, crate::platform::input::localize_mods(mods)).await
     }
 
-    /// Windows 에서는 네이티브 메뉴를 여는 키 조합(Alt·F10·Alt+글자 …)을 거부한다 (`menu_key_refusal`).
+    /// On Windows, refuses key combos that open native menus (Alt, F10, Alt+letter, …;
+    /// `menu_key_refusal`).
     pub async fn key(&self, combo: &str, repeat: u32) -> Result<()> {
         let combo = crate::platform::input::localize_combo(combo);
         #[cfg(windows)]
@@ -3241,7 +3327,7 @@ impl ElectronWorkspace {
     pub fn views(&self) -> (Vec<crate::desk::ViewInfo>, Option<String>) {
         let (mut v, a) = self.inner.views();
         for x in &mut v {
-            // VS Code 의 workbench.html 같은 긴 내부 URL 대신 앱 이름을 보여준다
+            // show the app name instead of long internal URLs like VS Code's workbench.html
             if x.detail.starts_with("vscode-file://") || x.detail.starts_with("file://") || x.detail.starts_with("app://") {
                 x.detail = format!("{} 창", self.app.name);
             }
@@ -3263,7 +3349,8 @@ impl ElectronWorkspace {
         self.closed.load(Ordering::SeqCst) || self.inner.is_closed()
     }
 
-    /// 인스펙터로 app.exit(0) → 3초 대기 → 프로세스 그룹/자손 SIGKILL → 자식 회수.
+    /// app.exit(0) through the inspector → wait 3 s → SIGKILL the process group/descendants → reap the
+    /// child.
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         for t in self.tasks.lock().drain(..) {
@@ -3271,8 +3358,8 @@ impl ElectronWorkspace {
         }
         self.inner.shutdown().await;
         if self.child.lock().is_some() {
-            // 종료 직전 자손 목록을 확보 (메인이 죽으면 부모가 launchd 로 바뀌므로).
-            // 자식을 아직 회수하지 않았으므로 main_pid/pgid 는 재사용되지 않은 상태다.
+            // grab the descendant list right before exit (once main dies, their parent becomes launchd). The
+            // child hasn't been reaped yet, so main_pid/pgid haven't been reused.
             #[cfg(target_os = "macos")]
             let tree: HashSet<i32> = proc::tree(self.main_pid, self.pgid);
             #[cfg(not(target_os = "macos"))]
@@ -3293,25 +3380,26 @@ impl ElectronWorkspace {
             }
             terminate_and_reap(self.main_pid, self.pgid, Some(&tree), &self.child);
         }
-        // 짧은 링크는 다음 실행 때 다시 만든다 (Windows 는 링크 없이 실제 폴더를 쓰므로 지우지 않는다)
+        // the short link is recreated on the next run (Windows uses the real folder without a link, so
+        // nothing to remove)
         if self.paths.root != self.paths.real_root {
             let _ = fs::remove_file(&self.paths.root);
         }
     }
 
-    // ───────── 추가 기능 ─────────
+    // ---- extras ----
 
-    /// 활성 창의 페이지에서 JS 평가
+    /// Evaluates JS in the active window's page.
     pub async fn eval(&self, expr: &str) -> Result<Value> {
         self.inner.eval(expr).await
     }
 
-    /// 메인 프로세스에서 JS 평가 (디버그/셀프 테스트용)
+    /// Evaluates JS in the main process (for debugging/self-tests).
     pub async fn main_eval(&self, expr: &str) -> Result<Value> {
         main_eval(&self.insp, expr, Duration::from_secs(5)).await
     }
 
-    /// 앱 메뉴(또는 마지막 컨텍스트 메뉴) 트리를 텍스트로.
+    /// The app menu (or last context menu) tree as text.
     pub async fn menu_text(&self, src: MenuSource) -> Result<String> {
         let v = self.menu_call(src, None).await?;
         if let Some(e) = v["error"].as_str() {
@@ -3320,7 +3408,8 @@ impl ElectronWorkspace {
         Ok(v["text"].as_str().unwrap_or_default().to_string())
     }
 
-    /// "File > New Text File" 같은 경로로 메뉴 항목을 실행한다 (화면/다른 앱에 영향을 주는 역할은 거부).
+    /// Runs a menu item by path like "File > New Text File" (roles affecting the screen or other apps
+    /// are refused).
     pub async fn menu_click(&self, src: MenuSource, path: &str) -> Result<String> {
         let parts: Vec<String> = path.split('>').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         ensure!(!parts.is_empty(), "메뉴 경로가 비었습니다");
@@ -3354,12 +3443,12 @@ impl Drop for ElectronWorkspace {
         for t in self.tasks.lock().drain(..) {
             t.abort();
         }
-        // shutdown 을 거치지 않았을 때만 실제로 동작 (이미 회수했으면 아무것도 죽이지 않음)
+        // only does anything if shutdown didn't run (kills nothing if already reaped)
         terminate_and_reap(self.main_pid, self.pgid, None, &self.child);
     }
 }
 
-/// 프로세스 그룹 + 자손(+미리 확보한 목록)을 SIGKILL.
+/// SIGKILLs the process group + descendants (+ a list grabbed earlier).
 fn kill_tree(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>) {
     #[cfg(target_os = "macos")]
     {
@@ -3367,7 +3456,7 @@ fn kill_tree(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>) {
         if let Some(x) = extra {
             all.extend(x.iter().copied());
         }
-        // 자기 자신의 그룹은 절대 죽이지 않는다 (process_group(0) 으로 띄웠으므로 달라야 정상)
+        // never kill our own group (launched with process_group(0), so it should differ)
         if pgid > 1 && pgid != unsafe { libc::getpgrp() } {
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
@@ -3385,21 +3474,19 @@ fn kill_tree(main_pid: i32, pgid: i32, extra: Option<&HashSet<i32>>) {
         if pgid > 1 && pgid != unsafe { libc::getpgrp() } {
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
-        // Windows 는 Job 객체로 정리한다 (kill_group_if_held / terminate_and_reap)
+        // Windows cleans up through the Job object (kill_group_if_held / terminate_and_reap)
         #[cfg(not(unix))]
         let _ = pgid;
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// macOS 네이티브 도우미 (읽기 전용 조회만)
-// ═════════════════════════════════════════════════════════════════════
+// ---- macOS native helpers (read-only queries only) ----
 
 #[cfg(target_os = "macos")]
 mod proc {
     use std::{collections::HashSet, ffi::c_void, path::PathBuf};
 
-    /// (pid, ppid, pgid) 전체 목록
+    /// Full (pid, ppid, pgid) list.
     pub fn all() -> Vec<(i32, i32, i32)> {
         let mut out = Vec::new();
         unsafe {
@@ -3427,7 +3514,7 @@ mod proc {
         out
     }
 
-    /// main_pid 의 자손 + 같은 프로세스 그룹
+    /// main_pid's descendants + the same process group.
     pub fn tree(main_pid: i32, pgid: i32) -> HashSet<i32> {
         let all = all();
         let mut set: HashSet<i32> = HashSet::new();
@@ -3494,7 +3581,8 @@ mod mac {
         o.downcast_ref::<NSNumber>().map(|n| n.doubleValue())
     }
 
-    /// CGWindowList 조회 (창 이름 등 화면 기록 권한이 필요한 값은 읽지 않음)
+    /// CGWindowList query (values needing Screen Recording permission, like window names, aren't
+    /// read).
     pub fn windows(onscreen_only: bool) -> Vec<WinRow> {
         objc2::rc::autoreleasepool(|_| {
             let opt = if onscreen_only { CGWindowListOption::OptionOnScreenOnly } else { CGWindowListOption::OptionAll };
@@ -3530,7 +3618,7 @@ mod mac {
         })
     }
 
-    /// 현재 커서 위치 (CGEventGetLocation(CGEventCreate(NULL)))
+    /// Current cursor position (CGEventGetLocation(CGEventCreate(NULL))).
     pub fn cursor() -> (f64, f64) {
         let ev = CGEvent::new(None);
         let p = CGEvent::location(ev.as_deref());
@@ -3572,7 +3660,7 @@ mod mac {
         })
     }
 
-    /// 커서 모양 변경 카운터 (SLSCurrentCursorSeed, 조회만 함). 없으면 -1.
+    /// Cursor shape change counter (SLSCurrentCursorSeed, query only). -1 if unavailable.
     pub fn cursor_seed() -> i64 {
         static S: OnceLock<usize> = OnceLock::new();
         let f = *S.get_or_init(|| unsafe {
@@ -3593,7 +3681,7 @@ mod mac {
         unsafe { f() as i64 }
     }
 
-    /// WindowServer 의 front 프로세스 pid (조회만 함)
+    /// pid of WindowServer's front process (query only).
     pub fn front_pid() -> i32 {
         let Some((gf, tp)) = syms() else { return -2 };
         let mut psn = Psn::default();
@@ -3607,11 +3695,10 @@ mod mac {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// 셀프 테스트
-// ═════════════════════════════════════════════════════════════════════
+// ---- self-test ----
 
-/// 비간섭 샘플러: 20ms 마다 커서·front 프로세스·우리 프로세스의 onscreen 창을 기록한다.
+/// Non-intrusive sampler: records the cursor, the front process and our processes' onscreen
+/// windows every 20 ms.
 #[cfg(target_os = "macos")]
 struct Sampler {
     stop: Arc<AtomicBool>,
@@ -3619,8 +3706,9 @@ struct Sampler {
     handle: Option<std::thread::JoinHandle<SamplerReport>>,
 }
 
-/// 비간섭 샘플러 (Windows): 20ms 마다 실제 커서 위치·모양, 전경 프로세스, 우리 프로세스의 창
-/// (모니터에 보이거나 작업 표시줄에 나타날 수 있는 창)을 기록한다. 조회만 한다.
+/// Non-intrusive sampler (Windows): records the real cursor position and shape, the foreground
+/// process and our processes' windows (visible on a monitor or able to show on the taskbar) every
+/// 20 ms. Query only.
 #[cfg(windows)]
 struct Sampler {
     stop: Arc<AtomicBool>,
@@ -3628,13 +3716,13 @@ struct Sampler {
     handle: Option<std::thread::JoinHandle<SamplerReport>>,
 }
 
-/// 샘플러가 "우리 프로세스"를 판별하는 방법
+/// How the sampler tells which processes are "ours".
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Clone)]
 enum OursBy {
-    /// main_pid 의 프로세스 그룹/자손 (Electron 셀프 테스트)
+    /// main_pid's process group/descendants (Electron self-test).
     Group,
-    /// 샘플러 시작 이후 새로 생긴, 실행 파일 경로에 이 문자열이 들어간 프로세스
+    /// Processes created after the sampler started whose executable path contains this string.
     NewWithPath(String),
 }
 
@@ -3686,7 +3774,7 @@ impl Sampler {
                 let ms = t0.elapsed().as_millis();
                 let mut mp = m2.load(Ordering::SeqCst);
                 if last_tree.elapsed() > Duration::from_millis(200) {
-                    // 종료 후에도 이전 목록을 유지(합집합)해서 늦게 남은 프로세스도 잡는다
+                    // keep the earlier list after exit too (union) to catch processes that linger
                     match &by {
                         OursBy::Group if mp > 0 => tree.extend(proc::tree(mp, mp)),
                         OursBy::NewWithPath(sub) => {
@@ -3792,7 +3880,7 @@ impl Sampler {
             rep.cursor_changes.push(format!("0ms 시작 cursor={last_cursor:?}"));
             let mut tree: HashSet<u32> = HashSet::new();
             let baseline: HashSet<u32> = win::processes().into_iter().map(|p| p.0).collect();
-            // 경로 비교는 대소문자·구분자 무시
+            // path comparison ignores case and separators
             let sub = match &by {
                 OursBy::NewWithPath(s) => s.to_lowercase().replace('/', "\\"),
                 OursBy::Group => String::new(),
@@ -3809,7 +3897,7 @@ impl Sampler {
                 let ms = t0.elapsed().as_millis();
                 let mp = m2.load(Ordering::SeqCst);
                 if last_tree.elapsed() > Duration::from_millis(200) {
-                    // 종료 후에도 이전 목록을 유지(합집합)해서 늦게 남은 프로세스도 잡는다
+                    // keep the earlier list after exit too (union) to catch processes that linger
                     match &by {
                         OursBy::Group if mp > 0 => tree.extend(win_screen::our_pids(mp)),
                         OursBy::NewWithPath(_) => {
@@ -3867,7 +3955,7 @@ impl Sampler {
                                 rep.our_visible_examples.push(format!("{ms}ms {s:?}"));
                             }
                         } else if t.visible && !t.cloaked && !t.minimized && win::intersects_any_monitor(t.rect) {
-                            // 모니터 위에 있지만 투명(alpha 0)한 창 (정보)
+                            // a window on a monitor but transparent (alpha 0); informational
                             rep.our_alpha0_onscreen += 1;
                             if rep.our_alpha0_examples.len() < 3 {
                                 rep.our_alpha0_examples.push(format!("{ms}ms {s:?}"));
@@ -3913,7 +4001,7 @@ fn img_diff_frac(a: &[u8], b: &[u8]) -> f64 {
 
 const EDITOR_TEXT_JS: &str = r#"(() => { const e = document.querySelector('.part.editor .editor-group-container.active .monaco-editor .view-lines') || document.querySelector('.part.editor .monaco-editor .view-lines'); return e ? e.innerText.replace(/ /g, ' ') : null })()"#;
 
-/// `ghostdesk --selftest-electron [출력폴더]`
+/// `ghostdesk --selftest-electron [output folder]`
 pub async fn selftest(args: &[String]) -> Result<()> {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -3928,7 +4016,8 @@ pub async fn selftest(args: &[String]) -> Result<()> {
             return sample_only(secs, args.get(2).cloned().unwrap_or_else(|| default_target.into())).await;
         }
         if args.first().map(String::as_str) == Some("orphan") {
-            // GhostDesk 가 강제 종료돼도 숨은 앱이 스스로 종료되는지 확인용: 실행 후 대기 (밖에서 kill -9)
+            // to check the hidden app exits on its own even if GhostDesk is killed: launch and wait (kill -9
+            // from outside)
             let code = detect_apps()
                 .into_iter()
                 .find(|a| a.bundle_id == "com.microsoft.VSCode" && a.hideable)
@@ -3960,13 +4049,14 @@ pub async fn selftest(args: &[String]) -> Result<()> {
             .ok_or_else(|| anyhow!("Visual Studio Code 를 찾지 못했습니다"))?;
         ensure!(code.hideable, "VS Code 가 숨김 모드를 지원하지 않습니다: {:?}", code.reason);
 
-        // 실행 직후(launch 가 끝나 main_pid 를 알기 전)의 창·front·Dock 변화도 잡도록, 새로 생긴 앱 번들 안의
-        // 프로세스를 모두 우리 것으로 본다 (테스트 중 사용자가 같은 앱을 열면 위반으로 잡힘 — 보수적)
+        // treat every process inside a newly created app bundle as ours, so window/front/Dock changes
+        // right after launch (before launch finishes and main_pid is known) are caught too (if the user
+        // opens the same app during the test it counts as a violation; conservative)
         let sampler =
             Sampler::start_with(OursBy::NewWithPath(format!("{}{}", code.bundle.display(), std::path::MAIN_SEPARATOR)));
         tokio::time::sleep(Duration::from_millis(500)).await;
         let res = selftest_live(code, outdir.as_deref(), &sampler).await;
-        // 종료 후 3초 더 관찰
+        // keep observing for 3 s after shutdown
         tokio::time::sleep(Duration::from_secs(3)).await;
         let rep = sampler.finish();
         print_report(&rep);
@@ -3995,8 +4085,8 @@ fn print_report(rep: &SamplerReport) {
     }
 }
 
-/// `ghostdesk --selftest-electron sample <초> <실행파일 경로 일부>`:
-/// 다른 테스트(예: 브라우저 --selftest)를 돌리는 동안 같은 기준으로 비간섭을 관찰한다.
+/// `ghostdesk --selftest-electron sample <seconds> <part of executable path>`: observes
+/// non-interference by the same criteria while another test (e.g. the browser --selftest) runs.
 #[cfg(any(target_os = "macos", windows))]
 async fn sample_only(secs: f64, sub: String) -> Result<()> {
     println!("비간섭 샘플러 {secs}초 시작 (새로 생긴 '{sub}' 프로세스를 우리 것으로 간주)");
@@ -4009,7 +4099,7 @@ async fn sample_only(secs: f64, sub: String) -> Result<()> {
     Ok(())
 }
 
-/// 퓨즈 파싱(설치된 앱 전체, 읽기 전용)과 가짜 폴더 복제 테스트
+/// Fuse parsing (every installed app, read only) and a fake folder clone test.
 fn selftest_static() -> Result<()> {
     println!("── 설치된 Electron 앱 (읽기 전용 검사) ──");
     let t = Instant::now();
@@ -4036,7 +4126,7 @@ fn selftest_static() -> Result<()> {
             ensure!(!a.hideable, "{} 는 차단 목록인데 hideable", a.name);
         }
     }
-    // Windows: 실행 파일 이름으로 막는 앱도 확인
+    // Windows: also check apps blocked by executable name
     #[cfg(windows)]
     for a in &apps {
         if blocked_reason(&a.bundle_id, &a.exe).is_some() {
@@ -4074,7 +4164,7 @@ fn selftest_static() -> Result<()> {
             ensure!(!dst.join(no).exists(), "{no} 가 복제됨");
         }
 
-        // 작업공간 준비 전체 경로 (가짜 VS Code 계열 앱 + 가짜 원본, 실행은 하지 않음)
+        // the whole workspace preparation path (fake VS Code family app + fake original, nothing launched)
         let fake = ElectronApp {
             name: "Fake Code".into(),
             bundle_id: "test.ghostdesk.fake".into(),
@@ -4095,7 +4185,7 @@ fn selftest_static() -> Result<()> {
         o.workspaces_root = Some(tmp.join("ws"));
         o.profile = ElectronProfile::Clone { source: src.clone(), refresh: false };
         let p = prepare_workspace(&o)?;
-        // Windows 는 짧은 링크 없이 실제 폴더를 그대로 쓴다 (명명 파이프라 경로 길이 한계가 없음)
+        // Windows uses the real folder without a short link (named pipes have no path length limit)
         #[cfg(windows)]
         let link_ok = p.root == p.real_root;
         #[cfg(not(windows))]
@@ -4116,7 +4206,7 @@ fn selftest_static() -> Result<()> {
         ensure!(args.iter().any(|a| a.starts_with("--extensions-dir=") && a.contains(&*p.root.to_string_lossy())), "--extensions-dir 누락");
         ensure!(args.iter().any(|a| a == "--inspect-brk=0"), "--inspect-brk 누락");
         println!("  작업공간 준비: 링크 {} → {}", p.root.display(), p.real_root.display());
-        // 다른 앱이 같은 작업공간을 쓰려 하면 거부
+        // refuse another app trying to use the same workspace
         let mut o2 = o.clone();
         o2.app.bundle_id = "other.app".into();
         ensure!(prepare_workspace(&o2).is_err(), "다른 앱의 작업공간 재사용이 허용됨");
@@ -4167,7 +4257,7 @@ async fn selftest_live(code: ElectronApp, outdir: Option<&Path>, sampler: &Sampl
     let link_gone = !ws.paths.root.exists();
     #[cfg(unix)]
     let _ = fs::remove_dir_all(&real);
-    // Windows: 방금 끝난 프로세스가 쥐고 있던 파일이 잠시 남을 수 있어 재시도한다
+    // Windows: files held by a process that just exited may linger briefly, so retry
     #[cfg(windows)]
     let _ = crate::platform::fsx::remove_dir_all_retry(&real);
     println!("  작업공간 삭제: {} (짧은 링크 제거: {link_gone})", !real.exists());
@@ -4184,7 +4274,7 @@ async fn selftest_drive(ws: &ElectronWorkspace, outdir: Option<&Path>, frames: &
             let _ = fs::write(d.join(format!("{name}.png")), png);
         }
     };
-    // 워크벤치 준비 대기
+    // wait for the workbench to be ready
     let start = Instant::now();
     loop {
         if ws.eval("!!document.querySelector('.monaco-workbench .part.editor')").await.ok() == Some(json!(true)) {
@@ -4259,7 +4349,7 @@ async fn selftest_drive(ws: &ElectronWorkspace, outdir: Option<&Path>, frames: &
     ws.switch_view(0).await?;
     println!("✔ views / switch_view");
 
-    // 소켓 경로 길이 확인 (lsof, 읽기 전용)
+    // check the socket path length (lsof, read only)
     #[cfg(unix)]
     {
         let lsof = Command::new("lsof").args(["-a", "-p", &ws.main_pid.to_string(), "-U", "-F", "n"]).output();
@@ -4275,7 +4365,7 @@ async fn selftest_drive(ws: &ElectronWorkspace, outdir: Option<&Path>, frames: &
             ensure!(socks.iter().all(|s| s.len() < SUN_PATH_MAX), "소켓 경로가 너무 김");
         }
     }
-    // Windows: VS Code 메인 IPC 는 명명 파이프 (이름만 나열, 연결하지 않음. 길이 한계 없음)
+    // Windows: VS Code main IPC is a named pipe (names listed only, no connection; no length limit)
     #[cfg(windows)]
     if let Ok(rd) = fs::read_dir(r"\\.\pipe\") {
         let n = rd.flatten().filter(|e| e.file_name().to_string_lossy().ends_with("-main-sock")).count();
@@ -4284,7 +4374,8 @@ async fn selftest_drive(ws: &ElectronWorkspace, outdir: Option<&Path>, frames: &
     let menu = ws.menu_text(MenuSource::App).await.unwrap_or_else(|e| format!("(메뉴 없음: {e})"));
     println!("  앱 메뉴 (앞부분): {}", menu.lines().take(6).collect::<Vec<_>>().join(" / "));
 
-    // 차단 훅 확인: 패치된 함수인지 먼저 확인한 뒤에만 호출 (실제 브라우저/대화상자가 뜨지 않도록)
+    // check the blocking hooks: only call after confirming the function is patched (so no real
+    // browser or dialog appears)
     let hooked = ws
         .main_eval("(() => { const e = globalThis.__ghostdesk.electron; return String(e.shell.openExternal).includes('외부 링크') && String(e.dialog.showMessageBox).includes('메시지 대화상자') && String(e.dialog.showOpenDialog).includes('파일 열기') && String(e.app.emit).includes('open-file'); })()")
         .await?;
@@ -4328,7 +4419,7 @@ mod tests {
 
     #[test]
     fn installed_apps_fuses() {
-        // 설치된 앱 전체 (읽기 전용). VS Code 가 있으면 인스펙터 퓨즈 ON 이어야 함.
+        // every installed app (read only). If VS Code is present, its inspector fuse must be on.
         for a in detect_apps() {
             assert!(a.fuses.is_some(), "{} 퓨즈 파싱 실패", a.name);
             if a.bundle_id == "com.microsoft.VSCode" {
@@ -4363,7 +4454,8 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Windows: 터미널 우클릭이 사용자의 실제 클립보드를 붙여 넣거나 덮어쓰지 않게 한다 (macOS 는 기존 설정 그대로)
+    /// Windows: the terminal's right click must neither paste nor overwrite the user's real clipboard
+    /// (macOS keeps the existing settings).
     #[test]
     fn vscode_terminal_clipboard_defaults() {
         let m = vscode_default_settings();
@@ -4413,28 +4505,29 @@ mod tests {
         let wins = [
             w(1, CONSOLE_CLASS, true, true),
             w(2, CONSOLE_CLASS, false, true),
-            w(3, CONSOLE_CLASS, false, false), // 숨은 콘솔 (windowsHide) — 할 일 없음
+            w(3, CONSOLE_CLASS, false, false), // hidden console (windowsHide): nothing to do
             w(4, "Chrome_WidgetWin_1", true, false),
             w(5, CONSOLE_CLASS, true, false),
         ];
         let now = Instant::now();
         let mut first = HashMap::new();
-        first.insert(5isize, now - CONSOLE_HIDE_GRACE); // 유예 시간이 지나도록 계속 보이는 창
-        first.insert(2isize, now - Duration::from_millis(200)); // 숨기는 중 (40ms 사전 감시를 여러 번 거쳐도 아직 유예 중)
+        first.insert(5isize, now - CONSOLE_HIDE_GRACE); // a window still visible past the grace period
+        first.insert(2isize, now - Duration::from_millis(200)); // being hidden (still within the grace period after several 40 ms pre-watch passes)
         let (hide, skip) = plan_console_hide(&wins, &first, now);
         assert_eq!(hide, vec![1, 2]);
         assert_eq!(skip, HashSet::from([1, 2]));
-        // 유예 시간이 지나면 2 도 포기
+        // once the grace period passes, 2 is given up on too
         let (hide2, _) = plan_console_hide(&wins, &first, now + CONSOLE_HIDE_GRACE);
         assert_eq!(hide2, vec![1]);
-        // 남은 것: 앱 창(4)과 숨기기를 포기한 콘솔(5)은 위반
+        // what's left: the app window (4) and the given-up console (5) are violations
         let rest: Vec<WinState> = wins.iter().filter(|x| !skip.contains(&x.hwnd)).cloned().collect();
         let d = describe_violations(&rest, None).unwrap();
         assert!(d.contains("hwnd=0x4") && d.contains("hwnd=0x5") && !d.contains("hwnd=0x1"), "{d}");
     }
 
-    /// PATCH_JS 의 Windows 도우미(child_process windowsHide 기본값, disable-features 병합, OS 드래그 차단)와 menuKey 필터를
-    /// 헤드리스 Chrome(빈 임시 프로필)의 V8 에서 확인하고, PATCH_JS 전체가 문법 오류 없이 컴파일되는지 본다.
+    /// Checks PATCH_JS's Windows helpers (child_process windowsHide default, disable-features merging,
+    /// OS drag blocking) and the menuKey filter in the V8 of headless Chrome (empty temp profile), and
+    /// that the whole PATCH_JS compiles without syntax errors.
     #[cfg(windows)]
     #[test]
     fn patch_js_helpers_in_v8() {
@@ -4472,7 +4565,7 @@ cp.fork('m'); cp.fork('m', {{ silent: true }});
 out.calls = calls; out.notMutated = o.windowsHide === undefined; out.extra = cp.exec.extra; out.marked = cp.spawn.__gdHide === true;
 const p = cp.exec[P]('c2');
 out.child = p.child && p.child.pid;
-// gdGuardDrag: 가짜 webContents·debugger 로 startDrag 차단과 웹뷰 게스트 드래그 가로채기를 확인
+// gdGuardDrag: checks startDrag blocking and webview guest drag interception with a fake webContents/debugger
 const mkWc = (type, failIntercept) => {{
   const ev = {{}}, dev = {{}}, cmds = [];
   const dbg = {{ attached: false, isAttached() {{ return this.attached; }}, attach(v) {{ this.attached = true; cmds.push(['attach', v]); }},
@@ -4558,7 +4651,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             ["execSync", ["c", { "windowsHide": false }]],
             ["fork", ["m", "undef", wh]],
             ["fork", ["m", { "silent": true, "windowsHide": true }]],
-            // util.promisify(exec) 경로도 감싼 함수를 거친다
+            // the util.promisify(exec) path also goes through the wrapped function
             ["exec", ["c2", wh, "fn"]]
         ]);
         assert_eq!(v["calls"], expect, "{v}");
@@ -4570,11 +4663,13 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(v["lastCall"], json!(["exec", ["c2", wh, "fn"]]), "{v}");
         assert_eq!(v["merge"], json!(["A,B,CalculateNativeWinOcclusion", "CalculateNativeWinOcclusion"]));
         assert_eq!(v["menu"], json!([true, false, false, true, true, true, true, false, false, true, false]), "{v}");
-        // startDrag 는 인스턴스·프로토타입 모두 막히고(원래 함수 호출 없음), 일반 창에는 debugger 를 붙이지 않는다
+        // startDrag is blocked on both instances and the prototype (the original is never called), and
+        // regular windows get no debugger attached
         let d = &v["drag"];
         assert_eq!(d["window"], json!("start"), "{v}");
         assert_eq!(d["windowCmds"], json!([]), "{v}");
-        // 웹뷰 게스트: 가로채기 켜기 → 가로챈 드래그 취소 → (target closed 는 무시) 떨어지면 다시 붙여 켜기
+        // webview guest: enable interception → cancel the intercepted drag → (target closed is ignored)
+        // reattach and re-enable after detaching
         let on = json!(["Input.setInterceptDrags", { "enabled": true }]);
         let data = json!({ "items": [{ "mimeType": "text/plain", "data": "x" }], "dragOperationsMask": 1 });
         assert_eq!(d["webview"], json!("webview"), "{v}");
@@ -4589,14 +4684,17 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             ]),
             "{v}"
         );
-        // 가로채기를 켤 수 없으면 게스트 문서의 dragstart 를 막는다 (지금 + dom-ready 마다)
+        // if interception can't be enabled, block dragstart in the guest document (now + on every
+        // dom-ready)
         assert_eq!(d["fallback"], json!("fallback"), "{v}");
         assert_eq!(d["fallbackCmds"], json!([["attach", "1.3"], on, ["js", true], ["js", true]]), "{v}");
         assert_eq!(d["notes"], json!(4), "{v}");
     }
 
-    /// Windows: 복제가 끝나지 않은 user-data(표시 파일이 남음)는 다음 실행에서 재사용하지 않고 다시 복제한다.
-    /// 잠긴 쿠키로 실패하면 CloneLocked 로 알리고 표시 파일을 남긴다.
+    /// Windows: user-data from an unfinished clone (marker left behind) isn't reused on the next run
+    /// but cloned again.
+    ///
+    /// A failure on locked cookies is reported as CloneLocked and leaves the marker.
     #[cfg(windows)]
     #[test]
     fn windows_unfinished_clone_is_not_reused() {
@@ -4626,14 +4724,15 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let mut o = ElectronLaunch::new(fake, "mark", 1024, 768);
         o.workspaces_root = Some(tmp.join("ws"));
         o.profile = ElectronProfile::Clone { source: src.clone(), refresh: false };
-        // 1) 원본 앱이 쿠키를 잠그고 있으면 CloneLocked, 표시 파일이 남는다
+        // 1) if the original app has the cookies locked: CloneLocked, and the marker remains
         let held = fs::OpenOptions::new().read(true).write(true).share_mode(0).open(src.join("Partitions/p/Network/Cookies")).unwrap();
         let err = prepare_workspace(&o).err().expect("잠긴 쿠키면 실패해야 함");
         assert!(err.downcast_ref::<profiles::CloneLocked>().is_some(), "{err:#}");
         let root = tmp.join("ws").join(profiles::slug("mark"));
         assert!(root.join(".ghostdesk-cloning").exists());
         drop(held);
-        // 2) 지우기에 실패해 반쪽 복제본이 남은 상황: 표시 파일이 있으면 재사용하지 않고 다시 복제한다
+        // 2) a half clone left after a failed delete: with the marker present, it's cloned again rather
+        // than reused
         fs::create_dir_all(root.join("user-data")).unwrap();
         fs::write(root.join("user-data/stale"), "partial").unwrap();
         let p = prepare_workspace(&o).unwrap();
@@ -4641,14 +4740,15 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert!(!ud.join("stale").exists(), "반쪽 복제본을 재사용함");
         assert!(ud.join("Partitions/p/Network/Cookies").is_file() && ud.join("Preferences").is_file());
         assert!(!root.join(".ghostdesk-cloning").exists());
-        // 3) 완성된 복제본은 (refresh 가 아니면) 그대로 재사용한다
+        // 3) a complete clone is reused as is (unless refresh)
         fs::write(ud.join("kept"), "x").unwrap();
         prepare_workspace(&o).unwrap();
         assert!(ud.join("kept").exists());
         crate::platform::fsx::remove_dir_all_retry(&tmp).unwrap();
     }
 
-    /// Windows: extra_args 의 --disable-features 는 가림 추적 끄기와 한 스위치로 합친다
+    /// Windows: --disable-features from extra_args is merged into one switch with the occlusion
+    /// tracking opt-out.
     #[cfg(windows)]
     #[test]
     fn windows_launch_plan_single_disable_features() {
@@ -4687,7 +4787,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert!(peek_exit(&c).is_none());
         std::thread::sleep(Duration::from_millis(600));
         assert!(peek_exit(&c).is_some());
-        // 회수 전이므로 pid 가 (좀비로) 남아 있어야 한다
+        // not reaped yet, so the pid must still exist (as a zombie)
         assert_eq!(unsafe { libc::kill(c.id() as i32, 0) }, 0);
         assert!(peek_exit(&c).is_some());
         assert!(c.wait().unwrap().success());
@@ -4715,12 +4815,12 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(regex_escape("out/main.js"), "out/main\\.js");
     }
 
-    // ───────── Windows 포팅: 플랫폼 공통 순수 함수 ─────────
+    // ---- Windows port: cross-platform pure functions ----
 
     #[test]
     fn sentinel_search_matches_naive() {
         let naive = |h: &[u8]| h.windows(FUSE_SENTINEL.len()).position(|w| w == FUSE_SENTINEL);
-        // 의사 난수 바이트 + 여러 위치에 센티넬(앞부분만 같은 함정 포함)
+        // pseudo-random bytes + sentinels at several positions (including traps matching only a prefix)
         let mut x: u32 = 12345;
         let mut buf: Vec<u8> = (0..200_000)
             .map(|_| {
@@ -4729,7 +4829,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             })
             .collect();
         assert_eq!(find_sentinel(&buf), naive(&buf));
-        buf[1000..1031].copy_from_slice(&FUSE_SENTINEL[..31]); // 마지막 바이트만 다름
+        buf[1000..1031].copy_from_slice(&FUSE_SENTINEL[..31]); // only the last byte differs
         buf[150_000..150_032].copy_from_slice(FUSE_SENTINEL);
         buf[190_000..190_032].copy_from_slice(FUSE_SENTINEL);
         assert_eq!(find_sentinel(&buf), Some(150_000));
@@ -4742,7 +4842,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(find_sentinel(&tail), Some(77));
     }
 
-    /// 최소한의 PE 파일 (섹션 표만 유효) — .text 와 .rdata 두 섹션
+    /// A minimal PE file (only the section table is valid) with two sections, .text and .rdata.
     fn fake_pe(rdata: &[u8], text: &[u8]) -> Vec<u8> {
         let mut f = vec![0u8; 0x400];
         f[0..2].copy_from_slice(b"MZ");
@@ -4780,7 +4880,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
     fn pe_rdata_fuses() {
         let tmp = std::env::temp_dir().join(format!("gd-pe-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        // .rdata 의 퓨즈가 .text 의 (가짜) 센티넬보다 우선
+        // fuses in .rdata win over a (fake) sentinel in .text
         let p = tmp.join("a.exe");
         fs::write(&p, fake_pe(&fuse_blob(b"001100011"), &fuse_blob(b"111111111"))).unwrap();
         let mut f = fs::File::open(&p).unwrap();
@@ -4790,11 +4890,11 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let fz = read_fuses_file(&p).unwrap();
         assert_eq!(fz.wire, "001100011");
         assert!(fz.inspect_allowed());
-        // .rdata 에 없으면 파일 전체에서 찾는다
+        // if .rdata has none, search the whole file
         let q = tmp.join("b.exe");
         fs::write(&q, fake_pe(b"nothing here", &fuse_blob(b"000000000"))).unwrap();
         assert_eq!(read_fuses_file(&q).unwrap().wire, "000000000");
-        // PE 도 Mach-O 도 아닌 파일
+        // a file that's neither PE nor Mach-O
         let r = tmp.join("c.bin");
         fs::write(&r, fuse_blob(b"0101")).unwrap();
         assert_eq!(read_fuses_file(&r).unwrap().wire, "0101");
@@ -4806,14 +4906,14 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
 
     #[test]
     fn breakpoint_url_regex() {
-        // macOS 는 기존 정규식 그대로
+        // macOS keeps the same regex as before
         assert_eq!(main_url_regex("out/main.js", false), "Resources/app(\\.asar)?/out/main\\.js$");
         let w = main_url_regex("out/main.js", true);
         assert_eq!(
             w,
             "[Rr][Ee][Ss][Oo][Uu][Rr][Cc][Ee][Ss][\\\\/][Aa][Pp][Pp](\\.[Aa][Ss][Aa][Rr])?[\\\\/][Oo][Uu][Tt][\\\\/][Mm][Aa][Ii][Nn]\\.[Jj][Ss]$"
         );
-        // 퍼센트 인코딩될 글자는 원래 글자와 인코딩 둘 다
+        // characters that get percent-encoded match both as is and encoded
         let s = main_url_regex("dist/main process.js", true);
         assert!(s.contains("(?: |%20)"), "{s}");
         let k = main_url_regex("앱/main.js", true);
@@ -4834,21 +4934,22 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         for c in [
             "ctrl+n", "ctrl+shift+p", "ctrl+F10", "ctrl+alt+f", "alt+1", "alt+Left", "alt+F4", "F5", "Return", "a", "shift+Tab", "ctrl+alt+Delete",
             "F1", "ctrl+,", "unknownkey+q",
-            // Shift/Win+Alt+글자는 니모닉을 열지 않는다 (VS Code: Shift+Alt+F 문서 서식, Shift+Alt+A 블록 주석 …)
+            // Shift/Win+Alt+letter doesn't open mnemonics (VS Code: Shift+Alt+F format document, Shift+Alt+A
+            // block comment, …)
             "shift+alt+f", "alt+shift+f", "Shift+Alt+A", "shift+alt+i", "super+alt+x", "alt+super+x",
-            // 대문자는 parse_combo 가 Shift 를 붙이므로 실제로 Shift+Alt+F 가 간다
+            // parse_combo adds Shift for uppercase, so Shift+Alt+F is actually sent
             "alt+F", "Alt+E",
         ] {
             assert!(menu_key_refusal(c).is_none(), "{c} 는 허용되어야 함");
         }
-        // cmd 는 현지화(ctrl) 뒤에 판정하므로 cmd+alt+f 는 허용
+        // cmd is judged after localization (ctrl), so cmd+alt+f is allowed
         let l = crate::platform::input::localize_combo_for("cmd+alt+f", true);
         assert!(menu_key_refusal(&l).is_none());
         let why = menu_key_refusal("alt+f").unwrap();
         assert!(why.contains("app_menu") && why.contains("Shift+Alt+글자"), "{why}");
     }
 
-    /// PATCH_JS 의 before-input-event 필터(menuKey)도 같은 규칙이어야 한다
+    /// PATCH_JS's before-input-event filter (menuKey) must follow the same rules.
     #[test]
     fn patch_menu_key_filter_matches() {
         let i = PATCH_JS.find("const menuKey").unwrap();
@@ -4859,18 +4960,19 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
 
     #[test]
     fn offscreen_math() {
-        // 100%: 실제 픽셀 = DIP
+        // 100%: real pixels = DIP
         assert_eq!(offscreen_dip_math((5920, 5080), 1.0, 1.0), (5920, 5080));
-        // 150% 주 모니터: 픽셀 / 1.5
+        // 150% primary monitor: pixels / 1.5
         assert_eq!(offscreen_dip_math((7840, 6160), 1.5, 1.5), (5227, 4107));
-        // 한계: |DIP| × 최대 배율 ≤ 24000 (16비트 좌표·-32000 최소화 표식에서 멀리)
+        // limit: |DIP| × max scale ≤ 24000 (well away from 16-bit coordinates and the -32000 minimized
+        // marker)
         for (px, p, m) in [((28000, 28000), 1.0, 1.0), ((28000, 28000), 1.0, 2.5), ((28000, 28000), 1.25, 3.0), ((20000, 9000), 2.0, 2.0)] {
             let (x, y) = offscreen_dip_math(px, p, m);
             let mx = m.max(p);
             assert!((x.abs() as f64) * mx <= 24000.0 && (y.abs() as f64) * mx <= 24000.0, "{px:?} {p} {m} → {x},{y}");
             assert!(x > 0 && y > 0);
         }
-        // 이상한 배율 값
+        // odd scale values
         assert_eq!(offscreen_dip_math((3000, 2000), f64::NAN, f64::NAN), (3000, 2000));
         assert_eq!(offscreen_dip_math((3000, 2000), 0.0, 0.0), (3000, 2000));
     }
@@ -4905,7 +5007,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let d = describe_violations(&[w(true, false)], None).unwrap();
         assert!(d.contains("보이는 창") && !d.contains("front"));
         assert!(describe_violations(&[w(false, true)], None).unwrap().contains("작업 표시줄"));
-        // 전경 위반은 "front" 를 포함해야 감시자가 rehide(true) 를 부른다
+        // foreground violations must include "front" so the watchdog calls rehide(true)
         assert!(describe_violations(&[], Some(42)).unwrap().contains("front"));
     }
 
@@ -4945,9 +5047,9 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(win_bundle_id(None, None, None, "Some App"), "win.some app");
     }
 
-    // ───────── Windows 전용 ─────────
+    // ---- Windows only ----
 
-    /// 최소한의 app.asar (헤더 피클 + 파일 내용)
+    /// A minimal app.asar (header pickle + file contents).
     #[cfg(windows)]
     fn write_asar(path: &Path, files: &[(&str, &[u8])]) {
         let mut entries = Map::new();
@@ -4969,14 +5071,15 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         fs::write(path, out).unwrap();
     }
 
-    /// 가짜 Electron 앱 폴더: 실행 파일(퓨즈 포함, 크게) + 도우미 + resources + 런타임 파일
+    /// Fake Electron app folder: executable (with fuses, made large) + helpers + resources + runtime
+    /// files.
     #[cfg(windows)]
     fn fake_app_dir(dir: &Path, exe: &str, wire: &[u8], pkg: Value, product: Option<Value>, asar: bool) {
         fs::create_dir_all(dir.join("resources")).unwrap();
         let mut body = vec![0u8; 64 * 1024];
         body.extend_from_slice(&fuse_blob(wire));
         fs::write(dir.join(exe), fake_pe(&body, b"text")).unwrap();
-        fs::write(dir.join("unins000.exe"), vec![1u8; 300 * 1024]).unwrap(); // 도우미는 더 커도 고르지 않음
+        fs::write(dir.join("unins000.exe"), vec![1u8; 300 * 1024]).unwrap(); // helpers aren't picked even when larger
         fs::write(dir.join("icudtl.dat"), b"icu").unwrap();
         let pkg_b = serde_json::to_vec(&pkg).unwrap();
         let product_b = product.map(|p| serde_json::to_vec(&p).unwrap());
@@ -4990,7 +5093,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             fs::create_dir_all(dir.join("resources/app")).unwrap();
             fs::write(dir.join("resources/app/package.json"), &pkg_b).unwrap();
             if let Some(p) = &product_b {
-                // BOM 이 붙은 JSON 도 읽어야 한다
+                // JSON with a BOM must be read too
                 let mut b = b"\xEF\xBB\xBF".to_vec();
                 b.extend_from_slice(p);
                 fs::write(dir.join("resources/app/product.json"), b).unwrap();
@@ -5005,7 +5108,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let tmp = std::env::temp_dir().join(format!("gd-winapps-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
 
-        // 1) VS Code 계열 (폴더형 resources\app, product.json 에 BOM)
+        // 1) VS Code family (folder-style resources\app, product.json with a BOM)
         let code = tmp.join("Fake Code");
         fake_app_dir(
             &code,
@@ -5028,22 +5131,23 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(a.fuses.as_ref().unwrap().wire, "101100011");
         assert_eq!(a.bundle, code);
         assert!(!a.running);
-        // .exe 경로로도 같은 앱
+        // the .exe path yields the same app
         let b = inspect(&code.join("Code.exe")).unwrap();
         assert_eq!((b.bundle_id.as_str(), b.exe.clone()), ("com.microsoft.VSCode", code.join("Code.exe")));
         assert_eq!(read_fuses(&code).unwrap().wire, "101100011");
 
-        // 2) Squirrel (루트\Update.exe + app-<버전>\, asar) — 가장 높은 버전, 루트가 bundle
+        // 2) Squirrel (root\Update.exe + app-<version>\, asar): highest version, root is the bundle
         let sq = tmp.join("SqApp");
         fs::create_dir_all(&sq).unwrap();
         fs::write(sq.join("Update.exe"), b"u").unwrap();
         fs::write(sq.join("SqApp.exe"), b"stub").unwrap();
-        // 옛 버전(1.9.0)만 인스펙터 퓨즈가 켜져 있다 → 최신(1.10.0)을 골랐다면 숨김 불가
+        // only the old version (1.9.0) has the inspector fuse on → picking the latest (1.10.0) means it
+        // can't be hidden
         fake_app_dir(&sq.join("app-1.9.0"), "SqApp.exe", b"0001", json!({ "name": "sq", "productName": "Sq App", "main": "index.js" }), None, true);
         fake_app_dir(&sq.join("app-1.10.0"), "SqApp.exe", b"0000", json!({ "name": "sq", "productName": "Sq App", "main": "index.js" }), None, true);
         let (root, appdir) = resolve_layout(&sq).unwrap();
         assert_eq!((root.as_path(), appdir.as_path()), (sq.as_path(), sq.join("app-1.10.0").as_path()));
-        // app-<버전> 폴더를 직접 가리켜도 루트는 Squirrel 루트
+        // pointing directly at an app-<version> folder still yields the Squirrel root
         assert_eq!(resolve_layout(&sq.join("app-1.9.0")).unwrap().0, sq);
         let s = inspect(&sq).unwrap();
         assert_eq!(s.bundle_id, "com.squirrel.SqApp.SqApp");
@@ -5052,12 +5156,12 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(s.main_script.as_deref(), Some("index.js"));
         assert_eq!(s.family, AppFamily::Generic);
         assert!(!s.hideable && s.reason.as_deref().unwrap_or("").contains("EnableNodeCliInspectArguments"));
-        // 루트의 실행기(stub)를 지정하면 최신 버전의 실제 실행 파일로
+        // the root's launcher (stub) maps to the latest version's real executable
         assert_eq!(inspect(&sq.join("SqApp.exe")).unwrap().exe, sq.join("app-1.10.0").join("SqApp.exe"));
-        // 도우미를 지정해도 본체로
+        // a helper maps to the main executable too
         assert_eq!(inspect(&sq.join("Update.exe")).unwrap().exe, sq.join("app-1.10.0").join("SqApp.exe"));
 
-        // 3) 한 단계 아래 커밋 이름 폴더
+        // 3) a commit-named folder one level down
         let nested = tmp.join("Nested");
         fake_app_dir(&nested.join("abcdef1234"), "Nested.exe", b"0001", json!({ "name": "OpenCode", "main": "main.js" }), None, true);
         fs::create_dir_all(nested.join("logs")).unwrap();
@@ -5067,7 +5171,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert_eq!(n.family, AppFamily::OpenCode);
         assert_eq!(n.bundle_id, "win.nested");
 
-        // 4) Electron 이 아닌 폴더 / 차단 목록 (실행 파일 이름)
+        // 4) a non-Electron folder / deny list (executable name)
         let not = tmp.join("NotElectron");
         fs::create_dir_all(not.join("resources/foo")).unwrap();
         fs::write(not.join("x.exe"), b"x").unwrap();
@@ -5083,7 +5187,8 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 이 PC 에 설치된 Electron 앱 (읽기 전용). Discord 가 있으면 퓨즈를 읽고 숨김 불가로 판정해야 한다.
+    /// Electron apps installed on this PC (read only). If Discord is present, its fuses must be read
+    /// and it must be judged not hideable.
     #[cfg(windows)]
     #[test]
     fn windows_installed_discord() {
@@ -5101,7 +5206,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let f = d.fuses.as_ref().expect("Discord 퓨즈");
         assert!(!f.inspect_allowed());
         assert!(!d.hideable);
-        // 두 번째 감지는 퓨즈 캐시 덕분에 빨라야 한다
+        // the second detection must be fast thanks to the fuse cache
         let t = Instant::now();
         let again = detect_apps();
         assert_eq!(again.len(), apps.len());
@@ -5112,7 +5217,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
     #[test]
     fn windows_peek_exit_and_kill_paths() {
         use crate::platform::proc::{group_pids, pid_alive, spawn_group};
-        // 종료 코드 표시 (회수하지 않고 확인)
+        // exit code shown (checked without reaping)
         let mut cmd = Command::new("cmd.exe");
         cmd.args(["/c", "exit 3"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let c = Arc::new(Mutex::new(Some(spawn_group(&mut cmd).unwrap())));
@@ -5129,7 +5234,8 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         ch.wait().unwrap();
         assert_eq!(peek_exit(&ch).as_deref(), Some("exit status: 0xc0000005"));
 
-        // 감시자의 강제 종료(kill_group_if_held): Job 의 손자까지 끝나고 Child 는 남아 있다 → 나중에 회수
+        // watchdog kill (kill_group_if_held): the Job's grandchildren end too and Child remains → reaped
+        // later
         let mut cmd = Command::new("cmd.exe");
         cmd.args(["/c", "ping -n 30 127.0.0.1 >NUL"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let child = spawn_group(&mut cmd).unwrap();
@@ -5149,7 +5255,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         ours.sort();
         pids.sort();
         assert_eq!(ours, pids);
-        // 콘솔 프로그램은 CREATE_NO_WINDOW 로 떠서 창이 없다 → 위반 없음
+        // console programs start with CREATE_NO_WINDOW and have no window → no violation
         assert!(scan_violation(pid, pid).is_none());
         assert!(child_alive(&c));
         kill_group_if_held(pid, pid, &c);
@@ -5183,7 +5289,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             running: false,
             launch_profile: String::new(),
         };
-        // 예약 장치 이름 + 아주 긴 한글 이름 (sun_path 한계는 Windows 에 없다)
+        // reserved device name + a very long Korean name (Windows has no sun_path limit)
         for name in ["CON", &"아주긴한글작업공간이름".repeat(6)] {
             let mut o = ElectronLaunch::new(fake.clone(), name, 1024, 768);
             o.workspaces_root = Some(tmp.join("ws"));
@@ -5200,17 +5306,17 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 실제 화면 정보로 계산한 화면 밖 좌표 (조회만 함)
+    /// Off-screen coordinates computed from the real display info (query only).
     #[cfg(windows)]
     #[test]
     fn windows_offscreen_dip_outside_monitors() {
         let mons = win_screen::monitors();
         if mons.is_empty() {
-            return; // 대화형 데스크톱이 없는 세션 (서비스 등)
+            return; // a session without an interactive desktop (services, …)
         }
         let (x, y) = win_screen::offscreen_dip();
         assert!(x > 0 && y > 0 && x < 24000 && y < 24000, "{x},{y}");
-        // 모든 모니터가 같은 배율이면 DIP × 배율 = 실제 픽셀이 모든 모니터 밖
+        // if all monitors share a scale, DIP × scale = real pixels outside every monitor
         let s = mons[0].1;
         if mons.iter().all(|m| (m.1 - s).abs() < 1e-6) {
             let px = ((x as f64 * s) as i32, (y as f64 * s) as i32);
@@ -5218,8 +5324,10 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         }
     }
 
-    /// 헤드리스 Chrome(빈 임시 프로필)으로 V8 정규식 의미 확인: 실제 CDP urlRegex 와 같은 엔진.
-    /// `cargo test -- --ignored breakpoint_regex_in_v8` 로 실행.
+    /// Checks V8 regex semantics with headless Chrome (empty temp profile): the same engine as the
+    /// real CDP urlRegex.
+    ///
+    /// Run with `cargo test -- --ignored breakpoint_regex_in_v8`.
     #[cfg(windows)]
     #[test]
     #[ignore]
@@ -5259,11 +5367,16 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         assert!(got.starts_with(&format!("{}:truetrue", serde_json::to_string(&want).unwrap())), "{got}");
     }
 
-    /// 실제 Electron 실행 파일로 Windows 경로를 확인한다 — **앱 코드는 한 줄도 실행하지 않는다**.
-    /// 빈 임시 프로필 + Job 으로 띄워 stderr 에서 Node 인스펙터 주소를 찾고(GUI 실행 파일), 메인 스크립트
-    /// 첫 줄에서 멈춘 상태로 중단점 정규식 일치·PATCH_JS 평가 결과(Windows 분기 포함)를 확인한 뒤
-    /// 재개하지 않고 Job 째 종료한다. 제품의 사전 감시자(40ms)가 함께 돌며 창이 보이거나 전경이 되면 즉시 종료한다.
-    /// 대상: GHOSTDESK_TEST_ELECTRON_EXE=<exe> 또는 인스펙터 퓨즈가 켜진 첫 감지 앱.
+    /// Checks the Windows path with a real Electron executable, **without running a single line of app
+    /// code**.
+    ///
+    /// Launches it with an empty temp profile inside a Job, finds the Node inspector address in stderr
+    /// (GUI executable), and while paused on the first line of the main script checks the breakpoint
+    /// regex match and the PATCH_JS evaluation result (Windows branches included), then ends the whole
+    /// Job without resuming. The product's pre-watcher (40 ms) runs alongside and kills it immediately
+    /// if a window becomes visible or takes the foreground. Target: GHOSTDESK_TEST_ELECTRON_EXE=<exe>
+    /// or the first detected app with the inspector fuse on.
+    ///
     /// `cargo test -- --ignored windows_live_patch_paused --nocapture`
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
@@ -5281,7 +5394,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let tmp = std::env::temp_dir().join(format!("gd-live-{}", std::process::id()));
         let mut o = ElectronLaunch::new(app.clone(), "live-paused", 1024, 700);
         o.workspaces_root = Some(tmp.clone());
-        let p = prepare_workspace(&o).unwrap(); // 빈 프로필 (복제하지 않음)
+        let p = prepare_workspace(&o).unwrap(); // empty profile (no clone)
         let (args, env) = launch_plan(&o, &p);
         let log = fs::File::create(tmp.join("app.log")).unwrap();
         let mut cmd = Command::new(&app.exe);
@@ -5347,7 +5460,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
                         let f = &e.params["callFrames"][0];
                         let url = scripts.get(f["location"]["scriptId"].as_str().unwrap_or_default()).cloned().unwrap_or_default();
                         let reason = e.params["reason"].as_str().unwrap_or_default().to_string();
-                        // 메인 스크립트가 아닌 곳에서 멈췄으면 재개하지 않고 실패 (앱 코드를 돌리지 않기 위해)
+                        // if it paused somewhere other than the main script, fail without resuming (so no app code runs)
                         ensure!(url_ends_with_ci(&url, &main), "메인 스크립트가 아닌 곳에서 멈춤: {url} ({reason})");
                         let hit = e.params["hitBreakpoints"].as_array().map(|a| a.iter().any(|b| b.as_str() == bp.as_deref())).unwrap_or(false);
                         let r = insp
@@ -5373,7 +5486,7 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
             }
         }
         .await;
-        // 재개하지 않고 Job 째 종료
+        // end the whole Job without resuming
         drop(stop);
         let pids = crate::platform::proc::group_pids(pid as u32).unwrap_or_default();
         terminate_and_reap(pid, pid, None, &c);
@@ -5401,8 +5514,11 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         p
     }
 
-    /// 헤드리스 Chrome(빈 임시 프로필)을 Job 으로 띄워 감시자 판정을 실제 프로세스·창 목록에서 확인한다.
-    /// 헤드리스라 보이는 창이 없으므로 위반이 없어야 한다. `cargo test -- --ignored windows_watchdog_headless`
+    /// Launches headless Chrome (empty temp profile) in a Job to check the watchdog's verdicts against
+    /// the real process and window lists.
+    ///
+    /// Headless means no visible window, so there must be no violation.
+    /// `cargo test -- --ignored windows_watchdog_headless`
     #[cfg(windows)]
     #[test]
     #[ignore]
@@ -5421,7 +5537,8 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let c = Arc::new(Mutex::new(Some(child)));
         let start = Instant::now();
         let mut max = 0;
-        // 감시자 경로(콘솔 창 숨기기·Windows Terminal 기록 포함)도 위반·메모가 없어야 한다
+        // the watchdog path (including console hiding and Windows Terminal recording) must produce no
+        // violations or notes either
         let side = WatchSide::new(Default::default());
         while start.elapsed() < Duration::from_secs(6) {
             max = max.max(win_screen::our_pids(pid).len());

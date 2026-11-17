@@ -1,20 +1,20 @@
-//! GhostDesk 가 쓰는 폴더·파일 위치.
+//! Where GhostDesk keeps its folders and files.
 //!
-//! | | macOS (기존과 같음) | Windows | Linux |
+//! | | macOS (unchanged) | Windows | Linux |
 //! |---|---|---|---|
-//! | 데이터 루트 | ~/Library/Application Support/GhostDesk | %LOCALAPPDATA%\GhostDesk | ~/.local/share/GhostDesk |
-//! | 로그 | ~/Library/Logs/GhostDesk | %LOCALAPPDATA%\GhostDesk\logs | <데이터 루트>/logs |
+//! | Data root | ~/Library/Application Support/GhostDesk | %LOCALAPPDATA%\GhostDesk | ~/.local/share/GhostDesk |
+//! | Logs | ~/Library/Logs/GhostDesk | %LOCALAPPDATA%\GhostDesk\logs | <data root>/logs |
 //!
-//! Windows 에서는 %APPDATA%(로밍)가 아니라 %LOCALAPPDATA% 를 쓴다: 복제한 브라우저 프로필은 수 GB 가
-//! 될 수 있고, 설정(자동 연결 등)도 이 컴퓨터의 설치 경로에 묶여 있어 다른 PC 로 옮겨 가면 안 된다.
-//! `dirs` 는 Windows 에서 SHGetKnownFolderPath 를 쓰므로, MCP 호스트가 환경변수를 지운 채
-//! 실행해도 같은 위치가 나온다.
+//! Windows uses %LOCALAPPDATA% rather than roaming %APPDATA%: cloned browser profiles can be
+//! several GB, and settings (auto-connect and the like) are tied to this machine's install path
+//! and must not roam to another PC. `dirs` uses SHGetKnownFolderPath on Windows, so the location
+//! is the same even when an MCP host launches us with a scrubbed environment.
 
 use std::path::{Path, PathBuf};
 
-/// GhostDesk 데이터 루트 (작업공간·설정·제어 소켓의 부모)
+/// GhostDesk data root (parent of workspaces, settings and the control socket).
 pub fn data_root() -> PathBuf {
-    // 시험·사진 찍기용: 사용자 설정을 건드리지 않게 따로 둔 폴더를 쓴다
+    // for tests and screenshots: use a separate folder so the user's settings are untouched
     if let Some(d) = std::env::var_os("GHOSTDESK_DATA_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(d);
     }
@@ -25,17 +25,17 @@ pub fn data_root() -> PathBuf {
     base.unwrap_or_else(std::env::temp_dir).join("GhostDesk")
 }
 
-/// 작업공간(복제된 프로필·앱 데이터) 루트
+/// Root for workspaces (cloned profiles, app data).
 pub fn workspaces_root() -> PathBuf {
     data_root().join("workspaces")
 }
 
-/// 앱 설정 파일 (자동 연결 등)
+/// App settings file (auto-connect and such).
 pub fn settings_path() -> PathBuf {
     data_root().join("settings.json")
 }
 
-/// 로그 폴더
+/// Log folder.
 pub fn logs_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -47,12 +47,13 @@ pub fn logs_dir() -> PathBuf {
     }
 }
 
-/// 실행 파일 이름 (설치·연결 설정에 쓰는 이름)
+/// Executable name, as used for installing and in connection configs.
 pub const EXE_NAME: &str = if cfg!(windows) { "ghostdesk.exe" } else { "ghostdesk" };
 
-/// `\\?\C:\...` 같은 verbatim 접두사를 (안전할 때만) 떼어 낸다.
-/// Windows 의 `canonicalize` 는 항상 verbatim 경로를 돌려주는데, 그대로 두면 다른 프로그램
-/// (Claude 앱·Codex·cmd.exe 등)이 인식하지 못하거나 사람이 읽기 어렵다.
+/// Strips a verbatim prefix like `\\?\C:\...`, but only when that's safe.
+///
+/// `canonicalize` on Windows always returns verbatim paths, which other programs (the Claude
+/// app, Codex, cmd.exe, …) may not understand and people find hard to read.
 pub fn simplify(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -61,7 +62,7 @@ pub fn simplify(p: &Path) -> PathBuf {
             return PathBuf::from(format!(r"\\{rest}"));
         }
         if let Some(rest) = s.strip_prefix(r"\\?\") {
-            // 드라이브 문자 경로이고 260자 제한 안이면 접두사를 떼도 의미가 같다
+            // a drive-letter path under the 260-char limit means the same thing without the prefix
             let b = rest.as_bytes();
             if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && rest.len() < 248 {
                 return PathBuf::from(rest);
@@ -75,12 +76,13 @@ pub fn simplify(p: &Path) -> PathBuf {
     }
 }
 
-/// `std::fs::canonicalize` 와 같지만 Windows 에서 verbatim 접두사를 붙이지 않는다.
+/// Like `std::fs::canonicalize`, but without the verbatim prefix on Windows.
 pub fn canonicalize(p: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(p).map(|c| simplify(&c))
 }
 
-/// 두 경로가 같은 파일을 가리키는가 (Windows·macOS 기본 파일 시스템은 대소문자 무시)
+/// Whether two paths point to the same file (the default Windows and macOS file systems are
+/// case-insensitive).
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let ca = canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
     let cb = canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
@@ -91,9 +93,10 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Windows 예약 장치 이름(CON, NUL, COM1 …)은 폴더 이름으로 쓸 수 없다.
-/// COM·LPT 뒤에는 0~9 와 위 첨자 ¹ ² ³ (U+00B9, U+00B2, U+00B3) 도 장치 이름이 된다.
-/// 위 첨자는 UTF-8 로 2바이트이므로 바이트가 아니라 글자 단위로 비교한다.
+/// Reserved Windows device names (CON, NUL, COM1, …) can't be used as folder names.
+///
+/// After COM and LPT, the digits 0–9 and the superscripts ¹ ² ³ (U+00B9, U+00B2, U+00B3) also
+/// form device names. The superscripts are two bytes in UTF-8, so compare characters, not bytes.
 pub fn is_reserved_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
     let cs: Vec<char> = stem.chars().collect();

@@ -1,12 +1,16 @@
-//! 에이전트가 일하는 동안 컴퓨터가 잠자기에 들어가지 않게 한다 (화면은 꺼지거나 잠겨도 된다).
+//! Keeps the computer from sleeping while agents work. The display may still turn off or lock.
 //!
-//! 화면이 잠기는 것 자체는 작업을 멈추지 않는다: 숨긴 브라우저·앱·원격 화면은 사용자 화면과 따로 돈다.
-//! 멈추게 하는 것은 (1) 일정 시간 뒤의 시스템 잠자기와 (2) macOS 가 뒤에 있는 앱을 느리게 하는 App Nap 이다.
-//! - macOS: `NSProcessInfo beginActivity(UserInitiated)` — 잠자기와 App Nap 을 함께 막고, 디스플레이 잠자기·잠금은 허용
-//! - Windows: `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` — 잠자기만 막고 화면 끄기·잠금은 허용
-//!   (부른 스레드에 묶이므로 늘 살아 있는 GUI 스레드에서 만들고 없앤다)
+//! A locked screen doesn't stop anything by itself: hidden browsers, apps and remote screens run
+//! independently of the user's display. What does stop them is (1) idle system sleep and (2)
+//! App Nap throttling background apps on macOS.
 //!
-//! 값을 들고 있는 동안만 막고, drop 하면 원래대로 돌아간다.
+//! - macOS: `NSProcessInfo beginActivity(UserInitiated)` prevents both sleep and App Nap while
+//!   still allowing display sleep and locking.
+//! - Windows: `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` prevents sleep only.
+//!   The state is tied to the calling thread, so it is created and dropped on the GUI thread,
+//!   which lives for the whole session.
+//!
+//! Sleep is blocked for as long as the value is held; dropping it restores the default.
 
 pub struct KeepAwake {
     #[cfg(target_os = "macos")]
@@ -14,7 +18,7 @@ pub struct KeepAwake {
 }
 
 impl KeepAwake {
-    /// 잠자기를 막기 시작한다. `reason` 은 macOS 의 `pmset -g assertions` 등에 보이는 설명.
+    /// Starts blocking sleep. `reason` is what macOS shows in `pmset -g assertions` and similar.
     pub fn start(reason: &str) -> Self {
         #[cfg(target_os = "macos")]
         {

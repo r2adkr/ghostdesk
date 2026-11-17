@@ -1,21 +1,25 @@
-//! `ghostdesk --mcp` — Claude 앱, Claude Code, Codex 같은 외부 에이전트용 MCP 서버 (stdio).
+//! `ghostdesk --mcp`: MCP server (stdio) for external agents like the Claude app, Claude Code
+//! and Codex.
 //!
-//! 외부 에이전트는 API 키 없이 GhostDesk 의 격리 화면(브라우저 / Mac·Windows 앱 / 원격 데스크톱)을
-//! 도구로 쓴다. 이 프로세스는 GhostDesk 창의 제어 연결(macOS/Linux: 유닉스 소켓, Windows: 명명 파이프)로
-//! 요청을 전달하는 얇은 다리이며, 창이 꺼져 있으면 자동으로 띄운다. 그래서 외부 에이전트가 하는 일을
-//! 사용자가 GhostDesk 창에서 가상 마우스로 지켜볼 수 있다.
+//! External agents use GhostDesk's isolated screens (browser / Mac and Windows apps / remote
+//! desktop) as tools, without an API key. This process is a thin bridge forwarding requests over
+//! the GhostDesk window's control connection (Unix socket on macOS/Linux, named pipe on Windows),
+//! and it launches the window if it isn't running. That way the user can watch what the external
+//! agent does, virtual mouse included, in the GhostDesk window.
 //!
-//! 주의: stdout 에는 JSON-RPC 메시지만 쓴다. 로그는 stderr 로.
-//! (시작할 때 진짜 stdout 을 따로 떼어 내고 fd 1(Windows: 표준 출력 핸들)을 stderr 로 돌려서,
-//! 실수로 println! 해도 섞이지 않는다.)
+//! Only JSON-RPC messages go to stdout; logs go to stderr. (At startup the real stdout is split
+//! off and fd 1 (Windows: the stdout handle) is pointed at stderr, so a stray `println!` can't
+//! corrupt the stream.)
 //!
-//! 구조:
-//! - stdin 에서 한 줄씩 읽고, tools/call 은 요청마다 task 로 돌린다. ping·tools/list 는 긴 호출이
-//!   진행 중이어도 곧바로 답한다. 응답은 stdout 전용 writer 하나로만 나간다.
-//! - GhostDesk 창과는 연결 하나만 유지하고(창은 연결이 끊기면 그 연결이 만든 화면을 닫는다),
-//!   요청 id 로 응답을 짝지어 여러 요청을 동시에 보낸다.
-//! - 연결이 끊기면 다음 호출 때 다시 연결한다(창이 꺼져 있으면 다시 띄움). 보내기 전에 끊긴 요청은
-//!   새 연결로 다시 보내지만, 보낸 뒤 끊긴 요청은 이미 실행되었을 수 있어 다시 보내지 않는다.
+//! Structure:
+//! - Reads stdin line by line and runs each tools/call as its own task. ping and tools/list are
+//!   answered right away even while long calls are in progress. Responses go out through a
+//!   single stdout writer.
+//! - Keeps a single connection to the GhostDesk window (the window closes screens created by a
+//!   connection when it drops) and multiplexes requests over it, matching responses by id.
+//! - A dropped connection is re-established on the next call (relaunching the window if it's
+//!   closed). Requests that failed before being sent are resent on the new connection; requests
+//!   lost after sending may already have run, so they aren't.
 
 use std::{
     collections::HashMap,
@@ -44,31 +48,33 @@ use crate::{
     },
 };
 
-/// 에이전트에게 알려 줄 이 OS 의 화면 종류·낱말 (도구 설명과 안내문을 만든다)
+/// This OS's screen kinds and wording, as told to agents (used to build tool descriptions and
+/// instructions).
 struct Plat {
-    /// "Mac 앱" / "Windows 앱"
+    /// "Mac 앱" / "Windows 앱".
     local_apps: &'static str,
-    /// 단축키 예시의 기본 수정키 ("cmd" / "ctrl")
+    /// Primary modifier in shortcut examples ("cmd" / "ctrl").
     primary_mod: &'static str,
-    /// app 인자 설명
+    /// Description of the `app` argument.
     app_hint: &'static str,
-    /// kind=app 을 쓸 수 있는가 (Electron 숨김 복제 또는 일반 앱)
+    /// Whether kind=app is available (hidden Electron clones or regular apps).
     app_kind: bool,
-    /// attach_running (실행 중인 사용자 앱 조작)
+    /// attach_running (driving the user's running app).
     attach: bool,
-    /// app_host (Windows 앱의 숨은 데스크톱·화면 밖 창 선택)
+    /// app_host (hidden desktop vs off-screen window for Windows apps).
     app_host: bool,
-    /// kind=session (별도 계정 세션)
+    /// kind=session (separate account session).
     session: bool,
-    /// kind=session 이 Windows 자식 세션(같은 계정)인가 — false 면 macOS 전용 계정 세션(account 인자)
+    /// Whether kind=session is a Windows child session (same account); false means the macOS
+    /// dedicated account session (`account` argument).
     child_session: bool,
-    /// virtual_display (가상 모니터)
+    /// virtual_display (virtual monitor).
     vdisplay: bool,
-    /// desk_open 의 dedicated_machine 설명
+    /// Description of desk_open's `dedicated_machine`.
     dedicated_hint: &'static str,
 }
 
-/// macOS 의 dedicated_machine 설명 (예전 그대로)
+/// macOS description of `dedicated_machine` (unchanged).
 const MAC_DEDICATED_HINT: &str = "remote: 대상이 에이전트 전용 Mac/VM 임을 사용자가 확인함";
 
 impl Plat {
@@ -80,7 +86,8 @@ impl Plat {
         } else {
             "app: 앱 이름(예: 'TextEdit', '계산기'), 번들 id 또는 .app 경로"
         },
-        // macOS 밖에서는 이 값이 '이 컴퓨터 자신의 VNC 서버' 보호도 푼다. 에이전트가 스스로 켜지 않게 분명히 적는다.
+        // outside macOS this also lifts the "this computer's own VNC server" protection, so say plainly
+        // that agents must not set it on their own
         dedicated_hint: if cfg!(target_os = "macos") {
             MAC_DEDICATED_HINT
         } else {
@@ -94,7 +101,7 @@ impl Plat {
         vdisplay: caps::VDISPLAY,
     };
 
-    /// macOS 의 값 (테스트에서 macOS 문구가 예전과 같은지 확인할 때 쓴다)
+    /// The macOS values (tests use them to check the macOS wording is unchanged).
     #[cfg(test)]
     const MAC: Plat = Plat {
         local_apps: "Mac 앱",
@@ -114,12 +121,13 @@ pub(crate) fn server_instructions() -> String {
     server_instructions_for(&Plat::CURRENT)
 }
 
-/// 이 OS 의 desk_open mode 목록 (연결 패키지의 스킬 문서용)
+/// This OS's desk_open modes (for the connection kit's skill doc).
 pub(crate) fn current_modes() -> Vec<(&'static str, String)> {
     modes(&Plat::CURRENT)
 }
 
-/// 이 OS 의 desk_open mode: (이름, 사용자에게 보여 줄 설명). 이름은 control.rs `apply_mode` 와 같아야 한다.
+/// This OS's desk_open modes: `(name, description shown to the user)`. Names must match
+/// `apply_mode` in control.rs.
 fn modes(pl: &Plat) -> Vec<(&'static str, String)> {
     let apps = pl.local_apps;
     let mut m = vec![
@@ -156,9 +164,10 @@ fn modes(pl: &Plat) -> Vec<(&'static str, String)> {
 fn server_instructions_for(pl: &Plat) -> String {
     let apps = pl.local_apps;
     let app_tools = if pl.app_kind { format!(", {apps}은 desk_app 으로 메뉴·접근성 요소를") } else { String::new() };
-    // 모드는 에이전트가 할 일에 맞게 스스로 고른다 (사용자에게 먼저 묻지 않는다). 민감한 모드는 GhostDesk 창의 승인 창이 지킨다.
-    // 사용자가 GhostDesk 를 말하지 않았어도 쓸 만한 일이면, 쓸지만 한 번 묻는다.
-    // 모드 목록은 desk_open 의 mode 설명에 한 번만 둔다.
+    // agents pick the mode themselves to fit the task (without asking the user first); sensitive
+    // modes are guarded by the approval dialog in the GhostDesk window. If the user didn't mention
+    // GhostDesk but it suits the task, ask once whether to use it. The mode list lives only in
+    // desk_open's mode description.
     format!(
         "사용자가 GhostDesk 를 말하지 않았더라도, 웹사이트나 앱 화면을 직접 눌러 보고 입력해야 하는 일(사이트에서 찾기·양식 채우기·화면 확인, 앱 조작 등)이고 \
          GhostDesk 로 하면 사용자의 화면·마우스를 빼앗지 않아 더 낫다고 판단되면, 시작하기 전에 \"GhostDesk 로 할까요?\" 처럼 한 문장으로 쓸지 물어보세요. \
@@ -283,10 +292,11 @@ fn tools_for(pl: &Plat) -> Value {
             "inputSchema": { "type": "object", "properties": { "desk_id": { "type": "string" } }, "required": ["desk_id"] }
         }
     ]);
-    // 이 OS 에서 쓸 수 없는 인자·도구는 알리지 않는다 (에이전트가 고른 뒤 승인 단계에서 실패하지 않게)
+    // don't advertise arguments or tools this OS can't use (so agents don't pick them and then fail
+    // at approval)
     if let Some(props) = t[0]["inputSchema"]["properties"].as_object_mut() {
         let drop: [(&str, bool); 2] = [
-            ("account", pl.session && !pl.child_session), // Windows 자식 세션은 같은 계정
+            ("account", pl.session && !pl.child_session), // Windows child sessions use the same account
             ("app", pl.app_kind),
         ];
         for (key, keep) in drop {
@@ -303,14 +313,15 @@ fn tools_for(pl: &Plat) -> Value {
     t
 }
 
-/// 제어 연결 호출 실패의 종류. 재시도해도 되는지가 여기서 갈린다.
+/// Kinds of control connection call failures; this decides whether retrying is safe.
 #[derive(Debug)]
 enum CallError {
-    /// 요청을 소켓에 쓰기 전에 연결이 이미 끊겨 있었다 → GhostDesk 쪽에서 실행되지 않았으므로 다시 보내도 안전
+    /// The connection was already gone before the request was written, so it never ran in GhostDesk
+    /// and is safe to resend.
     NotSent(String),
-    /// 요청을 보낸 뒤 응답을 받기 전에 연결이 끊겼다 → 이미 실행되었을 수 있다
+    /// The connection dropped after sending but before the response, so it may already have run.
     Lost(String),
-    /// 제어 서버가 돌려준 오류 (연결은 멀쩡함)
+    /// An error returned by the control server (the connection is fine).
     Remote(String),
 }
 
@@ -318,16 +329,18 @@ type Reply = std::result::Result<Value, String>;
 
 #[derive(Default)]
 struct Pending {
-    /// Some 이면 연결이 끊긴 이유 (더 이상 이 연결로 보내지 않는다)
+    /// Why the connection dropped, if it did (nothing more is sent on it).
     dead: Option<String>,
     map: HashMap<u64, oneshot::Sender<Reply>>,
 }
 
-/// GhostDesk 창의 제어 소켓 클라이언트 (연결 하나를 여러 요청이 id 로 나눠 쓴다).
+/// Client for the GhostDesk window's control socket (one connection shared by many requests,
+/// told apart by id).
 ///
-/// 제어 서버는 연결이 끊기면 그 연결이 만든 화면을 닫으므로, 요청마다 새 연결을 열지 않고
-/// 연결 하나를 유지한다. 응답은 리더 task 가 id 로 찾아 해당 요청에 넘기고(순서 무관),
-/// 쓰기는 전용 writer task 가 한 줄씩 통째로 쓴다(호출이 중간에 취소되어도 줄이 섞이지 않게).
+/// The control server closes a connection's screens when it drops, so one connection is kept
+/// rather than opening one per request. A reader task matches responses to requests by id (in
+/// any order), and a dedicated writer task writes whole lines (so a call cancelled midway can't
+/// interleave lines).
 struct Bridge {
     pending: Arc<PMutex<Pending>>,
     writes: mpsc::UnboundedSender<(String, oneshot::Sender<std::io::Result<()>>)>,
@@ -343,7 +356,8 @@ impl Drop for Bridge {
     }
 }
 
-/// 요청이 끝나기 전에 호출이 취소되면(notifications/cancelled) 대기 목록에서 지운다
+/// Removes the request from the pending list if the call is cancelled before it finishes
+/// (notifications/cancelled).
 struct PendingGuard<'a> {
     pending: &'a PMutex<Pending>,
     id: u64,
@@ -356,7 +370,8 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Bridge {
-    /// 연결 하나(읽기·쓰기 반쪽)로 브리지를 만든다. 소켓·명명 파이프 모두 `ipc` 가 상자에 담아 준다.
+    /// Builds a bridge on one connection (read and write halves). `ipc` boxes both sockets and named
+    /// pipes.
     fn new((rd, mut wr): (ipc::Reader, ipc::Writer)) -> Arc<Bridge> {
         let pending = Arc::new(PMutex::new(Pending::default()));
 
@@ -393,7 +408,7 @@ impl Bridge {
                     Err(e) => break e.to_string(),
                 }
             };
-            // 끊긴 표시와 대기 목록 비우기를 한 번에: 깨어난 요청은 이미 dead 가 설정된 상태를 본다
+            // mark dead and clear the pending list in one step: woken requests already see `dead` set
             let mut g = p.lock();
             g.dead.get_or_insert(why);
             g.map.clear();
@@ -407,7 +422,7 @@ impl Bridge {
                 let failed = r.as_ref().err().map(|e| e.to_string());
                 let _ = ack.send(r);
                 if let Some(e) = failed {
-                    // 큐에 남은 요청은 ack 가 버려져 '보내지 않음' 으로 처리된다
+                    // requests left in the queue have their ack dropped and count as "not sent"
                     let mut g = p.lock();
                     g.dead.get_or_insert(e);
                     g.map.clear();
@@ -464,10 +479,11 @@ impl Bridge {
     }
 }
 
-/// GUI 를 띄우는 함수 (테스트에서는 가짜 서버를 띄운다)
+/// Function that launches the GUI (tests launch a fake server).
 type Launcher = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
-/// 제어 연결 관리자: 끊기면 다음 호출 때 다시 연결하고, 창이 꺼져 있으면 띄운다.
+/// Control connection manager: reconnects on the next call after a drop, launching the window if
+/// it's closed.
 struct Conn {
     ep: ipc::Endpoint,
     launcher: Option<Launcher>,
@@ -480,7 +496,7 @@ struct ConnState {
     launched_at: Option<Instant>,
 }
 
-/// 응답을 못 받았어도 다시 보내도 되는 요청 (부작용 없음)
+/// Requests that are safe to resend even without a response (no side effects).
 fn idempotent(method: &str) -> bool {
     matches!(method, "hello" | "list")
 }
@@ -497,7 +513,8 @@ fn lost_message(method: &str, why: &str) -> String {
     }
 }
 
-/// 연결 실패를 사용자·에이전트에게 보여 줄 문구 (Unix 는 예전처럼 OS 오류 그대로)
+/// Text shown to the user and agent for a connection failure (Unix keeps the raw OS error, as
+/// before).
 fn connect_error_text(e: &ConnectError) -> String {
     match e {
         ConnectError::NotRunning(e) | ConnectError::Other(e) => e.to_string(),
@@ -510,8 +527,11 @@ impl Conn {
         Conn { ep, launcher, state: tokio::sync::Mutex::new(ConnState::default()) }
     }
 
-    /// 살아 있는 연결을 돌려준다. 없거나 끊겼으면 (필요하면 GUI 를 띄워서) 새로 연결한다.
-    /// 상태 잠금을 쥔 채 연결하므로 동시에 들어온 호출들이 창을 여러 번 띄우지 않는다.
+    /// Returns a live connection, connecting anew (launching the GUI if needed) when there is none
+    /// or it dropped.
+    ///
+    /// Connects while holding the state lock, so concurrent calls don't launch the window several
+    /// times.
     async fn bridge(&self) -> Result<Arc<Bridge>> {
         let mut st = self.state.lock().await;
         if let Some(b) = st.bridge.as_ref().filter(|b| !b.is_dead()) {
@@ -522,14 +542,14 @@ impl Conn {
         }
         let stream = match ipc::connect(&self.ep).await {
             Ok(s) => s,
-            // 연결 지점은 있지만 쓸 수 없다 (다른 사용자·관리자 권한의 창, 이름을 가로챈 프로그램):
-            // 창을 또 띄워도 소용없으므로 바로 알린다
+            // the endpoint exists but can't be used (another user's or an elevated window, or a program that
+            // grabbed the name): launching another window won't help, so report it right away
             Err(ConnectError::Denied(m)) => bail!("GhostDesk 창에 연결하지 못했습니다: {m}"),
             Err(first) => {
                 let Some(launch) = &self.launcher else {
                     bail!("GhostDesk 창에 연결하지 못했습니다 ({})", connect_error_text(&first));
                 };
-                // 방금 띄웠으면(아직 기동 중) 또 띄우지 않고 기다리기만 한다
+                // just launched (still starting up): wait instead of launching again
                 if st.launched_at.map_or(true, |t| t.elapsed() > Duration::from_secs(30)) {
                     launch()?;
                     st.launched_at = Some(Instant::now());
@@ -568,8 +588,10 @@ impl Conn {
         Ok(b)
     }
 
-    /// 제어 서버 요청. 연결이 끊겨 있었으면 다시 연결해 한 번 더 보낸다.
-    /// 단, 보낸 뒤에 끊긴 요청은 이미 실행되었을 수 있으므로 부작용이 없는 요청만 다시 보낸다.
+    /// A control server request. If the connection had dropped, reconnects and sends once more.
+    ///
+    /// Requests lost after sending may already have run, so only side-effect-free requests are
+    /// resent.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut retried = false;
         loop {
@@ -597,11 +619,13 @@ impl Conn {
 }
 
 
-/// GUI 를 백그라운드로 띄운다 (.app 번들 안이면 open 으로, 아니면 같은 실행 파일을 인자 없이).
+/// Launches the GUI in the background (with `open` inside an .app bundle, otherwise the same
+/// executable without arguments).
 ///
-/// Windows: 설치본(`install::stable_exe()`)이 있으면 그것을, 없으면 이 실행 파일을 띄운다.
-/// MCP 호스트와 분리해서(콘솔 없음·호스트의 Job 밖·사용자의 기본 환경변수) 띄우므로, 호스트가 MCP 서버를
-/// 끝내도 창은 남고 호스트의 파이프 핸들도 물려받지 않는다 (`run` 이 표준 핸들 상속을 미리 꺼 둔다).
+/// Windows: launches the installed copy (`install::stable_exe()`) if there is one, otherwise this
+/// executable. It's detached from the MCP host (no console, outside the host's Job, the user's
+/// default environment), so the window survives the host ending the MCP server and doesn't
+/// inherit the host's pipe handles (`run` turns off std handle inheritance beforehand).
 fn launch_gui() -> Result<()> {
     let exe = gui_exe()?;
     eprintln!("[ghostdesk-mcp] GhostDesk 창이 꺼져 있어 띄웁니다: {}", exe.display());
@@ -614,26 +638,29 @@ fn launch_gui() -> Result<()> {
         }
         _ => std::process::Command::new(&exe),
     };
-    // Windows: macOS 의 `open -g` 처럼 포커스를 빼앗지 않는 창으로 (이미 떠 있으면 그 창을 앞으로 가져오지 않고 끝난다)
+    // Windows: a window that doesn't take focus, like macOS's `open -g` (if one is already up, it
+    // just exits without bringing it forward)
     #[cfg(windows)]
     cmd.arg("--background");
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     if let Some(dir) = exe.parent() {
-        // MCP 호스트의 작업 폴더(사용자 프로젝트)를 창이 계속 붙잡고 있지 않게
+        // don't let the window keep the MCP host's working directory (the user's project) busy
         cmd.current_dir(dir);
     }
-    // Unix: 새 프로세스 그룹 (예전과 같음), Windows: DETACHED_PROCESS + Job 탈출 + 사용자 기본 환경
+    // Unix: a new process group (as before); Windows: DETACHED_PROCESS + Job breakaway + the user's
+    // default environment
     crate::platform::proc::spawn_detached(&mut cmd).context("GhostDesk 창 실행 실패")?;
     Ok(())
 }
 
-/// 띄울 GUI 실행 파일
+/// GUI executable to launch.
 fn gui_exe() -> Result<PathBuf> {
     let me = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
     #[cfg(windows)]
     {
-        // 연결 설정이 가리키는 설치본이 있으면 그것을 (임시 위치에서 돌던 사본이 창을 띄우지 않게)
+        // prefer the installed copy the connection config points at (so a copy running from a temp
+        // location doesn't launch the window)
         let installed = crate::install::stable_exe();
         if installed.is_file() {
             return Ok(installed);
@@ -650,7 +677,7 @@ fn image(b64: &str) -> Value {
     json!({ "type": "image", "data": b64, "mimeType": "image/png" })
 }
 
-/// 제어 서버 응답 → MCP 콘텐츠 블록
+/// Control server response → MCP content blocks.
 fn to_content(r: &Value, head: Option<String>) -> Vec<Value> {
     let mut c = Vec::new();
     let mut lines = Vec::new();
@@ -726,10 +753,10 @@ fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } })
 }
 
-/// 진행 중인 tools/call (요청 id 의 JSON 문자열 → (순번, 취소 핸들))
+/// tools/call requests in flight (request id as JSON string → (sequence, abort handle)).
 type InFlight = Arc<PMutex<HashMap<String, (u64, tokio::task::AbortHandle)>>>;
 
-/// tools/call 이 아닌 요청은 곧바로 답한다
+/// Answers anything other than tools/call right away.
 fn immediate_response(id: Value, method: &str, msg: &Value) -> Value {
     match method {
         "initialize" => {
@@ -749,11 +776,11 @@ fn immediate_response(id: Value, method: &str, msg: &Value) -> Value {
     }
 }
 
-/// MCP 서버 루프. 한 줄에 하나의 JSON-RPC 메시지를 읽고, 응답 줄은 `out` 으로 보낸다.
+/// The MCP server loop. Reads one JSON-RPC message per line and sends response lines to `out`.
 ///
-/// tools/call 은 각자 task 로 돌려서(승인 대기·wait 처럼 오래 걸리는 호출이 있어도) ping, tools/list,
-/// 다른 tools/call 이 막히지 않는다. 응답은 `out` 하나로만 나가므로 줄이 섞이지 않는다.
-/// 입력이 끝나면 진행 중인 호출이 끝날 때까지 기다렸다가 돌아온다.
+/// Each tools/call runs as its own task, so long calls (waiting for approval, `wait`) don't block
+/// ping, tools/list or other tools/call requests. Responses only go out through `out`, so lines
+/// never interleave. When input ends, waits for calls in progress to finish before returning.
 async fn serve<R>(input: R, out: mpsc::UnboundedSender<String>, conn: Arc<Conn>) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -784,7 +811,7 @@ where
                 continue;
             }
         };
-        // MCP 2025-06-18 부터 JSON-RPC 배치는 지원하지 않는다 → 배열 전체에 오류 하나로 답한다
+        // JSON-RPC batches aren't supported since MCP 2025-06-18, so answer the whole array with one error
         if msg.is_array() {
             send(rpc_error(Value::Null, -32600, "Invalid Request: batch not supported"));
             continue;
@@ -795,14 +822,14 @@ where
         };
         let id = obj.get("id").cloned();
         let Some(method) = obj.get("method").and_then(|m| m.as_str()).map(str::to_string) else {
-            // 우리가 보낸 요청에 대한 응답(result/error)이면 무시, 그 밖에 id 가 있으면 잘못된 요청
+            // ignore responses (result/error) to requests we sent; anything else with an id is invalid
             if let Some(id) = id.filter(|_| !obj.contains_key("result") && !obj.contains_key("error")) {
                 send(rpc_error(id, -32600, "Invalid Request: method 가 없습니다"));
             }
             continue;
         };
         let Some(id) = id else {
-            // 알림(notification)은 응답하지 않는다. 취소 알림이면 해당 호출을 멈춘다.
+            // notifications get no response; a cancel notification stops the matching call
             if method == "notifications/cancelled" {
                 let key = msg["params"]["requestId"].to_string();
                 if let Some((_, h)) = inflight.lock().remove(&key) {
@@ -830,7 +857,8 @@ where
         let task_key = key.clone();
         seq += 1;
         let my_seq = seq;
-        // 등록이 끝나기 전에 task 가 끝나 자기 항목을 지우지 못하는 일이 없도록 잠금을 쥔 채 spawn
+        // spawn while holding the lock, so the task can't finish and fail to remove its entry before it's
+        // registered
         let mut guard = inflight.lock();
         let handle = tasks.spawn(async move {
             let resp = match call_tool(&conn, &name, &args).await {
@@ -843,7 +871,7 @@ where
                     m.remove(&task_key);
                 }
             }
-            // 취소 알림을 받은 task 는 위의 await 지점에서 멈추므로 여기까지 오지 않는다
+            // a task that received a cancel stops at the await above and never gets here
             let _ = out.send(format!("{resp}\n"));
         });
         guard.insert(key, (my_seq, handle));
@@ -853,19 +881,20 @@ where
     Ok(())
 }
 
-/// 진짜 stdout 을 따로 떼어 내고, fd 1 은 stderr 로 돌린다.
-/// 그러면 어디선가 println! 이 불려도 JSON-RPC 스트림을 더럽히지 않는다.
+/// Splits off the real stdout and points fd 1 at stderr, so a `println!` anywhere can't corrupt
+/// the JSON-RPC stream.
 #[cfg(unix)]
 fn take_stdout() -> Result<std::fs::File> {
     use std::os::fd::FromRawFd;
-    // SAFETY: 표준 fd 를 복제·재지정할 뿐이며, 복제한 fd 는 여기서 만든 File 하나만 소유한다
+    // SAFETY: only duplicates and redirects std fds; the duplicated fd is owned solely by the File
+    // created here
     unsafe {
         let fd = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3);
         if fd < 0 {
             bail!("stdout 복제 실패: {}", std::io::Error::last_os_error());
         }
         if libc::dup2(2, 1) < 0 {
-            // stderr 가 닫혀 있는 등: 떠도는 출력은 버린다
+            // stderr closed or similar: discard stray output
             let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
             if null < 0 || libc::dup2(null, 1) < 0 {
                 let e = std::io::Error::last_os_error();
@@ -878,9 +907,11 @@ fn take_stdout() -> Result<std::fs::File> {
     }
 }
 
-/// Windows: 진짜 stdout 을 상속되지 않는 사본(DuplicateHandle)으로 떼어 내고,
-/// 표준 출력 핸들은 stderr(없으면 NUL)로 돌린다. Rust 의 println! 은 쓸 때마다 표준 출력 핸들을 다시 읽으므로
-/// 어디선가 println! 이 불려도 JSON-RPC 스트림을 더럽히지 않는다.
+/// Windows: splits off the real stdout as a non-inheritable duplicate (DuplicateHandle) and
+/// points the stdout handle at stderr (NUL if there is none).
+///
+/// Rust's `println!` rereads the stdout handle on every write, so a `println!` anywhere can't
+/// corrupt the JSON-RPC stream.
 #[cfg(windows)]
 fn take_stdout() -> Result<std::fs::File> {
     use std::os::windows::io::{AsHandle, IntoRawHandle};
@@ -888,13 +919,14 @@ fn take_stdout() -> Result<std::fs::File> {
     use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     let owned = std::io::stdout().as_handle().try_clone_to_owned().map_err(|e| anyhow!("stdout 복제 실패: {e}"))?;
     let file = std::fs::File::from(owned);
-    // SAFETY: 표준 핸들을 읽고 바꿀 뿐이다. NUL 핸들은 프로세스가 끝날 때까지 표준 출력으로 쓰므로 일부러 닫지 않는다.
+    // SAFETY: only reads and swaps std handles. The NUL handle serves as stdout until the process
+    // exits, so it's deliberately never closed.
     unsafe {
         let err = GetStdHandle(STD_ERROR_HANDLE);
         let target: HANDLE = if !err.is_null() && err != INVALID_HANDLE_VALUE {
             err
         } else {
-            // stderr 가 없는 등: 떠도는 출력은 버린다
+            // no stderr or similar: discard stray output
             match std::fs::OpenOptions::new().write(true).open("NUL") {
                 Ok(f) => f.into_raw_handle() as HANDLE,
                 Err(e) => bail!("stdout 재지정 실패: {e}"),
@@ -907,15 +939,16 @@ fn take_stdout() -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// MCP stdio 서버 본체
+/// The MCP stdio server.
 pub async fn run(_args: &[String]) -> Result<()> {
-    // Windows: MCP 호스트가 넘긴 표준 입출력 파이프가 GhostDesk 창(→ 브라우저 …)으로 상속되면, 이 프로세스가
-    // 끝나도 호스트가 EOF 를 받지 못한다. 무엇이든 띄우기 전에 상속을 끈다.
+    // Windows: if the stdio pipes the MCP host passed us are inherited by the GhostDesk window (→
+    // browsers, …), the host never sees EOF when this process ends. Turn inheritance off before
+    // launching anything.
     #[cfg(windows)]
     crate::platform::win::harden_std_handles();
     let mut stdout = take_stdout()?;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    // stdout 은 이 스레드 하나만 쓴다 (한 줄씩 통째로 쓰고 flush)
+    // only this thread writes stdout (whole lines, then flush)
     let writer = std::thread::spawn(move || {
         use std::io::Write;
         while let Some(line) = rx.blocking_recv() {
@@ -928,7 +961,7 @@ pub async fn run(_args: &[String]) -> Result<()> {
     let launcher: Launcher = Arc::new(launch_gui);
     let conn = Arc::new(Conn::new(control::endpoint(), Some(launcher)));
     let r = serve(tokio::io::stdin(), tx, conn).await;
-    // serve 가 보낸 응답을 다 쓸 때까지 기다린다 (tx 는 serve 와 함께 버려졌다)
+    // wait until every response from serve is written (tx was dropped along with serve)
     let _ = tokio::task::spawn_blocking(move || writer.join()).await;
     r
 }
@@ -936,7 +969,8 @@ pub async fn run(_args: &[String]) -> Result<()> {
 
 const SNIPPET_CLI_TITLE: &str = if cfg!(windows) { "Claude Code (터미널: 명령 프롬프트·PowerShell)" } else { "Claude Code (터미널)" };
 const SNIPPET_CLAUDE_APP_TITLE: &str = if cfg!(windows) {
-    // Windows 의 Claude 앱은 설치 방식(MSIX 등)에 따라 설정 파일 위치가 달라, 앱이 직접 열어 주는 메뉴로 안내한다
+    // on Windows the Claude app's config location depends on how it was installed (MSIX, …), so point
+    // to the menu that opens it directly
     "Claude 앱 (Settings > Developer > Edit Config 로 여는 claude_desktop_config.json 의 mcpServers 에 추가)"
 } else {
     "Claude 앱 (claude_desktop_config.json 의 mcpServers 에 추가)"
@@ -944,8 +978,8 @@ const SNIPPET_CLAUDE_APP_TITLE: &str = if cfg!(windows) {
 const SNIPPET_CODEX_TITLE: &str =
     if cfg!(windows) { r"Codex (%USERPROFILE%\.codex\config.toml 에 추가)" } else { "Codex (~/.codex/config.toml 에 추가)" };
 
-/// TOML 문자열 값. 따옴표·역슬래시가 없으면 예전처럼 "…", Windows 경로처럼 역슬래시가 있으면 '…'(리터럴),
-/// 그것도 안 되면 이스케이프한 "…".
+/// A TOML string value: "…" as before when there are no quotes or backslashes, '…' (literal)
+/// when there are backslashes like Windows paths, and an escaped "…" otherwise.
 fn toml_str(s: &str) -> String {
     let plain = |c: char| !c.is_control() || c == '\t';
     if !s.contains(['"', '\\']) && s.chars().all(plain) {
@@ -967,8 +1001,10 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// 연결 안내 (UI 와 README 에서 사용). `exe` 는 GhostDesk 실행 파일 경로.
-/// 경로는 JSON·TOML 규칙대로 이스케이프한다 (Windows 의 `C:\Users\…` 도 그대로 붙여 넣어 쓸 수 있게).
+/// Connection instructions (used by the UI and README). `exe` is the GhostDesk executable path.
+///
+/// The path is escaped per JSON and TOML rules (so Windows `C:\Users\…` paths can be pasted as
+/// is).
 pub fn setup_snippets(exe: &str) -> Vec<(&'static str, String)> {
     let json_exe = serde_json::to_string(exe).unwrap_or_else(|_| format!("\"{exe}\""));
     let toml_exe = toml_str(exe);
@@ -1014,7 +1050,7 @@ mod tests {
         let open = &t[0];
         let props = &open["inputSchema"]["properties"];
         assert_eq!(open["inputSchema"]["required"], json!(["mode"]));
-        // 옛 조합 인자는 알리지 않는다 (mode 하나로 고른다)
+        // the old combination arguments aren't advertised (a single `mode` picks)
         for gone in ["kind", "use_my_login", "app_host", "attach_running", "virtual_display"] {
             assert!(props.get(gone).is_none(), "{gone}");
         }
@@ -1024,16 +1060,16 @@ mod tests {
         assert_eq!(modes.contains(&"app_vdisplay".into()), caps::VDISPLAY);
         assert!(modes.contains(&"web".into()) && modes.contains(&"web_login".into()) && modes.contains(&"remote".into()));
         assert_eq!(props.get("account").is_some(), caps::SESSION && !cfg!(windows));
-        // mcp 와 control 의 mode 이름이 어긋나지 않게
+        // keep mode names in mcp and control in sync
         for m in mode_names(&Plat::CURRENT).iter().chain(mode_names(&Plat::MAC).iter()) {
             assert!(crate::control::MODES.contains(&m.as_str()), "{m}");
         }
         let mac = mode_names(&Plat::MAC);
         assert!(mac.contains(&"app_vdisplay".into()) && !mac.contains(&"app_current_session".into()));
         let ins = server_instructions();
-        // 모드는 묻지 않고 스스로 고르게 안내한다
+        // tells agents to pick the mode themselves without asking
         assert!(ins.contains("스스로 골라") && !ins.contains("어떤 모드로 할지") && ins.contains("mode"), "{ins}");
-        // GhostDesk 를 말하지 않아도 알맞은 일이면 쓸지 먼저 묻게 한다
+        // if GhostDesk wasn't mentioned but fits the task, ask first whether to use it
         assert!(ins.contains("GhostDesk 로 할까요?") && ins.contains("묻지 마세요"), "{ins}");
         if cfg!(windows) {
             assert!(modes.contains(&"app_current_session".into()) && modes.contains(&"app_running".into()));
@@ -1043,11 +1079,12 @@ mod tests {
             assert!(t[1]["description"].as_str().unwrap().contains("'ctrl+a'"));
             assert!(t[3]["description"].as_str().unwrap().contains("Windows 앱:"));
             let app = props["app"]["description"].as_str().unwrap();
-            // 앱 이름 예시는 시작 메뉴 바로 가기(.lnk) 이름으로 실제로 찾을 수 있는 것이어야 한다
+            // example app names must be findable by their Start menu shortcut (.lnk) names
             assert!(app.contains(".exe") && app.contains("'Character Map'") && !app.contains("문자표"), "{app}");
         }
         if !cfg!(target_os = "macos") {
-            // 이 컴퓨터 자신의 VNC 서버 보호도 풀리므로, 사용자가 말했을 때만 켜라고 적는다
+            // it also lifts the protection for this computer's own VNC server, so it says to set it only when
+            // the user says so
             let d = props["dedicated_machine"]["description"].as_str().unwrap();
             assert!(d.contains("직접 말했을 때만") && d.contains("이 컴퓨터 자신의 VNC 서버") && !d.contains("Mac"), "{d}");
         }
@@ -1071,7 +1108,7 @@ mod tests {
             assert_eq!(doc["mcp_servers"]["ghostdesk"]["command"].as_str(), Some(exe), "{}", s[2].1);
             assert_eq!(doc["mcp_servers"]["ghostdesk"]["env"]["GHOSTDESK_CLIENT_NAME"].as_str(), Some("Codex"));
         }
-        // macOS 경로는 예전과 글자 하나 다르지 않다
+        // macOS paths are unchanged to the character
         let mac = "/Users/a/Applications/GhostDesk.app/Contents/MacOS/ghostdesk";
         let s = setup_snippets(mac);
         assert_eq!(s[0].1, format!("claude mcp add ghostdesk -e GHOSTDESK_CLIENT_NAME=\"Claude Code\" -- \"{mac}\" --mcp"));
@@ -1086,7 +1123,7 @@ mod tests {
         }
         if cfg!(windows) {
             assert!(s[2].0.contains(r"%USERPROFILE%\.codex\config.toml"));
-            // Windows 경로는 읽기 쉬운 TOML 리터럴 문자열로
+            // Windows paths become readable TOML literal strings
             let w = setup_snippets(r"C:\Program Files\GhostDesk\ghostdesk.exe");
             assert!(w[2].1.contains(r"command = 'C:\Program Files\GhostDesk\ghostdesk.exe'"), "{}", w[2].1);
             assert!(w[1].1.contains(r#""command": "C:\\Program Files\\GhostDesk\\ghostdesk.exe""#), "{}", w[1].1);
@@ -1098,13 +1135,16 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::{io::AsyncWriteExt, sync::watch};
 
-        /// 가짜 제어 서버 (GhostDesk 창 대신). 요청마다 task 를 돌려 응답 순서가 요청 순서와 달라질 수 있다.
-        /// 실제와 같은 `ipc` 연결 지점(Unix: 임시 소켓, Windows: 명명 파이프) 위에서 돈다.
+        /// A fake control server (standing in for the GhostDesk window). Each request runs as a task, so
+        /// responses can arrive out of request order.
+        ///
+        /// Runs on the same `ipc` endpoint as the real thing (Unix: temp socket, Windows: named pipe).
         struct Fake {
             conns: Arc<AtomicUsize>,
             acts: Arc<AtomicUsize>,
             stop: watch::Sender<bool>,
-            /// Unix 는 멈출 때 소켓 파일을 지운다 (명명 파이프는 마지막 핸들이 닫히면 저절로 사라진다)
+            /// On Unix the socket file is removed on stop (a named pipe disappears by itself when its last
+            /// handle closes).
             #[cfg_attr(not(unix), allow(dead_code))]
             ep: ipc::Endpoint,
         }
@@ -1113,7 +1153,8 @@ mod tests {
             async fn start(ep: &ipc::Endpoint) -> Fake {
                 #[cfg(unix)]
                 let _ = std::fs::remove_file(ep.path());
-                // 앞서 멈춘 서버의 파이프 인스턴스가 아직 닫히는 중일 수 있어(Windows 의 첫 인스턴스 검사) 잠깐 다시 시도한다
+                // a previously stopped server's pipe instance may still be closing (Windows first-instance
+                // check), so retry briefly
                 let t0 = Instant::now();
                 let mut listener = loop {
                     match ipc::Listener::bind(ep).await {
@@ -1140,7 +1181,7 @@ mod tests {
                 Fake { conns, acts, stop, ep: ep.clone() }
             }
 
-            /// 동기 런처(GUI 띄우기 흉내) 안에서 쓰는 `start`
+            /// `start` for use inside the synchronous launcher (mimicking a GUI launch).
             fn start_blocking(ep: &ipc::Endpoint) -> Fake {
                 tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(Fake::start(ep)))
             }
@@ -1168,8 +1209,8 @@ mod tests {
                                 acts.fetch_add(1, Ordering::SeqCst);
                                 let input = &p["input"];
                                 match input["action"].as_str().unwrap_or("") {
-                                    // 요청을 받은 뒤 응답 없이 연결을 끊는다 (실행 도중 GUI 종료)
-                                    // (명명 파이프는 shutdown 으로 반쯤 닫히지 않으므로, 연결 task 가 두 반쪽을 모두 버려 닫는다)
+                                    // receive the request, then drop the connection without answering (GUI exiting mid-run). A named
+                                    // pipe can't be half-closed with shutdown, so the connection task drops both halves to close it.
                                     "drop" => {
                                         let _ = wr.lock().await.shutdown().await;
                                         let _ = kill.send(());
@@ -1191,7 +1232,8 @@ mod tests {
                 let _ = wr.lock().await.shutdown().await;
             }
 
-            /// GUI 종료 흉내: 모든 연결을 끊고 연결 지점을 없앤다 (Unix: 소켓 파일 삭제)
+            /// Mimics the GUI exiting: drops every connection and removes the endpoint (Unix: deletes the
+            /// socket file).
             fn stop(&self) {
                 let _ = self.stop.send(true);
                 #[cfg(unix)]
@@ -1205,7 +1247,8 @@ mod tests {
             }
         }
 
-        /// 테스트마다 다른 연결 지점 (Unix: 임시 폴더의 .sock, Windows: \\.\pipe\gdmcp-…-<SID>)
+        /// A different endpoint per test (Unix: .sock in a temp folder, Windows:
+        /// \\.\pipe\gdmcp-…-<SID>).
         pub(super) fn test_ep() -> ipc::Endpoint {
             static N: AtomicUsize = AtomicUsize::new(0);
             ipc::Endpoint::custom(&format!("gdmcp-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)))
@@ -1229,7 +1272,7 @@ mod tests {
             let (fast, fast_at) = fast;
             assert_eq!(fast.unwrap()["text"], "done B");
             assert!(fast_at < Duration::from_millis(300), "빠른 요청이 느린 요청에 막힘: {fast_at:?}");
-            // 제어 서버 오류는 연결을 끊지 않는다
+            // control server errors don't drop the connection
             let e = conn.call("act", json!({ "input": { "action": "fail" } })).await.unwrap_err();
             assert!(format!("{e}").contains("가짜 오류"));
             assert_eq!(conn.call("list", json!({})).await.unwrap()["desks"], json!([]));
@@ -1251,7 +1294,8 @@ mod tests {
             let conn = Conn::new(ep.clone(), Some(launcher));
             assert_eq!(conn.call("act", act("1", 0)).await.unwrap()["text"], "done 1");
 
-            // GUI 종료 → 브리지가 끊김을 알아챈 뒤, 다음 호출은 창을 다시 띄우고 재연결해서 성공해야 한다
+            // GUI exits → once the bridge notices, the next call must relaunch the window, reconnect and
+            // succeed
             first.stop();
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(conn.call("act", act("2", 0)).await.unwrap()["text"], "done 2");
@@ -1260,7 +1304,7 @@ mod tests {
             assert_eq!(second.conns.load(Ordering::SeqCst), 1);
             assert_eq!(second.acts.load(Ordering::SeqCst), 1);
 
-            // 연결 지점은 살아 있고 연결만 끊긴 경우(창은 켜져 있음)에는 다시 띄우지 않고 재연결만 한다
+            // endpoint alive and only the connection dropped (window still up): reconnect without relaunching
             let _ = second.stop.send(true);
             let third = Fake::start(&ep).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1278,7 +1322,7 @@ mod tests {
             let msg = format!("{e}");
             assert!(msg.contains("desk_list"), "{msg}");
             assert_eq!(fake.acts.load(Ordering::SeqCst), 1, "실행되었을 수 있는 요청을 다시 보내면 안 된다");
-            // 다음 호출은 새 연결로 정상 동작
+            // the next call works on a fresh connection
             assert_eq!(conn.call("act", act("again", 0)).await.unwrap()["text"], "done again");
             assert_eq!(fake.conns.load(Ordering::SeqCst), 2);
         }
@@ -1289,7 +1333,7 @@ mod tests {
             assert!(conn.call("list", json!({})).await.is_err());
         }
 
-        /// serve 를 띄우고 (입력 쓰기 핸들, 응답 수신기, serve 핸들) 을 돌려준다
+        /// Starts serve and returns `(input write handle, response receiver, serve handle)`.
         pub(super) fn start_serve(
             ep: &ipc::Endpoint,
         ) -> (tokio::io::DuplexStream, mpsc::UnboundedReceiver<String>, tokio::task::JoinHandle<Result<()>>) {
@@ -1336,7 +1380,7 @@ mod tests {
             let c = recv(&mut rx).await;
             assert_eq!(c["id"], 4, "빠른 호출이 느린 호출보다 먼저 끝나야 함: {c}");
             assert_eq!(c["result"]["content"][0]["text"], "done fast");
-            // 입력을 닫아도 진행 중인 호출의 응답은 보낸 뒤 끝난다
+            // closing input still lets in-flight calls send their responses before finishing
             drop(w);
             let d = recv(&mut rx).await;
             assert_eq!(d["id"], 1);
@@ -1360,7 +1404,7 @@ mod tests {
             let r = recv(&mut rx).await;
             assert_eq!(r["error"]["code"], -32700);
             assert_eq!(r["id"], Value::Null);
-            // 알림과 클라이언트가 보낸 응답에는 답하지 않는다
+            // notifications and responses sent by the client get no reply
             send_line(&mut w, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
             send_line(&mut w, r#"{"jsonrpc":"2.0","id":77,"result":{}}"#).await;
             send_line(&mut w, r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#).await;
@@ -1415,8 +1459,11 @@ mod tests {
         }
     }
 
-    /// Windows: take_stdout 뒤의 println! 은 stderr 로 가고, 떼어 낸 핸들로 쓴 것만 진짜 stdout 에 남는다.
-    /// (프로세스의 표준 핸들을 바꾸므로 이 테스트 실행 파일을 자식 프로세스로 다시 돌려서 확인한다)
+    /// Windows: after take_stdout, `println!` goes to stderr and only writes through the split-off
+    /// handle reach the real stdout.
+    ///
+    /// This changes the process's std handles, so it's checked by rerunning this test binary as a
+    /// child process.
     #[cfg(windows)]
     #[test]
     fn stray_prints_do_not_reach_stdout() {
@@ -1441,8 +1488,9 @@ mod tests {
         assert!(se.contains("STRAY-PRINT"), "stderr: {se}");
     }
 
-    /// Windows: run() 처럼 표준 핸들 상속을 끈 뒤 분리 실행한 자식(GUI 대역)은 호스트의 파이프를 물려받지 않는다.
-    /// 그래서 MCP 서버가 끝나는 즉시 호스트가 stdout EOF 를 받는다 (자식이 아직 살아 있어도).
+    /// Windows: a detached child (GUI stand-in) launched after turning off std handle inheritance,
+    /// as `run()` does, doesn't inherit the host's pipes. So the host gets stdout EOF as soon as the
+    /// MCP server ends, even while the child is still alive.
     #[cfg(windows)]
     #[test]
     fn launched_gui_does_not_inherit_host_pipes() {
@@ -1450,7 +1498,7 @@ mod tests {
         if std::env::var_os("GHOSTDESK_TEST_INHERIT").is_some() {
             crate::platform::win::harden_std_handles();
             let _out = take_stdout().unwrap();
-            // GUI 대신 3초쯤 살아 있는 콘솔 없는 프로세스
+            // a console-less process that lives about 3 s, standing in for the GUI
             let mut cmd = Command::new("cmd.exe");
             cmd.args(["/d", "/c", "ping -n 4 127.0.0.1 >NUL"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             crate::platform::proc::spawn_detached(&mut cmd).unwrap();
@@ -1475,7 +1523,8 @@ mod tests {
         assert!(eof_at < Duration::from_millis(2500), "자식이 호스트의 stdout 파이프를 물려받아 EOF 가 늦음: {eof_at:?}");
     }
 
-    /// stdio 서버 루프: initialize → (알림) → tools/list → ping. 창이 없어도 곧바로 답해야 한다.
+    /// stdio server loop: initialize → (notification) → tools/list → ping. Must answer right away
+    /// even without a window.
     #[tokio::test]
     async fn initialize_then_tools_list_over_stdio_loop() {
         use bridge::{recv, send_line, start_serve, test_ep};
@@ -1506,8 +1555,10 @@ mod tests {
         assert!(rx.recv().await.is_none(), "알림에는 답하지 않는다");
     }
 
-    /// `ghostdesk --mcp` 의 stdio 루프 → 실제 제어 서버(control.rs, GUI 없이)까지 한 번에.
-    /// 연결 지점은 실제와 같은 ipc 계층(Unix 소켓 / Windows 명명 파이프)이다.
+    /// The `ghostdesk --mcp` stdio loop end to end through the real control server (control.rs,
+    /// without a GUI).
+    ///
+    /// The endpoint is the same ipc layer as in production (Unix socket / Windows named pipe).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stdio_loop_to_real_control_server() {
         use bridge::{recv, send_line, start_serve, test_ep};
@@ -1519,13 +1570,13 @@ mod tests {
         let srv = ControlServer::new(ev_tx, eframe::egui::Context::default());
         let (srv2, ep2) = (srv.clone(), ep.clone());
         let server = tokio::spawn(async move { srv2.serve_on(&ep2).await });
-        // 연결을 받기 시작할 때까지
+        // until it starts accepting connections
         let t0 = Instant::now();
         while ipc::connect(&ep).await.is_err() {
             assert!(t0.elapsed() < Duration::from_secs(5), "제어 서버가 열리지 않음");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // 같은 연결 지점에 두 번째 창은 열 수 없다
+        // a second window can't open on the same endpoint
         let (tx2, _rx2) = mpsc::unbounded_channel();
         let dup = ControlServer::new(tx2, eframe::egui::Context::default()).serve_on(&ep).await.unwrap_err();
         assert!(format!("{dup:#}").contains("다른 GhostDesk 창"), "{dup:#}");
@@ -1543,7 +1594,7 @@ mod tests {
         assert_eq!(r["result"]["isError"], true);
         assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("찾을 수 없습니다"), "{r}");
         if !caps::SESSION {
-            // 지원하지 않는 종류는 승인 창 없이 바로 오류
+            // unsupported kinds error out right away without an approval dialog
             send_line(&mut w, &call(3, "desk_open", json!({ "kind": "session" }))).await;
             let r = recv(&mut rx).await;
             assert_eq!(r["result"]["isError"], true);
@@ -1551,7 +1602,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // 셸은 이름만으로 승인 창 없이 거부
+            // shells are refused by name alone, without an approval dialog
             send_line(&mut w, &call(4, "desk_open", json!({ "kind": "app", "app": "powershell" }))).await;
             let r = recv(&mut rx).await;
             assert_eq!(r["result"]["isError"], true);

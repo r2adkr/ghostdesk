@@ -1,12 +1,13 @@
-//! 설치된 Chromium 계열 브라우저와 프로필을 찾고, 프로필을 격리 작업공간으로 복제한다.
+//! Finds installed Chromium-based browsers and their profiles, and clones a profile into an
+//! isolated workspace.
 //!
-//! 원본 프로필은 읽기만 한다. 복제본은 같은 브라우저 바이너리로 실행되므로
-//! (macOS 에서는 같은 Keychain 항목으로, Windows 에서는 같은 사용자의 DPAPI·App-Bound 키로)
-//! 쿠키/로그인 세션이 그대로 복호화된다.
+//! The original profile is only read. The clone runs with the same browser binary (with the same
+//! Keychain item on macOS, and the same user's DPAPI / App-Bound key on Windows), so cookies and
+//! login sessions decrypt as is.
 //!
-//! Windows 에서는 브라우저가 실행 중이면 쿠키 DB(`Network\Cookies`)를 배타적으로 잠가 둔다.
-//! 이런 핵심 파일을 복사하지 못한 채 넘어가면 '로그아웃된' 복제본이 조용히 만들어지므로,
-//! 복제를 실패시키고(`CloneLocked`) 원본 브라우저를 완전히 종료하라고 알린다.
+//! On Windows a running browser holds an exclusive lock on its cookie DB (`Network\Cookies`).
+//! Skipping such a critical file would quietly produce a "logged out" clone, so the clone fails
+//! instead (`CloneLocked`) and the user is told to quit the original browser completely.
 
 use std::{
     fs,
@@ -17,9 +18,9 @@ use anyhow::{Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct ProfileInfo {
-    /// 폴더 이름 (예: "Default", "Profile 1")
+    /// Folder name (e.g. "Default", "Profile 1").
     pub dir: String,
-    /// 브라우저에 표시되는 이름
+    /// Name shown in the browser.
     pub name: String,
 }
 
@@ -62,14 +63,19 @@ fn candidates() -> Vec<(&'static str, PathBuf, PathBuf)> {
     v
 }
 
-/// Windows: 설치 위치 후보(시스템 전체·사용자별 설치)와 App Paths 레지스트리로 브라우저를 찾는다.
-/// 환경변수(ProgramFiles 등)는 MCP 호스트가 지운 채 실행할 수 있으므로 쓰지 않는다.
+/// Windows: finds browsers from candidate install locations (system-wide and per-user) and the
+/// App Paths registry key.
+///
+/// Environment variables (ProgramFiles, …) aren't used, since an MCP host may launch us with a
+/// scrubbed environment.
 #[cfg(windows)]
 mod win {
     use std::path::{Path, PathBuf};
 
-    /// (표시 이름, 설치 폴더 — Program Files 나 %LOCALAPPDATA% 기준, 실행 파일, 데이터 폴더 — %LOCALAPPDATA% 기준)
-    /// 실행 파일은 `<설치 루트>\<설치 폴더>\Application\<실행 파일>` 에 있다.
+    /// `(display name, install folder relative to Program Files or %LOCALAPPDATA%, executable, data
+    /// folder relative to %LOCALAPPDATA%)`.
+    ///
+    /// The executable lives at `<install root>\<install folder>\Application\<executable>`.
     pub(super) const BROWSERS: &[(&str, &str, &str, &str)] = &[
         ("Google Chrome", r"Google\Chrome", "chrome.exe", r"Google\Chrome\User Data"),
         ("Chrome Beta", r"Google\Chrome Beta", "chrome.exe", r"Google\Chrome Beta\User Data"),
@@ -87,7 +93,7 @@ mod win {
 
     pub(super) fn candidates() -> Vec<(&'static str, PathBuf, PathBuf)> {
         let local = dirs::data_local_dir().unwrap_or_default();
-        // 시스템 전체 설치(Program Files, Program Files (x86)) → 사용자별 설치(%LOCALAPPDATA%)
+        // system-wide installs (Program Files, Program Files (x86)) → per-user installs (%LOCALAPPDATA%)
         let mut roots = crate::platform::win::program_files_dirs();
         if !local.as_os_str().is_empty() {
             roots.push(local.clone());
@@ -106,8 +112,10 @@ mod win {
         p.to_string_lossy().replace('/', "\\").to_lowercase()
     }
 
-    /// `BROWSERS` 순서대로 찾은 실행 파일 경로.
-    /// 1) 설치 루트마다 표준 위치를 본다. 2) 못 찾은 것은 App Paths(다른 드라이브·사용자 지정 폴더 설치)로 채운다.
+    /// Executable paths found, in `BROWSERS` order.
+    ///
+    /// 1) Checks the standard location under each install root. 2) Fills in the rest from App Paths
+    /// (installs on other drives or in custom folders).
     pub(super) fn resolve(
         roots: &[PathBuf],
         app_path: &dyn Fn(&str) -> Option<PathBuf>,
@@ -128,11 +136,12 @@ mod win {
             if out.iter().flatten().any(|q| lower(q) == pl) {
                 continue;
             }
-            // 경로 끝(…\Google\Chrome Beta\Application\chrome.exe)으로 채널을 가린다
+            // tell the channel apart by the path's tail (…\Google\Chrome Beta\Application\chrome.exe)
             let by_suffix = BROWSERS.iter().position(|&(_, dir, e, _)| {
                 e == exe && pl.ends_with(&format!("\\{}", lower(&Path::new(dir).join("Application").join(e))))
             });
-            // 표준 폴더 구조가 아니면: 같은 실행 파일 이름 중 제품 이름이 맞는 것, 없으면 첫 번째(정식 채널)
+            // non-standard layout: same executable name with a matching product name, else the first
+            // (stable channel)
             let idx = by_suffix.or_else(|| {
                 let prod = product_name(&p).unwrap_or_default().to_lowercase();
                 BROWSERS
@@ -189,7 +198,7 @@ fn list_profiles(data_dir: &Path) -> Vec<ProfileInfo> {
     out
 }
 
-/// 복제에서 제외할 항목 (용량만 크고 로그인 상태와 무관한 캐시들)
+/// Entries left out of the clone (big caches unrelated to login state).
 const EXCLUDE: &[&str] = &[
     "Cache",
     "Code Cache",
@@ -212,11 +221,12 @@ const EXCLUDE: &[&str] = &[
     "Crashpad",
 ];
 
-/// 로그인 상태를 옮기는 데 꼭 필요한 파일 이름. 이 중 하나라도 **잠겨서** 복사하지 못하면
-/// 복제를 실패로 본다 (어느 깊이에 있든 이름으로 판단: Electron 의 Partitions/*/Cookies 등).
+/// File names essential for carrying over login state. If any of them is **locked** and can't be
+/// copied, the clone fails (matched by name at any depth, e.g. Electron's Partitions/*/Cookies).
 const CRITICAL_NAMES: &[&str] = &["Cookies", "Login Data", "Local State", "Preferences", "Secure Preferences", "Web Data"];
 
-/// 복사를 시작하기 전에 잠김을 미리 확인할 핵심 파일 위치 (복제 루트 기준)
+/// Locations of critical files to check for locks before copying starts (relative to the clone
+/// root).
 #[cfg(windows)]
 const CRITICAL_REL: &[&str] = &[
     "Network/Cookies",
@@ -231,12 +241,13 @@ const CRITICAL_REL: &[&str] = &[
 pub struct CloneStats {
     pub files: u64,
     pub bytes: u64,
-    /// 복사하지 못한 파일 수 (아래 `locked` 포함)
+    /// Files that couldn't be copied (including `locked` below).
     pub skipped: u64,
-    /// 그중 다른 프로그램이 잠그고 있어서(Windows 공유 위반·잠금 위반) 복사하지 못한 파일 수.
-    /// 핵심 파일이 잠긴 경우는 여기 들어가지 않고 복제 자체가 `CloneLocked` 로 실패한다.
+    /// Of those, files locked by another program (Windows sharing or lock violation).
+    ///
+    /// Locked critical files aren't counted here; the clone itself fails with `CloneLocked`.
     pub locked: u64,
-    /// 잠겨서 건너뛴 파일의 상대 경로 (앞의 몇 개만)
+    /// Relative paths of skipped locked files (only the first few).
     pub locked_paths: Vec<String>,
 }
 
@@ -245,7 +256,7 @@ impl CloneStats {
         CloneStats { files: 0, bytes: 0, skipped: 0, locked: 0, locked_paths: Vec::new() }
     }
 
-    /// 잠겨서 건너뛴 (핵심이 아닌) 파일이 있으면 진단용으로 남긴다
+    /// Logs any skipped (non-critical) locked files for diagnostics.
     fn report_locked(&self) {
         if self.locked > 0 {
             eprintln!(
@@ -257,18 +268,21 @@ impl CloneStats {
     }
 }
 
-/// 잠긴 파일 목록에 남길 최대 개수
+/// Maximum number of entries kept in the locked file list.
 const MAX_LOCKED_PATHS: usize = 20;
 
-/// 원본 브라우저(앱)가 실행 중이라 로그인에 꼭 필요한 파일이 잠겨 있어 복제할 수 없을 때의 오류.
-/// `anyhow::Error::downcast_ref::<CloneLocked>()` 로 구분할 수 있다.
+/// Error when critical login files are locked because the original browser (app) is running, so
+/// the profile can't be cloned.
+///
+/// Detect it with `anyhow::Error::downcast_ref::<CloneLocked>()`.
 #[derive(Debug)]
 pub struct CloneLocked {
-    /// 잠긴 핵심 파일 (복제 원본 기준 상대 경로)
+    /// The locked critical files (relative to the clone source).
     pub files: Vec<String>,
-    /// 파일을 쥐고 있는 프로그램 ("Google Chrome (pid 1234)"). 알아내지 못하면 빈 목록.
+    /// Programs holding the files ("Google Chrome (pid 1234)"). Empty if unknown.
     pub holders: Vec<String>,
-    /// 복사하다 만 폴더를 지우지 못했으면 (그 경로, 이유). 그 폴더는 로그인 정보가 빠진 불완전한 복제본이다.
+    /// `(path, reason)` if the partially copied folder couldn't be removed. That folder is an
+    /// incomplete clone missing login data.
     pub leftover: Option<(PathBuf, String)>,
 }
 
@@ -307,8 +321,10 @@ impl std::fmt::Display for CloneLocked {
 
 impl std::error::Error for CloneLocked {}
 
-/// Windows 공유 위반(32)·잠금 위반(33): 다른 프로그램이 파일을 배타적으로 열고 있다.
-/// (Unix 의 errno 32·33 은 EPIPE·EDOM 으로 뜻이 다르므로 Windows 에서만 본다)
+/// Windows sharing violation (32) or lock violation (33): another program has the file open
+/// exclusively.
+///
+/// Only checked on Windows; on Unix errno 32 and 33 are EPIPE and EDOM.
 fn is_lock_error(e: &std::io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33))
 }
@@ -317,15 +333,18 @@ fn is_critical(rel: &str) -> bool {
     rel.rsplit('/').next().map(|n| CRITICAL_NAMES.contains(&n)).unwrap_or(false)
 }
 
-/// 루트 기준 상대 경로("a/b")를 실제 경로로
+/// Root-relative path ("a/b") → real path.
 #[cfg(windows)]
 fn join_rel(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c))
 }
 
-/// 공유 모드를 모두 열고 읽기로 연다. 이것도 공유 위반이면 다른 프로그램이 배타적으로 잠근 것이다.
-/// (CopyFile(`fs::copy`)도 읽기·쓰기·삭제 공유로 원본을 열기 때문에, SQLite 처럼 공유로 열어 둔 파일은
-/// 그대로 복사되고 공유 없이 연 파일만 실패한다 — 그래서 복사는 `fs::copy` 그대로 쓴다)
+/// Opens for reading with every share mode. A sharing violation even then means another program
+/// locked it exclusively.
+///
+/// CopyFile (`fs::copy`) also opens the source with read/write/delete sharing, so files opened
+/// with sharing like SQLite databases copy fine and only files opened without sharing fail; that's
+/// why copying sticks with plain `fs::copy`.
 #[cfg(windows)]
 fn open_shared(src: &Path) -> std::io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -336,8 +355,10 @@ fn open_shared(src: &Path) -> std::io::Result<fs::File> {
         .open(src)
 }
 
-/// 복사를 시작하기 전에 핵심 파일이 잠겨 있는지 확인한다 (수 GB 를 복사한 뒤에야 실패하지 않게).
-/// 반환: (원본 경로, 표시용 상대 경로)
+/// Checks whether critical files are locked before copying starts (so it doesn't fail after
+/// copying several GB).
+///
+/// Returns `(source path, relative path for display)`.
 #[cfg(windows)]
 fn preflight(root: &Path, prefix: &str, skip: &dyn Fn(&str) -> bool) -> Vec<(PathBuf, String)> {
     CRITICAL_REL
@@ -356,7 +377,8 @@ fn preflight(root: &Path, prefix: &str, skip: &dyn Fn(&str) -> bool) -> Vec<(Pat
         .collect()
 }
 
-/// 잠긴 핵심 파일 목록 → 오류 (Windows 에서는 Restart Manager 로 쥐고 있는 프로그램 이름도 찾는다)
+/// Locked critical files → error (on Windows also finds the holding programs via Restart
+/// Manager).
 fn locked_error(locked: Vec<(PathBuf, String)>) -> anyhow::Error {
     let paths: Vec<PathBuf> = locked.iter().map(|(p, _)| p.clone()).collect();
     anyhow::Error::new(CloneLocked {
@@ -366,9 +388,12 @@ fn locked_error(locked: Vec<(PathBuf, String)>) -> anyhow::Error {
     })
 }
 
-/// 핵심 파일이 잠겨 복제가 실패했을 때: 복사하다 만 `dirs` 를 지우고 `CloneLocked` 오류를 만든다.
-/// 지우지 못한 폴더가 있으면 조용히 넘어가지 않고 오류(`leftover`)에 적는다 — 반쪽 복제본이 나중에
-/// 완성된 복제본처럼 쓰이지 않게 사용자에게 알린다. (`downcast_ref::<CloneLocked>()` 는 그대로 된다)
+/// When the clone failed on locked critical files: removes the partially copied `dirs` and builds
+/// the `CloneLocked` error.
+///
+/// A folder that can't be removed isn't passed over silently but recorded in the error
+/// (`leftover`), so the user knows and a half-clone is never used as if it were complete.
+/// (`downcast_ref::<CloneLocked>()` still works.)
 fn locked_error_cleanup(locked: Vec<(PathBuf, String)>, dirs: &[&Path]) -> anyhow::Error {
     let mut err = locked_error(locked);
     for d in dirs {
@@ -382,7 +407,8 @@ fn locked_error_cleanup(locked: Vec<(PathBuf, String)>, dirs: &[&Path]) -> anyho
     err
 }
 
-/// 파일을 열고 있는 프로세스 (Restart Manager: 이름과 pid 만 읽는다. 종료시키지 않는다)
+/// Processes holding a file open (Restart Manager: only reads names and pids, never terminates
+/// anything).
 #[cfg(windows)]
 fn lock_holders(paths: &[PathBuf]) -> Vec<String> {
     use crate::platform::win::{from_wide_buf, wide};
@@ -436,10 +462,11 @@ fn lock_holders(_paths: &[PathBuf]) -> Vec<String> {
     Vec::new()
 }
 
-/// `src_data_dir/<profile_dir>` 와 `Local State` 를 `dest` (새 user-data-dir) 로 복사한다.
+/// Copies `src_data_dir/<profile_dir>` and `Local State` into `dest` (a new user-data-dir).
 ///
-/// Windows 에서 원본 브라우저가 실행 중이라 쿠키 등 핵심 파일이 잠겨 있으면 `CloneLocked` 오류로
-/// 실패하고, 복사하던 프로필 폴더는 지운다 (로그아웃된 복제본이 완성된 것처럼 남지 않게).
+/// On Windows, if the original browser is running and critical files like cookies are locked,
+/// fails with `CloneLocked` and removes the partially copied profile folder (so a logged-out
+/// clone doesn't linger looking complete).
 pub fn clone_profile(
     src_data_dir: &Path,
     profile_dir: &str,
@@ -485,11 +512,11 @@ pub fn clone_profile(
     Ok(stats)
 }
 
-/// 폴더 전체를 복사한다 (원본은 읽기만 함). `exclude_rel` 은 루트 기준 상대 경로("a/b"),
-/// `exclude_names` 는 어느 깊이에 있든 이름이 같으면 제외할 항목이다. 심볼릭 링크·소켓은 건너뛴다.
+/// Copies a whole folder (the source is only read). `exclude_rel` holds root-relative paths
+/// ("a/b"); `exclude_names` are names excluded at any depth. Symlinks and sockets are skipped.
 ///
-/// 잠김 정책은 `clone_profile` 과 같다: 핵심 파일(쿠키 등)이 잠겨 있으면 `CloneLocked` 로 실패하고
-/// `dest` 를 지운다.
+/// Same locking policy as `clone_profile`: if critical files (cookies, …) are locked, fails with
+/// `CloneLocked` and removes `dest`.
 pub fn clone_dir(
     src: &Path,
     dest: &Path,
@@ -520,8 +547,8 @@ pub fn clone_dir(
     Ok(stats)
 }
 
-/// `critical` 에는 잠겨서 복사하지 못한 핵심 파일을 모은다. 하나라도 생기면 복제가 어차피 실패하므로
-/// 더 복사하지 않고 빠져나온다.
+/// `critical` collects critical files that couldn't be copied because they're locked. Once there
+/// is one the clone will fail anyway, so copying stops early.
 fn copy_tree(
     src: &Path,
     dst: &Path,
@@ -581,15 +608,18 @@ fn copy_tree(
     Ok(())
 }
 
-/// 앱 데이터 폴더 아래의 작업공간 루트
-/// (macOS: ~/Library/Application Support/GhostDesk/workspaces, Windows: %LOCALAPPDATA%\GhostDesk\workspaces)
+/// Workspace root under the app data folder (macOS:
+/// ~/Library/Application Support/GhostDesk/workspaces, Windows:
+/// %LOCALAPPDATA%\GhostDesk\workspaces).
 pub fn workspaces_root() -> PathBuf {
     crate::platform::paths::workspaces_root()
 }
 
-/// 작업공간 이름 → 폴더 이름. 글자·숫자·-·_ 만 남긴다.
-/// Windows 에서는 예약 장치 이름(CON, NUL, COM1 …)을 피하고, Chromium 내부 경로가 260자를 넘지 않게
-/// 길이를 줄인다 (줄였으면 원래 이름의 해시를 붙여 서로 다른 이름이 겹치지 않게).
+/// Workspace name → folder name, keeping only letters, digits, '-' and '_'.
+///
+/// On Windows it avoids reserved device names (CON, NUL, COM1, …) and shortens the name so
+/// Chromium's internal paths stay under 260 characters (a shortened name gets a hash of the
+/// original appended so different names don't collide).
 pub fn slug(name: &str) -> String {
     let s: String = name
         .chars()
@@ -601,14 +631,14 @@ pub fn slug(name: &str) -> String {
     s
 }
 
-/// Windows 작업공간 폴더 이름의 최대 글자 수
+/// Maximum length of a Windows workspace folder name.
 #[cfg(windows)]
 const SLUG_MAX: usize = 64;
 
 #[cfg(windows)]
 fn windows_safe_slug(name: &str, mut s: String) -> String {
     if s.chars().count() > SLUG_MAX {
-        // FNV-1a (원래 이름 전체)
+        // FNV-1a over the whole original name
         let mut h: u32 = 0x811c_9dc5;
         for b in name.bytes() {
             h ^= b as u32;
@@ -661,7 +691,7 @@ mod tests {
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
         fn tmp(tag: &str) -> PathBuf {
-            // 공백·한글이 들어간 경로에서도 동작해야 한다
+            // must work with paths containing spaces and Hangul
             let d = std::env::temp_dir().join(format!("ghostdesk 복제 {tag}-{}", std::process::id()));
             let _ = crate::platform::fsx::remove_dir_all_retry(&d);
             d
@@ -677,7 +707,7 @@ mod tests {
             fs::write(src.join("Default/Local Storage/leveldb/000003.log"), "ls").unwrap();
         }
 
-        /// 다른 프로그램이 공유 없이(share mode 0) 연 파일
+        /// A file opened by "another program" without sharing (share mode 0).
         fn hold_exclusive(p: &Path) -> fs::File {
             fs::OpenOptions::new().read(true).write(true).share_mode(0).open(p).unwrap()
         }
@@ -692,19 +722,20 @@ mod tests {
             let err = clone_profile(&src, "Default", &dst, &|_, _| {}).err().expect("잠긴 쿠키면 실패해야 함");
             let cl = err.downcast_ref::<CloneLocked>().expect("CloneLocked 오류여야 함");
             assert_eq!(cl.files, vec!["Default/Network/Cookies".to_string()]);
-            // Restart Manager 가 쥐고 있는 프로그램(= 이 테스트 프로세스)을 찾아야 한다
+            // Restart Manager must find the holder (= this test process)
             let me = format!("pid {})", std::process::id());
             assert!(cl.holders.iter().any(|h| h.ends_with(&me)), "holders: {:?}", cl.holders);
             let msg = err.to_string();
             assert!(msg.contains("Default\\Network\\Cookies") && msg.contains("완전히 종료"), "{msg}");
-            // 완성된 것처럼 보이는 복제본을 남기지 않는다
+            // no clone that looks complete is left behind
             assert!(!dst.join("Default").exists());
             assert!(!dst.join("Local State").exists());
             drop(_h);
             crate::platform::fsx::remove_dir_all_retry(&t).unwrap();
         }
 
-        /// 복사 도중(사전 확인 이후)에 핵심 파일이 잠겨 있는 경우: 예) Electron 의 Partitions/*/Cookies
+        /// A critical file locked during the copy (after the upfront check), e.g. Electron's
+        /// Partitions/*/Cookies.
         #[test]
         fn locked_cookies_mid_copy_fail_clone_dir() {
             let t = tmp("dir");
@@ -721,15 +752,15 @@ mod tests {
             assert_eq!(cl.files, vec!["Partitions/main/Network/Cookies".to_string()]);
             assert!(!dst.exists(), "실패한 복제본은 지워야 함");
             drop(_h);
-            // 잠금이 풀리면 정상 복제
+            // once the lock is released the clone succeeds
             let st = clone_dir(&src, &dst, &[], &[], &|_, _| {}).unwrap();
             assert_eq!(st.files, 3);
             assert!(dst.join("Partitions/main/Network/Cookies").exists());
             crate::platform::fsx::remove_dir_all_retry(&t).unwrap();
         }
 
-        /// 잠긴 핵심 파일로 실패한 뒤 복사하다 만 폴더를 지우지 못하면, 조용히 넘어가지 않고 오류에 적는다
-        /// (CloneLocked 로 구분되는 것은 그대로)
+        /// If the partial folder can't be removed after failing on a locked critical file, it's recorded
+        /// in the error instead of passed over (still detectable as CloneLocked).
         #[test]
         fn failed_cleanup_is_reported() {
             let t = tmp("cleanup");
@@ -738,7 +769,7 @@ mod tests {
             fs::write(src.join("Preferences"), "{}").unwrap();
             fs::write(src.join("Partitions/main/Network/Cookies"), "c").unwrap();
             let _h = hold_exclusive(&src.join("Partitions/main/Network/Cookies"));
-            // 다른 프로그램(백신 등)이 복제본 안의 파일을 지울 수 없게 쥐고 있는 상황
+            // another program (antivirus, …) holds a file inside the clone so it can't be deleted
             let dst = t.join("dst");
             fs::create_dir_all(&dst).unwrap();
             fs::write(dst.join("held"), "x").unwrap();
@@ -749,7 +780,7 @@ mod tests {
             assert_eq!(cl.leftover.as_ref().map(|(p, _)| p.as_path()), Some(dst.as_path()));
             let msg = err.to_string();
             assert!(msg.contains("지우지 못했습니다") && msg.contains("불완전한 복제본"), "{msg}");
-            // 지울 수 있으면 leftover 가 없다 (기존 동작)
+            // when it can be deleted there's no leftover (existing behavior)
             drop(_d);
             let err = clone_dir(&src, &dst, &[], &[], &|_, _| {}).err().expect("실패해야 함");
             assert!(err.downcast_ref::<CloneLocked>().unwrap().leftover.is_none());
@@ -758,7 +789,7 @@ mod tests {
             crate::platform::fsx::remove_dir_all_retry(&t).unwrap();
         }
 
-        /// 핵심이 아닌 파일이 잠겨 있으면 건너뛰고 따로 센다
+        /// Locked non-critical files are skipped and counted separately.
         #[test]
         fn locked_noncritical_is_counted() {
             let t = tmp("lock");
@@ -776,7 +807,8 @@ mod tests {
             crate::platform::fsx::remove_dir_all_retry(&t).unwrap();
         }
 
-        /// SQLite 처럼 읽기·쓰기 공유로 열어 둔 파일(History·Web Data·Login Data 등)은 잠김이 아니다: 그대로 복사된다
+        /// Files opened with read/write sharing like SQLite (History, Web Data, Login Data, …) aren't
+        /// locked; they're copied as is.
         #[test]
         fn shared_open_file_is_copied() {
             let t = tmp("shared");
@@ -810,7 +842,7 @@ mod tests {
             assert_eq!(a.chars().count(), SLUG_MAX);
             assert_ne!(a, b, "앞부분이 같아도 서로 다른 이름은 다른 폴더");
             assert_eq!(slug(&long_a), a, "같은 이름은 항상 같은 폴더");
-            // 이미 줄인 이름을 다시 넣어도 그대로 (control.rs 처럼 slug 를 두 번 거치는 경우)
+            // an already shortened name passes through unchanged (slug applied twice, as in control.rs)
             assert_eq!(slug(&a), a);
             let short = "a".repeat(SLUG_MAX);
             assert_eq!(slug(&short), short);
@@ -830,7 +862,7 @@ mod tests {
             let chrome = mk(pf.join(r"Google\Chrome\Application\chrome.exe"));
             let canary = mk(local.join(r"Google\Chrome SxS\Application\chrome.exe"));
             let edge = mk(pf.join(r"Microsoft\Edge\Application\msedge.exe"));
-            // 사용자 지정 위치 (App Paths 로만 찾을 수 있음)
+            // custom location (only findable through App Paths)
             let brave = mk(other.join(r"Apps\Brave\brave.exe"));
             let beta = mk(other.join(r"Google\Chrome Beta\Application\chrome.exe"));
             let roots = vec![pf.clone(), local.clone()];
@@ -855,7 +887,8 @@ mod tests {
             crate::platform::fsx::remove_dir_all_retry(&t).unwrap();
         }
 
-        /// 실제 설치 탐색: 실행 파일 경로만 확인한다 (사용자 프로필·Local State 는 읽지 않음)
+        /// Real install discovery: only checks executable paths (never reads user profiles or Local
+        /// State).
         #[test]
         fn real_candidates_are_sane() {
             let c = candidates();

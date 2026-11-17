@@ -1,9 +1,9 @@
-//! 에이전트 하나 = 격리 화면(Desk) 하나 + AI 대화 루프 하나.
+//! One agent = one isolated screen (`Desk`) + one AI conversation loop.
 //!
-//! - prompt: 시스템 프롬프트
-//! - workspace: 화면 준비 (브라우저·앱·원격·세션)
-//! - tools: 도구 호출 실행
-//! - history: 대화 기록을 작게 유지 (스크린샷 정리·중복 생략·새 구간 요약)
+//! - prompt: system prompt
+//! - workspace: screen setup (browser, app, remote, session)
+//! - tools: tool call execution
+//! - history: keeps the conversation small (screenshot pruning, dedup, segment summaries)
 
 mod history;
 mod prompt;
@@ -39,7 +39,8 @@ pub(crate) use tools::{coord, describe, exec_computer, exec_desk_tool};
 pub(crate) use workspace::local_vnc_refusal;
 pub(crate) use workspace::prepare_workspace_with;
 
-/// 화면 기록으로 남길 최대 줄 수. 넘으면 오래된 것부터 LOG_DRAIN 줄씩 버린다 (오래 돌아도 메모리가 늘지 않게)
+/// Maximum number of log rows kept for display. Beyond that the oldest LOG_DRAIN rows are
+/// dropped, so memory doesn't grow on long runs.
 const LOG_CAP: usize = 2000;
 const LOG_DRAIN: usize = 500;
 
@@ -71,35 +72,39 @@ pub struct LogEntry {
 }
 
 pub enum AgentCmd {
-    /// 추가 지시 (실행 중이면 다음 턴에 합류, 대기 중이면 대화 재개)
+    /// A further instruction (joins the next turn while running, resumes the conversation while
+    /// waiting).
     Instruction(String),
-    /// ask_user 에 대한 답
+    /// Answer to `ask_user`.
     Answer(String),
-    /// 대기열(shared.queue)에 새 작업이 들어왔음을 알림
+    /// A new task was added to the queue (`shared.queue`).
     Wake,
 }
 
 #[derive(Clone)]
 pub enum ProfileSource {
-    /// 원본 브라우저 프로필 복제 (로그인 상태 유지)
+    /// Clones the original browser profile (keeps logins).
     Clone { browser: InstalledBrowser, profile_dir: String, refresh: bool },
-    /// 빈 프로필
+    /// Empty profile.
     Empty { browser: InstalledBrowser },
 }
 
-/// 원격 데스크톱(RFB/VNC) 대상
+/// A remote desktop (RFB/VNC) target.
 #[derive(Clone)]
 pub struct RemoteTarget {
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
-    /// 대상이 macOS 화면 공유 서버일 때, 그 Mac 이 에이전트 전용(VM/별도 Mac)임을 사용자가 확인했는가.
-    /// macOS 밖에서는 이 컴퓨터 자신의 VNC 서버(루프백·자기 인터페이스 주소)에 접속할 때도 이 확인이 필요하다.
+    /// For a macOS Screen Sharing server: whether the user confirmed that Mac is dedicated to the
+    /// agent (a VM or separate Mac).
+    ///
+    /// Outside macOS this confirmation is also required to connect to this machine's own VNC server
+    /// (loopback or one of its own interface addresses).
     pub dedicated_ack: bool,
 }
 
-/// 에이전트가 조작할 격리 화면의 종류와 설정
+/// The kind of isolated screen the agent drives, and its settings.
 #[derive(Clone)]
 pub enum DeskTarget {
     Browser {
@@ -110,18 +115,18 @@ pub enum DeskTarget {
         start_url: String,
     },
     Remote(RemoteTarget),
-    /// 숨김 실행 Electron 앱 (빈 프로필 또는 사용자 동의 하의 userData 복제)
+    /// A hidden-launched Electron app (empty profile, or a userData clone with the user's consent).
     Electron {
         app: crate::electron::ElectronApp,
         profile: crate::electron::ElectronProfile,
         width: u32,
         height: u32,
     },
-    /// macOS 앱을 숨긴 채 조작
+    /// Drives macOS apps while they stay hidden.
     Native(crate::native::NativeOptions),
-    /// 실험: 가상 디스플레이 위에서 macOS 앱 실행 (사용자 동의 필요)
+    /// Experimental: runs macOS apps on a virtual display (needs the user's consent).
     VDisplay(crate::vdisplay::VirtualDisplayOptions),
-    /// 전용 에이전트 계정의 별도 로그인 세션 (RDP 방식)
+    /// A separate login session of a dedicated agent account (RDP-style).
     Session { account: String },
 }
 
@@ -132,7 +137,8 @@ pub struct AgentConfig {
     pub task: String,
     pub target: DeskTarget,
     pub max_steps: u64,
-    /// 사람에게 답할 언어 (영어 이름: "Korean", "English" …) — 화면 언어를 따른다
+    /// Language to address the user in (English name: "Korean", "English", …), following the UI
+    /// language.
     pub reply_lang: &'static str,
     pub llm: Llm,
 }
@@ -145,24 +151,26 @@ pub struct AgentShared {
     pub log: Mutex<Vec<LogEntry>>,
     pub frame: Mutex<Option<egui::ColorImage>>,
     pub frame_seq: AtomicU64,
-    /// 아직 디코딩하지 않은 최신 프레임 / 디코더 실행 중 여부
+    /// Latest frame not yet decoded / whether the decoder is running.
     pending_frame: Mutex<Option<Vec<u8>>>,
     decoding: AtomicBool,
     pub workspace: Mutex<Option<Desk>>,
     pub paused: AtomicBool,
-    /// 화면에 그릴 가상 마우스 상태 (에이전트/사용자 동작 기록)
+    /// Virtual mouse state to draw (recorded agent and user actions).
     pub cursor: Mutex<crate::cursor::CursorState>,
-    /// 현재 작업이 끝나면 차례로 이어서 실행할 작업들
+    /// Tasks to run one after another once the current one finishes.
     pub queue: Mutex<std::collections::VecDeque<String>>,
-    /// 외부(MCP) 에이전트가 조작하는 화면이면 그 클라이언트 설명 (LLM 루프 없음)
+    /// Client description when an external (MCP) agent drives this screen (no LLM loop).
     pub external: Mutex<Option<String>>,
-    /// 현재 배치 이후 멈추고 지시를 기다리게 한다 (대화 맥락은 유지)
+    /// Stop after the current batch and wait for instructions (conversation context is kept).
     pub stop: AtomicBool,
-    /// GUI 에서 '제거'됨. 준비 중이던 화면은 준비가 끝나는 즉시 닫아야 한다 (외부 화면 포함)
+    /// Removed in the GUI. A screen still being prepared must close as soon as it's ready (external
+    /// screens too).
     pub removed: AtomicBool,
     pub tokens: Mutex<(u64, u64)>,
     pub steps: AtomicU64,
-    /// 마지막 지시 뒤로 쓴 단계 (최대 단계에 닿으면 멈춘다 — 화면의 진행 막대)
+    /// Steps used since the last instruction (stops at the step limit; drives the on-screen progress
+    /// bar).
     pub run_steps: AtomicU64,
     pub ctx: egui::Context,
     started: Instant,
@@ -218,7 +226,7 @@ impl AgentShared {
         self.workspace.lock().clone()
     }
 
-    /// 원시 RGBA 프레임을 라이브 화면으로 올린다.
+    /// Pushes a raw RGBA frame to the live screen.
     pub fn push_rgba(&self, w: u32, h: u32, rgba: &[u8]) {
         if w == 0 || h == 0 || rgba.len() < (w * h * 4) as usize {
             return;
@@ -229,12 +237,13 @@ impl AgentShared {
         self.ctx.request_repaint();
     }
 
-    /// 인코딩된 프레임(PNG/JPEG)을 라이브 화면으로 올린다.
-    /// 프레임이 몰려도 가장 최신 것 하나만 백그라운드 스레드에서 디코딩한다 (latest-wins).
+    /// Pushes an encoded frame (PNG/JPEG) to the live screen.
+    ///
+    /// When frames pile up, only the latest one is decoded on a background thread (latest wins).
     pub fn push_frame(self: &Arc<Self>, bytes: &[u8]) {
         *self.pending_frame.lock() = Some(bytes.to_vec());
         if self.decoding.swap(true, Ordering::AcqRel) {
-            return; // 이미 디코더가 돌고 있으면 그쪽이 최신 프레임을 가져간다
+            return; // a decoder already running will pick up the latest frame
         }
         let me = self.clone();
         let work = move || me.decode_pending();
@@ -251,7 +260,7 @@ impl AgentShared {
             let next = self.pending_frame.lock().take();
             let Some(bytes) = next else {
                 self.decoding.store(false, Ordering::Release);
-                // 플래그를 내린 사이에 새 프레임이 들어왔으면 다시 맡는다
+                // a new frame arrived while the flag was down, so take it on again
                 if self.pending_frame.lock().is_some() && !self.decoding.swap(true, Ordering::AcqRel) {
                     continue;
                 }
@@ -278,8 +287,8 @@ pub async fn run_agent(shared: Arc<AgentShared>, cfg: AgentConfig, mut rx: mpsc:
 
 async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<()> {
     let ws = workspace::prepare_workspace(shared, &cfg.workspace, &cfg.target).await?;
-    // 준비 중에 '제거'됐으면 보이지 않는 화면을 남기지 않는다.
-    // (remove_agent 는 removed 를 먼저 세운 뒤 같은 락으로 take 하므로 둘 중 한쪽만 화면을 가진다)
+    // removed while preparing: don't leave an invisible screen behind. (remove_agent sets `removed`
+    // first and then takes under the same lock, so exactly one side ends up with the screen.)
     let stored = {
         let mut slot = shared.workspace.lock();
         if shared.removed.load(Ordering::SeqCst) {
@@ -294,19 +303,20 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         return Ok(());
     }
     let _ = ws.screenshot().await;
-    // 도구 목록과 시스템 프롬프트는 대화 내내 고정한다 (캐시/사고 블록 보존을 위해)
+    // tools and system prompt stay fixed for the whole conversation (keeps the cache and thinking
+    // blocks valid)
     let system = prompt::system_prompt(ws.kind(), cfg.reply_lang);
     let tools = Llm::tools(ws.kind());
 
     let mut messages: Vec<Value> = Vec::new();
-    // messages 를 직렬화했을 때의 대략적인 크기 (요청 본문 크기 추적용)
+    // rough serialized size of `messages` (to track request body size)
     let mut msg_bytes: usize = 0;
-    // 원래 작업과 이후 지시 (새 대화 구간을 시작할 때 요약에 넣는다)
+    // original task and later instructions (go into the summary when a new segment starts)
     let mut instructions: Vec<String> = Vec::new();
     let mut pending: Vec<Value> = Vec::new();
-    // 이미 보낸 화면·창 목록 (같으면 다시 보내지 않는다)
+    // screens and window lists already sent (not resent if unchanged)
     let mut seen = Seen::default();
-    // 직전 요청이 너무 길어(토큰) 다음 턴에 새 대화 구간을 시작해야 하는가
+    // whether the last request got too long (tokens) and the next turn must start a new segment
     let mut too_long = false;
     if !cfg.task.trim().is_empty() {
         remember(&mut instructions, &cfg.task);
@@ -316,11 +326,12 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
     }
     let mut steps_since_input: u64 = 0;
     let mut wait_reason = String::from("지시를 입력하세요");
-    // 직전 AI API 호출이 실패해 지시를 기다려야 하는가 (보내지 못한 턴은 pending 에 남아 있다)
+    // whether the last AI API call failed and we must wait for an instruction (the unsent turn stays
+    // in `pending`)
     let mut llm_failed = false;
 
     loop {
-        // 실행 중 들어온 추가 지시는 다음 user 메시지에 합류
+        // instructions that arrive mid-run join the next user message
         while let Ok(cmd) = rx.try_recv() {
             if let AgentCmd::Instruction(t) | AgentCmd::Answer(t) = cmd {
                 remember(&mut instructions, &t);
@@ -332,12 +343,12 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         }
 
         let stopped = shared.stop.swap(false, Ordering::SeqCst);
-        // max_steps == 0 이면 단계 제한 없이 계속 진행
+        // max_steps == 0 means no step limit
         let limit_hit = cfg.max_steps > 0 && steps_since_input >= cfg.max_steps;
         let failed = std::mem::take(&mut llm_failed);
-        // 중지·단계 제한·오류가 아니라 정상적으로 끝났을 때만 대기열 작업으로 이어간다
+        // only move on to queued tasks after a normal finish (not stop, step limit or error)
         let finished_normally = !stopped && !limit_hit && !failed;
-        // 현재 작업이 끝났고 대기열에 다음 작업이 있으면 멈추지 않고 바로 이어서 시작
+        // current task done and another queued: start it right away without pausing
         if pending.is_empty() && finished_normally {
             let next = shared.queue.lock().pop_front();
             if let Some(t) = next {
@@ -357,12 +368,12 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             } else if limit_hit {
                 wait_reason = format!("최대 단계({})에 도달 — 계속하려면 지시를 입력", cfg.max_steps);
             }
-            // (failed 이면 wait_reason 은 오류 처리 쪽에서 이미 정했다)
+            // (on failure the error path already set wait_reason)
             shared.set_status(AgentStatus::Idle(wait_reason.clone()));
-            // 대기 중에는 멈출 동작이 없다: 대기에 들어가며 남은 '중지'를 지운다
+            // nothing to stop while idle, so clear any leftover stop on the way in
             shared.stop.store(false, Ordering::SeqCst);
-            // 지시가 오거나, (정상적으로 끝났을 때만) 대기열에 작업이 들어올 때까지 기다린다.
-            // 중지·단계 제한·오류로 멈췄다면 대기열 알림(Wake)으로는 재개하지 않는다.
+            // wait for an instruction, or (after a normal finish only) a queued task. If we stopped on
+            // stop, step limit or error, a queue notification (Wake) doesn't resume.
             let t = loop {
                 let Some(cmd) = rx.recv().await else { return Ok(()) };
                 match cmd {
@@ -377,7 +388,7 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
                     }
                 }
             };
-            // 대기 중에 눌린 '중지'는 새 지시의 첫 배치를 버리게 하면 안 된다
+            // a stop pressed while idle must not discard the new instruction's first batch
             shared.stop.store(false, Ordering::SeqCst);
             remember(&mut instructions, &t);
             shared.log(LogKind::User, t.clone());
@@ -399,8 +410,8 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         let mut user_len = json_len(&user_msg);
         let too_big = msg_bytes + user_len > MAX_REQUEST_BYTES;
         if !messages.is_empty() && (too_big || std::mem::take(&mut too_long)) {
-            // 기록이 너무 커지면(요청 크기 한도·턴마다 늘어나는 토큰) 새 대화 구간을 시작한다:
-            // 원래 작업 + 최근 동작 요약 + 현재 화면만 이어간다.
+            // when the history gets too big (request size cap, per-turn token growth), start a new segment
+            // carrying only the original task, a summary of recent actions and the current screen
             let why = if too_big { format!("약 {:.1} MB 로 커져", (msg_bytes + user_len) as f64 / 1e6) } else { "길어져".into() };
             shared.log(LogKind::Info, format!("대화 기록이 {why} 새 대화 구간을 시작합니다 (원래 작업·최근 동작 요약·현재 화면만 이어감)"));
             seen = Seen::default();
@@ -424,8 +435,8 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         let resp = match cfg.llm.send(&system, &tools, &messages).await {
             Ok(r) => r,
             Err(e) => {
-                // 에이전트를 끝내지 않는다: 보내지 못한 user 턴을 pending 으로 되돌려 대화 맥락을 유지하고,
-                // 다음 지시가 오면 그 내용과 함께 다시 보낸다.
+                // don't end the agent: put the unsent user turn back into `pending` to keep the context, and
+                // send it again along with the next instruction
                 if let Some(Value::Object(mut m)) = messages.pop() {
                     msg_bytes = msg_bytes.saturating_sub(user_len);
                     if let Some(Value::Array(c)) = m.remove("content") {
@@ -446,15 +457,16 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             t.1 += u["output_tokens"].as_u64().unwrap_or(0);
         }
         too_long = input > MAX_CONTEXT_TOKENS;
-        // Claude 는 서버가 오래된 도구 결과를 지운다. 다른 회사는 같은 기준으로 여기서 지운다 (다음 요청부터 적용)
+        // Claude's server clears old tool results; for other providers clear them here at the same
+        // threshold (applies from the next request)
         if !cfg.llm.provider.clears_old_tool_results() && input > CLEAR_TOOL_RESULTS_AT {
             msg_bytes = msg_bytes.saturating_sub(clear_old_tool_results(&mut messages, crate::llm::KEEP_TOOL_USES));
         }
         let content = resp["content"].as_array().cloned().unwrap_or_default();
-        // 빈 답은 기록하지 않는다: 내용 없는 assistant 턴은 다음 요청에서 거절된다
-        // (이어지는 user 턴은 API 가 앞 user 턴과 합쳐 준다)
+        // don't record empty replies: an assistant turn without content is rejected on the next request
+        // (the API merges the following user turn into the previous one)
         if !content.is_empty() {
-            // 사고(thinking) 블록은 수정 없이 그대로 되돌려 보내야 한다 (preserved thinking)
+            // thinking blocks must be sent back unmodified (preserved thinking)
             let assistant = json!({ "role": "assistant", "content": content.clone() });
             msg_bytes += json_len(&assistant);
             messages.push(assistant);
@@ -485,7 +497,7 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             let cat = resp["stop_details"]["category"].as_str().unwrap_or("unknown");
             shared.log(LogKind::Error, format!("모델이 요청을 거절했습니다 (category: {cat})"));
             wait_reason = "모델 거절 — 다른 지시를 입력하세요".into();
-            // 정상 완료가 아니므로 대기열의 다음 작업으로 넘어가지 않고 지시를 기다린다
+            // not a normal finish, so wait for instructions instead of moving to the next queued task
             llm_failed = true;
             continue;
         }
@@ -504,7 +516,8 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
     }
 }
 
-/// 동작 뒤 화면이 안정될 때까지 짧게 기다린다. 브라우저는 페이지가 준비되면 바로 넘어간다.
+/// Waits briefly for the screen to settle after an action. Browsers move on as soon as the page
+/// is ready.
 pub(crate) async fn settle(ws: &Desk) {
     if let Some(b) = ws.as_browser() {
         b.wait_ready(Duration::from_millis(1500)).await;

@@ -1,18 +1,24 @@
-//! 노출 감시기: 앱의 창이 사용자 화면(어느 모니터든)에 걸치면 즉시 화면 밖으로 옮기고 기록한다.
+//! Exposure guard: if an app window touches the user's screen (any monitor), move it off-screen
+//! immediately and log it.
 //!
-//! - 전용 스레드가 앱 프로세스별 WinEvent 훅(EVENT_OBJECT_CREATE/SHOW/LOCATIONCHANGE, 프로세스 밖 훅)과
-//!   8ms 주기 검사(≈125Hz)를 함께 돈다. 훅은 창이 만들어지거나 보이는 순간 알려 주므로 대부분 한 화면 프레임 안에 옮긴다.
-//! - 새로 만들어진(아직 숨은) 창은 미리 화면 밖으로 옮겨 둔다(사전 주차). 그러면 앱이 나중에 그 창을 보여 줘도
-//!   대기열에 먼저 들어간 이동 요청이 첫 그리기 전에 처리된다 — 대화상자·메시지 상자의 노출이 수십 ms → 수 ms 로 줄었다.
-//! - 모든 이동은 비동기(SWP_ASYNCWINDOWPOS)다. 앱 스레드가 바빠도 감시기는 멈추지 않는다.
-//! - Mode A 의 앱 창에는 WS_EX_TOOLWINDOW 를 더해 작업 표시줄·Alt+Tab 에 나타나지 않게 한다(스타일 변경은 앱 스레드를
-//!   기다리므로 별도 작업 스레드에서). 실행 단계에서 숨김(SW_HIDE)으로 시작한 주 창은 화면 밖에서 SW_SHOWNOACTIVATE 로
-//!   보이게 한다(PrintWindow 는 보이는 창만 그린다).
-//! - 앱이 전경(키보드 포커스)을 가져가면 기록하고 직전 창에 되돌린다. 입력을 보내는 동안에는 전경 잠금
-//!   (LockSetForegroundWindow)을 잠시 걸어 앱이 전경을 가져가지 못하게 한다.
-//! - 앱이 시스템 클립보드에 쓰면(앱 자체의 복사 기능) 기록한다 (내용은 읽지 않는다). Mode A 의 앱은 Job 의 UI 제한으로
-//!   클립보드를 아예 읽거나 쓸 수 없으므로 이 기록은 사실상 Mode B(사용자 앱에 붙기)용이다.
-//! - 셸 창(작업 표시줄·바탕 화면)은 어떤 경우에도 옮기지 않고 뷰로 보이지 않는다.
+//! - A dedicated thread runs per-process WinEvent hooks (EVENT_OBJECT_CREATE/SHOW/
+//!   LOCATIONCHANGE, out-of-context) alongside an 8 ms check (≈125 Hz). The hooks fire the moment
+//!   a window is created or shown, so most windows are moved within one display frame.
+//! - Newly created (still hidden) windows are parked off-screen ahead of time. When the app shows
+//!   one later, the move request already queued is handled before the first paint, which cut
+//!   dialog and message box exposure from tens of ms to a few.
+//! - Every move is async (SWP_ASYNCWINDOWPOS), so a busy app thread never stalls the guard.
+//! - Mode A app windows get WS_EX_TOOLWINDOW so they stay off the taskbar and Alt+Tab (style
+//!   changes wait on the app thread, so they run on a separate worker). Main windows started
+//!   hidden (SW_HIDE) at launch are shown off-screen with SW_SHOWNOACTIVATE, since PrintWindow
+//!   only paints visible windows.
+//! - If the app takes the foreground (keyboard focus), it's logged and handed back to the
+//!   previous window. While input is being sent, the foreground lock (LockSetForegroundWindow)
+//!   is held briefly so the app can't take it.
+//! - Writes by the app to the system clipboard (its own copy feature) are logged, without
+//!   reading the content. Mode A apps can't touch the clipboard at all under the Job's UI limits,
+//!   so this is effectively for mode B (attaching to a user's app).
+//! - Shell windows (taskbar, desktop) are never moved and never shown as views.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,26 +44,31 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const QS_ALLINPUT: u32 = 0x04FF;
 const PM_REMOVE: u32 = 0x0001;
 
-/// 앱 창 목록·노출 판단에서 뺄 보조 창 클래스 (입력기·툴팁·드롭다운 목록·메뉴·그림자)
+/// Helper window classes left out of app window lists and exposure checks (IME, tooltips,
+/// drop-down lists, menus, shadows).
 pub fn is_helper_class(class: &str) -> bool {
     matches!(
         class,
         "IME" | "tooltips_class32" | "ComboLBox" | "#32768" | "SysShadow" | "OleMainThreadWndClass" | "OleDdeWndClass"
             | "CicMarshalWndClass" | "Tapi32WndClass" | "MSCTFIME Composition" | "TaskSwitcherWnd" | "Ghost"
-            // 입력 언어 표시기: 숨은 데스크톱에서는 텍스트 서비스가 앱 프로세스 안에 이 창들을 만든다
+            // input language indicators: on a hidden desktop the text services create these inside the app
+            // process
             | "UAC_InputIndicatorOverlayWnd" | "UAC Input Indicator" | "Shell_InputSwitchTopLevelWindow"
     ) || class.starts_with("MSCTFIME")
         || class.starts_with("GDI+ Hook Window")
         || class.starts_with(".NET-BroadcastEventWindow")
 }
 
-/// Windows 셸 창의 클래스 (작업 표시줄·보조 모니터 작업 표시줄·바탕 화면)
+/// Window classes of the Windows shell (taskbar, secondary taskbars, desktop).
 pub fn is_shell_class(class: &str) -> bool {
     matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW")
 }
 
-/// Windows 셸의 창인가 — 어떤 경우에도 옮기거나 에이전트에게 보이지 않는다.
-/// 'WorkerW' 는 셸 구성 요소를 쓰는 다른 앱도 만들 수 있는 이름이라 셸 프로세스의 것일 때만 해당한다.
+/// Whether a window belongs to the Windows shell. Such windows are never moved or shown to the
+/// agent.
+///
+/// 'WorkerW' is a name other apps using shell components can create too, so it only counts when
+/// owned by the shell process.
 pub fn is_shell_window(w: &TopWindow) -> bool {
     match w.class.as_str() {
         "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" => true,
@@ -66,7 +77,8 @@ pub fn is_shell_window(w: &TopWindow) -> bool {
     }
 }
 
-/// 에이전트가 볼 수 있는 앱 창인가 (보이는 최상위 창, 보조 창·셸 창 아님, 충분한 크기)
+/// Whether the agent may see this app window (visible top-level, not a helper or shell window,
+/// big enough).
 pub fn is_view_window(w: &TopWindow) -> bool {
     let (l, t, r, b) = w.rect;
     w.visible
@@ -79,7 +91,7 @@ pub fn is_view_window(w: &TopWindow) -> bool {
         && !is_shell_window(w)
 }
 
-/// 숨김 실행 때문에 보이지 않게 된 앱의 주 창 후보 (화면 밖에서 보이게 할 창)
+/// Candidate main window left invisible by the hidden launch (to be shown off-screen).
 fn is_reveal_candidate(w: &TopWindow, first_rect: (i32, i32, i32, i32), first_ex: u32) -> bool {
     let st = w32::style(w.hwnd);
     let (l, t, r, b) = first_rect;
@@ -95,12 +107,13 @@ fn is_reveal_candidate(w: &TopWindow, first_rect: (i32, i32, i32, i32), first_ex
         && !is_helper_class(&w.class)
 }
 
-/// 붙기(Mode B)에서 복원할 원래 상태
+/// Original state to restore when attaching (mode B).
 #[derive(Clone, Copy, Debug)]
 pub struct Saved {
     pub placement: Option<w32::Placement>,
     pub was_visible: bool,
-    /// 스냅된 창의 실제 화면 사각형 (배치의 보통 위치와 다를 때만)
+    /// Actual screen rectangle of a snapped window (only when it differs from the placement's
+    /// normal position).
     pub arranged: Option<(i32, i32, i32, i32)>,
 }
 
@@ -111,7 +124,7 @@ pub struct Shared {
     pids: Mutex<Vec<u32>>,
     origin: Mutex<(i32, i32)>,
     events: Mutex<Vec<String>>,
-    /// 지금까지 잰 가장 긴 노출 (ms)
+    /// Longest exposure measured so far (ms).
     pub worst_flash_ms: AtomicU64,
     pub flashes: AtomicU64,
     pub fg_steals: AtomicU64,
@@ -119,9 +132,9 @@ pub struct Shared {
     lease_until: Mutex<Option<Instant>>,
     lock_held: AtomicBool,
     reveal_until: Mutex<Option<Instant>>,
-    /// Mode B: 사용자가 앱을 다시 앞으로 가져왔다 (그 뒤로는 옮기지 않는다)
+    /// Mode B: the user brought the app back to the front (it isn't moved after that).
     pub reclaimed: AtomicBool,
-    /// 종료·복원 중: 더 옮기지 않는다
+    /// Shutting down or restoring: no more moves.
     paused: AtomicBool,
     saved: Mutex<HashMap<Hwnd, Saved>>,
     revealed: Mutex<HashSet<Hwnd>>,
@@ -163,7 +176,7 @@ impl Guard {
         Guard { shared, thread }
     }
 
-    /// 감시기가 남긴 기록 (가져가면 비워진다)
+    /// Events logged by the guard (cleared when taken).
     pub fn take_events(&self) -> Vec<String> {
         std::mem::take(&mut *self.shared.events.lock())
     }
@@ -176,7 +189,8 @@ impl Guard {
         *self.shared.origin.lock()
     }
 
-    /// 지금부터 dur 동안 전경 잠금을 유지한다 (입력을 보낸 직후 앱이 전경을 가져가지 못하게)
+    /// Holds the foreground lock for `dur` from now (so the app can't take the foreground right
+    /// after input is sent).
     pub fn lease(&self, dur: Duration) {
         let until = Instant::now() + dur;
         let mut l = self.shared.lease_until.lock();
@@ -185,14 +199,15 @@ impl Guard {
         }
     }
 
-    /// 호출한 쪽이 방금 잠금을 걸었음을 알린다 (임대가 끝나면 감시기가 푼다). 실패(false)는 기존 잠금 기록을 지우지 않는다.
+    /// Tells the guard the caller just took the lock (the guard releases it when the lease ends). A
+    /// failure (false) doesn't clear an existing lock record.
     pub fn adopt_lock(&self, held: bool) {
         if held {
             self.shared.lock_held.store(true, Ordering::SeqCst);
         }
     }
 
-    /// 지금부터 dur 동안 숨김으로 시작한 주 창을 화면 밖에서 보이게 한다 (실행 단계)
+    /// Shows main windows that started hidden, off-screen, for `dur` from now (launch phase).
     pub fn reveal_for(&self, dur: Duration) {
         *self.shared.reveal_until.lock() = Some(Instant::now() + dur);
     }
@@ -205,7 +220,8 @@ impl Guard {
         self.shared.worst_flash_ms.load(Ordering::SeqCst)
     }
 
-    /// Mode B: 옮겨 둔 사용자 창을 원래 자리·상태로 되돌린다 (활성화하지 않음). 더 이상 옮기지 않는다.
+    /// Mode B: returns the moved user windows to their original place and state (without
+    /// activating), and stops moving them.
     pub fn restore_all(&self) -> usize {
         self.shared.paused.store(true, Ordering::SeqCst);
         restore_saved(&self.shared)
@@ -232,7 +248,7 @@ fn restore_saved(s: &Shared) -> usize {
     }
     let hwnds: Vec<Hwnd> = saved.iter().map(|(h, _)| *h).collect();
     let mut n = 0;
-    // 활성화되지 않게 잠금을 걸고 되돌린다 (최대화 복원은 활성화를 동반한다)
+    // lock first so nothing activates (restoring maximized implies activation)
     let locked = w32::lock_foreground(true);
     for (h, sv) in saved {
         if !w32::is_window(h) {
@@ -252,14 +268,14 @@ fn restore_saved(s: &Shared) -> usize {
     n
 }
 
-// ───────────────────────── 감시 스레드 ─────────────────────────
+// ---- guard thread ----
 
 thread_local! {
     static PENDING: RefCell<Vec<(u32, Hwnd)>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe extern "system" fn on_win_event(_hook: isize, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _t: u32, _time: u32) {
-    // OBJID_WINDOW(0) + CHILDID_SELF(0) 인 창 자체의 사건만
+    // only events for the window itself: OBJID_WINDOW(0) + CHILDID_SELF(0)
     if hwnd.is_null() || id_object != 0 || id_child != 0 {
         return;
     }
@@ -314,12 +330,13 @@ fn run(s: Arc<Shared>) {
         clip_seq: w32::clipboard_sequence(),
         vscreen: pw::virtual_screen(),
     };
-    // 시작 시점의 전경 창 (앱 것이 아니면 되돌릴 대상)
+    // foreground window at startup (handed back to if it isn't the app's)
     let fg = w32::foreground();
     if !lp.is_ours(fg) {
         lp.prev_fg = fg;
     }
-    // Mode B: 사용자가 이미 띄워 둔 숨은 창은 건드리지 않는다 (사용자가 트레이에서 열 때 화면 밖에 뜨지 않게)
+    // mode B: leave hidden windows the user already had alone (so opening one from the tray
+    // doesn't show it off-screen)
     if s.mode == NativeMode::Attached {
         for w in pw::windows_of(&s.pids.lock().clone()) {
             if !w.visible {
@@ -379,7 +396,7 @@ impl Loop {
         self.s.events.lock().push(msg);
     }
 
-    /// 앱 프로세스 목록(Job)과 프로세스별 훅을 맞춘다
+    /// Syncs the per-process hooks with the app's process list (the Job).
     fn sync_hooks(&mut self) {
         if self.last_pid_refresh.elapsed() >= Duration::from_millis(100) {
             self.last_pid_refresh = Instant::now();
@@ -391,7 +408,7 @@ impl Loop {
             }
             let vs = pw::virtual_screen();
             if vs != self.vscreen {
-                // 모니터 구성이 바뀌었다 → 주차 위치를 다시 계산
+                // monitor layout changed, so recompute the parking spot
                 self.vscreen = vs;
                 *self.s.origin.lock() = pw::offscreen_origin();
             }
@@ -427,7 +444,7 @@ impl Loop {
         for w in &wins {
             self.visit(w);
         }
-        // 사라진 창 정리 (노출 중이던 창이 닫혔으면 노출 끝으로 기록)
+        // drop windows that are gone (a window closed while exposed ends its exposure)
         let closed: Vec<Hwnd> = self.onscreen.keys().filter(|h| !alive.contains(h)).copied().collect();
         for h in closed {
             if let Some((t0, desc)) = self.onscreen.remove(&h) {
@@ -460,7 +477,8 @@ impl Loop {
             self.save_original(w.hwnd, w.pid, w.visible);
         }
         if w32::is_zoomed(w.hwnd) {
-            // 최대화된 창은 모니터에 붙는다 → 보통 크기로 바꾸며 화면 밖에 둔다 (활성화 없이)
+            // maximized windows snap to a monitor, so restore them to normal size off-screen (without
+            // activating)
             if let Some(mut pl) = w32::get_placement(w.hwnd) {
                 let (l, t, r, b) = pl.normal;
                 pl.normal = (ox, oy, ox + (r - l).max(200), oy + (b - t).max(150));
@@ -474,7 +492,7 @@ impl Loop {
 
     fn visit(&mut self, w: &TopWindow) {
         if is_shell_window(w) {
-            // 셸(작업 표시줄·바탕 화면)은 절대 옮기지 않는다 (실행 전 검사·붙기 검사를 지나쳐도)
+            // never move the shell (taskbar, desktop), even if it got past the launch and attach checks
             return;
         }
         let h = w.hwnd;
@@ -488,7 +506,8 @@ impl Loop {
         let launched = self.s.mode == NativeMode::Launched;
         let (r0, ex0) = self.first.get(&h).copied().unwrap_or((w.rect, 0));
         let reveal_cand = launched && self.reveal_active() && is_reveal_candidate(w, r0, ex0);
-        // Mode A: 작업 표시줄·Alt+Tab 에서 빼기 (보이는 앱 창, 또는 곧 보이게 할 주 창)
+        // mode A: keep off the taskbar and Alt+Tab (visible app windows, or the main window about to be
+        // shown)
         if launched && !self.restyle_pending.contains(&h) && !is_helper_class(&w.class) {
             let ex = w32::ex_style(h);
             let unowned = w32::owner(h) == 0;
@@ -514,7 +533,8 @@ impl Loop {
         if let Some((t0, desc)) = self.onscreen.remove(&h) {
             self.finish_flash(&desc, t0, "화면 밖으로 옮겼습니다");
         }
-        // 새로 만든 숨은 창은 미리 화면 밖에 둔다 (보여질 때 첫 프레임 전에 자리를 잡게)
+        // park newly created hidden windows off-screen in advance (so they're in place before the first
+        // frame when shown)
         if first && !w.visible && !w.class.starts_with("MSCTFIME") && w.class != "IME" {
             let (l, t, r, b) = w.rect;
             if r - l > 1 && b - t > 1 && pw::intersects_any_monitor(w.rect) {
@@ -525,10 +545,11 @@ impl Loop {
                 w32::move_async(h, ox, oy);
             }
         }
-        // Mode A 실행 단계: 숨김으로 시작한 주 창을 화면 밖에서 보이게 (작업 표시줄 스타일을 먼저 바꾼 뒤)
+        // mode A launch phase: show the main window that started hidden, off-screen (after the taskbar
+        // style change)
         if reveal_cand && !self.s.revealed.lock().contains(&h) {
             let owner = w32::owner(h);
-            // 소유된 창은 소유자가 비활성(=모달 대화상자가 숨은 채 걸려 있음)일 때만 보이게 한다
+            // show owned windows only while the owner is disabled (a hidden modal dialog is up)
             let owner_ok = owner == 0 || (self.is_ours(owner) && !w32::is_enabled(owner));
             let styled = owner != 0 || self.restyle_done.lock().contains(&h);
             if owner_ok && styled {
@@ -539,7 +560,8 @@ impl Loop {
                 self.s.restyled.lock().insert(h);
             }
         }
-        // 최소화된 앱 창은 캡처가 안 되므로 화면 밖에서 원래 크기로 되돌린다 (Mode B 는 원래 상태를 저장해 두고 끝나면 다시 최소화)
+        // minimized app windows can't be captured, so restore them to normal size off-screen (mode B
+        // saves the original state and minimizes again at the end)
         if w.visible && w.minimized && !is_helper_class(&w.class) && w32::style(h) & w32::WS_CAPTION == w32::WS_CAPTION {
             let n = self.fixed_minimized.entry(h).or_insert(0);
             if *n < 3 {
@@ -558,14 +580,15 @@ impl Loop {
         }
     }
 
-    /// Mode B: 사용자 창을 처음 옮기기 전에 원래 배치를 저장하고 복구 기록에 적는다 (비정상 종료 대비)
+    /// Mode B: saves the original placement before the first move of a user window and writes it to
+    /// the recovery log (in case of a crash).
     fn save_original(&self, h: Hwnd, pid: u32, was_visible: bool) {
         let mut saved = self.s.saved.lock();
         if saved.contains_key(&h) {
             return;
         }
         let placement = w32::get_placement(h);
-        // 스냅된 창은 배치의 보통 위치가 스냅 전 사각형이다 → 실제 사각형도 기억한다
+        // a snapped window's placement holds the pre-snap rectangle, so remember the actual one too
         let arranged = placement
             .filter(|pl| was_visible && pl.show_cmd == w32::SW_SHOWNORMAL && !w32::is_iconic(h) && !w32::is_zoomed(h))
             .and_then(|pl| {
@@ -582,14 +605,16 @@ impl Loop {
         self.s.reveal_until.lock().map(|t| Instant::now() < t).unwrap_or(false)
     }
 
-    /// 확장 스타일 변경은 앱 스레드가 메시지를 처리할 때까지 막히므로 작업 스레드에서 한다
+    /// Extended style changes block until the app thread handles its messages, so do them on a
+    /// worker thread.
     fn start_restyle(&mut self, h: Hwnd, ex: u32, visible: bool) {
         self.restyle_pending.insert(h);
         let done = self.restyle_done.clone();
         let new_ex = (ex | w32::WS_EX_TOOLWINDOW) & !w32::WS_EX_APPWINDOW;
         let _ = std::thread::Builder::new().name("ghostdesk-winapp-style".into()).spawn(move || {
             if visible {
-                // 이미 보이는 창은 숨겼다가 스타일을 바꿔 다시 보여야 작업 표시줄 단추가 사라진다
+                // an already visible window has to be hidden, restyled and shown again for its taskbar button
+                // to go away
                 w32::show_async(h, w32::SW_HIDE);
             }
             w32::set_ex_style_blocking(h, new_ex);
@@ -614,11 +639,12 @@ impl Loop {
         if self.s.paused.load(Ordering::SeqCst) {
             return;
         }
-        // 우리가 입력을 보낸 직후(전경 잠금 임대 중)이고 사용자의 실제 입력이 없었다면 우리 입력 때문이다 → 가로챔으로 처리
+        // right after our own input (foreground lease active) and with no real user input, it's ours,
+        // so treat it as an interception
         let ours = self.s.lease_until.lock().map(|t| Instant::now() < t).unwrap_or(false) && w32::ms_since_user_input() > 500;
         match self.s.mode {
             NativeMode::Attached if !ours => {
-                // 사용자가 작업 표시줄·Alt+Tab 등으로 자기 앱을 앞으로 가져왔다 → 돌려준다
+                // the user brought their app to the front (taskbar, Alt+Tab, …), so hand it back
                 if !self.s.reclaimed.swap(true, Ordering::SeqCst) {
                     let n = restore_saved(&self.s);
                     self.record(format!(
@@ -650,7 +676,7 @@ impl Loop {
     fn manage_lock(&mut self) {
         let want = self.s.lease_until.lock().map(|t| Instant::now() < t).unwrap_or(false);
         if want {
-            // 사용자 조작(Alt·클릭)으로 잠금이 풀릴 수 있으니 주기적으로 다시 건다
+            // user actions (Alt, clicks) can release the lock, so retake it periodically
             if self.last_lock_try.elapsed() >= Duration::from_millis(400) {
                 self.last_lock_try = Instant::now();
                 if w32::lock_foreground(true) {
@@ -715,7 +741,7 @@ mod tests {
             }
         }
         assert!(!is_shell_class("CabinetWClass"));
-        // 이 PC 의 실제 작업 표시줄·바탕 화면
+        // this PC's real taskbar and desktop
         for w in pw::windows_of(&shell) {
             if is_shell_class(&w.class) {
                 assert!(is_shell_window(&w) && !is_view_window(&w), "{}", w.class);

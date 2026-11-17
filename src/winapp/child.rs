@@ -1,19 +1,25 @@
-//! Windows 자식 세션(PiP) 백엔드 — 같은 PC·같은 계정의 **별도 Windows 세션** 화면 전체를 에이전트에게 준다.
+//! Windows child session (PiP) backend: gives the agent the whole screen of a **separate
+//! Windows session** on the same PC and account.
 //!
-//! Microsoft 공식 기능(Child Sessions): 부모(사용자) 세션 안에서 RDP ActiveX 컨트롤이 `ConnectToChildSession`
-//! 으로 루프백 연결하면, 같은 사용자의 자식 세션이 로그온된다. 자식 세션은 자신의 데스크톱·입력 큐를 가지므로
-//! 그 안의 SendInput·화면 캡처는 사용자 화면·커서·키보드에 닿지 않는다.
+//! An official Microsoft feature (Child Sessions): when the RDP ActiveX control in the parent
+//! (user) session makes a loopback `ConnectToChildSession`, a child session of the same user logs
+//! on. It has its own desktop and input queue, so SendInput and screen capture inside it never
+//! touch the user's screen, cursor or keyboard.
 //!
-//! 구성 (macOS 별도 계정 세션과 같은 헬퍼 RPC 를 쓴다 — `session.rs`):
-//! - 부모: [`ensure_connected`] 가 STA 스레드에 RDP 컨트롤(AtlAxWin)을 화면 밖 창으로 띄워 자식 세션에 연결하고,
-//!   자식 세션 id 를 표시 파일에 적는다. 헬퍼 실행은 연결 직전에 HKCU RunOnce 로 예약한다.
-//! - 자식: [`run_helper`](`ghostdesk --session-helper`)가 표시 파일의 id 와 자기 세션 id 가 같을 때만
-//!   명명 파이프 `GhostDesk-child-<SID>` 로 화면 캡처·입력 서버를 연다. 다른 세션(사용자 본인 화면)이면 바로 끝난다.
-//! - 사용자는 GhostDesk 창의 라이브 뷰로 자식 세션 화면을 본다. RDP 창 자체는 화면 밖에 둔다
-//!   (최소화하면 RDP 가 화면 갱신을 멈출 수 있어 숨기거나 최소화하지 않는다).
+//! Layout (same helper RPC as the macOS separate-account session, see `session.rs`):
+//! - Parent: [`ensure_connected`] hosts the RDP control (AtlAxWin) in an off-screen window on an
+//!   STA thread, connects to the child session, and writes the child session id to a marker
+//!   file. The helper launch is scheduled via HKCU RunOnce right before connecting.
+//! - Child: [`run_helper`] (`ghostdesk --session-helper`) opens the capture/input server on the
+//!   named pipe `GhostDesk-child-<SID>` only if the marker's id matches its own session id. In
+//!   any other session (the user's own screen) it exits immediately.
+//! - The user watches the child session through the live view in the GhostDesk window. The RDP
+//!   window itself stays off-screen (not hidden or minimized, since minimized RDP can stop
+//!   updating the screen).
 //!
-//! 한계: 시스템 전체에서 연결된 자식 세션은 1개, 부모 세션이 끝나면 자식 세션도 끝난다. 기능 켜기
-//! (`WTSEnableChildSessions`)는 관리자 권한이 필요해 사용자가 UAC 로 승인해야 한다 — [`request_enable`].
+//! Limits: one connected child session system-wide, and it ends with the parent session.
+//! Enabling the feature (`WTSEnableChildSessions`) needs admin rights, so the user approves it
+//! via UAC; see [`request_enable`].
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,10 +51,10 @@ use crate::platform::ipc::Endpoint;
 use crate::platform::win::wide;
 use crate::session::{fit_size, DisplayInfo, ServerConfig, SessionPlatform};
 
-/// 자식 세션 화면 크기 (RDP 데스크톱 크기)
+/// Child session screen size (RDP desktop size).
 const DESK_W: i32 = 1280;
 const DESK_H: i32 = 800;
-/// 자식 세션 로그온 + 헬퍼 시작을 기다리는 시간
+/// How long to wait for the child session to log on and the helper to start.
 pub const HELPER_WAIT: Duration = Duration::from_secs(90);
 const CONNECT_WAIT: Duration = Duration::from_secs(60);
 const RUNONCE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\RunOnce";
@@ -72,14 +78,14 @@ Windows 의 공식 기능인 '자식 세션'으로, 지금 계정 그대로 **�
 - 스마트카드·Windows Hello 전용 로그인 등 일부 인증 방식에서는 자식 세션 자동 로그온이 되지 않을 수 있습니다.
 - 끄려면 관리자 PowerShell 에서: `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyChildConnections 1`"#;
 
-// ───────────────────────── 세션 정보 ─────────────────────────
+// ---- session info ----
 
 pub fn enabled() -> bool {
     let mut on: BOOL = 0;
     unsafe { WTSIsChildSessionsEnabled(&mut on) != 0 && on != 0 }
 }
 
-/// 이 (부모) 세션의 자식 세션 id
+/// Child session id of this (parent) session.
 pub fn child_session_id() -> Option<u32> {
     let mut id = 0u32;
     (unsafe { WTSGetChildSessionId(&mut id) } != 0 && id != u32::MAX && id != 0).then_some(id)
@@ -91,17 +97,18 @@ fn my_session_id() -> u32 {
     id
 }
 
-/// 헬퍼 파이프 (같은 사용자 SID 가 이름에 들어가고, ipc 가 소유자·무결성을 확인한다)
+/// Helper pipe. Its name includes the user's SID, and ipc checks owner and integrity.
 pub fn endpoint() -> Endpoint {
     Endpoint::custom("GhostDesk-child")
 }
 
-/// 부모가 적는 "지금 연결한 자식 세션 id" 표시 파일
+/// Marker file where the parent writes the id of the child session it just connected.
 fn marker_path() -> PathBuf {
     crate::platform::paths::data_root().join("child-session-id")
 }
 
-/// 헬퍼를 실행해도 되는 세션인가 (순수 함수: 표시 파일의 id, 내 세션, 콘솔 세션)
+/// Whether the helper may run in this session (pure function of the marker id, our session and
+/// the console session).
 fn helper_allowed(marker: Option<u32>, me: u32, console: u32) -> Result<(), String> {
     match marker {
         None => Err("부모 GhostDesk 가 자식 세션을 연결한 기록이 없습니다".into()),
@@ -111,9 +118,9 @@ fn helper_allowed(marker: Option<u32>, me: u32, console: u32) -> Result<(), Stri
     }
 }
 
-// ───────────────────────── 기능 켜기 (관리자) ─────────────────────────
+// ---- enabling the feature (admin) ----
 
-/// `ghostdesk --enable-child-sessions` (관리자 권한으로 실행됨)
+/// `ghostdesk --enable-child-sessions` (runs elevated).
 pub fn enable_cli() -> Result<()> {
     if unsafe { WTSEnableChildSessions(1) } == 0 {
         bail!("WTSEnableChildSessions 실패: {}", std::io::Error::last_os_error());
@@ -122,7 +129,8 @@ pub fn enable_cli() -> Result<()> {
     Ok(())
 }
 
-/// 관리자 승인(UAC) 창을 띄워 자식 세션을 켠다. 사용자가 승인해야만 켜진다. 블로킹 — GUI 스레드에서 부르지 말 것.
+/// Shows the admin approval (UAC) prompt to enable child sessions; only enabled if the user
+/// approves. Blocking, so don't call it from the GUI thread.
 pub fn request_enable() -> Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
@@ -151,9 +159,10 @@ pub fn request_enable() -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────── 캡처·입력 (자식 세션 안의 헬퍼) ─────────────────────────
+// ---- capture and input (helper inside the child session) ----
 
-/// 자식 세션의 주 모니터를 GDI 로 찍고 SendInput 으로 조작한다. 이 프로세스의 세션 안에서만 작용한다.
+/// Captures the child session's primary monitor with GDI and drives it with SendInput. Only
+/// affects this process's own session.
 struct ChildPlatform {
     session: u32,
 }
@@ -199,7 +208,7 @@ fn vk_event(vk: u16, up: bool) -> INPUT {
     key_input(vk, 0, f)
 }
 
-/// GhostDesk 수정키 비트 → 가상 키
+/// GhostDesk modifier bits → virtual keys.
 fn mod_vks(mods: i64) -> Vec<u16> {
     [(MOD_CTRL, 0x11), (MOD_SHIFT, 0x10), (MOD_ALT, 0x12), (MOD_META, 0x5B)]
         .into_iter()
@@ -208,7 +217,7 @@ fn mod_vks(mods: i64) -> Vec<u16> {
         .collect()
 }
 
-/// 수정키를 누른 채로 events 를 보낸다
+/// Sends `events` with the modifiers held down.
 fn with_mods(mods: i64, events: Vec<INPUT>) -> Result<()> {
     let vks = mod_vks(mods);
     let mut all: Vec<INPUT> = vks.iter().map(|&v| vk_event(v, false)).collect();
@@ -218,7 +227,7 @@ fn with_mods(mods: i64, events: Vec<INPUT>) -> Result<()> {
 }
 
 impl ChildPlatform {
-    /// 전역 픽셀 좌표 → SendInput 절대 좌표 (가상 데스크톱 0..65535)
+    /// Global pixel coordinates → SendInput absolute coordinates (virtual desktop 0..65535).
     fn abs(&self, x: f64, y: f64) -> (i32, i32) {
         let (vx, vy, vw, vh) = virtual_screen();
         let nx = ((x - vx as f64) * 65535.0 / (vw - 1).max(1) as f64).round() as i32;
@@ -290,11 +299,12 @@ impl SessionPlatform for ChildPlatform {
         })
     }
     fn mouse_move(&self, x: f64, y: f64, _pressed: Option<u8>, _mods: i64) -> Result<()> {
-        // 누른 버튼은 눌린 채로 남아 있으므로 그냥 움직이면 드래그가 된다
+        // a pressed button stays down, so plain moves turn into a drag
         send(&[self.move_ev(x, y)])
     }
     fn mouse_button(&self, x: f64, y: f64, button: u8, down: bool, _count: i64, mods: i64) -> Result<()> {
-        // 더블클릭은 Windows 가 두 번의 클릭 간격으로 판단한다 (서버가 down/up 을 count 번 보낸다)
+        // Windows decides double clicks from the interval between clicks (the server sends down/up
+        // `count` times)
         let flag = match (button, down) {
             (0, true) => MOUSEEVENTF_LEFTDOWN,
             (0, false) => MOUSEEVENTF_LEFTUP,
@@ -309,7 +319,7 @@ impl SessionPlatform for ChildPlatform {
         let mut ev = Vec::new();
         let v = super::input::wheel_notches(dy);
         if v != 0 {
-            ev.push(mouse(0, 0, -v * 120, MOUSEEVENTF_WHEEL)); // dy>0 = 아래 = 음수 휠
+            ev.push(mouse(0, 0, -v * 120, MOUSEEVENTF_WHEEL)); // dy > 0 = down = negative wheel
         }
         let hz = super::input::wheel_notches(dx);
         if hz != 0 {
@@ -360,17 +370,18 @@ impl SessionPlatform for ChildPlatform {
     }
 }
 
-// ───────────────────────── 헬퍼 (--session-helper, 자식 세션 안) ─────────────────────────
+// ---- helper (--session-helper, inside the child session) ----
 
 fn read_marker() -> Option<u32> {
     std::fs::read_to_string(marker_path()).ok()?.trim().parse().ok()
 }
 
-/// 자식 세션의 로그온 때 RunOnce 로 실행된다. 자식 세션이 아니면 아무것도 하지 않고 끝난다.
+/// Started via RunOnce when the child session logs on. Does nothing and exits outside a child
+/// session.
 pub async fn run_helper(_args: &[String]) -> Result<()> {
     let me = my_session_id();
     let console = unsafe { WTSGetActiveConsoleSessionId() };
-    // 부모가 표시 파일을 적기 전에 로그온이 먼저 끝날 수 있어 잠시 기다린다
+    // logon may finish before the parent writes the marker, so wait a bit
     let deadline = Instant::now() + Duration::from_secs(60);
     let verdict = loop {
         let v = helper_allowed(read_marker(), me, console);
@@ -380,7 +391,7 @@ pub async fn run_helper(_args: &[String]) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     if let Err(why) = verdict {
-        // 사용자 본인 세션 등: 아무 화면·입력 API 도 부르지 않고 끝낸다
+        // e.g. the user's own session: exit without calling any screen or input API
         eprintln!("[ghostdesk-session-helper] 실행 거부: {why}");
         bail!("세션 헬퍼 실행 거부: {why}");
     }
@@ -393,14 +404,15 @@ pub async fn run_helper(_args: &[String]) -> Result<()> {
     log(&format!("자식 세션 {me} 에서 대기 중: {}", ep.display()));
     let cfg = ServerConfig { allow_uids: vec![], allow_on_console: false, label: format!("자식 세션 {me}"), log: log.clone() };
     let handle = crate::session::spawn_server(listener, Arc::new(ChildPlatform { session: me }), cfg);
-    // 자식 세션이 로그오프되면 이 프로세스도 끝난다
+    // this process ends when the child session logs off
     let _ = tokio::signal::ctrl_c().await;
     handle.stop().await;
     log("종료됨");
     Ok(())
 }
 
-/// `ghostdesk --selftest-session`: 자식 세션 상태(읽기 전용) + mock 헬퍼 왕복. 시스템 설정을 바꾸지 않는다.
+/// `ghostdesk --selftest-session`: child session state (read only) plus a mock helper round
+/// trip. Changes no system settings.
 pub async fn selftest(_args: &[String]) -> Result<()> {
     println!(
         "자식 세션 기능: {} / 연결된 자식 세션: {:?} / 내 세션 {} (콘솔 {})",
@@ -414,16 +426,17 @@ pub async fn selftest(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────── 부모: RDP 컨트롤로 자식 세션 연결 ─────────────────────────
+// ---- parent: connecting the child session through the RDP control ----
 
-/// 연결을 유지하는 STA 스레드 (GhostDesk 가 끝나면 함께 끝난다 — 자식 세션은 로그온된 채 '연결 끊김'으로 남는다)
+/// STA thread holding the connection. It ends with GhostDesk; the child session then stays
+/// logged on but disconnected.
 struct Connector {
     alive: Arc<AtomicBool>,
 }
 
 static CONNECTOR: Mutex<Option<Connector>> = Mutex::new(None);
 
-/// 자식 세션이 연결된 상태가 되게 한다 (이미 연결돼 있으면 바로 돌아온다)
+/// Makes sure the child session is connected (returns right away if it already is).
 pub async fn ensure_connected() -> Result<()> {
     if !enabled() {
         bail!("Windows 자식 세션 기능이 꺼져 있습니다. 새 에이전트 창의 '자식 세션' 에서 '자식 세션 켜기' 를 눌러 관리자 승인 후 다시 시도하세요.");
@@ -435,7 +448,8 @@ pub async fn ensure_connected() -> Result<()> {
         }
     }
     let exe = std::env::current_exe()?;
-    // 다음 로그온(= 곧 시작될 자식 세션)에서 헬퍼를 실행하도록 예약. 실행되면 Windows 가 값을 지운다.
+    // schedule the helper for the next logon (the child session about to start); Windows removes
+    // the value once it runs
     set_run_once(&format!("\"{}\" --session-helper", exe.display()))?;
     let alive = Arc::new(AtomicBool::new(true));
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<()>>();
@@ -475,7 +489,8 @@ fn set_run_once(cmd: &str) -> Result<()> {
 }
 
 mod rdp {
-    //! RDP ActiveX(MsTscAx) 를 ATL 의 AtlAxWin 창에 띄우고 IDispatch 로 조작한다. 이벤트 싱크 없이 상태를 폴링한다.
+    //! Hosts the RDP ActiveX control (MsTscAx) in an ATL AtlAxWin window and drives it through
+    //! IDispatch. State is polled; there's no event sink.
     use super::*;
     use windows::core::{Interface, BSTR, GUID, HRESULT, IUnknown, PCWSTR};
     use windows::Win32::System::Com::{
@@ -489,7 +504,8 @@ mod rdp {
         SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
-    /// MSTSCAX 의 IMsRdpExtendedSettings (ConnectToChildSession 은 여기에만 있다). vtable: IUnknown 3개 다음 put_Property.
+    /// MSTSCAX's IMsRdpExtendedSettings (the only place `ConnectToChildSession` lives). vtable:
+    /// put_Property comes after the three IUnknown slots.
     const IID_EXTENDED_SETTINGS: GUID = GUID::from_u128(0x302D8188_0052_4807_806A_362B628F9AC5);
     type PutProperty = unsafe extern "system" fn(*mut core::ffi::c_void, *const u16, *const VARIANT) -> HRESULT;
 
@@ -499,7 +515,7 @@ mod rdp {
         unsafe { unk.query(&IID_EXTENDED_SETTINGS, &mut raw) }
             .ok()
             .context("IMsRdpExtendedSettings 가 없습니다 (Windows 버전 확인)")?;
-        let owner = unsafe { IUnknown::from_raw(raw) }; // drop 시 Release
+        let owner = unsafe { IUnknown::from_raw(raw) }; // Release on drop
         let name = BSTR::from(name);
         let hr = unsafe {
             let vtbl = *(raw as *const *const usize);
@@ -558,7 +574,7 @@ mod rdp {
         Ok(out)
     }
 
-    /// Connected 속성: 0 = 끊김, 1 = 연결됨, 2 = 연결 중
+    /// The Connected property: 0 = disconnected, 1 = connected, 2 = connecting.
     fn connected(d: &IDispatch) -> i32 {
         let Ok(mut v) = invoke(d, "Connected", DISPATCH_PROPERTYGET, None) else { return 0 };
         let n = unsafe {
@@ -584,7 +600,8 @@ mod rdp {
     type AtlAxWinInit = unsafe extern "system" fn() -> i32;
     type AtlAxGetControl = unsafe extern "system" fn(isize, *mut *mut core::ffi::c_void) -> HRESULT;
 
-    /// 연결하고, alive 가 유지되는 동안 메시지 펌프를 돈다. 연결 결과는 tx 로 한 번 알린다.
+    /// Connects and pumps messages while `alive` holds. Reports the connection result once via
+    /// `tx`.
     pub(super) fn run(alive: &AtomicBool, tx: &mut Option<tokio::sync::oneshot::Sender<Result<()>>>) -> Result<()> {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().context("COM 초기화 실패")?;
         let atl = unsafe { LoadLibraryW(wide("atl.dll").as_ptr()) };
@@ -599,7 +616,8 @@ mod rdp {
         if unsafe { init() } == 0 {
             bail!("AtlAxWinInit 실패");
         }
-        // 모든 모니터의 왼쪽 바깥: 사용자 화면에 보이지 않지만 최소화가 아니라 RDP 가 화면 갱신을 계속한다
+        // left of every monitor: invisible to the user, but not minimized, so RDP keeps updating the
+        // screen
         let (vx, vy, _, _) = virtual_screen();
         let hwnd = unsafe {
             CreateWindowExW(

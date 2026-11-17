@@ -1,8 +1,8 @@
-//! 에이전트 화면 위에 그리는 "가상 마우스".
+//! The "virtual mouse" drawn over agent screens.
 //!
-//! 격리 화면(headless 브라우저, 숨긴 앱 창, 원격 세션)에는 실제 커서가 그려지지 않으므로,
-//! 에이전트가 수행한 동작을 기록해 두었다가 GhostDesk 화면에서 커서·궤적·클릭 효과로 보여준다.
-//! 좌표는 모두 에이전트 좌표(스크린샷 픽셀)다.
+//! Isolated screens (headless browser, hidden app windows, remote sessions) don't draw a real
+//! cursor, so the agent's actions are recorded and replayed in GhostDesk as a cursor, trail and
+//! click effects. All coordinates are agent coordinates (screenshot pixels).
 
 use std::{
     collections::VecDeque,
@@ -14,13 +14,15 @@ use serde_json::Value;
 
 use crate::{agent::coord, llm::short};
 
-/// 효과가 화면에 남아 있는 시간
+/// How long effects stay on screen.
 const FX_LIFE: Duration = Duration::from_millis(1600);
-/// 궤적이 남아 있는 시간
+/// How long the trail stays on screen.
 const TRAIL_LIFE: Duration = Duration::from_millis(2500);
-/// 키 입력 효과 라벨 앞의 기호. macOS 는 ⌘(기존과 같음), 그 밖은 Lucide 키보드 아이콘.
-/// 여기서는 '기본 수정키'가 아니라 '키를 눌렀다'는 표시이므로 "Ctrl" 같은 수정키 이름을
-/// 쓰지 않는다 ("Ctrl Return" 처럼 잘못 읽히지 않게). Windows 사용자에게 ⌘ 는 낯선 Mac 전용 기호다.
+/// Glyph in front of key-press labels: ⌘ on macOS (as before), the Lucide keyboard icon
+/// elsewhere.
+///
+/// It marks "a key was pressed", not the primary modifier, so modifier names like "Ctrl" aren't
+/// used (it would read as "Ctrl Return"). To Windows users ⌘ is an unfamiliar Mac-only symbol.
 const KEY_GLYPH: &str = if cfg!(target_os = "macos") { "⌘" } else { crate::icon::KEYBOARD };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,7 +31,7 @@ pub enum FxKind {
     DoubleClick,
     RightClick,
     Drag,
-    /// 스크롤 방향 (위 = -1, 아래 = +1, 왼쪽/오른쪽은 가로)
+    /// Scroll direction (up = -1, down = +1; left/right is horizontal).
     Scroll { dx: f32, dy: f32 },
     Type,
     Key,
@@ -42,29 +44,30 @@ pub struct CursorFx {
     pub to: (f64, f64),
     pub label: String,
     pub at: Instant,
-    /// 사용자의 직접 조작인가 (에이전트와 다른 모양으로 표시)
+    /// Whether this is the user's own takeover input (drawn differently from the agent).
     pub by_user: bool,
 }
 
-/// 이동 거리(에이전트 픽셀)에 따른 미끄러짐 시간. 백엔드 이동과 화면 표시가 같은 값을 쓴다.
+/// Glide duration for a distance in agent pixels. The backend movement and the on-screen cursor
+/// use the same value.
 pub fn glide_duration(dist: f64) -> Duration {
     Duration::from_millis((140.0 + dist * 0.3).clamp(140.0, 480.0) as u64)
 }
 
-/// 실제 입력을 나눠 보낼 때 한 걸음 사이 시간 (약 60fps)
+/// Time between steps when real input is sent in pieces (about 60 fps).
 pub const FRAME_MS: u64 = 16;
-/// 버튼을 누르고 있는 시간
+/// How long a button is held down.
 pub const PRESS_MS: u64 = 45;
-/// 더블·트리플 클릭의 클릭 사이 간격 (운영체제의 더블 클릭 인식 시간보다 충분히 짧게)
+/// Gap between clicks of a double/triple click (well under the OS double-click time).
 pub const MULTI_CLICK_GAP_MS: u64 = 70;
 
-/// `dur` 동안 한 프레임씩 나눈 걸음 수
+/// Number of one-frame steps in `dur`.
 pub fn frames(dur: Duration) -> u32 {
     ((dur.as_millis() as u64 / FRAME_MS) as u32).clamp(6, 30)
 }
 
-/// 스크롤 `amount`(픽셀)를 나눠 보낼 비율들 (합은 1). 처음에 많이, 끝으로 갈수록 적게 (ease-out).
-/// 작은 스크롤은 한 번에 보낸다.
+/// Fractions (summing to 1) to split a scroll of `amount` pixels into: large at first, smaller
+/// toward the end (ease-out). Small scrolls go in one piece.
 pub fn scroll_parts(amount: f64) -> Vec<f64> {
     if amount <= 60.0 {
         return vec![1.0];
@@ -80,7 +83,7 @@ pub fn ease(t: f32) -> f32 {
     if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
-/// 진행 중인 미끄러짐 이동
+/// A glide in progress.
 #[derive(Clone, Debug)]
 pub struct Glide {
     pub from: (f64, f64),
@@ -122,7 +125,8 @@ impl CursorState {
         }
     }
 
-    /// 동작을 실행하기 직전에 목표 지점을 알려 화면의 커서가 같은 곡선으로 미끄러지게 한다.
+    /// Announces the target right before an action runs, so the on-screen cursor glides along the
+    /// same curve.
     pub fn aim(&mut self, to: (f64, f64), fallback_from: (f64, f64)) {
         let from = self.current(Instant::now()).unwrap_or(self.pos.unwrap_or(fallback_from));
         let dist = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
@@ -131,9 +135,12 @@ impl CursorState {
         self.last_change = Some(now);
     }
 
-    /// 미끄러짐이 끝났으면 목표 지점을 현재 위치로 확정한다 (궤적 포함). 아직 미끄러지는 중이면 true.
-    /// 백엔드 동작이 UI 쪽 미끄러짐보다 늦게 끝나 record() 가 아직 불리지 않았어도
-    /// 커서가 출발점으로 되돌아갔다가 다시 오지 않게 한다 (record() 가 같은 좌표면 no-op).
+    /// Commits the target as the current position (trail included) once the glide is over. Returns
+    /// true while still gliding.
+    ///
+    /// Keeps the cursor from snapping back to the start and returning when the backend action
+    /// finishes later than the UI glide and `record()` hasn't been called yet (`record()` with the
+    /// same coordinates is a no-op).
     fn settle_glide(&mut self, now: Instant) -> bool {
         let gliding = self.glide.as_ref().map(|g| now.duration_since(g.start) < g.dur).unwrap_or(false);
         if !gliding {
@@ -144,14 +151,15 @@ impl CursorState {
         gliding
     }
 
-    /// 미끄러짐 중이면 현재 위치
+    /// Current position while gliding.
     fn current(&self, now: Instant) -> Option<(f64, f64)> {
         let g = self.glide.as_ref()?;
         let t = ease(now.duration_since(g.start).as_secs_f32() / g.dur.as_secs_f32().max(0.001)) as f64;
         Some((g.from.0 + (g.to.0 - g.from.0) * t, g.from.1 + (g.to.1 - g.from.1) * t))
     }
 
-    /// computer-use 동작 하나를 기록한다. `pos_after` 는 동작 뒤 백엔드가 알려준 마우스 위치.
+    /// Records one computer-use action. `pos_after` is the mouse position the backend reported after
+    /// the action.
     pub fn record(&mut self, name: &str, input: &Value, pos_after: (f64, f64), by_user: bool) {
         let now = Instant::now();
         let target = coord(&input["coordinate"]).unwrap_or(pos_after);
@@ -206,7 +214,7 @@ impl CursorState {
         self.last_change = Some(now);
     }
 
-    /// 애니메이션이 진행 중인가 (다시 그려야 하는가)
+    /// Whether an animation is running (needs a repaint).
     pub fn animating(&self, now: Instant) -> bool {
         self.last_change.map(|t| now.duration_since(t) < TRAIL_LIFE).unwrap_or(false)
     }
@@ -221,7 +229,7 @@ impl CursorState {
     }
 }
 
-/// 에이전트 id 별 고유 색
+/// A distinct color per agent id.
 pub fn agent_color(id: u64) -> Color32 {
     const P: [Color32; 8] = [
         Color32::from_rgb(255, 92, 92),
@@ -240,11 +248,11 @@ fn with_alpha(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
-/// 화살표 커서 (끝점이 `tip`). size 는 화면 픽셀 기준 높이.
+/// Arrow cursor with its tip at `tip`. `size` is the height in screen pixels.
 fn draw_arrow(p: &egui::Painter, tip: Pos2, size: f32, fill: Color32) {
     let s = size / 18.0;
     let pt = |x: f32, y: f32| tip + Vec2::new(x * s, y * s);
-    // 머리(삼각형)와 꼬리(사각형)로 나눠 볼록 다각형으로 그린다.
+    // drawn as convex polygons: a head (triangle) and a tail (quad)
     let head = vec![pt(0.0, 0.0), pt(0.0, 15.0), pt(11.5, 11.5)];
     let tail = vec![pt(4.2, 11.8), pt(7.2, 11.0), pt(10.2, 17.5), pt(7.4, 18.6)];
     let outline = Stroke::new((1.6 * s).max(1.0), Color32::from_black_alpha(230));
@@ -259,7 +267,7 @@ fn draw_arrow(p: &egui::Painter, tip: Pos2, size: f32, fill: Color32) {
     p.add(egui::Shape::convex_polygon(inset(&tail), fill, Stroke::NONE));
 }
 
-/// 사용자의 직접 조작은 손가락 대신 테두리 원으로 표시한다.
+/// The user's takeover input is shown as a ring instead of a pointer.
 fn draw_user_pointer(p: &egui::Painter, at: Pos2, size: f32) {
     let r = size * 0.38;
     p.circle_filled(at, r, Color32::from_rgba_unmultiplied(255, 180, 60, 70));
@@ -267,15 +275,15 @@ fn draw_user_pointer(p: &egui::Painter, at: Pos2, size: f32) {
     p.circle_filled(at, 2.0, Color32::from_rgb(255, 180, 60));
 }
 
-/// 화면 표시용 상태 (부드러운 이동을 위해 UI 쪽에서 들고 있는다)
+/// Display state, kept on the UI side for smooth movement.
 #[derive(Default)]
 pub struct CursorView {
     disp: Option<Pos2>,
     last_frame: Option<Instant>,
 }
 
-/// 에이전트 화면 `rect` 위에 커서와 효과를 그린다. `scale` = 화면 픽셀 / 에이전트 픽셀.
-/// 다시 그려야 하면 true 를 돌려준다.
+/// Draws the cursor and effects over the agent screen `rect`. `scale` is screen pixels per agent
+/// pixel. Returns true if a repaint is needed.
 pub fn paint(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -291,12 +299,12 @@ pub fn paint(
     state.prune(now);
     let painter = painter.with_clip_rect(rect);
     let to_screen = |p: (f64, f64)| rect.min + Vec2::new(p.0 as f32 * scale, p.1 as f32 * scale);
-    // 미끄러짐 이동 중이면 곡선 위 위치, 끝났으면 기록된 위치
+    // position on the curve while gliding, the recorded position once done
     let gliding = state.settle_glide(now);
     let logical = if gliding { state.current(now) } else { None };
     let target = to_screen(logical.or(state.pos).unwrap_or(fallback_pos));
 
-    // 남은 오차만 짧게 보정 (지수 감쇠 40ms) — 큰 이동은 위의 미끄러짐 곡선이 담당
+    // only ease out the remaining error (40 ms exponential decay); big moves follow the glide curve
     let dt = view.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0).min(0.1);
     view.last_frame = Some(now);
     let disp = match view.disp {
@@ -313,7 +321,7 @@ pub fn paint(
     view.disp = Some(disp);
     let moving = gliding || disp.distance(target) > 0.5;
 
-    // 궤적
+    // trail
     if state.trail.len() >= 2 {
         let pts: Vec<(Pos2, f32)> = state
             .trail
@@ -326,7 +334,7 @@ pub fn paint(
         }
     }
 
-    // 동작 효과
+    // action effects
     let base = if compact { 9.0 } else { 14.0 };
     for f in state.fx.iter() {
         let age = now.duration_since(f.at).as_secs_f32();
@@ -375,7 +383,7 @@ pub fn paint(
         }
     }
 
-    // 커서 본체
+    // the cursor itself
     let size = if compact { 13.0 } else { 20.0 };
     if state.by_user {
         draw_user_pointer(&painter, disp, size);
@@ -442,10 +450,10 @@ mod tests {
         s.record("left_click", &json!({"coordinate": [0, 0]}), (0.0, 0.0), false);
         s.aim((400.0, 0.0), (0.0, 0.0));
         let g = s.glide.clone().unwrap();
-        // 미끄러짐 도중에는 위치를 바꾸지 않는다
+        // position doesn't change mid-glide
         assert!(s.settle_glide(g.start));
         assert_eq!(s.pos, Some((0.0, 0.0)));
-        // 끝나면 record() 전이라도 목표 지점으로 확정 (되돌아가는 rubber-band 없음)
+        // once done it commits to the target even before record() (no rubber-banding back)
         assert!(!s.settle_glide(g.start + g.dur + Duration::from_millis(500)));
         assert_eq!(s.pos, Some((400.0, 0.0)));
         assert!(s.glide.is_none());

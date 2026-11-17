@@ -1,15 +1,20 @@
-//! 같은 사용자 프로세스끼리의 로컬 연결 (GhostDesk 창 ↔ `ghostdesk --mcp`).
+//! Local connections between processes of the same user (GhostDesk window ↔ `ghostdesk --mcp`).
 //!
-//! - Unix: 데이터 루트의 유닉스 도메인 소켓 `control.sock` (권한 0600 + 상대 uid 확인) — 기존과 같다.
-//! - Windows: 명명 파이프 `\\.\pipe\GhostDesk-control-<사용자 SID>`.
-//!   - 보안 설명자: 소유자 = 이 사용자, DACL = 이 사용자 + SYSTEM 만 (다른 사용자는 열 수 없음)
-//!   - 원격(SMB) 클라이언트 거부, 첫 인스턴스 플래그로 "이미 다른 창이 받고 있음"을 감지
-//!   - 서버: 클라이언트 프로세스의 사용자 SID 를 한 번 더 확인 (확인할 수 없으면 DACL 에 맡김)
-//!   - 클라이언트: 파이프 **소유자** SID 가 이 사용자인지 확인 (다른 사용자가 이름을 먼저 차지하는 공격 방지)
-//!     + 파이프 객체의 무결성 레이블과 서버 프로세스의 무결성 수준이 보통(클라이언트가 그보다 낮으면 클라이언트 수준)보다
-//!       낮지 않은지 확인 (같은 사용자의 샌드박스 프로세스가 차지하는 것 방지)
+//! - Unix: a Unix domain socket `control.sock` in the data root (mode 0600 plus a peer uid
+//!   check), as before.
+//! - Windows: the named pipe `\\.\pipe\GhostDesk-control-<user SID>`.
+//!   - Security descriptor: owner = this user, DACL = this user + SYSTEM only (other users can't
+//!     open it)
+//!   - Remote (SMB) clients are rejected; the first-instance flag detects "another window is
+//!     already listening"
+//!   - Server: double-checks the client process's user SID (falls back to the DACL if it can't)
+//!   - Client: checks that the pipe's **owner** SID is this user (stops another user from
+//!     squatting the name), and that neither the pipe object's integrity label nor the server
+//!     process's integrity level is below medium (or the client's own level if lower), which
+//!     stops a sandboxed process of the same user from squatting it
 //!
-//! 스트림은 읽기·쓰기 반쪽으로 나눠 상자에 담아 돌려주므로, 위쪽 코드(줄 단위 JSON RPC)는 OS 를 모른다.
+//! Streams are returned split into boxed read and write halves, so the code above (line-based
+//! JSON RPC) doesn't know about the OS.
 
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -19,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub type Reader = Box<dyn AsyncRead + Send + Unpin>;
 pub type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
-/// 연결 지점
+/// A connection endpoint.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     #[cfg(unix)]
@@ -29,7 +34,7 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// GhostDesk 창의 제어 연결 지점
+    /// Control endpoint of the GhostDesk window.
     pub fn control() -> Endpoint {
         #[cfg(unix)]
         {
@@ -38,14 +43,14 @@ impl Endpoint {
         #[cfg(windows)]
         {
             let who = super::win::current_user_sid().unwrap_or_else(|_| {
-                // SID 를 못 얻는 경우는 사실상 없지만, 그래도 사용자마다 다른 이름이 되게 한다
+                // failing to get the SID practically never happens, but keep the name per-user anyway
                 std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
             });
             Endpoint { name: format!(r"\\.\pipe\GhostDesk-control-{who}") }
         }
     }
 
-    /// 테스트·다른 용도용: 임의 이름(Unix 는 경로)
+    /// For tests and other uses: an arbitrary name (a path on Unix).
     #[allow(dead_code)]
     pub fn custom(id: &str) -> Endpoint {
         #[cfg(unix)]
@@ -59,7 +64,7 @@ impl Endpoint {
         }
     }
 
-    /// 사람이 읽을 위치 (UI·오류 메시지)
+    /// Human-readable location (UI, error messages).
     pub fn display(&self) -> String {
         #[cfg(unix)]
         {
@@ -77,13 +82,15 @@ impl Endpoint {
     }
 }
 
-/// 연결 실패의 종류
+/// Kinds of connection failure.
 #[derive(Debug)]
 pub enum ConnectError {
-    /// 받는 쪽이 없다 (GhostDesk 창이 꺼져 있음) → 창을 띄우고 다시 시도
+    /// Nobody is listening (the GhostDesk window is closed): open the window and retry.
     NotRunning(std::io::Error),
-    /// 연결 지점은 있지만 쓸 수 없다 (다른 사용자의 것, 권한 없음 등) → 다시 시도해도 소용없음.
-    /// Windows 전용: Unix 는 권한 오류도 기존처럼 창을 띄우고 다시 시도한다 (`Other`).
+    /// The endpoint exists but can't be used (another user's, no permission, …), so retrying won't
+    /// help.
+    ///
+    /// Windows only: on Unix permission errors also open the window and retry, as before (`Other`).
     #[cfg_attr(unix, allow(dead_code))]
     Denied(String),
     Other(std::io::Error),
@@ -110,8 +117,9 @@ pub async fn connect(ep: &Endpoint) -> Result<(Reader, Writer), ConnectError> {
             let (r, w) = s.into_split();
             Ok((Box::new(r), Box::new(w)))
         }
-        // 권한 오류(EACCES)도 Denied 가 아니라 Other: 기존처럼 창을 띄우고 다시 시도한다.
-        // 새로 뜬 창의 bind 가 연결할 수 없는 남은 소켓(예: sudo 로 실행했던 GhostDesk 의 것)을 지우고 다시 만든다.
+        // permission errors (EACCES) are Other too, not Denied: open the window and retry as before.
+        // The new window's bind removes a stale socket it can't connect to (e.g. one left by a GhostDesk
+        // run with sudo) and recreates it.
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => Err(ConnectError::NotRunning(e)),
             _ => Err(ConnectError::Other(e)),
@@ -126,7 +134,7 @@ pub struct Listener {
 
 #[cfg(unix)]
 impl Listener {
-    /// 연결을 받기 시작한다. 다른 GhostDesk 가 이미 받고 있으면 오류.
+    /// Starts listening. Fails if another GhostDesk is already listening.
     pub async fn bind(ep: &Endpoint) -> anyhow::Result<Listener> {
         use anyhow::Context;
         use std::os::unix::fs::PermissionsExt;
@@ -145,11 +153,11 @@ impl Listener {
         Ok(Listener { inner })
     }
 
-    /// 같은 사용자의 연결 하나를 받는다 (다른 uid 는 조용히 버린다).
+    /// Accepts one connection from the same user (other uids are silently dropped).
     pub async fn accept(&mut self) -> std::io::Result<(Reader, Writer)> {
         loop {
             let (stream, _) = self.inner.accept().await?;
-            // 같은 사용자만 허용 (소켓 권한 0600 에 더해 한 번 더 확인)
+            // same user only (a second check on top of the socket's 0600 mode)
             if let Ok(cred) = stream.peer_cred() {
                 if cred.uid() != unsafe { libc::getuid() } {
                     continue;
@@ -181,7 +189,7 @@ pub async fn connect(ep: &Endpoint) -> Result<(Reader, Writer), ConnectError> {
         match ClientOptions::new().open(&ep.name) {
             Ok(c) => break c,
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                // 서버가 다음 인스턴스를 만드는 아주 짧은 틈: 잠깐 뒤 다시
+                // the brief gap while the server creates the next instance: retry shortly
                 if start.elapsed() > Duration::from_secs(5) {
                     return Err(ConnectError::Other(e));
                 }
@@ -202,13 +210,17 @@ pub async fn connect(ep: &Endpoint) -> Result<(Reader, Writer), ConnectError> {
     Ok((Box::new(r), Box::new(w)))
 }
 
-/// 연결한 파이프의 서버가 믿을 만한지 확인한다 (다른 프로그램이 같은 이름을 먼저 만들어 가로채는 것 방지).
-/// 1. 파이프 소유자가 이 사용자인가 (다른 사용자)
-/// 2. 파이프의 무결성 수준이 낮지 않은가 (같은 사용자라도 샌드박스 안의 낮은 무결성 프로세스는 소유자가
-///    이 사용자로 같으므로 1 만으로는 못 막는다)
-///    - 파이프 객체의 무결성 레이블: 낮은 무결성 프로세스가 만든 객체에는 그 수준이 붙고, 만든 쪽이 올리거나
-///      뗄 수 없다. 자기 프로세스의 DACL 을 비워 토큰 조회를 막아도 이것은 가릴 수 없다.
-///    - 파이프를 연 서버 프로세스의 토큰 무결성 수준 (읽을 수 있으면 한 번 더, 오류 메시지에 프로그램 이름도 담는다)
+/// Checks that the server of a connected pipe can be trusted (stops another program from
+/// creating the same name first and intercepting).
+///
+/// 1. The pipe's owner is this user (not another user).
+/// 2. The pipe's integrity level isn't low. A low-integrity sandboxed process of the same user
+///    has the same owner, so 1 alone can't stop it.
+///    - The pipe object's integrity label: objects created by a low-integrity process carry its
+///      level, and the creator can't raise or remove it. Emptying its own process DACL to block
+///      token queries doesn't hide this.
+///    - The integrity level of the server process's token (checked as well when readable, and
+///      used to name the program in the error message).
 #[cfg(windows)]
 fn check_server(pipe: windows_sys::Win32::Foundation::HANDLE) -> Result<(), ConnectError> {
     use super::win;
@@ -241,19 +253,24 @@ fn check_server(pipe: windows_sys::Win32::Foundation::HANDLE) -> Result<(), Conn
     })
 }
 
-/// 서버(파이프)에 필요한 최소 무결성 수준: 이 프로세스의 수준, 단 보통(Medium)을 넘지 않는다.
-/// 관리자 권한(높음)으로 실행된 `ghostdesk --mcp` 도 보통 권한의 GhostDesk 창에 연결할 수 있어야 하고,
-/// 막아야 할 것은 보통보다 낮은(샌드박스) 프로세스가 이름을 차지하는 경우다.
+/// Minimum integrity level required of the server (pipe): this process's level, capped at
+/// medium.
+///
+/// A `ghostdesk --mcp` running elevated (high) must still be able to reach a GhostDesk window at
+/// medium; what has to be stopped is a below-medium (sandboxed) process squatting the name.
 #[cfg(windows)]
 fn required_integrity(mine: u32) -> u32 {
     mine.min(super::win::INTEGRITY_MEDIUM)
 }
 
-/// 서버의 무결성 판정. 거부하면 사유(문장 일부)를 돌려준다.
-/// - `label`: 파이프 객체의 무결성 레이블 (레이블 없음 = 보통). 필요한 수준보다 낮으면 거부 — 이것이 기준이다.
-/// - `process`: 서버 프로세스 토큰의 무결성 수준. 필요한 수준보다 낮으면 거부.
-///   읽을 권한이 없으면(ERROR_ACCESS_DENIED) 더 높은 권한의 프로세스이거나 자기 DACL 을 막아 둔 프로세스인데,
-///   어느 쪽이든 파이프 레이블로 이미 판단했으므로 허용. 그 밖의 오류(프로세스가 이미 끝남 등)는 거부.
+/// Integrity verdict on the server. Returns a reason (part of a sentence) when rejecting.
+///
+/// - `label`: the pipe object's integrity label (no label = medium). Rejected if below the
+///   required level; this is the deciding check.
+/// - `process`: the server process token's integrity level. Rejected if below the required
+///   level. Without access (ERROR_ACCESS_DENIED) it's either a higher-privileged process or one
+///   that locked down its own DACL; either way the pipe label already decided, so it's allowed.
+///   Any other error (process already gone, …) is rejected.
 #[cfg(windows)]
 fn server_integrity_verdict(label: u32, process: std::io::Result<u32>, mine: u32) -> Result<(), String> {
     use super::win::integrity_name;
@@ -277,9 +294,12 @@ fn server_integrity_verdict(label: u32, process: std::io::Result<u32>, mine: u32
     }
 }
 
-/// 이미 열린 같은 이름의 파이프가 믿을 수 없는 프로그램의 것이면 그 사유.
-/// 잠깐 연결해 `check_server` 로 확인한다 (GhostDesk 창의 것이면 빈 연결 하나가 곧바로 끝날 뿐이다).
-/// 연결할 수 없으면(더 높은 권한의 GhostDesk 창, 빈 인스턴스 없음 등) 판단하지 않는다.
+/// If a pipe with the same name is already open and belongs to an untrusted program, the
+/// reason.
+///
+/// Connects briefly and checks with `check_server` (if it's a GhostDesk window, that's just one
+/// empty connection that ends right away). If it can't connect (a higher-privileged GhostDesk
+/// window, no free instance, …), no verdict is made.
 #[cfg(windows)]
 fn foreign_pipe_owner(name: &str) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
@@ -304,17 +324,18 @@ impl Listener {
         let mut sa = sd.attributes();
         let mut opts = ServerOptions::new();
         opts.first_pipe_instance(first).reject_remote_clients(true).pipe_mode(PipeMode::Byte);
-        // SAFETY: sa 와 그 안의 보안 설명자는 호출하는 동안 살아 있다
+        // SAFETY: sa and the security descriptor inside it outlive the call
         unsafe { opts.create_with_security_attributes_raw(name, &mut sa as *mut _ as *mut core::ffi::c_void) }
     }
 
-    /// 연결을 받기 시작한다. 다른 GhostDesk 가 이미 받고 있으면 오류.
+    /// Starts listening. Fails if another GhostDesk is already listening.
     pub async fn bind(ep: &Endpoint) -> anyhow::Result<Listener> {
         let sd = super::win::SecurityDescriptor::owner_only()?;
         let next = match Self::create(&ep.name, &sd, true) {
             Ok(s) => s,
-            // 첫 인스턴스가 아니면 ACCESS_DENIED: 이미 다른 GhostDesk 창(또는 같은 이름을 가진 무언가)이 있다
-            // 인스턴스 수가 꽉 찬 파이프면 PIPE_BUSY: GhostDesk 창은 인스턴스 수를 제한하지 않으므로 다른 프로그램의 것이다
+            // ACCESS_DENIED if we're not the first instance: another GhostDesk window (or something with the
+            // same name) exists. PIPE_BUSY if the pipe is at its instance limit: GhostDesk windows don't
+            // limit instances, so it belongs to another program
             Err(e) if matches!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED) | Some(ERROR_PIPE_BUSY)) => {
                 if let Some(why) = foreign_pipe_owner(&ep.name) {
                     anyhow::bail!("GhostDesk 가 아닌 다른 프로그램이 연결 파이프 이름을 차지하고 있어 외부 연결을 받을 수 없습니다: {why}")
@@ -332,22 +353,25 @@ impl Listener {
         Ok(Listener { name: ep.name.clone(), sd, next })
     }
 
-    /// 같은 사용자의 연결 하나를 받는다.
+    /// Accepts one connection from the same user.
     pub async fn accept(&mut self) -> std::io::Result<(Reader, Writer)> {
         use std::os::windows::io::AsRawHandle;
         loop {
             if let Err(e) = self.next.connect().await {
-                // 고장 난 인스턴스를 계속 재시도하지 않게 새 인스턴스로 바꿔 두고 오류를 알린다
-                // (클라이언트가 붙자마자 끊은 경우(ERROR_NO_DATA)는 연결된 것으로 처리되어 여기 오지 않는다)
+                // swap in a fresh instance so a broken one isn't retried forever, and report the error (a client
+                // that disconnects right after connecting (ERROR_NO_DATA) counts as connected and never gets
+                // here)
                 if let Ok(fresh) = Self::create(&self.name, &self.sd, false) {
                     self.next = fresh;
                 }
                 return Err(e);
             }
-            // 다음 클라이언트를 위해 곧바로 새 인스턴스를 만든다 (틈이 생기면 클라이언트는 PIPE_BUSY 로 재시도)
+            // create the next instance right away for the next client (during any gap clients retry on
+            // PIPE_BUSY)
             let fresh = Self::create(&self.name, &self.sd, false)?;
             let conn = std::mem::replace(&mut self.next, fresh);
-            // 클라이언트 프로세스의 사용자 확인: DACL 이 이미 막지만 한 번 더 (확인할 수 없으면 DACL 에 맡긴다)
+            // check the client process's user: the DACL already blocks others, this is a second check
+            // (falls back to the DACL if it can't tell)
             let mut pid = 0u32;
             let got = unsafe {
                 windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId(conn.as_raw_handle() as _, &mut pid)
@@ -376,10 +400,11 @@ mod tests {
         let ep = Endpoint::custom(&format!("ghostdesk-ipc-test-{}", std::process::id()));
         #[cfg(unix)]
         let _ = std::fs::remove_file(ep.path());
-        // 아무도 없으면 NotRunning
+        // nobody listening → NotRunning
         assert!(matches!(connect(&ep).await, Err(ConnectError::NotRunning(_))));
         let mut l = Listener::bind(&ep).await.unwrap();
-        // 두 번째 bind 는 거부 (같은 프로세스가 연 파이프이므로 '다른 프로그램'이 아니라 '다른 GhostDesk 창')
+        // a second bind is refused (the pipe was opened by this same process, so it's "another GhostDesk
+        // window", not "another program")
         let dup = Listener::bind(&ep).await.err().expect("두 번째 bind 는 실패해야 함");
         assert!(format!("{dup:#}").contains("다른 GhostDesk 창"), "{dup:#}");
         let server = tokio::spawn(async move {
@@ -387,7 +412,7 @@ mod tests {
             while served < 2 {
                 let (r, mut w) = l.accept().await.unwrap();
                 let mut lines = BufReader::new(r).lines();
-                // Windows: 두 번째 bind 가 확인하려고 잠깐 연결했다 끊은 빈 연결은 건너뛴다
+                // Windows: skip the empty connection the second bind made briefly to check
                 let Ok(Some(line)) = lines.next_line().await else { continue };
                 w.write_all(format!("echo:{line}\n").as_bytes()).await.unwrap();
                 served += 1;
@@ -409,29 +434,31 @@ mod tests {
     fn server_integrity_rules() {
         use super::super::win::{INTEGRITY_HIGH, INTEGRITY_LOW, INTEGRITY_MEDIUM};
         const M: u32 = INTEGRITY_MEDIUM;
-        // 같거나 높으면 허용, 낮으면 거부
+        // equal or higher is allowed, lower is rejected
         assert!(server_integrity_verdict(M, Ok(M), M).is_ok());
         assert!(server_integrity_verdict(M, Ok(INTEGRITY_HIGH), M).is_ok());
         let low = server_integrity_verdict(M, Ok(INTEGRITY_LOW), M).unwrap_err();
         assert!(low.contains("무결성 수준(낮음)") && low.contains("보통"), "{low}");
         assert!(server_integrity_verdict(M, Ok(0), M).is_err());
-        // 관리자 권한(높음) 클라이언트도 보통 권한의 창에는 연결한다 (보통 미만만 거부)
+        // an elevated (high) client still connects to a medium window (only below medium is rejected)
         assert!(server_integrity_verdict(M, Ok(M), INTEGRITY_HIGH).is_ok());
         assert!(server_integrity_verdict(M, Ok(INTEGRITY_LOW), INTEGRITY_HIGH).is_err());
-        // 낮은 무결성 클라이언트끼리는 그 수준까지 허용
+        // low-integrity clients are allowed down to their own level
         assert!(server_integrity_verdict(INTEGRITY_LOW, Ok(INTEGRITY_LOW), INTEGRITY_LOW).is_ok());
-        // 파이프 레이블이 낮으면 프로세스 토큰과 상관없이 거부 (토큰을 숨겨도 마찬가지)
+        // a low pipe label is rejected whatever the process token says (even if the token is hidden)
         let denied = || std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
         let lbl = server_integrity_verdict(INTEGRITY_LOW, Err(denied()), M).unwrap_err();
         assert!(lbl.contains("파이프 무결성 수준(낮음)"), "{lbl}");
         assert!(server_integrity_verdict(INTEGRITY_LOW, Ok(INTEGRITY_HIGH), INTEGRITY_HIGH).is_err());
-        // 레이블이 보통 이상이고 토큰을 읽을 권한이 없으면(더 높은 권한) 허용, 그 밖의 오류(끝난 프로세스 등) → 거부
+        // with a label at medium or above and no access to the token (higher privilege) it's allowed;
+        // other errors (process gone, …) are rejected
         assert!(server_integrity_verdict(M, Err(denied()), M).is_ok());
         let gone = std::io::Error::from_raw_os_error(87); // ERROR_INVALID_PARAMETER
         assert!(server_integrity_verdict(M, Err(gone), M).is_err());
     }
 
-    /// 이 프로세스가 만든 객체: 레이블 없음(보통으로 봄) 또는 이 프로세스 수준 이상, 그리고 명시한 낮은 레이블은 그대로 읽힌다
+    /// Objects created by this process have no label (treated as medium) or at least this process's
+    /// level, and an explicitly set low label reads back as is.
     #[cfg(windows)]
     #[test]
     fn object_integrity_label() {
@@ -445,13 +472,14 @@ mod tests {
         let p = Listener::create(&plain, &sd, true).unwrap();
         let rid = win::object_integrity_rid(p.as_raw_handle() as _).unwrap();
         assert!(rid >= mine.min(INTEGRITY_MEDIUM), "레이블 {rid:#x}, 이 프로세스 {mine:#x}");
-        // 낮은 무결성 레이블을 명시한 파이프 (자기보다 낮은 레이블은 누구나 붙일 수 있다)
+        // a pipe with an explicit low integrity label (anyone can set a label below their own)
         let low = Endpoint::custom(&format!("ghostdesk-label-low-{}", std::process::id())).name;
         let sid = win::current_user_sid().unwrap();
         let lsd = win::SecurityDescriptor::from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;LW)")).unwrap();
         let q = Listener::create(&low, &lsd, true).unwrap();
         assert_eq!(win::object_integrity_rid(q.as_raw_handle() as _).unwrap(), INTEGRITY_LOW);
-        // 그 파이프에 클라이언트로 붙으면 check_server 가 거부한다 (보통 이상에서 실행할 때)
+        // connecting to that pipe as a client is rejected by check_server (when running at medium or
+        // above)
         if mine >= INTEGRITY_MEDIUM {
             let c = tokio::net::windows::named_pipe::ClientOptions::new().open(&low).unwrap();
             match check_server(c.as_raw_handle() as _) {
@@ -461,8 +489,9 @@ mod tests {
         }
     }
 
-    /// 수동 확인용: 낮은 무결성(Low IL) 프로세스가 미리 만들어 둔 파이프(빈 인스턴스 2개)의 전체 이름을
-    /// GHOSTDESK_TEST_LOWIL_PIPE 로 주면, 클라이언트 연결과 창의 bind 가 모두 '가로챈 프로그램'으로 알아챈다.
+    /// Manual check: with GHOSTDESK_TEST_LOWIL_PIPE set to the full name of a pipe pre-created by a
+    /// low-integrity (Low IL) process (two free instances), both the client connection and the
+    /// window's bind flag it as an intercepting program.
     #[cfg(windows)]
     #[tokio::test]
     #[ignore]
@@ -482,7 +511,7 @@ mod tests {
         assert!(format!("{e:#}").contains("GhostDesk 가 아닌 다른 프로그램"), "{e:#}");
     }
 
-    /// 이 프로세스가 연 파이프는 소유자·무결성 확인을 통과한다
+    /// A pipe opened by this process passes the owner and integrity checks.
     #[cfg(windows)]
     #[tokio::test]
     async fn own_pipe_passes_server_check() {
@@ -502,7 +531,8 @@ mod tests {
         let c = tokio::net::windows::named_pipe::ClientOptions::new().open(&ep.name).unwrap();
         assert!(check_server(c.as_raw_handle() as _).is_ok());
         drop(c);
-        // 서버가 다음 인스턴스를 만들 때까지 기다렸다가, bind 가 쓰는 확인(잠깐 연결)도 통과하는지
+        // wait for the server to create the next instance, then check bind's probe (a brief connect)
+        // passes too
         let t0 = std::time::Instant::now();
         while accepted.load(Ordering::SeqCst) < 1 {
             assert!(t0.elapsed() < std::time::Duration::from_secs(5));

@@ -1,5 +1,5 @@
-//! xdotool 스타일 키 이름("ctrl+shift+a", "Return", "Page_Down")을
-//! CDP `Input.dispatchKeyEvent` 파라미터로 바꾼다.
+//! Converts xdotool-style key names ("ctrl+shift+a", "Return", "Page_Down") into
+//! CDP `Input.dispatchKeyEvent` parameters.
 
 use anyhow::{anyhow, Result};
 
@@ -13,11 +13,11 @@ pub struct KeyDef {
     pub key: String,
     pub code: String,
     pub key_code: i64,
-    /// 입력 시 삽입될 글자 (수정키 없이 눌렀을 때)
+    /// Text inserted when the key is pressed without modifiers.
     pub text: Option<String>,
-    /// 이 키 자체가 수정키라면 해당 비트
+    /// The modifier bit, if this key is itself a modifier.
     pub modifier_bit: i64,
-    /// 이 글자를 치려면 shift 가 필요한가 (대문자, !@# 등)
+    /// Whether typing this character needs shift (capitals, `!@#`, …).
     pub needs_shift: bool,
 }
 
@@ -91,7 +91,7 @@ fn named_key(name: &str) -> Option<KeyDef> {
     Some(k)
 }
 
-/// 출력 가능한 ASCII 문자 하나에 대한 키 정의.
+/// Key definition for a single printable ASCII character.
 pub fn char_key(c: char) -> Option<KeyDef> {
     if !c.is_ascii() || c.is_ascii_control() {
         return None;
@@ -156,7 +156,7 @@ pub fn char_key(c: char) -> Option<KeyDef> {
 
 pub fn parse_combo(combo: &str) -> Result<Combo> {
     let combo = combo.trim();
-    // "ctrl++" 처럼 '+' 자체를 누르는 경우 처리
+    // handle "ctrl++", where '+' itself is the key
     let parts: Vec<String> = if combo.ends_with("++") {
         let mut v: Vec<String> = combo[..combo.len() - 2]
             .split('+')
@@ -188,7 +188,7 @@ pub fn parse_combo(combo: &str) -> Result<Combo> {
     if main.needs_shift {
         mods |= MOD_SHIFT;
     }
-    // 단일 대문자 키에 shift 가 붙으면 key 를 대문자로
+    // a single letter with shift is sent as the capital
     let mut main = main;
     if mods & MOD_SHIFT != 0 && main.key.len() == 1 {
         let c = main.key.chars().next().unwrap();
@@ -204,8 +204,8 @@ pub fn parse_combo(combo: &str) -> Result<Combo> {
     })
 }
 
-/// macOS 에서 Chrome 은 Cmd 단축키를 NSResponder 를 통해 처리하므로,
-/// CDP 로 보낼 때는 편집 명령을 `commands` 로 직접 지정해야 한다.
+/// On macOS, Chrome handles Cmd shortcuts through NSResponder, so editing shortcuts sent over
+/// CDP have to name the editing commands explicitly in `commands`.
 pub fn mac_edit_commands(combo: &Combo) -> Vec<&'static str> {
     if !cfg!(target_os = "macos") || combo.mods & (MOD_CTRL | MOD_META) == 0 {
         return vec![];

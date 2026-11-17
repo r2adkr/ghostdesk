@@ -1,9 +1,12 @@
-//! 고전 Win32 메뉴(HMENU): 읽기, 단축키(가속기) 글자 해석, WM_COMMAND 로 실행, 안전 규칙.
+//! Classic Win32 menus (HMENU): reading, parsing accelerator text, invoking via WM_COMMAND, and
+//! safety rules.
 //!
-//! 메뉴 막대는 화면 밖 창의 비작업 영역에 있으므로 열지 않는다(팝업 메뉴는 사용자 모니터 안으로 끌려 들어와 그려진다).
-//! 대신 GetMenu/GetMenuItemInfoW 로 구조를 읽고(다른 프로세스의 메뉴도 읽힌다) 항목 id 를 WM_COMMAND 로 보낸다.
-//! 백그라운드 창에 보낸 Ctrl 키 메시지는 앱의 GetKeyState 에 반영되지 않아 단축키가 먹지 않으므로,
-//! 단축키는 같은 가속기 글자("Ctrl+S")를 가진 메뉴 항목을 찾아 실행하는 방식으로 흉내 낸다.
+//! The menu bar lives in the non-client area of an off-screen window, so it is never opened
+//! (popup menus get pulled onto the user's monitor). Instead the structure is read with
+//! GetMenu/GetMenuItemInfoW (which works across processes) and item ids are sent as WM_COMMAND.
+//! Ctrl key messages sent to a background window don't show up in the app's GetKeyState, so
+//! shortcuts don't work; they are emulated by finding and invoking the menu item with the same
+//! accelerator text ("Ctrl+S").
 
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
@@ -43,7 +46,7 @@ pub const VK_OEM_COMMA: u32 = 0xBC;
 pub const VK_OEM_MINUS: u32 = 0xBD;
 pub const VK_OEM_PERIOD: u32 = 0xBE;
 
-/// 단축키 하나 (가상 키 + 수정키)
+/// A single shortcut (virtual key + modifiers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Accel {
     pub ctrl: bool,
@@ -147,13 +150,13 @@ fn key_token_vk(t: &str) -> Option<u32> {
     })
 }
 
-/// 메뉴 항목의 단축키 글자("Ctrl+Shift+S", "Strg+S", "Del", "F5")를 해석한다
+/// Parses a menu item's accelerator text ("Ctrl+Shift+S", "Strg+S", "Del", "F5").
 pub fn parse_accel(text: &str) -> Option<Accel> {
     let t = text.trim();
     if t.is_empty() {
         return None;
     }
-    // 끝의 '+' 는 키 자체: "Ctrl++" → ["Ctrl", "+"], "Ctrl+Num +" → ["Ctrl", "Num +"]
+    // a trailing '+' is the key itself: "Ctrl++" → ["Ctrl", "+"], "Ctrl+Num +" → ["Ctrl", "Num +"]
     let mut raw: Vec<String> = t.split('+').map(|s| s.to_string()).collect();
     if t.ends_with('+') {
         raw.pop();
@@ -178,13 +181,13 @@ pub fn parse_accel(text: &str) -> Option<Accel> {
     Some(a)
 }
 
-/// 메뉴 항목 하나
+/// A single menu item.
 #[derive(Clone, Debug)]
 pub struct Item {
     pub id: u32,
-    /// '&' 를 뺀 이름
+    /// Title without '&'.
     pub title: String,
-    /// '\t' 뒤의 단축키 글자 (있으면)
+    /// Accelerator text after '\t', if any.
     pub accel_text: Option<String>,
     pub disabled: bool,
     pub checked: bool,
@@ -193,7 +196,10 @@ pub struct Item {
     pub sub: Option<isize>,
 }
 
-/// HMENU 의 항목들. owner 가 있으면 먼저 WM_INITMENUPOPUP 으로 활성 상태를 갱신하게 한다 (index = 상위 메뉴에서의 위치).
+/// Items of an HMENU.
+///
+/// With an owner, sends WM_INITMENUPOPUP first so the app refreshes enabled states (`index` is
+/// the position in the parent menu).
 pub fn items(hmenu: isize, refresh: Option<(Hwnd, usize)>) -> Vec<Item> {
     if hmenu == 0 {
         return vec![];
@@ -233,7 +239,7 @@ pub fn items(hmenu: isize, refresh: Option<(Hwnd, usize)>) -> Vec<Item> {
     out
 }
 
-/// 메뉴를 가진 창 (현재 창 → 소유자 순으로 처음 GetMenu 가 있는 창)
+/// The window that owns a menu: the first of this window and its owners with a GetMenu.
 pub fn menu_owner(h: Hwnd) -> Option<(Hwnd, isize)> {
     let mut cur = h;
     for _ in 0..6 {
@@ -249,7 +255,7 @@ pub fn menu_owner(h: Hwnd) -> Option<(Hwnd, isize)> {
     None
 }
 
-// ───────────── 안전 규칙 ─────────────
+// ---- safety rules ----
 
 pub const R_HELP: &str = "도움말은 브라우저나 도움말 창을 사용자 화면 앞에 띄우므로 차단했습니다";
 pub const R_CLIPBOARD: &str =
@@ -258,8 +264,11 @@ pub const R_SYSTEM: &str = "이 항목은 창을 사용자 화면으로 옮기�
 pub const R_MODAL: &str = "모달 대화상자가 열려 있어 본 창(메뉴를 가진 창)이 비활성이므로 실행하지 않았습니다 — 실제 키보드로도 대화상자가 \
     열린 동안에는 본 창의 메뉴·단축키가 동작하지 않습니다. 대화상자를 먼저 끝내거나 닫으세요 (app_control list_windows 로 확인)";
 
-/// 메뉴 소유 창이 쓸 수 있는가: 모달 대화상자(DialogBox·MessageBox·공용 대화상자)가 열려 있으면 소유 창은 비활성이고,
-/// 그 창에 WM_COMMAND 를 보내면 대화상자의 모달 루프 안에서 명령이 다시 실행된다 (저장·끝내기 중첩 → 자료 손상·충돌).
+/// Whether the menu's owner window can take commands.
+///
+/// While a modal dialog (DialogBox, MessageBox, common dialogs) is open the owner is disabled,
+/// and WM_COMMAND sent to it runs inside the dialog's modal loop (nested save/exit → data
+/// corruption and crashes).
 pub fn owner_usable(owner: Hwnd) -> bool {
     w32::is_enabled(owner)
 }
@@ -283,7 +292,7 @@ pub fn is_help_title(t: &str) -> bool {
     HELP_TITLES.contains(&n.as_str())
 }
 
-/// 이름이 시스템 클립보드를 쓰는 동작(복사·잘라내기·붙여넣기)인가
+/// Whether a title names an action that uses the system clipboard (copy, cut, paste).
 pub fn is_clipboard_title(t: &str) -> bool {
     let n = norm(t);
     CLIP_WORDS.iter().any(|w| n == *w || n.starts_with(&format!("{w} ")) || n.ends_with(&format!(" {w}")))
@@ -297,7 +306,7 @@ pub fn is_clipboard_accel(a: &Accel) -> bool {
     c
 }
 
-/// 항목 차단 이유 (top_title = 최상위 메뉴 이름)
+/// Why an item is blocked (`top_title` is the top-level menu name).
 pub fn block_reason(top_title: &str, item: &Item) -> Option<&'static str> {
     if is_help_title(top_title) || is_help_title(&item.title) {
         return Some(R_HELP);
@@ -310,10 +319,12 @@ pub fn block_reason(top_title: &str, item: &Item) -> Option<&'static str> {
 
 type Found = (String, Item, Option<&'static str>);
 
-/// 단축키를 가진 메뉴 항목을 찾는다: (경로, 메뉴 소유 창, 항목, 차단 이유).
-/// 활성 항목·차단 항목을 먼저 돌려주고, 같은 단축키가 비활성 항목에만 있으면 그 항목을 돌려준다 (호출자가 '비활성'이라고 알림).
-/// 소유 창이 비활성(모달 대화상자가 열림)이면 WM_INITMENU/WM_INITMENUPOPUP 도 보내지 않는다 — 호출자는 소유 창을
-/// [`owner_usable`] 로 확인하고 실행하지 않아야 한다.
+/// Finds the menu item with a given shortcut: `(path, owner window, item, block reason)`.
+///
+/// Enabled and blocked items come first; if the shortcut only exists on a disabled item, that
+/// item is returned (the caller reports it as disabled). If the owner is disabled (a modal dialog
+/// is open), WM_INITMENU/WM_INITMENUPOPUP aren't sent either; callers must check the owner with
+/// [`owner_usable`] and not invoke anything.
 pub fn find_by_accel(h: Hwnd, want: &Accel) -> Option<(String, Hwnd, Item, Option<&'static str>)> {
     let (owner, bar) = menu_owner(h)?;
     let refresh = owner_usable(owner);
@@ -365,7 +376,7 @@ pub fn find_by_accel(h: Hwnd, want: &Accel) -> Option<(String, Hwnd, Item, Optio
     disabled.map(|(p, it, r)| (p, owner, it, r))
 }
 
-/// 메뉴 항목 실행 (WM_COMMAND)
+/// Invokes a menu item (WM_COMMAND).
 pub fn invoke(owner: Hwnd, id: u32) -> bool {
     w32::post(owner, w32::WM_COMMAND, w32::make_wparam(id, 0), 0)
 }

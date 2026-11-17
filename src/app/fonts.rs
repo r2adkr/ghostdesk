@@ -1,8 +1,9 @@
-//! 한글·아이콘 글꼴 등록.
+//! Korean and icon font registration.
 
 use super::*;
 
-/// 한글 글꼴 후보 (앞에서부터 처음 읽히는 하나를 기본 글꼴 뒤에 대체 글꼴로 붙인다).
+/// Korean font candidates. The first one that loads is appended to the default fonts as a
+/// fallback.
 pub(super) fn font_candidates() -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     {
@@ -22,9 +23,12 @@ pub(super) fn font_candidates() -> Vec<std::path::PathBuf> {
     }
 }
 
-/// Windows 한글 글꼴 후보: 맑은 고딕(Windows 기본 한글 글꼴) → 굴림·바탕(선택 설치 글꼴) →
-/// 사용자가 설치한 나눔고딕·Noto Sans KR (모든 사용자용 `fonts` 폴더, 그다음 사용자별 글꼴 폴더).
-/// `local_appdata` 는 사용자별 글꼴 폴더(%LOCALAPPDATA%\Microsoft\Windows\Fonts)의 기준.
+/// Windows Korean font candidates: Malgun Gothic (the default Korean font) → Gulim/Batang
+/// (optional fonts) → user-installed NanumGothic / Noto Sans KR (all-users `fonts` folder, then
+/// the per-user font folder).
+///
+/// `local_appdata` is the base of the per-user font folder
+/// (%LOCALAPPDATA%\Microsoft\Windows\Fonts).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn windows_font_candidates(fonts: &std::path::Path, local_appdata: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
     const SYSTEM: &[&str] = &["malgun.ttf", "malgunsl.ttf", "gulim.ttc", "batang.ttc"];
@@ -40,8 +44,10 @@ pub(super) fn windows_font_candidates(fonts: &std::path::Path, local_appdata: Op
     v
 }
 
-/// 시스템 글꼴 폴더: 알려진 폴더(FOLDERID_Fonts) → %SystemRoot%\Fonts → C:\Windows\Fonts.
-/// (MCP 호스트가 환경변수를 지운 채 GUI 를 띄워도 찾을 수 있게 알려진 폴더 API 를 먼저 쓴다.)
+/// System font folder: known folder (FOLDERID_Fonts) → %SystemRoot%\Fonts → C:\Windows\Fonts.
+///
+/// The known-folder API comes first so fonts are found even when an MCP host starts the GUI with
+/// a scrubbed environment.
 #[cfg(windows)]
 pub(super) fn windows_fonts_dir() -> std::path::PathBuf {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -65,8 +71,11 @@ pub(super) fn windows_fonts_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\Fonts"))
 }
 
-/// 일본어·중국어 화면용 글꼴 후보 (한글 글꼴에 없는 가나·간체자를 채운다). 한국어·영어는 없음.
-/// 고른 언어일 때만 읽는다: 중국어 글꼴은 20MB 가까이 되어, 늘 들고 있으면 메모리를 많이 쓴다.
+/// Font candidates for Japanese and Chinese UIs, filling in kana and simplified characters the
+/// Korean font lacks. None for Korean and English.
+///
+/// Only loaded for the chosen language: Chinese fonts are close to 20 MB, too much to keep
+/// around.
 pub(super) fn lang_font_candidates(lang: Lang) -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     let (dir, ja, zh): (std::path::PathBuf, &[&str], &[&str]) =
@@ -85,9 +94,12 @@ pub(super) fn lang_font_candidates(lang: Lang) -> Vec<std::path::PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
 }
 
-/// 글꼴 파일을 메모리 맵으로 연다. 통째로 읽으면 macOS 한글 글꼴(여러 굵기가 든 .ttc, 약 55MB)이
-/// 그대로 힙에 올라가지만, 맵으로 열면 실제로 그린 글자의 쪽만 올라오고 그마저 운영체제가 언제든 회수할 수 있다.
-/// 한 번 연 파일은 프로그램이 끝날 때까지 맵을 유지하고 다시 쓴다 (언어를 바꿔 글꼴을 다시 등록해도 새로 열지 않음).
+/// Memory-maps a font file.
+///
+/// Reading it whole would put the macOS Korean font (a multi-weight .ttc, about 55 MB) straight
+/// on the heap; a map only pages in glyphs actually drawn, and the OS can reclaim those at any
+/// time. Maps stay open for the life of the process and are reused (switching languages and
+/// re-registering fonts doesn't reopen them).
 fn map_font(path: &std::path::Path) -> Option<&'static [u8]> {
     static OPEN: parking_lot::Mutex<Vec<(std::path::PathBuf, &'static [u8])>> = parking_lot::Mutex::new(Vec::new());
     let mut open = OPEN.lock();
@@ -95,31 +107,32 @@ fn map_font(path: &std::path::Path) -> Option<&'static [u8]> {
         return Some(bytes);
     }
     let file = std::fs::File::open(path).ok()?;
-    // SAFETY: 시스템 글꼴 폴더의 파일이라 실행 중에 잘리거나 바뀌지 않는다 (macOS 는 시스템 볼륨이 읽기 전용,
-    // Windows 는 맵을 연 파일을 지우거나 줄일 수 없다). 맵은 일부러 놓지 않아 'static 으로 쓴다.
+    // SAFETY: files in the system font folder aren't truncated or modified while we run (the macOS
+    // system volume is read-only; Windows won't delete or shrink a mapped file). The map is leaked
+    // on purpose to get a 'static slice.
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     let bytes: &'static [u8] = Box::leak(Box::new(map));
     open.push((path.to_path_buf(), bytes));
     Some(bytes)
 }
 
-/// 글꼴을 등록한다. 켤 때와 언어를 바꿀 때 부른다.
+/// Registers fonts. Called at startup and on language change.
 pub(super) fn setup_fonts(ctx: &egui::Context, lang: Lang) {
     let mut fonts = egui::FontDefinitions::default();
-    // 앞에 둘수록 먼저 쓰인다: (일본어·중국어 글꼴) → 한글 글꼴 → egui 기본 글꼴.
-    // 일본어·중국어는 같은 한자도 모양이 달라 그 언어 글꼴을 한글 글꼴보다 앞에 둔다.
+    // earlier entries win: (Japanese/Chinese font) → Korean font → egui defaults. The same Han
+    // characters look different in Japanese and Chinese, so that language's font goes first.
     let first = |c: Vec<std::path::PathBuf>| c.into_iter().find_map(|p| map_font(&p));
     for (name, bytes) in [("lang", first(lang_font_candidates(lang))), ("korean", first(font_candidates()))].into_iter().rev() {
         let Some(bytes) = bytes else { continue };
         fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
-        // 본문 글꼴은 시스템 글꼴(맑은 고딕·Apple SD 산돌고딕 Neo 등)을 맨 앞에 두어 영문·한글 모양을 맞춘다.
-        // 고정폭 글꼴은 기존 글꼴을 쓰고 한글·한자만 이 글꼴로 채운다.
+        // proportional text puts the system font (Malgun Gothic, Apple SD Gothic Neo, …) first so Latin
+        // and Hangul match; monospace keeps its font and only falls back for Hangul and Han.
         fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, name.into());
         let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
         let at = mono.iter().position(|f| f == "korean").unwrap_or(mono.len());
         mono.insert(at, name.into());
     }
-    // Lucide 아이콘 글꼴은 사용자 영역(U+E000~) 글자만 있으므로 맨 앞에 두어도 다른 글자 모양을 바꾸지 않는다
+    // Lucide only has Private Use Area glyphs (U+E000..), so putting it first changes nothing else
     fonts.font_data.insert("lucide".into(), Arc::new(egui::FontData::from_static(crate::icon::FONT)));
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().insert(0, "lucide".into());
@@ -135,21 +148,21 @@ mod tests {
     fn windows_font_candidate_order() {
         use std::path::Path;
         let v = windows_font_candidates(Path::new(r"D:\Win\Fonts"), Some(Path::new(r"C:\Users\u\AppData\Local")));
-        // 맑은 고딕이 가장 먼저, 시스템 글꼴 폴더 기준
+        // Malgun Gothic first, from the system font folder
         assert_eq!(v[0], Path::new(r"D:\Win\Fonts").join("malgun.ttf"));
         let pos = |p: &std::path::Path| v.iter().position(|x| x == p).unwrap_or_else(|| panic!("{p:?} 없음: {v:?}"));
         let gulim = pos(&Path::new(r"D:\Win\Fonts").join("gulim.ttc"));
         let nanum_sys = pos(&Path::new(r"D:\Win\Fonts").join("NanumGothic.ttf"));
         let nanum_user = pos(&Path::new(r"C:\Users\u\AppData\Local").join("Microsoft").join("Windows").join("Fonts").join("NanumGothic.ttf"));
         assert!(0 < gulim && gulim < nanum_sys && nanum_sys < nanum_user, "{v:?}");
-        // 사용자별 글꼴 폴더를 모르면 시스템 폴더만
+        // without a per-user font folder, only the system one
         let only_sys = windows_font_candidates(Path::new(r"C:\Windows\Fonts"), None);
         assert!(only_sys.iter().all(|p| p.starts_with(r"C:\Windows\Fonts")), "{only_sys:?}");
     }
 
     #[test]
     fn korean_font_is_loaded() {
-        // 실제 글꼴 파일을 찾아 egui 에 넣었을 때 한글 글리프가 생기는가 (기본 egui 글꼴에는 한글이 없다)
+        // loading a real font into egui yields Hangul glyphs (egui's default fonts have none)
         let ctx = egui::Context::default();
         setup_fonts(&ctx, Lang::Ko);
         ctx.run_ui(Default::default(), |_ui| {}).drop_without_applying_deltas();
@@ -159,7 +172,8 @@ mod tests {
         }
     }
 
-    /// 일본어·중국어를 고르면 가나·간체자가 그려지고, 한글도 그대로 그려진다 (글꼴은 메모리 맵으로 연다)
+    /// Choosing Japanese or Chinese renders kana and simplified characters, and Hangul still renders
+    /// (fonts are memory-mapped).
     #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn cjk_fonts_cover_their_language() {
@@ -180,7 +194,7 @@ mod tests {
         let dir = windows_fonts_dir();
         assert!(dir.is_dir(), "{dir:?}");
         assert!(dir.ends_with("Fonts"), "{dir:?}");
-        // Windows 10/11 에는 맑은 고딕이 항상 설치되어 있다
+        // Windows 10/11 always ship Malgun Gothic
         let first = font_candidates().into_iter().find(|p| p.is_file()).expect("한글 글꼴 없음");
         assert!(first.file_name().unwrap().to_string_lossy().eq_ignore_ascii_case("malgun.ttf"), "{first:?}");
     }

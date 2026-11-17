@@ -1,8 +1,10 @@
-//! 자체 시험용 Win32 창 (`ghostdesk --selftest-native --target`).
+//! Win32 test window for the self-test (`ghostdesk --selftest-native --target`).
 //!
-//! 메뉴(가속기 글자 포함)·여러 줄 입력 칸·단추·체크 상자·콤보 상자·메시지 상자·"저장할까요?" 확인을 가진
-//! 고전 Win32 앱. GhostDesk 가 숨김으로 띄워 메뉴 흉내·대화상자 처리·종료를 결정적으로 시험한다.
-//! 이 창의 '복사' 메뉴는 시스템 클립보드를 쓰지 않는다 (차단이 실패해도 사용자 클립보드는 안전하게).
+//! A classic Win32 app with a menu (including accelerator text), a multi-line edit, buttons, a
+//! check box, a combo box, a message box and a "Save changes?" prompt. GhostDesk launches it
+//! hidden to test menu emulation, dialog handling and shutdown deterministically. Its Copy menu
+//! item doesn't touch the system clipboard, so the user's clipboard stays safe even if blocking
+//! fails.
 
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
@@ -52,7 +54,8 @@ const ID_CHECK: i32 = 1004;
 const ID_COMBO: i32 = 1005;
 const ID_ENV: i32 = 1006;
 
-/// 이 프로세스가 놓인 환경 (자체 시험이 ui_tree 로 읽는다): 속한 Job 의 UI 제한, 물려받은 오류 모드
+/// The environment this process runs in, read by the self-test via `ui_tree`: the UI limits of
+/// its Job and the inherited error mode.
 pub fn env_label() -> String {
     let ui = super::launch::job_ui_limits(std::ptr::null_mut()).map(|u| format!("{u:#x}")).unwrap_or_else(|| "none".into());
     let account = pw::current_user_sid().unwrap_or_default();
@@ -131,7 +134,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                     let c = pw::wide("GhostDesk 시험");
                     wm::MessageBoxW(h, t.as_ptr(), c.as_ptr(), wm::MB_OK | wm::MB_ICONINFORMATION);
                 }
-                // 본 창 메뉴의 Alt+Y 단축키 — 질문 상자(예(&Y))가 열린 동안에는 실행되면 안 된다
+                // the main window's Alt+Y menu shortcut; must not fire while the question box (with &Yes) is open
                 ID_ALTY => set_text(h as isize, "Alt+Y 메뉴 실행됨"),
                 ID_ASK => {
                     let t = pw::wide("시험용 질문 상자입니다");
@@ -213,8 +216,11 @@ unsafe fn build_menu() -> wm::HMENU {
     bar
 }
 
-/// 시험 대상 창을 띄우고 메시지 루프를 돈다. offscreen_visible 이면 처음부터 화면 밖에 도구 창으로 보이게
-/// (Mode B — "사용자가 이미 띄워 둔 앱" 흉내, 사용자 화면에는 나타나지 않음). minimized 면 그 상태로 최소화 (도구 창의 최소화 위치는 화면 밖).
+/// Opens the test window and runs the message loop.
+///
+/// With `offscreen_visible` it starts as a visible tool window off-screen (mode B, mimicking an
+/// app the user already had open, never shown on the user's screen). With `minimized` it starts
+/// minimized (a tool window minimizes to an off-screen spot).
 pub fn run(offscreen_visible: bool, minimized: bool) -> Result<()> {
     unsafe {
         let hinst = GetModuleHandleW(std::ptr::null());
@@ -254,7 +260,7 @@ pub fn run(offscreen_visible: bool, minimized: bool) -> Result<()> {
         if hwnd.is_null() {
             anyhow::bail!("시험 창을 만들지 못했습니다");
         }
-        // 일반 앱처럼 시작 정보(STARTUPINFO)의 표시 방법을 따른다 (GhostDesk 가 SW_HIDE 로 띄움)
+        // honor STARTUPINFO's show command like a normal app (GhostDesk launches with SW_HIDE)
         wm::ShowWindow(
             hwnd,
             if minimized {
@@ -266,7 +272,8 @@ pub fn run(offscreen_visible: bool, minimized: bool) -> Result<()> {
             },
         );
         if minimized {
-            // '최대화 상태에서 최소화된 창' 흉내 (복원하면 최대화): 최대화 자체는 사용자 모니터에 붙으므로 하지 않고 플래그만 둔다
+            // mimic "minimized from maximized" (restores maximized): actually maximizing would snap to the
+            // user's monitor, so only set the flag
             let mut wp: wm::WINDOWPLACEMENT = std::mem::zeroed();
             wp.length = std::mem::size_of::<wm::WINDOWPLACEMENT>() as u32;
             if wm::GetWindowPlacement(hwnd, &mut wp) != 0 {

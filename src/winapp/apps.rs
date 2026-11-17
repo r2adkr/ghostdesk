@@ -1,8 +1,9 @@
-//! 설치된 앱 찾기: 시작 메뉴 바로 가기(.lnk)와 App Paths 레지스트리.
+//! Finding installed apps: Start menu shortcuts (.lnk) and the App Paths registry key.
 //!
-//! .lnk 는 MS-SHLLINK 형식을 직접 읽는다 (COM 의 IShellLinkW 를 쓰지 않으므로 MSI '광고' 바로 가기를
-//! 실수로 설치·복구시키는 일이 없다). 대상 경로는 환경 변수 블록(%windir%\…) → LinkInfo 의 로컬 경로 →
-//! 상대 경로 순으로 찾는다.
+//! .lnk files are parsed directly as MS-SHLLINK. Not going through COM's IShellLinkW means MSI
+//! "advertised" shortcuts never trigger an accidental install or repair. The target is taken
+//! from the environment variable block (%windir%\…), then LinkInfo's local path, then the
+//! relative path.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -24,17 +25,17 @@ const HAS_ICON_LOCATION: u32 = 0x40;
 const IS_UNICODE: u32 = 0x80;
 const HAS_DARWIN_ID: u32 = 0x1000;
 
-/// .lnk 에서 읽은 정보
+/// Information read from a .lnk.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Lnk {
-    /// LinkInfo 의 로컬 경로 (기본 경로 + 접미사)
+    /// LinkInfo's local path (base path + suffix).
     pub local_path: Option<String>,
-    /// 환경 변수 블록의 대상 (예: %windir%\system32\charmap.exe, 펼치기 전)
+    /// Target from the environment variable block (e.g. %windir%\system32\charmap.exe, unexpanded).
     pub env_target: Option<String>,
     pub relative_path: Option<String>,
     pub working_dir: Option<String>,
     pub arguments: Option<String>,
-    /// MSI '광고' 바로 가기 (실행하면 설치·복구가 돌 수 있음)
+    /// MSI "advertised" shortcut (launching it may run an install or repair).
     pub darwin: bool,
 }
 
@@ -46,7 +47,7 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
 }
 
-/// NUL 로 끝나는 ANSI 문자열 (ASCII 가 아니면 None — 코드 페이지를 모르므로)
+/// NUL-terminated ANSI string (`None` if not ASCII, since the code page is unknown).
 fn ansi_z(b: &[u8], o: usize) -> Option<String> {
     let rest = b.get(o..)?;
     let n = rest.iter().position(|&c| c == 0)?;
@@ -75,7 +76,7 @@ fn utf16_z(b: &[u8], o: usize) -> Option<String> {
     Some(String::from_utf16_lossy(&v))
 }
 
-/// MS-SHLLINK 바이트를 읽는다
+/// Parses MS-SHLLINK bytes.
 pub fn parse_lnk(b: &[u8]) -> Option<Lnk> {
     if u32_at(b, 0)? != 0x4C || b.get(4..20)? != [0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46] {
         return None;
@@ -92,7 +93,7 @@ pub fn parse_lnk(b: &[u8]) -> Option<Lnk> {
         let hdr = u32_at(b, li + 4)? as usize;
         let li_flags = u32_at(b, li + 8)?;
         if li_flags & 1 != 0 {
-            // 0x10 LocalBasePathOffset, 0x18 CommonPathSuffixOffset, (헤더 ≥ 0x24 이면) 0x1C/0x20 유니코드 판
+            // 0x10 LocalBasePathOffset, 0x18 CommonPathSuffixOffset, (header ≥ 0x24) 0x1C/0x20 Unicode variants
             let base_off = u32_at(b, li + 0x10)? as usize;
             let suffix_off = u32_at(b, li + 0x18)? as usize;
             let (base, suffix) = if hdr >= 0x24 {
@@ -143,7 +144,7 @@ pub fn parse_lnk(b: &[u8]) -> Option<Lnk> {
     if flags & HAS_ICON_LOCATION != 0 {
         read_str(&mut o)?;
     }
-    // ExtraData 블록들
+    // ExtraData blocks
     while let Some(size) = u32_at(b, o) {
         let size = size as usize;
         if size < 8 {
@@ -151,7 +152,7 @@ pub fn parse_lnk(b: &[u8]) -> Option<Lnk> {
         }
         let sig = u32_at(b, o + 4).unwrap_or(0);
         if sig == 0xA000_0001 && size >= 0x314 {
-            // EnvironmentVariableDataBlock: TargetAnsi[260] 다음 TargetUnicode[520 바이트]
+            // EnvironmentVariableDataBlock: TargetAnsi[260] followed by TargetUnicode[520 bytes]
             out.env_target = utf16_z(b, o + 8 + 260).filter(|s| !s.is_empty()).or_else(|| ansi_z(b, o + 8).filter(|s| !s.is_empty()));
         } else if sig == 0xA000_0006 {
             out.darwin = true;
@@ -161,7 +162,7 @@ pub fn parse_lnk(b: &[u8]) -> Option<Lnk> {
     Some(out)
 }
 
-/// %VAR% 를 펼친다
+/// Expands %VAR%.
 pub fn expand_env(s: &str) -> String {
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
     if !s.contains('%') {
@@ -182,7 +183,7 @@ pub fn expand_env(s: &str) -> String {
     }
 }
 
-/// 바로 가기의 대상 실행 파일 (있는 파일만)
+/// The shortcut's target executable (only if it exists).
 pub fn lnk_target(lnk_path: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(lnk_path).ok()?;
     let l = parse_lnk(&bytes)?;
@@ -199,8 +200,9 @@ pub fn lnk_target(lnk_path: &Path) -> Option<PathBuf> {
     if let (Some(r), Some(dir)) = (&l.relative_path, lnk_path.parent()) {
         cands.push(dir.join(r));
     }
-    // 네트워크·장치 경로(\\server\share, \\?\UNC\…, \\.\…)는 건드리지도 않는다: is_file() 만으로도 SMB 인증
-    // (사용자 NTLM 자격 증명)이 그 서버로 가고, 오프라인 공유는 몇 초씩 멈춘다. 그런 대상은 어차피 열지 않는다.
+    // don't even touch network or device paths (\\server\share, \\?\UNC\…, \\.\…): is_file() alone
+    // sends SMB auth (the user's NTLM credentials) to that server, and offline shares stall for
+    // seconds. Such targets are never opened anyway.
     cands
         .into_iter()
         .filter(|p| !is_network_or_device(p))
@@ -208,8 +210,10 @@ pub fn lnk_target(lnk_path: &Path) -> Option<PathBuf> {
         .map(|p| paths::canonicalize(&p).unwrap_or(p))
 }
 
-/// `\\server\share`·`//server`·`\\?\UNC\…`·`\\?\GLOBALROOT\…`·`\\.\…`·`\??\…` 처럼 로컬 드라이브가 아닌 경로인가
-/// (`\\?\C:\…` 는 로컬). 문자열만 보고 판단하므로 파일 시스템에 접근하지 않는다.
+/// Whether a path is not on a local drive: `\\server\share`, `//server`, `\\?\UNC\…`,
+/// `\\?\GLOBALROOT\…`, `\\.\…`, `\??\…` (`\\?\C:\…` is local).
+///
+/// Decided from the string alone, without touching the file system.
 fn is_network_or_device(p: &Path) -> bool {
     let s = p.to_string_lossy();
     let s = s.trim().trim_matches('"').trim().replace('/', "\\");
@@ -220,7 +224,7 @@ fn is_network_or_device(p: &Path) -> bool {
     s.starts_with(r"\\") || s.starts_with(r"\??\")
 }
 
-// ───────────────────────── 설치된 앱 ─────────────────────────
+// ---- installed apps ----
 
 fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
@@ -267,14 +271,16 @@ const SKIP_NAME_WORDS: [&str; 22] = [
     "홈페이지", "license", "라이선스", "release notes", "changelog", "documentation", "what's new", "support", "고객 지원", "온라인",
 ];
 
-/// Windows 셸과, 다른 프로그램을 띄우기만 하는 시스템 실행기·관리 도구 (조작할 창이 없거나, 셸 창(작업 표시줄·바탕 화면)이거나,
-/// 시스템 전체에 작용). 앱 목록에서 빼고 실행 전 검사([`super::launch::preflight`])에서도 거부한다.
+/// The Windows shell plus system launchers and admin tools that only start other programs (no
+/// window to drive, a shell window like the taskbar or desktop, or system-wide effects).
+///
+/// Left out of the app list and refused by the pre-launch check ([`super::launch::preflight`]).
 pub const SHELL_LAUNCHERS: [&str; 13] = [
     "hh.exe", "explorer.exe", "control.exe", "mmc.exe", "rundll32.exe", "msiexec.exe", "wscript.exe", "cscript.exe", "mshta.exe",
     "regedit.exe", "taskmgr.exe", "msconfig.exe", "systemsettingsadminflows.exe",
 ];
 
-/// 앱 목록에서 뺄 바로 가기 (제거 프로그램·도움말·웹 사이트 등)
+/// Shortcuts to leave out of the app list (uninstallers, help, web sites, …).
 pub fn skip_shortcut(name: &str, target: &Path) -> bool {
     let n = name.to_lowercase();
     if SKIP_NAME_WORDS.iter().any(|w| n.contains(w)) {
@@ -313,7 +319,7 @@ fn scan_installed() -> Vec<(String, String)> {
         seen.insert(key);
         out.push((name, t));
     }
-    // App Paths (시작 메뉴에 없는 앱)
+    // App Paths (apps not in the Start menu)
     let base = r"Software\Microsoft\Windows\CurrentVersion\App Paths";
     for root in [pw::HKEY_CURRENT_USER, pw::HKEY_LOCAL_MACHINE] {
         for k in pw::reg_subkeys(root, base) {
@@ -341,7 +347,7 @@ fn scan_installed() -> Vec<(String, String)> {
     out.into_iter().map(|(n, p)| (n, p.to_string_lossy().to_string())).collect()
 }
 
-/// 설치된 앱 목록 (표시 이름, 실행 파일 경로) — 1분 동안 캐시
+/// Installed apps `(display name, executable path)`, cached for a minute.
 pub fn installed_apps() -> Vec<(String, String)> {
     static CACHE: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::new(None);
     if let Some((t, v)) = CACHE.lock().as_ref() {
@@ -363,14 +369,16 @@ fn search_path(exe: &str) -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file())
 }
 
-/// 사용자가 적은 앱(경로·.lnk·표시 이름·실행 파일 이름)을 실행 파일 경로로
+/// Resolves what the user typed (path, .lnk, display name, executable name) to an executable
+/// path.
 pub fn resolve_app_query(query: &str) -> Option<PathBuf> {
     let q = query.trim().trim_matches('"').trim();
     if q.is_empty() {
         return None;
     }
-    // 이미 있는 파일의 절대 경로는 그대로 쓴다: 다시 펼치면 이름에 '%NAME%' 이 그대로 든 경로(검사·승인한 파일)가
-    // 다른 파일로 바뀔 수 있다. 환경 변수 펼치기는 '%SystemRoot%\…' 처럼 사람이 적은 경로에만 한다.
+    // an absolute path to an existing file is used as is: expanding it again could turn a path
+    // that literally contains '%NAME%' (the file checked and approved) into a different file.
+    // Expansion is only for paths a person typed, like '%SystemRoot%\…'.
     let raw = Path::new(q);
     let expanded = if raw.is_absolute() && raw.is_file() { q.to_string() } else { expand_env(q) };
     let p = PathBuf::from(&expanded);
@@ -405,14 +413,15 @@ pub fn resolve_app_query(query: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// 최소 .lnk 만들기: LinkInfo(로컬 경로) + 상대 경로 + 인자 (+ 환경 변수 블록)
+    /// Builds a minimal .lnk: LinkInfo (local path) + relative path + arguments (+ environment
+    /// variable block).
     fn build_lnk(local: &str, rel: &str, args: &str, env: Option<&str>) -> Vec<u8> {
         let mut b = vec![0u8; 0x4C];
         b[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
         b[4..20].copy_from_slice(&[0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
         let flags = HAS_LINK_INFO | HAS_RELATIVE_PATH | HAS_ARGUMENTS | IS_UNICODE;
         b[0x14..0x18].copy_from_slice(&flags.to_le_bytes());
-        // LinkInfo: 헤더 0x1C, 볼륨 id(최소), 로컬 기본 경로(ANSI), 접미사(빈 문자열)
+        // LinkInfo: 0x1C header, minimal volume id, local base path (ANSI), empty suffix
         let mut li = vec![0u8; 0x1C];
         let vol = [0x10u8, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0];
         let vol_off = li.len();
@@ -467,7 +476,7 @@ mod tests {
 
     #[test]
     fn lnk_files_on_this_pc() {
-        // 이 PC 의 시작 메뉴 바로 가기 중 대상이 있는 것은 실행 파일 경로로 풀려야 한다
+        // Start menu shortcuts on this PC whose target exists must resolve to an executable path
         let mut lnks = Vec::new();
         for d in start_menu_dirs() {
             walk_lnk(&d, 0, &mut lnks);
@@ -493,14 +502,15 @@ mod tests {
         }
         assert!(resolve_app_query("").is_none());
         assert!(resolve_app_query(r"C:\no\such\app.exe").is_none());
-        // 셸·시스템 실행기는 목록에서 뺀다
+        // shell and system launchers are left out of the list
         assert!(skip_shortcut("파일 탐색기", Path::new(r"C:\Windows\explorer.exe")));
         assert!(skip_shortcut("Script", Path::new(r"C:\Windows\System32\cscript.exe")));
     }
 
     #[test]
     fn existing_absolute_path_is_not_env_expanded() {
-        // 이름에 '%USERNAME%' 이 그대로 든 폴더의 실행 파일은 그 파일 그대로 (사용자 이름 폴더의 같은 이름 파일이 아니라)
+        // an executable in a folder literally named '%USERNAME%' stays that file (not a same-named file
+        // in the user's folder)
         let user = std::env::var("USERNAME").unwrap_or_default();
         if user.is_empty() {
             return;
@@ -516,10 +526,10 @@ mod tests {
         let got = resolve_app_query(&q.to_string_lossy()).unwrap();
         assert!(got.to_string_lossy().contains("%USERNAME%"), "{got:?}");
         assert!(paths::same_path(&got, &q), "{got:?}");
-        // 따옴표로 감싸도 같다
+        // same with quotes around it
         let got = resolve_app_query(&format!("\"{}\"", q.display())).unwrap();
         assert!(paths::same_path(&got, &q), "{got:?}");
-        // 그런 파일이 없으면 지금처럼 펼친다 (사람이 적은 '%VAR%\…' 경로)
+        // if no such file exists, expand as before (a '%VAR%\…' path a person typed)
         let q2 = root.join("%USERNAME%").join("only-in-user.exe");
         std::fs::write(other.join("only-in-user.exe"), b"MZ").unwrap();
         let got = resolve_app_query(&q2.to_string_lossy()).unwrap();

@@ -1,15 +1,18 @@
-//! GhostDesk GUI 안에서 도는 로컬 제어 서버.
+//! Local control server running inside the GhostDesk GUI.
 //!
-//! 외부 에이전트(Claude 앱, Claude Code, Codex 등)가 `ghostdesk --mcp` 를 통해 격리 화면을
-//! 만들고 조작할 수 있게 한다. 외부에서 만든 화면도 GUI 그리드에 나타나고 가상 마우스로 보인다.
+//! Lets external agents (the Claude app, Claude Code, Codex, …) create and drive isolated
+//! screens through `ghostdesk --mcp`. Screens created from outside also show up in the GUI grid
+//! with their virtual mouse.
 //!
-//! 프로토콜: 같은 사용자만 열 수 있는 로컬 연결 위의 JSON Lines (`platform::ipc`).
-//!   - macOS/Linux: 유닉스 도메인 소켓 (권한 0600 + 상대 uid 확인)
-//!   - Windows: 명명 파이프 `\\.\pipe\GhostDesk-control-<사용자 SID>` (이 사용자 + SYSTEM 만 열 수 있는 DACL)
-//!   요청  {"id": 1, "method": "open" | "list" | "act" | "close" | "hello", "params": {...}}
-//!   응답  {"id": 1, "result": {...}} 또는 {"id": 1, "error": "메시지"}
+//! Protocol: JSON Lines over a local connection only the same user can open (`platform::ipc`).
+//!   - macOS/Linux: Unix domain socket (mode 0600 + peer uid check)
+//!   - Windows: named pipe `\\.\pipe\GhostDesk-control-<user SID>` (DACL allowing only this user
+//!     and SYSTEM)
+//!   Request   {"id": 1, "method": "open" | "list" | "act" | "close" | "hello", "params": {...}}
+//!   Response  {"id": 1, "result": {...}} or {"id": 1, "error": "message"}
 //!
-//! 민감한 요청(내 로그인 복제, 실행 중인 내 앱 사용, 원격 접속)은 GUI 에서 사용자가 허용해야 진행된다.
+//! Sensitive requests (cloning my login, using my running app, remote connections) only proceed
+//! once the user allows them in the GUI.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -41,18 +44,20 @@ use crate::{
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// 사용자가 '직접 조작'·일시정지 중일 때 외부 동작이 기다리는 최대 시간
+/// How long external actions wait at most while the user has taken over or paused.
 const PAUSE_WAIT: Duration = Duration::from_secs(120);
-/// 승인 창 응답을 기다리는 최대 시간
+/// How long to wait at most for an answer to the approval dialog.
 const APPROVAL_WAIT: Duration = Duration::from_secs(180);
-/// 로그인 미사용(빈 프로필)으로 만든 MCP 작업공간 표식. 이 표식 없이 내용이 있는 폴더는 빈 프로필로 열지 않는다.
+/// Marker for MCP workspaces created without login (empty profile). Folders with content but
+/// without this marker are never opened as an empty profile.
 const BLANK_MARKER: &str = "ghostdesk-mcp-blank";
 
-/// 외부 에이전트가 절대 열 수 없는 앱 (셸·스크립트·자격 증명·보안 설정 계열).
-/// GhostDesk 자신은 여기 없다: 따로 떼어 낸 시험용 인스턴스로만 연다 (`is_ghostdesk`, `app_target`).
-/// 번들 id 는 대소문자 구분 없이 비교한다.
+/// Apps external agents can never open (shells, scripts, credentials, security settings).
+///
+/// GhostDesk itself isn't listed here: it's only opened as a separate test instance
+/// (`is_ghostdesk`, `app_target`). Bundle ids are compared case-insensitively.
 const EXTERNAL_DENY: &[&str] = &[
-    // 터미널·셸
+    // terminals and shells
     "com.apple.Terminal",
     "com.googlecode.iterm2",
     "dev.warp.Warp-Stable",
@@ -64,19 +69,19 @@ const EXTERNAL_DENY: &[&str] = &[
     "com.mitchellh.ghostty",
     "co.zeit.hyper",
     "org.tabby",
-    // 스크립트·자동화
+    // scripting and automation
     "com.apple.ScriptEditor2",
     "com.apple.Automator",
     "com.apple.shortcuts",
     "com.latenightsw.ScriptDebugger8",
-    // 자격 증명
+    // credentials
     "com.apple.keychainaccess",
     "com.apple.Passwords",
     "com.1password.1password",
     "com.agilebits.onepassword7",
     "com.bitwarden.desktop",
     "org.keepassxc.keepassxc",
-    // 시스템·보안 설정, 파일·프로세스 관리
+    // system and security settings, file and process management
     "com.apple.systempreferences",
     "com.apple.finder",
     "com.apple.ActivityMonitor",
@@ -86,10 +91,10 @@ const EXTERNAL_DENY: &[&str] = &[
     "com.apple.installer",
 ];
 
-/// GhostDesk 자신의 번들 id
+/// GhostDesk's own bundle id.
 const GHOSTDESK_BUNDLE_ID: &str = "dev.ghostdesk.app";
 
-/// 번들 id 를 못 읽었을 때를 위한 이름(번들 파일 이름, 소문자) 기준 차단 목록
+/// Deny list by name (bundle file name, lowercase) for when the bundle id can't be read.
 const EXTERNAL_DENY_NAMES: &[&str] = &[
     "terminal",
     "iterm",
@@ -119,33 +124,35 @@ const EXTERNAL_DENY_NAMES: &[&str] = &[
     "keepassxc",
 ];
 
-/// GUI 로 보내는 이벤트
+/// Events sent to the GUI.
 pub enum ControlEvent {
-    /// 외부 에이전트가 새 화면을 만들었다 (그리드에 추가)
+    /// An external agent created a new screen (added to the grid).
     Register(Arc<AgentShared>),
-    /// 사용자 승인이 필요하다. 요청자가 시간 초과·연결 끊김으로 포기하면 `reply` 의 수신 쪽이 drop 된다
-    /// (GUI 는 `reply.is_closed()` 인 항목을 치운다).
+    /// User approval is needed. If the requester gives up (timeout, disconnect), the receiving side
+    /// of `reply` is dropped (the GUI clears items whose `reply.is_closed()`).
     Approval { title: String, detail: String, reply: oneshot::Sender<bool> },
 }
 
-/// 승인 창·오류 문구에 쓰는 이 OS 의 일반 앱 이름 ("macOS 앱" / "Windows 앱")
+/// This OS's word for regular apps in approval dialogs and errors ("macOS 앱" / "Windows 앱").
 const NATIVE_APP_WORD: &str = if cfg!(target_os = "macos") { "macOS 앱" } else { text::LOCAL_APPS };
-/// 승인 창에서 앱 식별자 줄의 이름 (macOS: 번들 id, Windows: 실행 파일 원래 이름·게시자)
+/// Label of the app identifier line in the approval dialog (macOS: bundle id, Windows: original
+/// executable name and publisher).
 const APP_ID_LABEL: &str = if cfg!(target_os = "macos") { "번들 id" } else { "앱 정보" };
-/// 외부 에이전트가 app 으로 줄 수 있는 값
+/// Values an external agent may pass as app.
 const APP_QUERY_HINT: &str = if cfg!(windows) { "앱 이름·실행 파일 이름·.exe/.lnk 경로" } else { "앱 이름·번들 id·.app 경로" };
 
-/// GhostDesk 창의 제어 연결 지점
-/// (macOS: ~/Library/Application Support/GhostDesk/control.sock, Windows: \\.\pipe\GhostDesk-control-<사용자 SID>)
+/// The GhostDesk window's control endpoint (macOS:
+/// ~/Library/Application Support/GhostDesk/control.sock, Windows:
+/// \\.\pipe\GhostDesk-control-<user SID>).
 pub fn endpoint() -> ipc::Endpoint {
     ipc::Endpoint::control()
 }
 
-/// 제어 연결 하나 (= `ghostdesk --mcp` 프로세스 하나)
+/// One control connection (= one `ghostdesk --mcp` process).
 #[derive(Clone)]
 struct Conn {
     id: u64,
-    /// 상대가 연결을 닫으면 true
+    /// true once the peer closes the connection.
     closed: watch::Receiver<bool>,
 }
 
@@ -156,22 +163,23 @@ impl Conn {
 
     async fn wait_closed(&self) {
         let mut rx = self.closed.clone();
-        // 보내는 쪽이 사라져도(Err) 연결이 끝난 것으로 본다
+        // a vanished sender (Err) also counts as the connection being over
         let _ = rx.wait_for(|c| *c).await;
     }
 }
 
-/// 외부 에이전트가 연 화면 하나
+/// A screen opened by an external agent.
 struct DeskEntry {
     shared: Arc<AgentShared>,
-    /// 이 화면을 만든 연결 id. 다른 연결은 `shared_access` 가 아니면 조작·닫기를 할 수 없다.
+    /// id of the connection that created this screen. Other connections can't drive or close it
+    /// unless `shared_access`.
     conn: u64,
     shared_access: bool,
-    /// 작업공간 예약 키 (닫을 때 해제)
+    /// Workspace reservation key (released on close).
     reservation: String,
 }
 
-/// 작업공간 예약. 열기에 실패하면 drop 될 때 자동으로 해제된다.
+/// Workspace reservation. Released automatically on drop if opening fails.
 struct Reservation<'a> {
     set: &'a Mutex<HashSet<String>>,
     key: String,
@@ -180,7 +188,7 @@ struct Reservation<'a> {
 }
 
 impl Reservation<'_> {
-    /// 화면이 열렸다: 예약을 화면 항목으로 넘긴다 (닫을 때 해제)
+    /// The screen opened: hands the reservation over to the screen entry (released on close).
     fn keep(mut self) -> String {
         self.keep = true;
         std::mem::take(&mut self.key)
@@ -195,20 +203,22 @@ impl Drop for Reservation<'_> {
     }
 }
 
-/// 작업공간 이름 → 예약 키 (APFS 는 대소문자를 구분하지 않으므로 소문자로)
+/// Workspace name → reservation key (lowercase, since APFS is case-insensitive).
 fn reservation_key(workspace: &str) -> String {
     profiles::slug(workspace).to_lowercase()
 }
 
 pub struct ControlServer {
     desks: Mutex<HashMap<String, DeskEntry>>,
-    /// 사용 중(준비 중 포함)인 작업공간 이름. 같은 폴더를 두 프로그램이 동시에 쓰지 않게 한다.
+    /// Workspace names in use (including ones being prepared), so two programs never use the same
+    /// folder at once.
     reserved: Mutex<HashSet<String>>,
     events: mpsc::UnboundedSender<ControlEvent>,
     ctx: egui::Context,
     next_id: AtomicU64,
     next_conn: AtomicU64,
-    /// GUI 실행마다 달라지는 태그 (재시작 전의 desk_id 가 새 화면을 가리키지 않게)
+    /// Tag that changes with every GUI run (so a desk_id from before a restart doesn't point at a new
+    /// screen).
     instance: String,
 }
 
@@ -225,21 +235,24 @@ impl ControlServer {
         })
     }
 
-    /// 제어 연결 지점(소켓/명명 파이프)을 열고 연결을 받는다. 다른 GhostDesk 가 이미 열어 두었으면 오류.
+    /// Opens the control endpoint (socket/named pipe) and accepts connections. Errors if another
+    /// GhostDesk already has it.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         self.serve_on(&endpoint()).await
     }
 
-    /// `serve` 의 본체. 테스트는 임시 연결 지점(`ipc::Endpoint::custom`)으로 띄운다.
+    /// The body of `serve`. Tests run it on a temporary endpoint (`ipc::Endpoint::custom`).
     pub(crate) async fn serve_on(self: Arc<Self>, ep: &ipc::Endpoint) -> Result<()> {
-        // 다른 창이 이미 받고 있으면 오류, 남은 소켓 파일 정리·권한 0600 (Unix) / 소유자 전용 DACL (Windows)
+        // errors if another window is already listening; cleans up a stale socket file and sets mode 0600
+        // (Unix) / an owner-only DACL (Windows)
         let mut listener = ipc::Listener::bind(ep).await?;
         loop {
-            // 같은 사용자의 연결만 돌아온다 (다른 사용자는 ipc 계층이 버린다)
+            // only same-user connections come back (the ipc layer drops other users)
             let (rd, wr) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => {
-                    // EMFILE 등 일시적 오류: 서버를 멈추지 않고 잠깐 쉬었다가 계속 받는다 (busy-loop 방지)
+                    // transient errors like EMFILE: don't stop the server, pause briefly and keep accepting (avoids a
+                    // busy loop)
                     eprintln!("[ghostdesk] 제어 소켓 accept 오류 (재시도): {e}");
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
@@ -254,8 +267,8 @@ impl ControlServer {
 
     async fn handle_conn(self: Arc<Self>, rd: ipc::Reader, mut wr: ipc::Writer) -> Result<()> {
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        // 읽기는 별도 task 가 맡는다: 요청을 처리하는 동안에도 연결이 끊긴 것을 알아채
-        // 승인 대기·일시정지 대기를 끝내기 위해서다.
+        // reading happens in a separate task so a dropped connection is noticed even while a request is
+        // being handled, ending any approval or pause wait
         let (closed_tx, closed_rx) = watch::channel(false);
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
         let reader = tokio::spawn(async move {
@@ -289,8 +302,8 @@ impl ControlServer {
             }
         }
         reader.abort();
-        // 연결이 끝났다 (EOF·오류·쓰기 실패): 이 연결이 만든 화면을 모두 닫는다.
-        // (headless 브라우저·숨김 인스턴스가 쌓이지 않게, attach 로 숨긴 사용자 앱은 원래대로 돌린다)
+        // the connection is over (EOF, error, write failure): close every screen it created (so headless
+        // browsers and hidden instances don't pile up, and user apps hidden by attach are restored)
         self.close_conn_desks(conn_id).await;
         Ok(())
     }
@@ -306,7 +319,8 @@ impl ControlServer {
         }
     }
 
-    /// GUI 에서 제거된 화면을 목록에서 치운다 (예약 해제, 남은 프로그램 종료)
+    /// Drops screens removed in the GUI from the list (releasing reservations, ending leftover
+    /// programs).
     fn prune_removed(&self) {
         let gone: Vec<DeskEntry> = {
             let mut desks = self.desks.lock();
@@ -319,7 +333,8 @@ impl ControlServer {
         }
     }
 
-    /// 항목을 버린다: 예약을 풀고, 아직 화면이 남아 있으면 백그라운드에서 종료한다
+    /// Discards an entry: releases its reservation and shuts down any remaining screen in the
+    /// background.
     fn discard(&self, e: DeskEntry) {
         self.reserved.lock().remove(&e.reservation);
         let left = e.shared.workspace.lock().take();
@@ -328,7 +343,7 @@ impl ControlServer {
         }
     }
 
-    /// 항목을 닫는다: 화면 종료 후 예약 해제
+    /// Closes an entry: shuts the screen down, then releases the reservation.
     async fn shutdown_entry(&self, e: DeskEntry, why: &str) {
         let desk = e.shared.workspace.lock().take();
         if let Some(d) = desk {
@@ -340,7 +355,7 @@ impl ControlServer {
         self.ctx.request_repaint();
     }
 
-    /// 끊긴 연결이 만든 화면을 모두 닫는다
+    /// Closes every screen created by a dropped connection.
     async fn close_conn_desks(&self, conn: u64) {
         let mine: Vec<DeskEntry> = {
             let mut desks = self.desks.lock();
@@ -370,7 +385,7 @@ impl ControlServer {
         Ok((id, shared, desk))
     }
 
-    /// 사용자가 GhostDesk 창에서 화면을 제거했으면 정리하고 오류를 낸다
+    /// If the user removed the screen in the GhostDesk window, cleans up and returns an error.
     fn ensure_not_removed(&self, id: &str, shared: &Arc<AgentShared>) -> Result<()> {
         if shared.removed.load(Ordering::SeqCst) {
             let e = self.desks.lock().remove(id);
@@ -406,7 +421,8 @@ impl ControlServer {
         json!({ "desks": out })
     }
 
-    /// GUI 에 승인 창을 띄우고 기다린다. 시간 초과·요청자 연결 끊김이면 수신 쪽을 drop 해 승인 창이 사라지게 한다.
+    /// Shows an approval dialog in the GUI and waits. On timeout or requester disconnect, drops the
+    /// receiving side so the dialog goes away.
     async fn ask(&self, conn: &Conn, title: &str, detail: String) -> Result<()> {
         if conn.is_closed() {
             bail!("요청한 에이전트의 연결이 끊겨 승인 요청을 취소했습니다");
@@ -424,12 +440,12 @@ impl ControlServer {
             },
             _ = conn.wait_closed() => Err(anyhow!("요청한 에이전트의 연결이 끊겨 승인 요청을 취소했습니다")),
         };
-        // rx 가 drop 되었으니 GUI 가 다시 그려지면서 남은 승인 창을 치우게 한다
+        // rx was dropped, so have the GUI repaint and clear the leftover approval dialog
         self.ctx.request_repaint();
         res
     }
 
-    /// 작업공간 이름을 원자적으로 예약한다. 이미 쓰는 중이면 번호를 붙인다.
+    /// Atomically reserves a workspace name, appending a number if it's already in use.
     fn reserve(&self, base: &str, n: u64) -> Reservation<'_> {
         let mut set = self.reserved.lock();
         let mut name = base.to_string();
@@ -456,24 +472,26 @@ impl ControlServer {
         let desk_id = format!("d{}-{n}", self.instance);
         let use_login = p["use_my_login"].as_bool().unwrap_or(false);
         let shared_access = p["shared"].as_bool().unwrap_or(false);
-        // 로그인 복제를 쓰는 화면과 안 쓰는 화면은 작업공간 이름 공간을 나눈다.
-        // 로그인 미사용은 "mcp_" (4번째 글자 '_'), 로그인 사용은 "mcp-login-" (4번째 글자 '-') 이라
-        // 어떤 workspace 이름(slug)을 줘도 두 공간이 겹치지 않는다 (대소문자를 무시하는 APFS 에서도).
-        // (예전에 승인받아 만든 복제본을, 승인 없이 '로그인 미사용' 요청으로 다시 여는 것을 막는다)
+        // screens with and without login cloning use separate workspace namespaces. Without login it's
+        // "mcp_" (4th char '_'), with login "mcp-login-" (4th char '-'), so no workspace name (slug) can
+        // make the two overlap (even on case-insensitive APFS). This stops a clone created with approval
+        // from being reopened later by a "no login" request without approval.
         let ws_slug = profiles::slug(p["workspace"].as_str().unwrap_or(&label));
         let base = if use_login { format!("mcp-login-{ws_slug}") } else { format!("mcp_{ws_slug}") };
-        // 같은 작업공간을 동시에 두 프로그램이 쓰면 충돌하므로 원자적으로 예약하고, 겹치면 번호를 붙인다
+        // two programs using the same workspace at once would clash, so reserve atomically and number on
+        // collision
         let reservation = self.reserve(&base, n);
         let workspace = reservation.name.clone();
         let ws_dir = profiles::workspaces_root().join(profiles::slug(&workspace));
 
-        // 이 OS 에서 쓸 수 없는 종류는 사용자에게 무엇을 묻기 전에 거절한다
+        // kinds this OS can't use are refused before asking the user anything
         if let Some(why) = unsupported_kind(kind) {
             bail!("{why}");
         }
 
-        // kind=remote (macOS 밖): 실제로 접속한 주소가 이 컴퓨터 자신이어도 접속할지.
-        // 사람이 승인 창에서 '이 컴퓨터 자신의 VNC 서버' 경고를 본 경우에만 허용한다 (None = 대상의 확인을 따름)
+        // kind=remote (outside macOS): whether to connect even if the address actually connected to is
+        // this computer itself. Only allowed once a person saw the "this computer's own VNC server"
+        // warning in the approval dialog (None = follow the target's own check).
         #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut remote_local_ok: Option<bool> = None;
         let target = match kind {
@@ -521,7 +539,7 @@ impl ControlServer {
                 if !valid_account_name(&account) {
                     bail!("account 는 계정 이름(영문 소문자·숫자·'.'·'_'·'-', 64자 이하)이어야 합니다 (받은 값: {account})");
                 }
-                // Windows 자식 세션은 사용자 본인 계정이라 실제 데이터에 닿는다 → 사람에게 묻는다
+                // a Windows child session is the user's own account and reaches real data, so ask a person
                 #[cfg(windows)]
                 self.ask(
                     conn,
@@ -547,11 +565,13 @@ impl ControlServer {
                          대상이 정말 에이전트 전용 머신일 때만 허용하세요.",
                     );
                 }
-                // macOS 밖: 이 컴퓨터 자신의 VNC 서버는 사용자의 실제 화면일 수 있다. 사람에게 묻기 전에 확인해,
-                // 에이전트가 전용 머신이라고 주장하지 않았으면 묻지 않고 거절하고, 주장했으면 그 위험을 승인 창에 크게 알린다.
-                // 승인 전에는 이름을 풀지 않는다 (승인 없이 에이전트가 고른 이름으로 DNS 질의가 나가지 않게):
-                // 주소·localhost 만 여기서 보고, 실제로 접속한 주소는 접속 단계(agent::prepare_remote → rfb)에서 확인한다.
-                // 여기서 '이 컴퓨터 자신' 경고를 보이지 않은 요청은 접속한 주소가 이 컴퓨터면 확인이 있어도 거절한다.
+                // outside macOS: this computer's own VNC server may be the user's real screen. Check before asking
+                // a person: refuse without asking unless the agent claimed a dedicated machine, and if it did,
+                // show that risk prominently in the approval dialog. Names aren't resolved before approval (so no
+                // DNS query goes out for an agent-chosen name without approval): only addresses and localhost are
+                // checked here, and the address actually connected to is checked at connect time
+                // (agent::prepare_remote → rfb). Requests that didn't show the "this computer itself" warning here
+                // are refused if the connected address turns out to be this computer, even with confirmation.
                 #[cfg(not(target_os = "macos"))]
                 {
                     let local = remote_is_this_computer(&host, port);
@@ -588,7 +608,8 @@ impl ControlServer {
             other => bail!("kind 는 browser / app / session / remote 중 하나여야 합니다 (받은 값: {other})"),
         };
 
-        // 빈 프로필로 여는데 폴더에 이전 데이터(로그인 복제 흔적 등)가 있으면 거부한다
+        // opening with an empty profile, but the folder has earlier data (login clone leftovers, …):
+        // refuse
         let blank = matches!(
             &target,
             DeskTarget::Browser { source: ProfileSource::Empty { .. }, .. }
@@ -619,8 +640,9 @@ impl ControlServer {
             let _ = std::fs::create_dir_all(&ws_dir);
             let _ = std::fs::write(ws_dir.join(BLANK_MARKER), "GhostDesk MCP 로그인 미사용 작업공간\n");
         }
-        // 준비하는 동안 사용자가 GUI 에서 제거했으면 보이지 않는 화면이 남지 않게 바로 닫는다.
-        // (remove_agent 는 removed 를 먼저 세우고 같은 락으로 take 하므로 둘 중 하나만 화면을 가진다)
+        // if the user removed it in the GUI during preparation, close it right away so no invisible screen
+        // is left. (remove_agent sets removed first and takes under the same lock, so only one side ends
+        // up owning the screen.)
         let stored = {
             let mut slot = shared.workspace.lock();
             if shared.removed.load(Ordering::SeqCst) {
@@ -634,7 +656,8 @@ impl ControlServer {
             desk.shutdown().await;
             bail!("사용자가 GhostDesk 창에서 이 화면을 제거했습니다");
         }
-        // 준비하는 동안 요청자가 떠났으면 (취소·종료) 아무도 쓰지 않을 화면을 남기지 않는다
+        // if the requester left during preparation (cancelled, exited), don't leave a screen nobody will
+        // use
         if conn.is_closed() {
             let d = shared.workspace.lock().take();
             if let Some(d) = d {
@@ -663,9 +686,10 @@ impl ControlServer {
         }))
     }
 
-    /// 앱 이름/번들 id/경로 → Electron(숨김 복제) 또는 macOS·Windows 앱(숨김 창) 대상
+    /// App name/bundle id/path → Electron (hidden clone) or macOS/Windows app (hidden window) target.
     async fn app_target(&self, app: &str, p: &Value, use_login: bool, client: &str, workspace: &str, conn: &Conn) -> Result<DeskTarget> {
-        // hidden·offscreen 은 auto 가 알아서 고르므로 외부 에이전트에게는 열어 두지 않는다 (셀프테스트만 쓴다)
+        // auto already picks between hidden and offscreen, so those aren't exposed to external agents
+        // (only the self-test uses them)
         let host = match p.get("app_host").filter(|v| !v.is_null()).map(|v| v.as_str()) {
             None | Some(Some("auto")) => crate::native::NativeHost::Auto,
             Some(Some("current_session")) => crate::native::NativeHost::CurrentSession,
@@ -676,7 +700,7 @@ impl ControlServer {
         if current_session && (!cfg!(windows) || attach) {
             bail!("current_session 은 Windows에서 기존 로그인으로 새로 실행하는 모드입니다. attach_running 없이 쓰세요.");
         }
-        // 이 OS 에 없는 방식은 앱을 찾거나 승인을 묻기 전에 거절한다
+        // modes this OS doesn't have are refused before looking up the app or asking for approval
         if p["virtual_display"].as_bool().unwrap_or(false) && !caps::VDISPLAY {
             bail!("{} kind=app 은 virtual_display 없이 쓰세요.", text::unsupported("virtual_display (가상 디스플레이)"));
         }
@@ -691,15 +715,16 @@ impl ControlServer {
             None => bid,
         };
 
-        // 셸·스크립트·자격 증명·보안 설정 계열 앱은 외부 에이전트에게 열어 주지 않는다
+        // shells, scripts, credentials and security settings apps aren't opened for external agents
         if is_denied(&r) {
             bail!(
                 "보안상 외부 에이전트는 '{}' ({bid}) 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.",
                 r.name
             );
         }
-        // GhostDesk 자신: 지금 창을 조작하면 승인 창을 스스로 누르거나 설정·키·연결을 바꿀 수 있으므로,
-        // 빈 데이터 폴더를 쓰는 시험용 인스턴스로 새로 띄울 때만 연다 (설정·키·외부 연결·제어 연결이 모두 따로)
+        // GhostDesk itself: driving the current window could click its own approval dialogs or change
+        // settings, keys and connections, so it's only opened as a freshly launched test instance with
+        // an empty data folder (separate settings, keys, external connections and control endpoint)
         if is_ghostdesk(&r) {
             if cfg!(windows) || attach || current_session || use_login || p["virtual_display"].as_bool().unwrap_or(false) {
                 bail!("GhostDesk 자신은 따로 떼어 낸 시험용 인스턴스(mode=app)로만 열 수 있습니다. 지금 쓰는 GhostDesk 창(app_running)이나 로그인 복제로는 열지 않습니다.");
@@ -723,8 +748,9 @@ impl ControlServer {
                 ..Default::default()
             }));
         }
-        // 이 OS 에서 아직 못 쓰는 백엔드면 승인을 묻기 전에 거절한다
-        // (Electron 앱을 일반 앱 방식으로 대신 열면 사용자의 실제 데이터로 뜨므로 그렇게 넘기지 않는다)
+        // backends this OS can't use yet are refused before asking for approval. (Opening an Electron app
+        // the regular-app way instead would run it on the user's real data, so it isn't handed off like
+        // that.)
         let native = current_session || attach || r.electron.is_none();
         if !native && !caps::ELECTRON {
             bail!("{}", text::unsupported("Electron 앱 숨김 실행"));
@@ -735,7 +761,7 @@ impl ControlServer {
 
         if let Some(e) = r.electron.filter(|_| !native) {
             if !e.hideable {
-                // 네이티브 방식으로 열면 사용자의 실제 로그인 데이터로 뜨므로 그쪽으로 넘기지 않는다
+                // opening it natively would run it on the user's real login data, so don't hand it off that way
                 bail!(
                     "'{}' 은(는) Electron 앱이지만 숨김 실행을 지원하지 않습니다: {}. 사용자의 실제 계정 데이터로 열리는 것을 막기 위해 {NATIVE_APP_WORD} 방식으로도 열지 않습니다.",
                     e.name,
@@ -744,7 +770,7 @@ impl ControlServer {
             }
             let profile = if use_login {
                 let src = e.user_data_guess.clone().ok_or_else(|| anyhow!("{} 의 원본 데이터 폴더를 찾지 못했습니다", e.name))?;
-                // macOS 는 .app 번들, Windows 는 실제로 실행할 exe 를 보여 준다
+                // show the .app bundle on macOS and the exe actually launched on Windows
                 let shown = if cfg!(windows) { &e.exe } else { &e.bundle };
                 self.ask(
                     conn,
@@ -766,8 +792,9 @@ impl ControlServer {
             return Ok(DeskTarget::Electron { app: e, profile, width, height });
         }
 
-        // Windows: 로컬 앱 백엔드가 실행할 때 항상 거절하는 대상(Store 앱·실행 별칭·Store 실행기·콘솔 프로그램 등)은
-        // 사람에게 승인을 묻기 전에 거절한다 (승인해도 실패할 요청으로 승인 창을 띄우지 않게)
+        // Windows: targets the local app backend always refuses at launch (Store apps, execution aliases,
+        // Store launchers, console programs, …) are refused before asking a person (no approval dialog
+        // for a request that would fail even if approved)
         #[cfg(windows)]
         {
             let exe = r.path.clone();
@@ -775,9 +802,10 @@ impl ControlServer {
                 .await
                 .map_err(|e| anyhow!("앱 확인 실패: {e}"))??;
         }
-        // macOS 앱은 격리되지 않고 사용자의 실제 데이터를 그대로 쓰므로 항상 승인을 받는다
+        // macOS apps aren't isolated and use the user's real data, so approval is always required
         let path = r.path.display().to_string();
-        // 실험: 가상 디스플레이 위에서 실행 (실제 픽셀 클릭·드래그 가능, 대신 가상 모니터가 추가됨)
+        // experimental: run on a virtual display (real pixel clicks and drags work, at the cost of an
+        // extra virtual monitor)
         if p["virtual_display"].as_bool().unwrap_or(false) {
             self.ask(
                 conn,
@@ -832,12 +860,12 @@ impl ControlServer {
     async fn act(&self, p: &Value, conn: &Conn) -> Result<Value> {
         let (id, shared, desk) = self.get(p, conn)?;
         self.ensure_not_removed(&id, &shared)?;
-        // 사용자가 '중지'를 눌렀으면 이번 동작을 거부한다 (한 번 거부하면 풀린다)
+        // if the user pressed Stop, refuse this action (one refusal clears it)
         if shared.stop.swap(false, Ordering::SeqCst) {
             shared.log(LogKind::Info, "사용자가 '중지'를 눌러 외부 에이전트의 동작을 거부했습니다");
             bail!("사용자가 GhostDesk 창에서 '중지'를 눌렀습니다. 동작을 멈추고 사용자에게 다음 지시를 확인하세요.");
         }
-        // 일시정지·직접 조작 중이면 풀릴 때까지 기다린다 (사용자 입력과 에이전트 입력이 섞이지 않게)
+        // while paused or taken over, wait until released (so user and agent input don't mix)
         if shared.paused.load(Ordering::SeqCst) {
             shared.log(LogKind::Info, "사용자가 직접 조작 중이라 외부 에이전트의 동작을 기다리게 합니다");
             let deadline = Instant::now() + PAUSE_WAIT;
@@ -902,8 +930,11 @@ impl ControlServer {
         act_reply(&desk, text, out.image, p["screenshot"].as_bool().unwrap_or(true)).await
     }
 
-    /// `input.actions`: 여러 computer 동작을 순서대로 실행한다 (한 번의 호출로 클릭 → 입력 → Enter 같은 묶음).
-    /// 하나가 실패하거나 사용자가 중지·일시정지하면 거기서 멈추고, 몇 번째까지 했는지 알린다. 화면은 끝에 한 번만 찍는다.
+    /// `input.actions`: runs several computer actions in order (a bundle like click → type → Enter in
+    /// one call).
+    ///
+    /// Stops at the first failure or when the user stops/pauses, reporting how far it got. The screen
+    /// is captured only once, at the end.
     async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, input: &Value, want_shot: bool) -> Result<Value> {
         let steps = input["actions"].as_array().ok_or_else(|| anyhow!("actions 는 동작 객체의 배열이어야 합니다"))?;
         anyhow::ensure!(!steps.is_empty(), "actions 가 비어 있습니다");
@@ -947,7 +978,8 @@ impl ControlServer {
                     bail!("{}{n}번째 동작({name})이 실패해 거기서 멈췄습니다: {e:#}", done_prefix(&lines));
                 }
             }
-            // 화면이 앞 동작에 반응할 틈 (사람이 잇달아 누르는 정도)
+            // give the screen a moment to react to the previous action (about as fast as a person pressing in
+            // a row)
             if n < steps.len() {
                 tokio::time::sleep(Duration::from_millis(60)).await;
             }
@@ -955,7 +987,8 @@ impl ControlServer {
         let client = shared.external.lock().clone().unwrap_or_default();
         shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
         shared.ctx.request_repaint();
-        // 묶음 끝의 화면이 중요하므로, 중간 스크린샷이 있어도 마지막 동작이 스크린샷이 아니면 새로 찍는다
+        // the screen at the end of the bundle matters, so capture a fresh one unless the last action was
+        // a screenshot, even if there were screenshots midway
         let last_is_shot = steps.last().and_then(|s| s["action"].as_str()).is_some_and(|a| a == "screenshot" || a == "zoom");
         if !last_is_shot {
             image = None;
@@ -978,10 +1011,10 @@ impl ControlServer {
     }
 }
 
-/// 한 번의 desk_action 으로 실행할 수 있는 동작 수
+/// Number of actions a single desk_action can run.
 const MAX_SEQUENCE: usize = 50;
 
-/// 묶음이 중간에 멈췄을 때 앞에서 실행된 것을 알리는 머리말
+/// Preamble listing what already ran when a bundle stops midway.
 fn done_prefix(lines: &[String]) -> String {
     if lines.is_empty() {
         String::new()
@@ -990,7 +1023,8 @@ fn done_prefix(lines: &[String]) -> String {
     }
 }
 
-/// 동작 결과: 글, 이벤트, 창·탭 목록, 화면 (`want_shot` 이고 동작이 화면을 돌려주지 않았으면 새로 찍는다)
+/// Action result: text, events, window/tab list, screen (captured fresh when `want_shot` and the
+/// action returned no screen).
 async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot: bool) -> Result<Value> {
     let mut image = image;
     if image.is_none() && want_shot {
@@ -1008,20 +1042,21 @@ async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot:
     }))
 }
 
-/// GUI 실행마다 달라지는 짧은 태그 (pid + 시작 시각)
+/// Short tag that changes with every GUI run (pid + start time).
 fn instance_tag() -> String {
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     format!("{:x}{:04x}", std::process::id(), millis & 0xffff)
 }
 
-/// MCP 로 받은 화면 크기를 모델이 축소 없이 볼 수 있는 범위로 맞춘다
+/// Clamps a screen size received over MCP to what the model can see without downscaling.
 fn desk_dims(p: &Value) -> (u32, u32) {
     let w = p["width"].as_u64().unwrap_or(1280).clamp(640, 1920) as u32;
     let h = p["height"].as_u64().unwrap_or(800).clamp(400, 1200) as u32;
     (w, h)
 }
 
-/// 외부 요청의 세션 계정은 평범한 계정 이름만 허용한다 (경로·옵션처럼 해석될 값 금지)
+/// Session accounts in external requests must be plain account names (nothing that could be read
+/// as a path or option).
 fn valid_account_name(a: &str) -> bool {
     !a.is_empty()
         && a.len() <= 64
@@ -1030,7 +1065,8 @@ fn valid_account_name(a: &str) -> bool {
         && a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
-/// 빈 프로필로 열 작업공간 폴더 확인: 비어 있거나, 예전에 로그인 미사용으로 만든 폴더여야 한다.
+/// Checks a workspace folder to be opened with an empty profile: it must be empty or created
+/// earlier without login.
 fn check_blank_workspace(dir: &Path, workspace: &str) -> Result<()> {
     let has_content = dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
     if has_content && !dir.join(BLANK_MARKER).is_file() {
@@ -1041,29 +1077,29 @@ fn check_blank_workspace(dir: &Path, workspace: &str) -> Result<()> {
     Ok(())
 }
 
-/// 외부 요청의 앱 지정을 실제 번들로 해석한 결과
+/// An external request's app resolved to a real bundle.
 struct ResolvedApp {
-    /// 정규화된 .app 번들 경로 (Windows: 실행 파일 .exe 경로)
+    /// Normalized .app bundle path (Windows: .exe path).
     path: PathBuf,
     bundle_id: Option<String>,
     name: String,
-    /// Electron 앱이면 검사 결과 (위치와 상관없이 번들 자체를 검사)
+    /// Inspection result if it's an Electron app (the bundle itself is inspected, wherever it lives).
     electron: Option<crate::electron::ElectronApp>,
-    /// Windows: 실행 파일 VERSIONINFO 의 원래 파일 이름 (이름을 바꾼 복사본도 알아보기 위해)
+    /// Windows: original file name from the executable's VERSIONINFO (to recognize renamed copies).
     #[cfg(windows)]
     original_filename: Option<String>,
-    /// Windows: 게시자 (VERSIONINFO CompanyName) — 승인 창에 보여 준다
+    /// Windows: publisher (VERSIONINFO CompanyName), shown in the approval dialog.
     #[cfg(windows)]
     publisher: Option<String>,
 }
 
-/// 비교용 정규화: 공백 제거, 소문자, 끝의 '/' 와 ".app" 제거
+/// Normalization for comparison: whitespace removed, lowercase, trailing '/' and ".app" stripped.
 fn norm_app_query(s: &str) -> String {
     let l = s.trim().trim_end_matches('/').to_lowercase();
     l.strip_suffix(".app").map(str::to_string).unwrap_or(l)
 }
 
-/// 경로 안에서 가장 바깥의 .app 번들 (예: X.app/Contents/MacOS/x → X.app)
+/// Outermost .app bundle in a path (e.g. X.app/Contents/MacOS/x → X.app).
 fn outer_bundle(p: &Path) -> Option<PathBuf> {
     p.ancestors()
         .filter(|a| a.extension().map(|x| x.eq_ignore_ascii_case("app")).unwrap_or(false))
@@ -1094,7 +1130,8 @@ fn path_for_bundle_id(_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// 앱 이름·번들 id·경로(끝 '/', 중복 '/', ".app" 유무, 대소문자 무관) → 실제 번들
+/// App name, bundle id or path (trailing '/', doubled '/', with or without ".app", any case) → the
+/// real bundle.
 #[cfg(not(windows))]
 fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     let raw = input.trim();
@@ -1127,7 +1164,8 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     if !path.is_dir() {
         bail!("앱을 찾지 못했습니다: {}", path.display());
     }
-    // 목록에 있으면 그 항목(실행 중 여부 포함), 아니면 위치와 상관없이 번들 자체를 검사
+    // use the list entry if there is one (including whether it's running), otherwise inspect the
+    // bundle itself wherever it lives
     let electron = electrons
         .into_iter()
         .find(|a| std::fs::canonicalize(&a.bundle).map(|b| b == path).unwrap_or(false))
@@ -1141,10 +1179,12 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     Ok(ResolvedApp { path, bundle_id, name, electron })
 }
 
-/// Windows: 앱 이름·실행 파일 이름·.exe/.lnk 경로·Electron 설치 폴더 → 실제 실행 파일 (.exe 만)
+/// Windows: app name, executable name, .exe/.lnk path or Electron install folder → the real
+/// executable (.exe only).
 ///
-/// 순서: (이름으로 먼저 차단) → 경로면 그대로 / 폴더면 Electron 설치 폴더 / 그 밖(.lnk 등)은 로컬 앱 백엔드가 해석,
-/// 이름이면 Electron 앱 목록(이름·실행 파일 이름) → 로컬 앱 백엔드(시작 메뉴·App Paths 등).
+/// Order: (block by name first) → a path is used as is / a folder as an Electron install folder /
+/// anything else (.lnk, …) is resolved by the local app backend; a name goes to the Electron app
+/// list (name, executable name) → the local app backend (Start menu, App Paths, …).
 #[cfg(windows)]
 fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     use crate::platform::paths;
@@ -1152,14 +1192,15 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     if raw.is_empty() {
         bail!("app 이 비어 있습니다");
     }
-    // 네트워크 공유(\\host\…, //host/…, \\?\UNC\…)·장치(\\.\…, \\?\GLOBALROOT\…) 경로는 파일 시스템에 손대기 전에 거절한다.
-    // 그런 경로를 열어 보기만 해도 SMB/WebDAV 가 사용자의 Windows 자격 증명(NTLM)으로 그 호스트에 인증하기 때문이다.
-    // (%VAR% 를 펼친 결과도 본다. 로컬 드라이브의 \\?\C:\… 는 허용)
+    // network shares (\\host\…, //host/…, \\?\UNC\…) and device paths (\\.\…, \\?\GLOBALROOT\…) are
+    // refused before touching the file system, since merely opening one makes SMB/WebDAV authenticate
+    // to that host with the user's Windows credentials (NTLM). (The %VAR%-expanded form is checked
+    // too; local \\?\C:\… is fine.)
     if win_policy::network_or_device(raw) || win_policy::network_or_device(&win_policy::expand_path(raw).to_string_lossy()) {
         bail!("보안상 외부 에이전트는 네트워크 공유·장치 경로의 앱을 열 수 없습니다: {raw}");
     }
-    // 셸·시스템 도구는 경로를 찾기 전에 이름만으로 먼저 거부한다
-    // (wt.exe 같은 App Execution Alias 는 실제 파일을 열 수 없어 경로 확인 단계까지 가지 못하므로)
+    // shells and system tools are refused by name alone, before resolving a path (App Execution
+    // Aliases like wt.exe can't be opened as real files, so they'd never reach the path check)
     if win_policy::denied_query(raw) {
         bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱과 GhostDesk 자신은 차단됩니다.");
     }
@@ -1171,13 +1212,13 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
         if win_policy::has_ext(&p, "exe") && p.is_file() {
             p
         } else if p.is_dir() {
-            // Electron 앱 설치 폴더면 그 앱의 실행 파일
+            // an Electron app's install folder → that app's executable
             crate::electron::inspect_app(&p)
                 .map(|e| e.exe)
                 .or_else(|| crate::native::resolve_app_query(raw))
                 .ok_or_else(|| anyhow!("{raw} 는 실행 파일(.exe)이 아닙니다"))?
         } else {
-            // 바로 가기(.lnk) 등은 로컬 앱 백엔드가 실제 실행 파일로 바꾼다
+            // shortcuts (.lnk) and the like are turned into the real executable by the local app backend
             crate::native::resolve_app_query(raw).ok_or_else(|| anyhow!("앱을 찾지 못했습니다: {raw}"))?
         }
     } else {
@@ -1188,30 +1229,34 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
             .or_else(|| crate::native::resolve_app_query(raw))
             .ok_or_else(|| anyhow!("앱을 찾지 못했습니다: {raw} ({APP_QUERY_HINT} 를 지정하세요)"))?
     };
-    // 바로 가기(.lnk)·App Paths 등이 가리킨 대상이 네트워크 공유·장치면 정규화(파일 열기)하기 전에 거절한다
+    // if a shortcut (.lnk), App Paths entry, … points at a network share or device, refuse before
+    // canonicalizing (which opens the file)
     if win_policy::network_or_device(&picked.to_string_lossy()) {
         bail!("보안상 외부 에이전트는 네트워크 공유·장치 경로의 앱을 열 수 없습니다: {}", picked.display());
     }
-    // 접두사 \\?\ 없는 정규 경로 (승인 창에 그대로 보여 준다)
+    // canonical path without the \\?\ prefix (shown as is in the approval dialog)
     let exe = paths::canonicalize(&picked).unwrap_or_else(|_| paths::simplify(&picked));
-    // 로컬 경로가 네트워크 공유로 이어지면 (공유를 가리키는 정션·바로 가기 등) 그 파일을 더 읽지 않는다
+    // if a local path leads to a network share (a junction or shortcut pointing at one, …), stop
+    // reading that file
     if win_policy::network_or_device(&exe.to_string_lossy()) {
         bail!("보안상 외부 에이전트는 네트워크 공유·장치 경로의 앱을 열 수 없습니다: {}", exe.display());
     }
-    // 로컬 앱 백엔드는 실행할 때 경로의 %VAR% 를 한 번 더 펼치므로, 이름에 % 가 든 경로는
-    // 여기서 확인·승인한 파일과 실제로 실행되는 파일이 달라질 수 있다 → 거절
+    // the local app backend expands %VAR% in the path once more at launch, so for a path with % in it
+    // the file checked and approved here could differ from the one actually run: refuse
     if exe.to_string_lossy().contains('%') {
         bail!("보안상 경로에 '%' 가 든 실행 파일은 열 수 없습니다: {}", exe.display());
     }
-    // 보안상 실행 파일(.exe)만 연다 (.bat/.cmd/.ps1/.vbs/.msc/.cpl/.msi 같은 스크립트·설정 파일은 안 됨)
+    // for security only executables (.exe) are opened (no scripts or config files like
+    // .bat/.cmd/.ps1/.vbs/.msc/.cpl/.msi)
     if !win_policy::has_ext(&exe, "exe") {
         bail!("{} 는 실행 파일(.exe)이 아닙니다. 보안상 외부 에이전트는 .exe 앱만 열 수 있습니다", exe.display());
     }
     if !exe.is_file() {
         bail!("앱을 찾지 못했습니다: {}", exe.display());
     }
-    // 목록에 있으면 그 항목(실행 중 여부 포함), 아니면 실행 파일·설치 폴더를 직접 검사.
-    // Electron 앱이면 (일반 앱 방식처럼 사용자의 실제 데이터로 띄우지 않고) 숨김 복제 인스턴스로만 연다.
+    // use the list entry if there is one (including whether it's running), otherwise inspect the
+    // executable and install folder directly. Electron apps are only opened as hidden clone instances
+    // (never on the user's real data, as the regular-app path would).
     let electron = electrons
         .into_iter()
         .find(|a| paths::same_path(&a.exe, &exe))
@@ -1233,17 +1278,19 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     Ok(ResolvedApp { path: exe, bundle_id, name, electron, original_filename: vi.original_filename, publisher: vi.company_name })
 }
 
-/// GhostDesk 자신의 .app 번들 (설치본·개발 빌드 모두)
+/// GhostDesk's own .app bundle (installed or dev build).
 fn own_bundle() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     outer_bundle(&exe)
 }
 
-/// GhostDesk 를 따로 떼어 낸 인스턴스로 띄울 때 넘기는 인자 (main.rs 가 읽어 데이터 폴더를 바꾸고 자동 연결을 끈다)
+/// Argument passed when launching GhostDesk as a separate instance (main.rs reads it to switch the
+/// data folder and turn off auto-connect).
 pub const ISOLATED_DATA_ARG: &str = "--isolated-data";
 
-/// 열려는 앱이 GhostDesk 자신인가 (번들 id · 이 실행 파일의 번들 · 번들 이름)
+/// Whether the app being opened is GhostDesk itself (bundle id, this executable's bundle, bundle
+/// name).
 fn is_ghostdesk(r: &ResolvedApp) -> bool {
     r.bundle_id.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(GHOSTDESK_BUNDLE_ID))
         || own_bundle().is_some_and(|o| o == r.path)
@@ -1260,7 +1307,8 @@ fn is_denied(r: &ResolvedApp) -> bool {
     if EXTERNAL_DENY_NAMES.contains(&stem.as_str()) {
         return true;
     }
-    // Windows: 실행 파일 이름·원래 파일 이름·표시 이름·위치(시스템 폴더, 패키지)·GhostDesk 자신
+    // Windows: executable name, original file name, display name, location (system folders,
+    // packages), GhostDesk itself
     #[cfg(windows)]
     if win_policy::denied(r) {
         return true;
@@ -1268,10 +1316,13 @@ fn is_denied(r: &ResolvedApp) -> bool {
     false
 }
 
-/// macOS 밖: kind=remote 대상이 이 컴퓨터 자신(루프백·미지정·이 컴퓨터의 주소, localhost)인가 — 사람에게 승인을 묻기 전에 본다.
-/// 이름 풀이(DNS·LLMNR 등)는 하지 않는다: 승인 전에 에이전트가 고른 이름으로 네트워크 질의가 나가지 않게 하고,
-/// 응답이 바뀌는 이름으로 이 판단을 속일 수도 없게 하려는 것이다. 그 밖의 이름은 아니라고 보고,
-/// 실제로 접속한 주소를 접속 단계(rfb 의 refuse_local)에서 확인한다.
+/// Outside macOS: whether a kind=remote target is this computer itself (loopback, unspecified, one
+/// of this computer's addresses, localhost), checked before asking a person for approval.
+///
+/// No name resolution (DNS, LLMNR, …) is done: no network query goes out for an agent-chosen name
+/// before approval, and a name with changing answers can't fool this check. Other names are
+/// assumed not to be local, and the address actually connected to is checked at connect time (rfb's
+/// refuse_local).
 #[cfg(not(target_os = "macos"))]
 fn remote_is_this_computer(host: &str, port: u16) -> bool {
     let h = host.trim();
@@ -1283,12 +1334,14 @@ fn remote_is_this_computer(host: &str, port: u16) -> bool {
     name == "localhost" || name.ends_with(".localhost")
 }
 
-/// desk_open 의 mode 이름 (mcp.rs `modes` 와 같아야 한다)
+/// desk_open mode names (must match mcp.rs `modes`).
 pub(crate) const MODES: [&str; 9] =
     ["web", "web_login", "app", "app_login", "app_current_session", "app_running", "app_vdisplay", "session", "remote"];
 
-/// desk_open 의 mode → 내부 인자(kind + 옵션). 에이전트가 함께 보낸 옛 옵션은 지워 mode 하나만 따른다.
-/// mode 가 없으면 옛 인자(kind 등)를 그대로 쓴다.
+/// desk_open mode → internal arguments (kind + options). Old options the agent sent along are
+/// dropped so only the mode applies.
+///
+/// Without a mode, the old arguments (kind, …) are used as is.
 fn apply_mode(p: &Value) -> Result<Value> {
     let Some(mode) = p.get("mode").filter(|v| !v.is_null()) else { return Ok(p.clone()) };
     let (kind, opt): (&str, Option<(&str, Value)>) = match mode.as_str().unwrap_or("") {
@@ -1314,7 +1367,7 @@ fn apply_mode(p: &Value) -> Result<Value> {
     Ok(Value::Object(q))
 }
 
-/// 이 OS 에서 쓸 수 없는 화면 종류면 그 이유 (사용자에게 승인을 묻기 전에 거절할 때 쓴다)
+/// Reason a screen kind can't be used on this OS (to refuse before asking the user for approval).
 fn unsupported_kind(kind: &str) -> Option<String> {
     match kind {
         "browser" if !caps::BROWSER => Some(text::unsupported("kind=browser")),
@@ -1347,10 +1400,10 @@ fn kind_name(k: DeskKind) -> &'static str {
     }
 }
 
-/// Windows 일반 앱 화면 사용법 (화면 밖 창 + UI Automation)
+/// How to use Windows regular app screens (off-screen window + UI Automation).
 const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 창입니다 (사용자에게는 보이지 않습니다). 좌표는 스크린샷 픽셀입니다. 정확한 조작은 desk_app {action:ui_tree} 후 press/set_value/focus/menu 를 쓰세요. 단축키는 ctrl 기준입니다 (cmd 는 ctrl 로 바뀝니다).";
 
-/// 외부 에이전트에게 알려 줄 화면별 사용법
+/// Per-screen usage notes for external agents.
 pub fn guide(k: DeskKind) -> &'static str {
     match k {
         DeskKind::Browser => "격리된 headless 브라우저입니다. 스크린샷은 페이지 영역만 보이며 주소창이 없으니 desk_browser(navigate/back/new_tab...)로 이동하세요. 좌표는 스크린샷 픽셀입니다.",
@@ -1373,7 +1426,7 @@ pub fn guide(k: DeskKind) -> &'static str {
 fn resolve_app_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.contains('/') {
-        return None; // 이미 경로
+        return None; // already a path
     }
     let want = norm_app_query(name);
     let mut dirs_ = vec![
@@ -1400,15 +1453,16 @@ fn resolve_app_name(name: &str) -> Option<String> {
     None
 }
 
-/// Windows 에서 외부 에이전트가 열 수 없는 앱 판정.
+/// Decides which apps external agents can't open on Windows.
 ///
-/// macOS 의 번들 id 목록에 해당하는 것을 여러 겹으로 본다:
-/// 1. 실행 파일 이름(확장자 뺀 소문자) — 정확히 같거나 접두사가 같으면 차단
-/// 2. VERSIONINFO 의 OriginalFilename — 이름을 바꾼 복사본(cmd.exe → tool.exe)도 잡는다
-/// 3. 표시 이름(FileDescription/시작 메뉴 이름) — "명령 프롬프트", "Registry Editor" …
-/// 4. 위치: %SystemRoot% 아래는 기본 차단(무해한 몇 개만 허용), 네트워크 경로 차단,
-///    차단한 패키지(WindowsApps\<패키지>) 안의 실행 파일 차단
-/// 5. GhostDesk 자신 (실행 중인 파일, 설치본, 설치 폴더)
+/// The counterpart of macOS's bundle id list, checked in several layers:
+/// 1. Executable name (lowercase, no extension): blocked on an exact or prefix match.
+/// 2. VERSIONINFO OriginalFilename: also catches renamed copies (cmd.exe → tool.exe).
+/// 3. Display name (FileDescription/Start menu name): "명령 프롬프트", "Registry Editor", ….
+/// 4. Location: anything under %SystemRoot% is blocked by default (a few harmless ones allowed),
+///    network paths are blocked, and executables inside blocked packages
+///    (WindowsApps\<package>) are blocked.
+/// 5. GhostDesk itself (the running file, the installed copy, its install folder).
 #[cfg(windows)]
 mod win_policy {
     use std::path::{Path, PathBuf};
@@ -1416,38 +1470,39 @@ mod win_policy {
     use super::ResolvedApp;
     use crate::platform::{paths, win};
 
-    /// 정확히 같으면 차단하는 실행 파일 이름 (확장자 뺀 소문자)
+    /// Executable names blocked on an exact match (lowercase, no extension).
     const DENY_EXE: &[&str] = &[
-        // 셸·터미널·원격 셸
+        // shells, terminals, remote shells
         "cmd", "wt", "wtd", "openconsole", "conhost", "bash", "sh", "zsh", "fish", "nu", "git-bash", "git-cmd", "mintty",
         "cmder", "alacritty", "hyper", "tabby", "warp", "kitty", "putty", "plink", "ssh", "telnet", "termius",
         "fluentterminal", "sudo", "gsudo",
-        // 스크립트 호스트·인터프리터·시스템 바이너리 악용(LOLBin)
+        // script hosts, interpreters, abusable system binaries (LOLBins)
         "wscript", "cscript", "mshta", "rundll32", "regsvr32", "msbuild", "installutil", "cmstp", "forfiles", "schtasks",
         "at", "sc", "bitsadmin", "certutil", "wmic", "psexec", "psexec64", "runas", "hh", "msdt", "pcalua",
         "scriptrunner", "mavinject", "msxsl", "odbcconf", "regasm", "regsvcs", "ieexec", "presentationhost",
         "syncappvpublishingserver", "appvlp", "ftp", "tftp", "py", "pyw", "node", "deno", "bun", "perl", "ruby", "php",
         "php-cgi", "php-win", "java", "javaw", "lua", "tclsh", "wish", "code-tunnel", "code-insiders-tunnel",
-        // 자동화
+        // automation
         "pad.console.host", "pad.designer", "pad.robot",
-        // 자격 증명
+        // credentials
         "keeper", "keeperpasswordmanager", "credwiz", "proton pass",
-        // 시스템·보안 설정 (System Settings·Disk Utility·Installer 에 해당)
+        // system and security settings (the counterparts of System Settings, Disk Utility, Installer)
         "systemsettings", "control", "mmc", "regedit", "reg", "msconfig", "useraccountcontrolsettings", "netplwiz",
         "optionalfeatures", "eventvwr", "perfmon", "resmon", "diskpart", "dfrgui", "bcdedit", "dism", "rstrui",
         "sechealthui", "securityhealthsystray", "msiexec", "winget", "appinstaller", "gpedit", "secpol", "certmgr",
         "compmgmt", "services", "lusrmgr", "taskschd", "devmgmt", "wf", "fodhelper", "computerdefaults", "sdclt",
-        // 사용자의 실제 화면·입력에 끼어드는 접근성 도구
+        // accessibility tools that interfere with the user's real screen and input
         "osk", "magnify", "narrator", "sethc", "utilman",
-        // 프로세스 관리 (Activity Monitor 에 해당)
+        // process management (the counterpart of Activity Monitor)
         "taskmgr", "tcpview", "tcpview64",
-        // 파일 관리자 (Finder 에 해당)
+        // file managers (the counterpart of Finder)
         "explorer", "totalcmd", "totalcmd64", "dopus", "xyplorer", "freecommander", "onecommander", "files",
-        // 원격 제어·화면 공유
+        // remote control and screen sharing
         "mstsc", "msra", "quickassist", "teamviewer", "anydesk", "rustdesk",
     ];
 
-    /// 이 접두사로 시작하면 차단 (변형 이름: powershell_ise, pwsh-preview, ubuntu2204, keepassxc, regedt32 …)
+    /// Blocked when starting with these prefixes (variants like powershell_ise, pwsh-preview,
+    /// ubuntu2204, keepassxc, regedt32, …).
     const DENY_EXE_PREFIX: &[&str] = &[
         "powershell", "pwsh", "windowsterminal", "wezterm", "mobaxterm", "conemu", "wsl", "ubuntu", "debian", "kali",
         "opensuse", "sles", "oraclelinux", "archlinux", "python", "autohotkey", "autoit3", "keepass", "1password",
@@ -1455,7 +1510,7 @@ mod win_policy {
         "procmon", "autoruns", "processhacker", "systeminformer", "ghostdesk",
     ];
 
-    /// 표시 이름(소문자)으로 차단 — 시작 메뉴 이름·FileDescription
+    /// Blocked by display name (lowercase): Start menu name, FileDescription.
     const DENY_DISPLAY: &[&str] = &[
         "command prompt", "명령 프롬프트", "windows command processor", "windows terminal", "터미널", "terminal",
         "windows powershell", "windows powershell ise", "powershell 7", "git bash", "git cmd",
@@ -1469,7 +1524,8 @@ mod win_policy {
         "magnifier", "돋보기", "task scheduler", "작업 스케줄러", "windows script host", "microsoft (r) html application host",
     ];
 
-    /// 이 패키지(WindowsApps\<이름>_<버전>_…) 안의 실행 파일은 차단 (소문자 접두사)
+    /// Executables inside these packages (WindowsApps\<name>_<version>_…) are blocked (lowercase
+    /// prefixes).
     const DENY_PACKAGES: &[&str] = &[
         "microsoft.windowsterminal",
         "microsoft.powershell",
@@ -1488,10 +1544,12 @@ mod win_policy {
         "agilebits.",
     ];
 
-    /// %SystemRoot%, System32, SysWOW64 바로 아래에서 예외로 허용하는 무해한 기본 도구
+    /// Harmless built-in tools allowed as exceptions directly under %SystemRoot%, System32 and
+    /// SysWOW64.
     const SYSTEM_ALLOW: &[&str] = &["notepad", "mspaint", "calc", "charmap", "write"];
 
-    /// 비교용 정규화: 따옴표·끝 구분자 제거, 마지막 경로 조각, 소문자, ".exe"/".lnk"/".app" 제거
+    /// Normalization for comparison: strips quotes and trailing separators, keeps the last path
+    /// segment, lowercases, and removes ".exe"/".lnk"/".app".
     pub(super) fn norm_query(s: &str) -> String {
         let t = s.trim().trim_matches('"').trim_end_matches(['/', '\\']);
         let last = t.rsplit(['/', '\\']).next().unwrap_or(t);
@@ -1508,7 +1566,7 @@ mod win_policy {
         p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext))
     }
 
-    /// 실행 파일 이름(확장자 뺀 소문자)이 차단 목록에 있는가
+    /// Whether the executable name (lowercase, no extension) is on the deny list.
     pub(super) fn denied_stem(stem: &str) -> bool {
         let s = stem.trim();
         !s.is_empty() && (DENY_EXE.contains(&s) || DENY_EXE_PREFIX.iter().any(|p| s.starts_with(p)))
@@ -1519,12 +1577,14 @@ mod win_policy {
         !n.is_empty() && (DENY_DISPLAY.contains(&n.as_str()) || denied_stem(&n))
     }
 
-    /// 앱을 찾기 전에 요청 문자열만으로 거부할지 (이름·실행 파일 이름·경로의 파일 이름)
+    /// Whether to refuse based on the request string alone, before finding the app (name, executable
+    /// name, file name of a path).
     pub(super) fn denied_query(raw: &str) -> bool {
         denied_name(&norm_query(raw))
     }
 
-    /// Electron 앱 목록 항목이 요청과 맞는가 (id·이름·실행 파일 이름·설치 폴더 이름)
+    /// Whether an Electron app list entry matches the request (id, name, executable name, install
+    /// folder name).
     pub(super) fn electron_matches(a: &crate::electron::ElectronApp, raw: &str, q: &str) -> bool {
         let lower = |p: &Path| p.file_name().map(|s| s.to_string_lossy().to_lowercase());
         let exe_stem = a.exe.file_stem().map(|s| s.to_string_lossy().to_lowercase());
@@ -1534,7 +1594,7 @@ mod win_policy {
             || lower(&a.bundle).as_deref() == Some(q)
     }
 
-    /// `%VAR%` 와 앞의 `~\` 를 펼친다
+    /// Expands `%VAR%` and a leading `~\`.
     pub(super) fn expand_path(raw: &str) -> PathBuf {
         let mut s = String::new();
         let mut rest = raw;
@@ -1569,9 +1629,11 @@ mod win_policy {
         PathBuf::from(s)
     }
 
-    /// 네트워크 공유·장치 경로인가 (문자열만 본다. 파일 시스템에 손대지 않는다).
-    /// `\\host\…`, `//host/…`, `\\?\UNC\…`, `\\?\GLOBALROOT\…`, `\\.\…`, NT 경로 `\??\…` 가 해당한다.
-    /// 로컬 드라이브의 `\\?\C:\…` 는 아니다.
+    /// Whether it's a network share or device path (only looks at the string, never touches the file
+    /// system).
+    ///
+    /// Covers `\\host\…`, `//host/…`, `\\?\UNC\…`, `\\?\GLOBALROOT\…`, `\\.\…` and NT paths `\??\…`.
+    /// A local drive's `\\?\C:\…` isn't one.
     pub(super) fn network_or_device(s: &str) -> bool {
         let s = s.trim().trim_matches('"').trim().replace('/', "\\");
         if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -1581,7 +1643,8 @@ mod win_policy {
         s.starts_with(r"\\") || s.starts_with(r"\??\")
     }
 
-    /// 비교용 로컬 경로 문자열 (소문자, '\\' 구분자, \\?\ 접두사 제거). 네트워크·장치 경로면 None.
+    /// Local path string for comparison (lowercase, '\\' separators, \\?\ prefix removed). None for
+    /// network and device paths.
     fn local_form(p: &Path) -> Option<String> {
         let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
         let s = match s.strip_prefix(r"\\?\") {
@@ -1593,7 +1656,8 @@ mod win_policy {
         Some(s.trim_end_matches('\\').to_string())
     }
 
-    /// Windows 폴더 (보통 C:\Windows) — 환경변수가 지워진 채 실행되어도 정확하게 알려진 폴더 API 로
+    /// The Windows folder (usually C:\Windows), from the known-folder API so it's right even when run
+    /// with the environment cleared.
     fn system_root() -> String {
         static ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         ROOT.get_or_init(|| {
@@ -1618,7 +1682,8 @@ mod win_policy {
         .clone()
     }
 
-    /// %SystemRoot% 아래인데 허용 목록에 없는가 (시스템 폴더에는 셸·관리 도구·LOLBin 이 수백 개라 기본 차단)
+    /// Whether it's under %SystemRoot% and not on the allowlist (system folders hold hundreds of
+    /// shells, admin tools and LOLBins, so they're blocked by default).
     fn system_dir_denied(s: &str) -> bool {
         let root = system_root();
         let Some(rest) = s.strip_prefix(root.as_str()).and_then(|r| r.strip_prefix('\\')) else { return false };
@@ -1627,7 +1692,8 @@ mod win_policy {
         !(matches!(dir, "" | "system32" | "syswow64") && SYSTEM_ALLOW.contains(&stem))
     }
 
-    /// 차단한 패키지(Windows Terminal·PowerShell·WSL·설정·Windows 보안 …) 안의 실행 파일인가
+    /// Whether it's an executable inside a blocked package (Windows Terminal, PowerShell, WSL,
+    /// Settings, Windows Security, …).
     fn denied_package(s: &str) -> bool {
         let parts: Vec<&str> = s.split('\\').collect();
         parts.windows(2).any(|w| {
@@ -1638,7 +1704,8 @@ mod win_policy {
         })
     }
 
-    /// GhostDesk 자신 (실행 중인 파일·설치본·설치 폴더 안의 다른 실행 파일)
+    /// GhostDesk itself (the running file, the installed copy, other executables in its install
+    /// folder).
     fn is_own(p: &Path, s: &str) -> bool {
         if std::env::current_exe().is_ok_and(|me| paths::same_path(p, &me)) {
             return true;
@@ -1654,13 +1721,14 @@ mod win_policy {
             .is_some_and(|d| s.starts_with(&format!("{d}\\")))
     }
 
-    /// 실행 파일 경로 하나에 대한 판정 (이름·위치·GhostDesk 자신)
+    /// Verdict for a single executable path (name, location, GhostDesk itself).
     fn denied_exe(p: &Path) -> bool {
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
         if denied_stem(&stem) {
             return true;
         }
-        // 네트워크 공유(\\server\…, \\localhost\C$\Windows\…)·장치 경로는 위치를 확인할 수 없으므로 차단
+        // network shares (\\server\…, \\localhost\C$\Windows\…) and device paths can't be located, so
+        // they're blocked
         let Some(s) = local_form(p) else { return true };
         system_dir_denied(&s) || denied_package(&s) || is_own(p, &s)
     }
@@ -1668,7 +1736,7 @@ mod win_policy {
     fn denied_original_name(o: Option<&str>) -> bool {
         o.is_some_and(|o| {
             let n = o.trim().to_lowercase();
-            // pwsh.dll, PowerShell.EXE.MUI 처럼 붙은 확장자를 모두 뗀다
+            // strip every stacked extension, like pwsh.dll or PowerShell.EXE.MUI
             let stem = n.split('.').next().unwrap_or("");
             denied_stem(stem) || denied_stem(&norm_query(&n))
         })
@@ -1701,7 +1769,7 @@ mod tests {
 
     #[test]
     fn namespaces_never_collide() {
-        // 로그인 미사용 이름에 어떤 slug 를 넣어도 로그인 복제 공간과 겹치지 않는다
+        // no slug put into a no-login name can overlap the login clone namespace
         for w in ["login-foo", "login", "-login-foo", "LOGIN-foo", "foo", "x_y-z"] {
             let plain = format!("mcp_{}", profiles::slug(w)).to_lowercase();
             assert!(!plain.starts_with("mcp-login-"), "{plain}");
@@ -1758,7 +1826,7 @@ mod tests {
         assert!(is_denied(&mk("/x/Renamed.app", Some("COM.APPLE.SCRIPTEDITOR2"))));
         assert!(is_denied(&mk("/x/Script Editor.app", None)));
         assert!(!is_denied(&mk("/System/Applications/TextEdit.app", Some("com.apple.TextEdit"))));
-        // GhostDesk 자신은 차단 목록이 아니라 시험용 인스턴스로만 여는 대상이다 (app_target)
+        // GhostDesk itself isn't on the deny list; it's only opened as a test instance (app_target)
         if !cfg!(windows) {
             assert!(!is_denied(&mk("/x/Foo.app", Some("dev.ghostdesk.app"))));
         }
@@ -1771,14 +1839,14 @@ mod tests {
     fn blank_workspace_check() {
         let tmp = std::env::temp_dir().join(format!("ghostdesk-ctl-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // 없는 폴더 / 빈 폴더는 허용
+        // missing and empty folders are allowed
         assert!(check_blank_workspace(&tmp, "w").is_ok());
         std::fs::create_dir_all(&tmp).unwrap();
         assert!(check_blank_workspace(&tmp, "w").is_ok());
-        // 표식 없이 데이터(복제 흔적)가 있으면 거부
+        // data (clone leftovers) without the marker is refused
         std::fs::write(tmp.join("Local State"), "{}").unwrap();
         assert!(check_blank_workspace(&tmp, "w").is_err());
-        // 로그인 미사용으로 만든 폴더면 허용
+        // a folder created without login is allowed
         std::fs::write(tmp.join(BLANK_MARKER), "").unwrap();
         assert!(check_blank_workspace(&tmp, "w").is_ok());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1800,10 +1868,10 @@ mod tests {
             Reservation { set: &set, key, name, keep: false }
         };
         let a = reserve("mcp_foo", 1);
-        let b = reserve("mcp_FOO", 2); // 대소문자만 다른 이름도 같은 폴더
+        let b = reserve("mcp_FOO", 2); // names differing only in case are the same folder
         assert_eq!(a.name, "mcp_foo");
         assert_eq!(b.name, "mcp_FOO-2");
-        drop(b); // 실패 → 해제
+        drop(b); // failure → released
         assert!(!set.lock().contains("mcp_foo-2"));
         let key = a.keep();
         assert!(set.lock().contains(&key));
@@ -1848,17 +1916,17 @@ mod tests {
                 DeskEntry { shared: sh, conn: owner, shared_access: shared, reservation: reservation_key(&format!("mcp_{id}")) },
             );
         }
-        // 다른 연결은 조작·닫기 불가, shared 는 가능
+        // other connections can't drive or close it, shared ones can
         assert!(srv.get(&json!({ "desk_id": "d-1" }), &b).err().unwrap().to_string().contains("다른 에이전트"));
         assert!(srv.close(&json!({ "desk_id": "d-1" }), &b).await.is_err());
         assert!(srv.close(&json!({ "desk_id": "d-2" }), &b).await.is_ok());
         assert!(!srv.reserved.lock().contains("mcp_d-2"));
-        // GUI 에서 제거된 화면은 정리된다
+        // screens removed in the GUI are cleaned up
         srv.desks.lock()["d-3"].shared.removed.store(true, Ordering::SeqCst);
         srv.prune_removed();
         assert!(!srv.desks.lock().contains_key("d-3"));
         assert!(!srv.reserved.lock().contains("mcp_d-3"));
-        // 연결이 끊기면 그 연결이 만든 화면은 모두 닫힌다
+        // when a connection drops, every screen it created is closed
         srv.close_conn_desks(a.id).await;
         assert!(srv.desks.lock().is_empty());
         assert!(srv.reserved.lock().is_empty());
@@ -1871,13 +1939,13 @@ mod tests {
         assert_eq!(apply_mode(&json!({"mode": "web_login"})).unwrap()["use_my_login"], json!(true));
         assert_eq!(apply_mode(&json!({"mode": "session"})).unwrap()["kind"], json!("session"));
         assert!(apply_mode(&json!({"mode": "hidden"})).unwrap_err().to_string().contains("web_login"));
-        // mode 없이 오면 옛 인자 그대로
+        // without a mode, old arguments pass through as is
         assert_eq!(apply_mode(&json!({"kind": "remote"})).unwrap(), json!({"kind": "remote"}));
     }
 
     #[test]
     fn kinds_gated_by_platform() {
-        // macOS 는 모든 종류를 받는다 (기존 동작 그대로)
+        // macOS accepts every kind (unchanged behavior)
         for k in ["browser", "remote", "app", "session", "nope"] {
             if caps::SESSION || k != "session" {
                 assert!(unsupported_kind(k).is_none(), "{k}");
@@ -1912,7 +1980,7 @@ mod tests {
     fn windows_deny_policy() {
         let sys = win_policy::system_root_for_test();
         let s = |rel: &str| format!(r"{sys}\{rel}");
-        // 셸·터미널·인터프리터·암호 관리자·GhostDesk: 실행 파일 이름으로
+        // shells, terminals, interpreters, password managers, GhostDesk: by executable name
         for p in [
             r"C:\Program Files\Git\git-bash.exe",
             r"C:\Program Files\PowerShell\7\pwsh.exe",
@@ -1925,15 +1993,15 @@ mod tests {
         ] {
             assert!(is_denied(&win_app(p, None, "")), "{p}");
         }
-        // 이름을 바꾼 복사본: 원래 파일 이름으로
+        // renamed copies: by original file name
         for o in ["Cmd.Exe", "pwsh.dll", "PowerShell.EXE.MUI", "regedit.exe", "PAD.Console.Host.exe"] {
             assert!(is_denied(&win_app(r"C:\Users\a\Desktop\tool.exe", Some(o), "")), "{o}");
         }
-        // 표시 이름으로
+        // by display name
         for n in ["Registry Editor", "명령 프롬프트", "Windows PowerShell", "Task Manager", "Bitwarden"] {
             assert!(is_denied(&win_app(r"C:\Users\a\Desktop\tool.exe", None, n)), "{n}");
         }
-        // 시스템 폴더는 기본 차단, 바로 아래의 무해한 몇 개만 허용
+        // system folders are blocked by default, with a few harmless tools directly under them allowed
         assert!(is_denied(&win_app(&s(r"System32\dxdiag.exe"), None, "")));
         assert!(is_denied(&win_app(&s(r"System32\WindowsPowerShell\v1.0\x.exe"), None, "")));
         assert!(is_denied(&win_app(&s(r"System32\sub\notepad.exe"), None, "")));
@@ -1942,21 +2010,21 @@ mod tests {
         assert!(!is_denied(&win_app(&s("notepad.exe"), None, "Notepad")));
         assert!(!is_denied(&win_app(&s(r"SysWOW64\charmap.exe"), None, "")));
         assert!(!is_denied(&win_app(&s(r"System32\calc.exe").to_uppercase(), None, "")));
-        // 네트워크 공유·장치 경로
+        // network share and device paths
         assert!(is_denied(&win_app(r"\\localhost\C$\Windows\System32\dxdiag.exe", None, "")));
         assert!(is_denied(&win_app(r"\\?\UNC\srv\share\app.exe", None, "")));
         assert!(is_denied(&win_app(r"\\?\GLOBALROOT\Device\x.exe", None, "")));
-        // 차단한 패키지 안의 실행 파일
+        // executables inside blocked packages
         assert!(is_denied(&win_app(
             r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.21.10351.0_x64__8wekyb3d8bbwe\Other.exe",
             None,
             ""
         )));
         assert!(is_denied(&win_app(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe\x.exe", None, "")));
-        // GhostDesk 자신 (실행 중인 파일)
+        // GhostDesk itself (the running file)
         let me = std::env::current_exe().unwrap();
         assert!(is_denied(&win_app(&me.to_string_lossy(), None, "")));
-        // 일반 앱은 통과
+        // regular apps pass
         for (p, n) in [
             (r"C:\Program Files\Microsoft VS Code\Code.exe", "Visual Studio Code"),
             (r"C:\Program Files\Google\Chrome\Application\chrome.exe", "Google Chrome"),
@@ -2015,7 +2083,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("ghostdesk-ctl-win-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        // 이름을 바꾼 cmd.exe 복사본: 경로는 해석되지만 원래 파일 이름(VERSIONINFO)으로 차단된다
+        // a renamed copy of cmd.exe: the path resolves, but it's blocked by its original file name
+        // (VERSIONINFO)
         let copy = tmp.join("harmless-tool.exe");
         std::fs::copy(sys.join(r"System32\cmd.exe"), &copy).unwrap();
         let r = resolve_external_app(&copy.to_string_lossy()).unwrap();
@@ -2024,25 +2093,26 @@ mod tests {
         assert!(r.original_filename.as_deref().unwrap_or("").to_lowercase().starts_with("cmd"), "{:?}", r.original_filename);
         assert!(r.electron.is_none());
         assert!(is_denied(&r), "이름을 바꾼 cmd.exe 는 차단되어야 함");
-        // .exe 가 아닌 파일·없는 파일·빈 값은 열지 않는다
+        // non-.exe files, missing files and empty values aren't opened
         let bat = tmp.join("x.bat");
         std::fs::write(&bat, "@echo off\r\n").unwrap();
         assert!(resolve_external_app(&bat.to_string_lossy()).is_err());
         assert!(resolve_external_app(&tmp.join("missing.exe").to_string_lossy()).is_err());
         assert!(resolve_external_app("  ").is_err());
         assert!(resolve_external_app("ghostdesk-no-such-app-xyz").is_err());
-        // 시스템 폴더 바로 아래의 허용 도구 (있을 때만)
+        // allowed tools directly under the system folder (only if present)
         let np = sys.join("notepad.exe");
         if np.is_file() {
             for q in [np.to_string_lossy().into_owned(), r"%SystemRoot%\notepad.exe".to_string(), format!("\"{}\"", np.display())] {
                 let r = resolve_external_app(&q).unwrap();
                 assert!(!is_denied(&r), "{q}: {:?}", r.path);
-                // 이름은 VERSIONINFO 설명 (Windows 표시 언어에 따라 "Notepad" / "메모장")
+                // the name is the VERSIONINFO description ("Notepad" / "메모장" depending on the Windows display
+                // language)
                 assert!(!r.name.is_empty(), "{q}");
                 assert!(r.original_filename.as_deref().unwrap_or("").to_lowercase().starts_with("notepad"), "{q}");
             }
         }
-        // 시스템 폴더의 다른 도구는 차단
+        // other tools in the system folder are blocked
         let dx = sys.join(r"System32\dxdiag.exe");
         if dx.is_file() {
             assert!(is_denied(&resolve_external_app(&dx.to_string_lossy()).unwrap()));
@@ -2134,8 +2204,8 @@ mod tests {
         }
         assert!(srv.reserved.lock().is_empty());
         let sys = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
-        // 로컬 앱 백엔드가 실행할 때 거절할 대상(Win11 의 Store 실행기 calc, 실행 별칭 notepad, 콘솔 프로그램)은
-        // 승인을 묻기 전에 그 이유로 거절한다
+        // targets the local app backend refuses at launch (Win11's Store launcher calc, the notepad
+        // execution alias, console programs) are refused with that reason before asking for approval
         let console = std::env::temp_dir().join(format!("ghostdesk-ctl-console-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&console);
         std::fs::create_dir_all(&console).unwrap();
@@ -2149,7 +2219,7 @@ mod tests {
             let Err(why) = crate::native::preflight_app(&canonical) else { continue };
             let p = json!({ "kind": "app", "app": exe.to_string_lossy() });
             let e = srv.open(&p, &c).await.unwrap_err().to_string();
-            // 제어 서버와 같은 정규 경로로 비교한다 (TEMP 는 8.3 짧은 경로일 수 있다).
+            // compare with the same canonical path as the control server (TEMP may be an 8.3 short path)
             assert_eq!(e.to_lowercase(), why.to_string().to_lowercase(), "{p}");
             assert!(ev_rx.try_recv().is_err(), "승인 창을 띄우기 전에 거절해야 함: {p}");
             let p = json!({ "kind": "app", "app": exe.to_string_lossy(), "attach_running": true });
@@ -2159,8 +2229,8 @@ mod tests {
         assert!(crate::native::preflight_app(&console_exe).unwrap_err().to_string().contains("콘솔"));
         let _ = std::fs::remove_dir_all(&console);
         assert!(srv.reserved.lock().is_empty());
-        // 허용되고 실행할 수 있는 앱은 승인을 묻는다 (거부하면 아무것도 실행하지 않는다).
-        // Win11 의 notepad 처럼 실행 별칭이면 위에서 이미 승인 없이 거절되었으므로 그대로 실행되는 앱만 본다.
+        // allowed, runnable apps ask for approval (a refusal runs nothing). Execution aliases like Win11's
+        // notepad were already refused above without approval, so only apps that run as is are checked.
         let runnable = [sys.join("notepad.exe"), sys.join(r"System32\charmap.exe")]
             .into_iter()
             .find(|p| p.is_file() && crate::native::preflight_app(p).is_ok());
@@ -2201,7 +2271,8 @@ mod tests {
         for s in [r"C:\Program Files\x.exe", r"\\?\C:\Program Files\x.exe", "notepad", r"%SystemRoot%\notepad.exe", r"\Windows\x.exe", "C:x.exe"] {
             assert!(!win_policy::network_or_device(s), "{s}");
         }
-        // %VAR% 를 펼친 결과가 네트워크 경로여도 (경로처럼 보이지 않는 이름이라도) 거절한다
+        // refuse when the %VAR%-expanded result is a network path (even for a name that doesn't look like
+        // a path)
         std::env::set_var("GD_CTL_TEST_UNC_TARGET", r"\\ghostdesk-test.invalid\share\tool.exe");
         let e = resolve_external_app("%GD_CTL_TEST_UNC_TARGET%").err().unwrap().to_string();
         assert!(e.contains("네트워크 공유"), "{e}");
@@ -2213,7 +2284,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_refuses_percent_in_resolved_path() {
-        // 로컬 앱 백엔드가 실행할 때 %VAR% 를 다시 펼치므로, 확인한 파일과 실행할 파일이 달라질 수 있는 경로는 거절
+        // the local app backend expands %VAR% again at launch, so paths where the checked file and the
+        // launched file could differ are refused
         let sys = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
         let tmp = std::env::temp_dir().join(format!("ghostdesk-ctl-pct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2222,11 +2294,12 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::copy(sys.join(r"System32\where.exe"), dir.join("tool.exe")).unwrap();
         }
-        // 정의되지 않은 변수 이름은 그대로 남아 정규 경로에 % 가 든다
+        // an undefined variable name stays as is, leaving a % in the canonical path
         let e = resolve_external_app(&format!(r"{}\%GD_CTL_NO_SUCH_VAR%\tool.exe", tmp.display())).err().unwrap().to_string();
         assert!(e.contains("'%'"), "{e}");
-        // 한 번 펼친 결과에 '%USERNAME%' 이 남는 경우 (8.3 짧은 이름·바로 가기 대상 등으로도 생긴다):
-        // 여기서 확인한 파일은 ...\%USERNAME%\tool.exe 인데 실행할 때는 ...\<사용자 이름>\tool.exe 가 된다
+        // one expansion still leaves '%USERNAME%' (8.3 short names and shortcut targets can cause this
+        // too): the file checked here is ...\%USERNAME%\tool.exe, but at launch it becomes
+        // ...\<user name>\tool.exe
         std::env::set_var("GD_CTL_PCT_DIR", "%USERNAME%");
         let e = resolve_external_app(&format!(r"{}\%GD_CTL_PCT_DIR%\tool.exe", tmp.display())).err().unwrap().to_string();
         assert!(e.contains("'%'"), "{e}");
@@ -2239,13 +2312,13 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let srv = ControlServer::new(ev_tx, egui::Context::default());
         let (_t, c) = conn(1);
-        // 전용 머신이라고 하지 않았으면 묻지 않고 같은 문구로 거절
+        // without a dedicated machine claim, refuse with the same message without asking
         for host in ["127.0.0.1", "localhost", "::1"] {
             let e = srv.open(&json!({ "kind": "remote", "host": host, "port": 5999 }), &c).await.unwrap_err().to_string();
             assert_eq!(e, agent::local_vnc_refusal(host, 5999));
             assert!(ev_rx.try_recv().is_err(), "승인 창을 띄우기 전에 거절해야 함: {host}");
         }
-        // 전용 머신이라고 했으면 '이 컴퓨터 자신' 경고를 크게 보여 주고 묻는다
+        // with a dedicated machine claim, ask with a prominent "this computer itself" warning
         let (srv2, c2) = (srv.clone(), c.clone());
         let task = tokio::spawn(async move {
             srv2.open(&json!({ "kind": "remote", "host": "127.0.0.1", "port": 5999, "dedicated_machine": true }), &c2).await
@@ -2257,7 +2330,7 @@ mod tests {
         assert!(!detail.contains("에이전트 전용 Mac/VM"), "{detail}");
         let _ = reply.send(false);
         assert!(task.await.unwrap().unwrap_err().to_string().contains("거부"));
-        // 이 컴퓨터가 아닌 대상은 '이 컴퓨터 자신' 경고 없이 묻는다
+        // targets other than this computer are asked about without the "this computer itself" warning
         let (srv2, c2) = (srv.clone(), c.clone());
         let task = tokio::spawn(async move {
             srv2.open(&json!({ "kind": "remote", "host": "192.0.2.50", "port": 5999, "dedicated_machine": true }), &c2).await
@@ -2267,16 +2340,18 @@ mod tests {
         assert!(detail.contains("에이전트 전용"), "{detail}");
         let _ = reply.send(false);
         assert!(task.await.unwrap().is_err());
-        // 승인 전에는 이름을 풀지 않는다: 주소·localhost 만 이 컴퓨터로 보고, 그 밖의 이름은 접속 단계에서
-        // 실제로 접속한 주소로 확인한다 (승인 창에서 '이 컴퓨터 자신' 경고를 보이지 않았으면 그때 거절)
+        // names aren't resolved before approval: only addresses and localhost count as this computer;
+        // other names are checked against the address actually connected to at connect time (and refused
+        // then if the approval dialog didn't show the "this computer itself" warning)
         for h in ["127.0.0.2", "0.0.0.0", "[::1]", " LocalHost. ", "agent.localhost"] {
             assert!(remote_is_this_computer(h, 5900), "{h}");
         }
         for h in ["192.0.2.50", "ghostdesk-test.invalid", "localhost.ghostdesk-test.invalid", ""] {
             assert!(!remote_is_this_computer(h, 5900), "{h}");
         }
-        // 사람이 '이 컴퓨터 자신' 경고를 보고 승인했으면 이 컴퓨터의 VNC 서버에 접속을 시도한다
-        // (가짜 서버라 핸드셰이크에서 실패하지만, 이 컴퓨터라는 이유로 거절하지는 않는다)
+        // once a person approved after seeing the "this computer itself" warning, connecting to this
+        // computer's VNC server is attempted (the fake server fails the handshake, but it isn't refused
+        // for being this computer)
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {

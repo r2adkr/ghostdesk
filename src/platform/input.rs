@@ -1,15 +1,16 @@
-//! 키 조합·수정키의 운영체제별 해석.
+//! Per-OS interpretation of key combos and modifiers.
 //!
-//! 에이전트(특히 macOS 에 익숙한 모델)는 "cmd+c" 처럼 Command 키를 쓰는 경우가 많다.
-//! macOS 가 아닌 곳에서 **이 컴퓨터 안의** 백엔드(헤드리스 브라우저·Electron·로컬 앱)를 조작할 때는
-//! 같은 뜻의 Ctrl 로 바꿔 준다. 원격(VNC)·별도 세션은 상대 컴퓨터의 OS 를 따르므로 바꾸지 않는다.
-//! `super`/`win`/`meta` 처럼 명시적으로 Windows 키를 고른 경우는 그대로 둔다.
+//! Agents (especially models used to macOS) often send Command combos like "cmd+c". When driving
+//! a backend running **on this machine** (headless browser, Electron, local apps) outside macOS,
+//! those become the equivalent Ctrl combos. Remote (VNC) and separate-session screens follow the
+//! other machine's OS and are left alone. Explicit Windows-key choices (`super`, `win`, `meta`)
+//! are kept as is.
 
 use std::borrow::Cow;
 
 use crate::keys::{MOD_CTRL, MOD_META};
 
-/// 이 OS 에서 cmd → ctrl 치환이 필요한가
+/// Whether this OS needs cmd → ctrl remapping.
 pub const REMAP_CMD: bool = !cfg!(target_os = "macos");
 
 fn is_cmd_token(t: &str) -> bool {
@@ -23,7 +24,8 @@ fn is_ctrl_token(t: &str) -> bool {
     )
 }
 
-/// 로컬 백엔드용 키 조합 현지화 ("cmd+shift+p" → "ctrl+shift+p", macOS 에서는 그대로).
+/// Localizes a key combo for local backends ("cmd+shift+p" → "ctrl+shift+p"; unchanged on
+/// macOS).
 pub fn localize_combo(combo: &str) -> Cow<'_, str> {
     localize_combo_for(combo, REMAP_CMD)
 }
@@ -33,7 +35,7 @@ pub fn localize_combo_for(combo: &str, remap: bool) -> Cow<'_, str> {
         return Cow::Borrowed(combo);
     }
     let trimmed = combo.trim();
-    // "cmd++" 처럼 '+' 자체를 누르는 꼬리는 따로 떼어 둔다 (keys::parse_combo 와 같은 규칙)
+    // split off a trailing '+' key as in "cmd++" (same rule as keys::parse_combo)
     let (body, tail) = if trimmed.ends_with("++") {
         (&trimmed[..trimmed.len() - 2], "++")
     } else {
@@ -48,9 +50,9 @@ pub fn localize_combo_for(combo: &str, remap: bool) -> Cow<'_, str> {
     for (i, p) in parts.iter().enumerate() {
         let last = i + 1 == parts.len() && tail.is_empty();
         if is_cmd_token(p) {
-            // 마지막 토큰(= 누르는 키 자체)이 cmd 이면 Ctrl 키를 누르는 것으로
+            // if the last token (the key itself) is cmd, press Ctrl
             if has_ctrl && !last {
-                continue; // ctrl 이 이미 있으면 중복 제거
+                continue; // drop a duplicate ctrl
             }
             out.push("ctrl");
         } else {
@@ -64,7 +66,7 @@ pub fn localize_combo_for(combo: &str, remap: bool) -> Cow<'_, str> {
     Cow::Owned(s)
 }
 
-/// 마우스 수정키 비트 현지화: macOS 가 아니면 Meta(cmd) → Ctrl.
+/// Localizes mouse modifier bits: Meta (cmd) → Ctrl outside macOS.
 pub fn localize_mods(mods: i64) -> i64 {
     localize_mods_for(mods, REMAP_CMD)
 }
@@ -77,13 +79,16 @@ pub fn localize_mods_for(mods: i64, remap: bool) -> i64 {
     }
 }
 
-/// 직접 조작 중 egui 가 `Copy`/`Cut` 이벤트로 바꿔 버린 키를 격리 화면에 보낼 조합으로 되돌린다.
+/// Turns keys that egui converted into `Copy`/`Cut` events during takeover back into a combo to
+/// send to the isolated screen.
 ///
-/// egui-winit 은 cmd/ctrl+C → Copy, cmd/ctrl+X → Cut 으로 바꾸고 원래 키는 알려 주지 않는다 (Key 이벤트도 없음).
-/// Windows 에서는 옛 클립보드 키 ctrl+Insert → Copy, shift+Delete → Cut 도 같은 이벤트가 된다.
-/// - macOS 등: 예전처럼 기본 수정키 + c/x
-/// - Windows: 사람이 Insert/Delete 로 눌렀으면 그 조합 그대로 (원격 리눅스 터미널의 ctrl+Insert 가 ctrl+c(SIGINT)로,
-///   탐색기의 shift+Delete(영구 삭제)가 ctrl+x 로 바뀌지 않게)
+/// egui-winit turns cmd/ctrl+C into Copy and cmd/ctrl+X into Cut without reporting the original
+/// key (no Key event either). On Windows the legacy clipboard keys ctrl+Insert → Copy and
+/// shift+Delete → Cut become the same events.
+/// - macOS and others: the primary modifier + c/x, as before
+/// - Windows: if the person pressed Insert/Delete, keep that combo, so ctrl+Insert in a remote
+///   Linux terminal doesn't become ctrl+c (SIGINT) and shift+Delete (permanent delete) in
+///   Explorer doesn't become ctrl+x
 pub fn takeover_clipboard_combo(copy: bool, m: eframe::egui::Modifiers) -> String {
     #[cfg(windows)]
     if let Some(c) = legacy_clipboard_combo(copy, m, win_key_down) {
@@ -99,7 +104,8 @@ const VK_INSERT: i32 = 0x2D;
 #[cfg(any(windows, test))]
 const VK_C: i32 = 0x43;
 
-/// 이 스레드가 마지막으로 읽은 키 메시지 기준으로 키가 눌려 있는가 (GetKeyState: 메시지와 맞춰진 상태)
+/// Whether a key is down as of the last key message this thread read (GetKeyState, which is in
+/// sync with the message queue).
 #[cfg(windows)]
 fn win_key_down(vk: i32) -> bool {
     #[link(name = "user32")]
@@ -109,23 +115,25 @@ fn win_key_down(vk: i32) -> bool {
     unsafe { GetKeyState(vk) < 0 }
 }
 
-/// egui-winit 의 Windows 규칙: Cut = Cut 키 | ctrl 단독 + X | shift(+아무 수정키) + Delete,
-/// Copy = Copy 키 | ctrl 단독 + C | ctrl(+아무 수정키) + Insert.
-/// 수정키만으로 구별되면 그것으로 정하고, ctrl 단독(ctrl+C 와 ctrl+Insert)일 때만 키 상태를 본다.
-/// 옛 클립보드 키가 아니면 None (기본 수정키 + c/x).
+/// egui-winit's Windows rules: Cut = Cut key | ctrl alone + X | shift (+ any modifier) + Delete;
+/// Copy = Copy key | ctrl alone + C | ctrl (+ any modifier) + Insert.
+///
+/// Decides by modifiers when they are enough, and only checks key state for ctrl alone (ctrl+C
+/// vs ctrl+Insert). Returns `None` for anything but the legacy clipboard keys (primary modifier
+/// + c/x).
 #[cfg(any(windows, test))]
 fn legacy_clipboard_combo(copy: bool, m: eframe::egui::Modifiers, down: impl Fn(i32) -> bool) -> Option<String> {
     let (legacy, key) = if copy {
-        // ctrl+C 는 ctrl 단독일 때만 Copy 가 되므로, shift·alt 가 함께면 ctrl+Insert
+        // ctrl+C is only Copy with ctrl alone, so ctrl with shift or alt means ctrl+Insert
         (m.ctrl && (!m.command_only() || (down(VK_INSERT) && !down(VK_C))), "Insert")
     } else {
-        // ctrl+X 는 ctrl 단독일 때만 Cut 이 되므로, shift 가 눌려 있으면 shift+Delete (ctrl+shift+Delete 포함)
+        // ctrl+X is only Cut with ctrl alone, so with shift held it's shift+Delete (incl. ctrl+shift+Delete)
         (m.shift, "Delete")
     };
     if !legacy {
         return None;
     }
-    // app.rs 의 egui_key_combo 와 같은 순서·이름
+    // same order and names as egui_key_combo in app.rs
     let mut s = String::new();
     if m.mac_cmd {
         s.push_str("cmd+");
@@ -157,25 +165,25 @@ mod tests {
         let none = |_: i32| false;
         let insert_down = |vk: i32| vk == VK_INSERT;
         let c_down = |vk: i32| vk == VK_C;
-        // ctrl+C / ctrl+X → 기존대로 (None = 기본 수정키 + c/x)
+        // ctrl+C / ctrl+X → unchanged (None = primary modifier + c/x)
         assert_eq!(legacy_clipboard_combo(true, ctrl, c_down), None);
         assert_eq!(legacy_clipboard_combo(true, ctrl, none), None);
         assert_eq!(legacy_clipboard_combo(false, ctrl, none), None);
-        // ctrl+Insert (키 상태로 구별), ctrl+shift+Insert·ctrl+alt+Insert (수정키로 구별)
+        // ctrl+Insert (told apart by key state), ctrl+shift+Insert and ctrl+alt+Insert (by modifiers)
         assert_eq!(legacy_clipboard_combo(true, ctrl, insert_down).as_deref(), Some("ctrl+Insert"));
         assert_eq!(legacy_clipboard_combo(true, ctrl_shift, none).as_deref(), Some("ctrl+shift+Insert"));
         assert_eq!(legacy_clipboard_combo(true, ctrl_alt, none).as_deref(), Some("ctrl+alt+Insert"));
         // shift+Delete, ctrl+shift+Delete
         assert_eq!(legacy_clipboard_combo(false, shift, none).as_deref(), Some("shift+Delete"));
         assert_eq!(legacy_clipboard_combo(false, ctrl_shift, none).as_deref(), Some("ctrl+shift+Delete"));
-        // 수정키 없는 Copy/Cut 키 → 기존대로
+        // Copy/Cut keys without modifiers → unchanged
         assert_eq!(legacy_clipboard_combo(true, Modifiers::default(), none), None);
         assert_eq!(legacy_clipboard_combo(false, Modifiers::default(), none), None);
-        // 결과는 keys::parse_combo 로 해석 가능
+        // results parse with keys::parse_combo
         for c in ["ctrl+Insert", "ctrl+shift+Delete"] {
             assert!(crate::keys::parse_combo(c).is_ok(), "{c}");
         }
-        // macOS 는 예전과 같은 cmd+c / cmd+x
+        // macOS keeps cmd+c / cmd+x
         if cfg!(target_os = "macos") {
             let cmd = Modifiers { mac_cmd: true, command: true, ..Default::default() };
             assert_eq!(takeover_clipboard_combo(true, cmd), "cmd+c");
@@ -197,7 +205,7 @@ mod tests {
         assert_eq!(l("Return"), "Return");
         assert_eq!(l("ctrl+c"), "ctrl+c");
         assert_eq!(localize_combo_for("cmd+c", false), "cmd+c");
-        // 결과는 keys::parse_combo 로 해석 가능해야 한다
+        // results must parse with keys::parse_combo
         for c in ["cmd+c", "cmd+shift+p", "cmd++", "cmd+ctrl+f", "cmd"] {
             let out = l(c);
             let parsed = crate::keys::parse_combo(&out).unwrap();

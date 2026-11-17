@@ -1,57 +1,64 @@
-//! (실험적, opt-in) 가상 디스플레이를 에이전트 전용 화면으로 쓰는 macOS 백엔드.
+//! (Experimental, opt-in) macOS backend that uses a virtual display as the agent's own screen.
 //!
-//! ## 아이디어
-//! 숨긴 앱 창(네이티브 백엔드)에는 마우스 이벤트가 전달되지 않는다. 대상 pid 전용 입력
-//! (`CGEventPostToPid` + 대상 PSN 에만 보내는 SkyLight 키 창 레코드 + 창-로컬 좌표
-//! `CGEventSetWindowLocation`)은 창이 **화면에 올라가 있을 때(ordered-in)만** 실제 픽셀 클릭이 된다.
-//! 그래서 비공개 CoreGraphics 클래스 `CGVirtualDisplay` 로 사용자에게 보이지 않는 가상 모니터를 하나
-//! 만들고, 대상 앱 창을 그 위에만 올린다. 앱은 비활성(front 가 아님) 상태로 유지되므로
-//! 사용자의 커서·포커스·front 앱은 바뀌지 않는다.
+//! ## Idea
+//! Hidden app windows (the native backend) get no mouse events. Input aimed at the target pid
+//! (`CGEventPostToPid` + a SkyLight key window record sent only to the target PSN + window-local
+//! coordinates via `CGEventSetWindowLocation`) only becomes real pixel clicks while the window is
+//! **on screen (ordered in)**. So the private CoreGraphics class `CGVirtualDisplay` creates a
+//! virtual monitor the user never sees, and the target app's windows are placed only on it. The
+//! app stays inactive (not frontmost), so the user's cursor, focus and front app don't change.
 //!
-//! ## 한계와 위험 (사용자에게 알려야 함)
-//! - 가상 디스플레이는 사용자의 디스플레이 배치에 **합류한다** (headless 옵션 없음). 사용자의 커서가
-//!   가장자리를 넘어 그쪽으로 갈 수 있다 → Dock 반대편 가장 바깥쪽 가장자리에, 주 디스플레이에 아래쪽 정렬로
-//!   붙여 우연히 넘어갈 가능성을 줄인다. 주 디스플레이로 만들거나 미러링하지 않는다.
-//! - 디스플레이를 없애면 그 위에 남은 창은 다른 디스플레이로 옮겨진다 → 종료 시 먼저 앱을 끝내고(또는
-//!   Mode B 면 원래 위치로 되돌리고) 디스플레이를 없앤다. 사용자 창 위치를 생성 전/후/제거 후 비교해 보고한다.
-//! - 앱이 새 창을 사용자 디스플레이에 띄우면 감시기(50ms)가 가상 디스플레이로 옮기고, 옮기지 못하면 앱을 숨긴다.
-//! - 앱이 스스로 활성화(front)되면 사용자의 키보드 포커스를 가져가므로 즉시 숨기고 노트로 알린다 (Mode A).
-//! - 열기/저장 패널은 별도 시스템 프로세스의 창이라 클릭할 수 없다. 열기 패널(File > Open…, cmd+O)은
-//!   사용자 화면에 뜰 수 있어 차단한다.
+//! ## Limits and risks (the user must be told)
+//! - The virtual display **joins** the user's display arrangement (there's no headless option).
+//!   The user's cursor can cross the edge onto it, so it's attached at the outermost edge away
+//!   from the Dock, bottom-aligned with the main display, to make that less likely. It's never
+//!   made the main display or mirrored.
+//! - Removing the display moves any windows left on it to another display, so shutdown ends the
+//!   app first (or, in Mode B, puts windows back) before removing the display. User window
+//!   positions are compared before creation, after creation and after removal, and reported.
+//! - If the app opens a new window on a user display, the watchdog (50 ms) moves it to the
+//!   virtual display, and hides the app if it can't.
+//! - If the app activates itself (becomes frontmost) it takes the user's keyboard focus, so it's
+//!   hidden immediately and reported in a note (Mode A).
+//! - Open/save panels are windows of a separate system process and can't be clicked. Open panels
+//!   (File > Open…, cmd+O) can appear on the user's screen, so they're blocked.
 //!
-//! ## 금지 (이 파일의 모든 경로)
-//! 전역 `CGEventPost`, 커서 워프, `SetFrontProcess`/`_SLPSSetFrontProcessWithOptions`, `activateWithOptions`,
-//! `AXRaise` 를 쓰지 않는다. 입력은 우리가 띄운(또는 동의 하에 붙은) pid 에만 보낸다.
+//! ## Forbidden (on every path in this file)
+//! Global `CGEventPost`, cursor warping, `SetFrontProcess`/`_SLPSSetFrontProcessWithOptions`,
+//! `activateWithOptions` and `AXRaise` are never used. Input only goes to the pid we launched (or
+//! attached to with consent).
 //!
-//! ## 스크린샷
-//! ScreenCaptureKit 디스플레이 필터 + includingApplications(우리 pid) → 가상 디스플레이 전체를 찍되
-//! **우리 앱 창만** 그린다 (메뉴 막대·배경화면·가상 디스플레이로 흘러온 사용자 창은 찍히지 않는다).
-//! 에이전트 좌표(width×height 픽셀) → 전역 포인트 = bounds.origin + p × (bounds.size / agent size).
+//! ## Screenshots
+//! ScreenCaptureKit display filter + includingApplications(our pid) → captures the whole virtual
+//! display but draws **only our app's windows** (the menu bar, wallpaper and any user windows
+//! that wander onto the virtual display aren't captured). Agent coordinates (width×height
+//! pixels) → global points = bounds.origin + p × (bounds.size / agent size).
 
 #![allow(dead_code)]
 
 use std::path::PathBuf;
 
-/// 가상 디스플레이 작업공간 설정
+/// Virtual display workspace options.
 #[derive(Clone, Debug)]
 pub struct VirtualDisplayOptions {
-    /// 대상 앱: `.app` 경로 또는 번들 id
+    /// Target app: `.app` path or bundle id.
     pub app: String,
-    /// 에이전트 화면(=가상 디스플레이 포인트) 가로 픽셀
+    /// Agent screen (= virtual display points) width in pixels.
     pub width: u32,
-    /// 에이전트 화면 세로 픽셀
+    /// Agent screen height in pixels.
     pub height: u32,
-    /// Mode B 동의: 사용자가 실행 중인 앱의 창을 작업하는 동안 가상 디스플레이로 옮겨도 된다는 명시적 동의
+    /// Mode B consent: explicit permission to move the user's running app's windows to the virtual
+    /// display while working.
     pub attach_consent: bool,
-    /// Mode B 에서 붙을 pid (없으면 번들 id 의 첫 인스턴스)
+    /// pid to attach to in Mode B (defaults to the bundle id's first instance).
     pub attach_pid: Option<i32>,
-    /// 라이브 뷰 초당 프레임 (0 이면 끔)
+    /// Live view frames per second (0 = off).
     pub live_fps: f64,
-    /// HiDPI 가상 디스플레이 (픽셀 2배). 기본 false = 포인트와 픽셀이 1:1
+    /// HiDPI virtual display (2x pixels). Default false = points and pixels are 1:1.
     pub hidpi: bool,
-    /// Mode A 에서 시작할 때 열 파일
+    /// Files to open at startup in Mode A.
     pub open_files: Vec<PathBuf>,
-    /// 추가 실행 인자
+    /// Extra launch arguments.
     pub extra_args: Vec<String>,
 }
 
@@ -73,13 +80,14 @@ impl Default for VirtualDisplayOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VdMode {
-    /// 우리가 새로 띄운 인스턴스 (종료 시 프로세스를 끝낸다)
+    /// An instance we launched (its process is ended on shutdown).
     Launched,
-    /// 사용자의 실행 중인 인스턴스에 동의 하에 붙음 (종료 시 창 위치·숨김 상태를 되돌린다)
+    /// Attached with consent to the user's running instance (window positions and hidden state are
+    /// restored on shutdown).
     Attached,
 }
 
-/// 에이전트 시스템 프롬프트의 Environment 절 (agent.rs 의 ENV_* 와 같은 형식)
+/// Environment section of the agent system prompt (same format as agent.rs's ENV_*).
 pub const ENV_VDISPLAY: &str = r#"Environment
 - You operate a macOS app that runs on a separate virtual display reserved for you. The human does not see it on their own screen, and your input goes only to this app: it never moves the human's mouse pointer or keyboard focus.
 - The screenshot is the whole virtual display but shows ONLY this app's windows on a black background (no menu bar, Dock or other apps). Coordinates are screenshot pixels (origin top-left).
@@ -89,7 +97,7 @@ pub const ENV_VDISPLAY: &str = r#"Environment
 - Blocked for the human's safety: links that would open the human's browser, the minimize / full-screen window buttons, File > Open… (cmd+O), and system-wide shortcuts (lock screen, log out, force quit...). System open/save panels belong to another process and cannot be clicked; avoid them.
 - New windows appear on your display automatically. If Events says the app was hidden, activated by the human, or the display disappeared, stop and ask the human via `ask_user`."#;
 
-/// control.rs (외부 MCP 에이전트) 용 한 줄 설명
+/// One-line description for control.rs (external MCP agents).
 pub const CONTROL_HINT: &str = "보이지 않는 가상 디스플레이 위의 macOS 앱입니다. 실제 화면처럼 클릭·더블클릭·우클릭·드래그·스크롤이 됩니다 (입력은 그 앱에만 전달). 스크린샷에는 그 앱 창만 보이고 메뉴 막대는 없으니 메뉴는 desk_app {action:menus|menu}, 정확한 요소 조작은 ui_tree 후 press/set_value 를 쓰세요.";
 
 pub const APP_CONTROL_DESCRIPTION: &str = "Semantic control of the macOS app running on your virtual display.\n\
@@ -105,7 +113,7 @@ Actions:\n\
 - menu {path}: run a menu bar item, e.g. \"File > Save\" or localized \"파일 > 저장\".\n\
 Blocked: the Apple menu, Services / Hide Others / Show All, Help, Share, dictation / emoji / writing tools, File > Open…, links, minimize / full-screen buttons.";
 
-/// LLM 에 노출할 `app_control` 도구 정의 (가상 디스플레이용 부분집합)
+/// The `app_control` tool definition exposed to the LLM (the virtual display subset).
 pub fn app_control_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "app_control",
@@ -128,10 +136,11 @@ pub fn app_control_tool() -> serde_json::Value {
     })
 }
 
-// ═════════════════════════════════════ 순수 기하 (모든 OS) ═════════════════════════════════════
+// ---- pure geometry (all OSes) ----
 
 pub mod geom {
-    /// 전역 포인트 좌표의 사각형 (좌상단 원점, y 아래로 증가 — CGDisplayBounds/CGWindowList 와 같은 좌표계)
+    /// A rectangle in global point coordinates (top-left origin, y grows downward; the same space as
+    /// CGDisplayBounds/CGWindowList).
     #[derive(Clone, Copy, Debug, PartialEq, Default)]
     pub struct Rect {
         pub x: f64,
@@ -161,7 +170,7 @@ pub mod geom {
             let h = (self.max_y().min(o.max_y()) - self.y.max(o.y)).max(0.0);
             w * h
         }
-        /// self 가 outer 안에 (tol 포인트 오차 허용) 완전히 들어가는가
+        /// Whether self fits entirely inside outer (with tol points of slack).
         pub fn inside(&self, outer: &Rect, tol: f64) -> bool {
             self.x >= outer.x - tol
                 && self.y >= outer.y - tol
@@ -176,14 +185,14 @@ pub mod geom {
         }
     }
 
-    /// 가상 디스플레이를 붙일 쪽
+    /// Which side to attach the virtual display on.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Side {
         Right,
         Left,
     }
 
-    /// Dock 이 오른쪽에 있으면 Dock 은 가장 오른쪽 디스플레이로 옮겨 간다 → 그때는 왼쪽 끝에 붙인다.
+    /// With the Dock on the right, it moves to the rightmost display, so attach on the left end then.
     pub fn side_for_dock(orientation: Option<&str>) -> Side {
         match orientation.map(|s| s.trim().to_ascii_lowercase()) {
             Some(s) if s == "right" => Side::Left,
@@ -195,12 +204,13 @@ pub mod geom {
         (y + h).min(d.max_y()) - y.max(d.y)
     }
 
-    /// 새 디스플레이(size, 포인트)의 원점.
+    /// Origin for the new display (size, in points).
     ///
-    /// - Right: 현재 배치의 가장 오른쪽 가장자리(max x)에, Left: 가장 왼쪽 가장자리(min x) 바깥에 붙인다.
-    ///   그 바깥에는 다른 디스플레이가 없으므로 겹치지 않는다.
-    /// - 세로: 주 디스플레이에 아래쪽 정렬. 그 높이에서 기준(가장 바깥) 디스플레이와 세로로 맞닿지 않으면
-    ///   (배치에 틈이 생기면 macOS 가 임의로 옮기므로) 기준 디스플레이에 아래쪽 정렬한다.
+    /// - Right: attached outside the arrangement's rightmost edge (max x); Left: outside the leftmost
+    ///   edge (min x). No other display lies beyond it, so nothing overlaps.
+    /// - Vertical: bottom-aligned with the main display. If at that height it wouldn't touch the
+    ///   reference (outermost) display vertically (macOS moves displays arbitrarily when the
+    ///   arrangement has gaps), it's bottom-aligned with the reference display instead.
     pub fn arrangement_origin(displays: &[Rect], main: &Rect, size: (f64, f64), side: Side) -> (i32, i32) {
         let (w, h) = size;
         let y_main = main.max_y() - h;
@@ -228,7 +238,7 @@ pub mod geom {
         (x.round() as i32, y.round() as i32)
     }
 
-    /// 에이전트 픽셀 → 전역 포인트 (화면 밖 좌표는 가장자리로 자른다)
+    /// Agent pixels → global points (off-screen coordinates are clamped to the edge).
     pub fn agent_to_global(b: &Rect, agent: (u32, u32), x: f64, y: f64) -> (f64, f64) {
         let (aw, ah) = (agent.0.max(1) as f64, agent.1.max(1) as f64);
         let x = x.clamp(0.0, aw - 1.0);
@@ -236,20 +246,21 @@ pub mod geom {
         (b.x + x * b.w / aw, b.y + y * b.h / ah)
     }
 
-    /// 전역 포인트 → 에이전트 픽셀
+    /// Global points → agent pixels.
     pub fn global_to_agent(b: &Rect, agent: (u32, u32), gx: f64, gy: f64) -> (f64, f64) {
         let (aw, ah) = (agent.0.max(1) as f64, agent.1.max(1) as f64);
         ((gx - b.x) * aw / b.w.max(1.0), (gy - b.y) * ah / b.h.max(1.0))
     }
 
-    /// 전역 사각형 → 에이전트 픽셀 [x, y, w, h]
+    /// Global rectangle → agent pixels [x, y, w, h].
     pub fn rect_to_agent(b: &Rect, agent: (u32, u32), r: &Rect) -> [i64; 4] {
         let (x0, y0) = global_to_agent(b, agent, r.x, r.y);
         let (x1, y1) = global_to_agent(b, agent, r.max_x(), r.max_y());
         [x0.round() as i64, y0.round() as i64, (x1 - x0).round() as i64, (y1 - y0).round() as i64]
     }
 
-    /// zoom 영역(에이전트 픽셀 [x0,y0,x1,y1]) → 원본 해상도 캡처에서 잘라낼 (x, y, w, h)
+    /// Zoom region (agent pixels [x0,y0,x1,y1]) → (x, y, w, h) to crop from the native-resolution
+    /// capture.
     pub fn region_to_pixels(region: [f64; 4], agent: (u32, u32), full: (u32, u32)) -> (u32, u32, u32, u32) {
         let kx = full.0 as f64 / agent.0.max(1) as f64;
         let ky = full.1 as f64 / agent.1.max(1) as f64;
@@ -262,8 +273,10 @@ pub mod geom {
         (cx, cy, cw, ch)
     }
 
-    /// 창을 디스플레이(위쪽 top_inset 포인트는 메뉴 막대 자리로 비움) 안에 들어가게 한 프레임.
-    /// 이미 들어가 있으면 그대로, 아니면 (필요하면 줄여서) 가운데에 놓는다.
+    /// Frame that fits the window inside the display (keeping the top top_inset points free for the
+    /// menu bar).
+    ///
+    /// Unchanged if it already fits, otherwise centered (and shrunk if needed).
     pub fn fit_window(win: &Rect, disp: &Rect, top_inset: f64) -> Rect {
         let avail = Rect::new(disp.x, disp.y + top_inset, disp.w, (disp.h - top_inset).max(1.0));
         if win.inside(&avail, 0.5) {
@@ -279,12 +292,12 @@ pub mod geom {
         )
     }
 
-    /// 창이 사용자 디스플레이(others)에 조금이라도(1pt² 초과) 걸치는가
+    /// Whether the window overlaps a user display (others) at all (more than 1 pt²).
     pub fn is_stray(win: &Rect, others: &[Rect]) -> bool {
         others.iter().any(|d| win.intersection_area(d) > 1.0)
     }
 
-    /// from → to 직선 경로 (시작점 제외, 끝점 포함)
+    /// Straight path from → to (start excluded, end included).
     pub fn interp(from: (f64, f64), to: (f64, f64), steps: usize) -> Vec<(f64, f64)> {
         let n = steps.max(1);
         (1..=n)
@@ -295,13 +308,13 @@ pub mod geom {
             .collect()
     }
 
-    /// 드래그 중간 이벤트 개수
+    /// Number of intermediate drag events.
     pub fn drag_steps(from: (f64, f64), to: (f64, f64)) -> usize {
         let d = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
         ((d / 8.0) as usize).clamp(6, 60)
     }
 
-    /// 스크롤 양(픽셀)을 한 이벤트당 max 이하 조각으로 나눈다 (부호 유지)
+    /// Splits a scroll amount (pixels) into pieces of at most max per event (keeping the sign).
     pub fn scroll_chunks(d: f64, max: f64) -> Vec<f64> {
         let max = max.abs().max(1.0);
         let mut out = vec![];
@@ -314,7 +327,7 @@ pub mod geom {
         out
     }
 
-    /// 가상 디스플레이 모드 크기(포인트). hidpi 면 픽셀의 절반.
+    /// Virtual display mode size (points). Half the pixels when hidpi.
     pub fn mode_for(width_px: u32, height_px: u32, hidpi: bool) -> (u32, u32) {
         if hidpi {
             ((width_px / 2).max(1), (height_px / 2).max(1))
@@ -323,12 +336,13 @@ pub mod geom {
         }
     }
 
-    /// 110 ppi 기준 물리 크기(mm) — 너무 크거나 작게 보고하면 macOS 가 기본 배율을 이상하게 고른다
+    /// Physical size (mm) at 110 ppi; reporting something too large or small makes macOS pick an odd
+    /// default scale.
     pub fn physical_size_mm(w_pt: f64, h_pt: f64) -> (f64, f64) {
         (w_pt / 110.0 * 25.4, h_pt / 110.0 * 25.4)
     }
 
-    /// 사용자 창 스냅샷 한 줄
+    /// One line of a user window snapshot.
     #[derive(Clone, Debug, PartialEq)]
     pub struct WinSnap {
         pub wid: u32,
@@ -337,7 +351,8 @@ pub mod geom {
         pub name: String,
     }
 
-    /// 두 스냅샷 사이에 위치/크기가 바뀐 창 (둘 다에 있는 창만 비교 — 닫히거나 새로 열린 창은 사용자 활동일 수 있음)
+    /// Windows whose position/size changed between two snapshots (only windows present in both are
+    /// compared; closed or newly opened windows may be user activity).
     pub fn diff_windows(before: &[WinSnap], after: &[WinSnap], tol: f64) -> Vec<String> {
         let mut out = vec![];
         for b in before {
@@ -353,12 +368,13 @@ pub mod geom {
         out
     }
 
-    /// 사각형들 중 point 를 덮는 창(전체 화면 오버레이 제외) 판정용: r 이 디스플레이 면적의 95% 이상을 덮는가
+    /// For deciding which window covers a point (excluding full-screen overlays): whether r covers 95%
+    /// or more of the display area.
     pub fn covers_display(r: &Rect, disp: &Rect) -> bool {
         r.intersection_area(disp) >= disp.area() * 0.95
     }
 
-    /// Objective-C 타입 인코딩에서 오프셋 숫자를 지운다 ("v20@0:8I16" → "v@:I")
+    /// Strips offset digits from an Objective-C type encoding ("v20@0:8I16" → "v@:I").
     pub fn strip_encoding(enc: &str) -> String {
         enc.chars().filter(|c| !c.is_ascii_digit()).collect()
     }
@@ -419,12 +435,14 @@ mod imp {
         input, skylight,
     };
 
-    // 비공개 클래스(CGVirtualDisplay*)는 CoreGraphics 안에 있다 — 클래스 조회 전에 반드시 로드되어 있게 한다.
+    // the private classes (CGVirtualDisplay*) live in CoreGraphics, which must be loaded before the
+    // class lookup
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {}
 
     extern "C" {
-        /// libdispatch (libSystem). attr = NULL → 직렬 큐. 반환값은 +1 retained OS_dispatch_queue (ObjC 객체)
+        /// libdispatch (libSystem). attr = NULL → serial queue. Returns a +1 retained OS_dispatch_queue
+        /// (an ObjC object).
         fn dispatch_queue_create(label: *const c_char, attr: *mut c_void) -> *mut AnyObject;
     }
 
@@ -433,12 +451,14 @@ mod imp {
         fn CFPreferencesCopyAppValue(key: *const c_void, app: *const c_void) -> *const c_void;
     }
 
-    /// 창 위쪽에 비워 둘 메뉴 막대 자리 (가상 디스플레이에도 "디스플레이마다 별도 공간"이면 메뉴 막대가 그려진다)
+    /// Space kept free at the top of the window for the menu bar (with "Displays have separate
+    /// Spaces", the menu bar is drawn on the virtual display too).
     const TOP_INSET: f64 = 30.0;
     const NO_WINDOW: &str = "에이전트 앱 창이 없는 곳입니다";
 
-    /// 작업 스레드에서 실행한다. tokio 작업 스레드는 재사용되어 오래 살므로 AppKit/SCK 가 autorelease 한
-    /// 객체가 스레드 종료 때까지 쌓이지 않게 호출마다 autorelease 풀로 감싼다.
+    /// Runs on a worker thread. Tokio worker threads are reused and long-lived, so each call is
+    /// wrapped in an autorelease pool to keep objects autoreleased by AppKit/SCK from piling up until
+    /// the thread exits.
     async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
         tokio::task::spawn_blocking(move || objc2::rc::autoreleasepool(|_| f()))
             .await
@@ -453,7 +473,7 @@ mod imp {
         Rect::new(c.origin.x, c.origin.y, c.size.width, c.size.height)
     }
 
-    // ───────────────────────── 디스플레이 조회 ─────────────────────────
+    // ---- display queries ----
 
     fn active_displays() -> Vec<u32> {
         let mut ids = [0u32; 32];
@@ -469,12 +489,12 @@ mod imp {
         r(CGDisplayBounds(id))
     }
 
-    /// id 를 뺀 나머지 활성 디스플레이 영역
+    /// Rects of the active displays other than id.
     fn other_display_rects(id: u32) -> Vec<Rect> {
         active_displays().into_iter().filter(|d| *d != id).map(display_rect).collect()
     }
 
-    /// Dock 위치 (com.apple.dock orientation: bottom/left/right). 읽기 전용.
+    /// Dock position (com.apple.dock orientation: bottom/left/right). Read only.
     fn dock_orientation() -> Option<String> {
         let key = CFString::from_str("orientation");
         let app = CFString::from_str("com.apple.dock");
@@ -489,9 +509,10 @@ mod imp {
         v.downcast_ref::<CFString>().map(|s| s.to_string())
     }
 
-    // ───────────────────────── 비공개 클래스 확인 (읽기 전용) ─────────────────────────
+    // ---- private class checks (read only) ----
 
-    /// (클래스, 셀렉터, 기대 인코딩(숫자 제거)) — 이 Mac(macOS 27.0.1)의 런타임에서 확인한 값.
+    /// (class, selector, expected encoding with digits stripped), as found in this Mac's runtime
+    /// (macOS 27.0.1).
     const REQUIRED: &[(&str, &str, &str)] = &[
         ("CGVirtualDisplayDescriptor", "init", "@@:"),
         ("CGVirtualDisplayDescriptor", "setName:", "v@:@"),
@@ -525,14 +546,15 @@ mod imp {
         Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().to_string())
     }
 
-    /// 디스크립터의 큐 설정 셀렉터 (setQueue: 우선, 없으면 setDispatchQueue:)
+    /// The descriptor's queue setter selector (setQueue: preferred, setDispatchQueue: otherwise).
     fn queue_selector(cls: &AnyClass) -> Option<Sel> {
         [sel!(setQueue:), sel!(setDispatchQueue:)]
             .into_iter()
             .find(|s| method_encoding(cls, *s).map(|e| geom::strip_encoding(&e) == "v@:@").unwrap_or(false))
     }
 
-    /// 읽기 전용 확인 결과 (각 줄 = 확인 항목). 클래스 객체에 대한 조회만 하고 인스턴스는 만들지 않는다.
+    /// Read-only check results (one line per item). Only queries class objects; no instances are
+    /// created.
     pub fn available_report() -> Result<Vec<String>> {
         let mut lines = vec![];
         let mut missing = vec![];
@@ -571,7 +593,8 @@ mod imp {
         Ok(lines)
     }
 
-    /// 비공개 클래스와 셀렉터, 입력에 쓰는 비공개 심볼이 있는지 읽기 전용으로 확인한다 (디스플레이를 만들지 않음).
+    /// Checks read-only that the private classes, selectors and private input symbols exist (no
+    /// display is created).
     pub fn available() -> Result<()> {
         available_report().map(|_| ())
     }
@@ -582,7 +605,7 @@ mod imp {
 
     type TermBlock = RcBlock<dyn Fn(*mut AnyObject, *mut AnyObject)>;
 
-    /// CGVirtualDisplay 하나. drop 하면 디스플레이가 사라진다.
+    /// A single CGVirtualDisplay. Dropping it removes the display.
     pub struct VirtualDisplay {
         display: Option<Retained<AnyObject>>,
         queue: Option<Retained<AnyObject>>,
@@ -591,10 +614,11 @@ mod imp {
         id: u32,
         hidpi: bool,
         name: String,
-        /// 생성·배치 중 남긴 기록
+        /// Notes left during creation and placement.
         pub notes: Vec<String>,
     }
-    // CGVirtualDisplay 는 스레드 안전한 프록시 객체로 취급한다 (생성·해제만 하고 다른 메시지는 보내지 않음).
+    // CGVirtualDisplay is treated as a thread-safe proxy object (only created and released, no other
+    // messages sent)
     unsafe impl Send for VirtualDisplay {}
     unsafe impl Sync for VirtualDisplay {}
 
@@ -606,16 +630,17 @@ mod imp {
     }
 
     impl VirtualDisplay {
-        /// 가상 디스플레이를 만들고 배치의 가장 바깥(기본 오른쪽, Dock 이 오른쪽이면 왼쪽) 가장자리에
-        /// 주 디스플레이에 아래쪽 정렬로 붙인다. 주 디스플레이나 미러링이 되면 즉시 없애고 오류.
+        /// Creates a virtual display and attaches it at the arrangement's outermost edge (right by
+        /// default, left when the Dock is on the right), bottom-aligned with the main display. If it
+        /// becomes the main display or gets mirrored, it's removed immediately with an error.
         ///
-        /// width_px/height_px = 프레임버퍼 픽셀. hidpi 면 포인트 크기는 그 절반.
+        /// width_px/height_px = framebuffer pixels. With hidpi the point size is half that.
         pub fn create(width_px: u32, height_px: u32, hidpi: bool, name: &str) -> Result<VirtualDisplay> {
             if !(320..=7680).contains(&width_px) || !(240..=4320).contains(&height_px) {
                 bail!("가상 디스플레이 크기가 범위를 벗어났습니다: {width_px}x{height_px}");
             }
             available()?;
-            let _ = CGMainDisplayID(); // CLI 에서 CGS 연결 초기화
+            let _ = CGMainDisplayID(); // initializes the CGS connection from the CLI
             let main_before = CGMainDisplayID();
             let before_ids: HashSet<u32> = active_displays().into_iter().collect();
             let before_rects: Vec<(u32, Rect)> = before_ids.iter().map(|d| (*d, display_rect(*d))).collect();
@@ -668,7 +693,7 @@ mod imp {
                     notes: vec![],
                 }
             };
-            // 여기부터 오류가 나면 vd 가 drop 되며 디스플레이가 사라진다.
+            // from here on an error drops vd, which removes the display
             if vd.id == 0 {
                 bail!("가상 디스플레이 id 가 0 입니다");
             }
@@ -687,7 +712,7 @@ mod imp {
                     bail!("가상 디스플레이 설정(applySettings:)이 거부되었습니다");
                 }
             }
-            // 활성 디스플레이 목록에 나타날 때까지 (최대 3초)
+            // wait until it shows up in the active display list (up to 3 s)
             let t = Instant::now();
             while !active_displays().contains(&vd.id) {
                 if t.elapsed() > Duration::from_secs(3) {
@@ -701,7 +726,7 @@ mod imp {
                 Err(e) => vd.notes.push(format!("가상 디스플레이 배치 실패 (macOS 기본 위치 사용): {e}")),
             }
             vd.check_safe(main_before)?;
-            // 사용자 디스플레이의 위치가 바뀌었는지
+            // did any user display move?
             for (d, before) in &before_rects {
                 let now = display_rect(*d);
                 if !now.approx_eq(before, 0.5) {
@@ -723,7 +748,7 @@ mod imp {
             Ok(vd)
         }
 
-        /// 주 디스플레이가 바뀌었거나 미러링되었으면 오류 (호출자가 drop → 디스플레이 제거)
+        /// Errors if the main display changed or got mirrored (the caller drops it → display removed).
         fn check_safe(&self, main_before: u32) -> Result<()> {
             let main_now = CGMainDisplayID();
             if main_now != main_before || main_now == self.id {
@@ -735,7 +760,7 @@ mod imp {
             Ok(())
         }
 
-        /// 배치의 가장 바깥 가장자리에 붙인다 (kCGConfigureForSession — 로그아웃하면 잊힘)
+        /// Attaches it at the arrangement's outermost edge (kCGConfigureForSession; forgotten on log out).
         fn place(&self) -> Result<(i32, i32)> {
             let others = other_display_rects(self.id);
             let main = display_rect(CGMainDisplayID());
@@ -751,7 +776,7 @@ mod imp {
                 if e != CGError::Success || cfg.is_null() {
                     bail!("CGBeginDisplayConfiguration 실패 ({e:?})");
                 }
-                // 기본 재구성 페이드(사용자 화면이 잠깐 어두워짐)를 끈다
+                // turn off the default reconfiguration fade (which briefly dims the user's screen)
                 let _ = CGConfigureDisplayFadeEffect(cfg, 0.0, 0.0, 0.0, 0.0, 0.0);
                 let e = CGConfigureDisplayOrigin(cfg, self.id, x, y);
                 if e != CGError::Success {
@@ -779,13 +804,13 @@ mod imp {
             self.id
         }
 
-        /// 전역 포인트 영역 (CGDisplayBounds)
+        /// Region in global points (CGDisplayBounds).
         pub fn bounds(&self) -> Rect {
             display_rect(self.id)
         }
 
-        /// 프레임버퍼 픽셀 크기. CGDisplayPixelsWide 는 HiDPI 모드에서 포인트 크기를 돌려주므로
-        /// 현재 모드의 실제 픽셀 크기(CGDisplayModeGetPixelWidth)를 먼저 쓴다.
+        /// Framebuffer pixel size. CGDisplayPixelsWide returns the point size in HiDPI modes, so the
+        /// current mode's actual pixel size (CGDisplayModeGetPixelWidth) is used first.
         pub fn pixel_size(&self) -> (u32, u32) {
             if let Some(m) = CGDisplayCopyDisplayMode(self.id) {
                 let (w, h) = (CGDisplayMode::pixel_width(Some(&m)), CGDisplayMode::pixel_height(Some(&m)));
@@ -800,13 +825,13 @@ mod imp {
             active_displays().contains(&self.id)
         }
 
-        /// 시스템이 디스플레이를 끝냈는가 (terminationHandler)
+        /// Whether the system terminated the display (terminationHandler).
         pub fn terminated(&self) -> bool {
             self.terminated.load(Ordering::SeqCst)
         }
 
-        /// 디스플레이를 없앤다. 없애기 직전 그 위에 있던 남의(our_pids 와 GhostDesk 자신이 아닌) 창을 기록한다 —
-        /// 그런 창은 macOS 가 다른 디스플레이로 옮긴다.
+        /// Removes the display. Right before, records other people's windows on it (not our_pids and not
+        /// GhostDesk itself), which macOS will move to another display.
         pub fn destroy(mut self, our_pids: &[i32]) -> Vec<String> {
             let mut notes = vec![];
             let b = self.bounds();
@@ -851,9 +876,9 @@ mod imp {
         }
     }
 
-    // ───────────────────────── 사용자 창 스냅샷 ─────────────────────────
+    // ---- user window snapshot ----
 
-    /// 사용자 화면에 보이는 일반(layer 0) 창들 — exclude pid 제외
+    /// Regular (layer 0) windows visible on the user's screen, excluding the given pids.
     fn snapshot_user_windows(exclude: &[i32]) -> Vec<WinSnap> {
         apps::cg_windows(&[], true)
             .into_iter()
@@ -862,13 +887,13 @@ mod imp {
             .collect()
     }
 
-    // ───────────────────────── AX 보조 ─────────────────────────
+    // ---- AX helpers ----
 
     fn size_value(s: CGSize) -> Option<CFRetained<AXValue>> {
         unsafe { AXValue::new(AXValueType::CGSize, NonNull::from(&s).cast()) }
     }
 
-    /// AX 로 창 프레임 설정 (위치 → 크기 → 위치). 반환: 다시 읽은 프레임
+    /// Sets a window frame via AX (position → size → position). Returns the frame read back.
     fn set_frame(el: &El, f: Rect) -> Option<Rect> {
         let p = CGPoint { x: f.x, y: f.y };
         let s = CGSize { width: f.w, height: f.h };
@@ -980,7 +1005,8 @@ mod imp {
         n.el.children()
     }
 
-    /// 누르면 사용자 화면에 영향을 주는 요소인가 (링크 → 사용자의 브라우저, 최소화 → Dock, 전체 화면 → 공간 전환)
+    /// Whether pressing the element would affect the user's screen (links → the user's browser,
+    /// minimize → the Dock, full screen → a Space switch).
     fn element_block_reason(role: &str, subrole: &str) -> Option<&'static str> {
         if role == "AXLink" {
             return Some("링크는 사용자의 브라우저를 사용자 화면에 열 수 있어 누르지 않았습니다. 링크 주소가 필요하면 app_control read 로 읽고 사용자에게 알리세요.");
@@ -992,7 +1018,7 @@ mod imp {
         }
     }
 
-    // ───────────── 메뉴 안전 (native.rs 와 같은 규칙의 축약 복사본) ─────────────
+    // ---- menu safety (trimmed copy of native.rs's rules) ----
 
     const R_APPLE: &str = "Apple 메뉴(잠금 화면·로그아웃·재시동·시스템 종료·강제 종료 등)는 사용자의 Mac 전체에 영향을 주므로 차단했습니다";
     const R_APP_MENU: &str = "앱 메뉴의 서비스·기타 가리기·모두 보기는 사용자의 다른 앱에 영향을 주므로 차단했습니다";
@@ -1094,7 +1120,7 @@ mod imp {
         None
     }
 
-    /// 사용자 세션 전체에 작용하는 시스템 단축키
+    /// System shortcuts acting on the whole user session.
     fn system_combo_block(c: &input::MacCombo) -> Option<&'static str> {
         let has = |b: i64| c.mods & b != 0;
         match c.keycode {
@@ -1107,7 +1133,7 @@ mod imp {
         }
     }
 
-    /// 메뉴 막대에서 단축키(ch + 수정키) 항목을 찾아 (경로, 차단 이유)
+    /// Finds the menu bar item with a shortcut (ch + modifiers): (path, block reason).
     fn find_menu_by_shortcut(app: &El, ch: char, mods: i64) -> Option<(String, Option<&'static str>)> {
         let bar = app.element("AXMenuBar")?;
         let want_mods = (if mods & MOD_SHIFT != 0 { 1 } else { 0 })
@@ -1154,14 +1180,14 @@ mod imp {
         None
     }
 
-    // ───────────────────────── 입력 이벤트 ─────────────────────────
+    // ---- input events ----
 
-    /// 이벤트를 받을 창
+    /// The window receiving the event.
     #[derive(Clone, Copy, Debug)]
     struct Target {
         pid: i32,
         wid: u32,
-        /// 창 프레임 (전역 포인트)
+        /// Window frame (global points).
         win: Rect,
     }
 
@@ -1187,7 +1213,8 @@ mod imp {
         }
     }
 
-    /// 창-로컬 좌표를 실은 이벤트의 공통 필드 (macOS 27 에서 확인한 조합: 1,3,7,40,51,58,91,92 + CGEventSetWindowLocation)
+    /// Common fields for events carrying window-local coordinates (the combination verified on
+    /// macOS 27: 1,3,7,40,51,58,91,92 + CGEventSetWindowLocation).
     fn stamp(ev: &CGEvent, t: &Target, g: CGPoint, click_state: i64, button_num: i64, mods: i64) {
         type SetWinLoc = unsafe extern "C" fn(*const CGEvent, CGPoint);
         for (f, v) in [
@@ -1202,7 +1229,8 @@ mod imp {
         ] {
             CGEvent::set_integer_value_field(Some(ev), CGEventField(f), v);
         }
-        // HIDSystemState 소스는 사용자가 누르고 있는 수정키를 섞을 수 있으므로 항상 명시적으로 덮어쓴다
+        // a HIDSystemState source can mix in modifiers the user is holding, so always overwrite them
+        // explicitly
         CGEvent::set_flags(Some(ev), input::mods_to_flags(mods));
         let setloc = skylight::sym("CGEventSetWindowLocation");
         if !setloc.is_null() {
@@ -1231,7 +1259,7 @@ mod imp {
         Ok(())
     }
 
-    // ───────────────────────── 캡처 ─────────────────────────
+    // ---- capture ----
 
     struct ScFilter {
         filter: Retained<SCContentFilter>,
@@ -1272,7 +1300,7 @@ mod imp {
         }
     }
 
-    // ───────────────────────── 작업공간 ─────────────────────────
+    // ---- workspace ----
 
     #[derive(Clone)]
     struct WinEntry {
@@ -1291,20 +1319,20 @@ mod imp {
 
     #[derive(Default)]
     struct State {
-        /// 에이전트 좌표의 마지막 포인터 위치
+        /// Last pointer position in agent coordinates.
         mouse: (f64, f64),
         down: Option<Down>,
-        /// 키 입력 대상 (pid, wid)
+        /// Key input target (pid, wid).
         key_target: Option<(i32, u32)>,
         last_records: Option<((i32, u32), Instant)>,
         windows: Vec<WinEntry>,
         notes: Vec<String>,
         ui_ids: Vec<El>,
-        /// 앱이 숨겨진 이유 (복구 전까지)
+        /// Why the app was hidden (until recovered).
         hidden_reason: Option<String>,
         recoveries: u32,
         focus_steals: u32,
-        /// Mode B: 사용자가 앱을 직접 활성화했다 → 입력 중지
+        /// Mode B: the user activated the app themselves, so input stops.
         user_active: bool,
     }
 
@@ -1330,16 +1358,17 @@ mod imp {
         report: Mutex<Vec<String>>,
         watchdog_stop: Arc<AtomicBool>,
         watchdog: Mutex<Option<std::thread::JoinHandle<()>>>,
-        /// 입력 시퀀스(클릭·드래그·키)를 한 번에 하나씩
+        /// Runs input sequences (clicks, drags, keys) one at a time.
         input_lock: Mutex<()>,
     }
 
-    /// 가상 디스플레이 위의 macOS 앱 작업공간
+    /// macOS app workspace on a virtual display.
     pub struct VirtualDisplayDesk {
         inner: Arc<Inner>,
     }
 
-    /// 상태 복원/저장을 끄고, 시작 시 열기 패널 대신 빈 문서를 만들게 하는 기본 인자 (native.rs 와 같음)
+    /// Default arguments that turn off state restoration/saving and make apps start with an empty
+    /// document instead of an open panel (same as native.rs).
     const DEFAULT_ARGS: [&str; 6] = [
         "-ApplePersistenceIgnoreState",
         "YES",
@@ -1359,7 +1388,8 @@ mod imp {
         guard: Option<ExposureGuard>,
     }
 
-    /// Mode A: 숨김·비활성 새 인스턴스 실행 / Mode B: 동의 하에 실행 중인 앱에 붙어 숨김
+    /// Mode A: launches a new hidden, inactive instance. Mode B: attaches to a running app with
+    /// consent and hides it.
     fn start_app(o: &VirtualDisplayOptions, target: &apps::AppTarget) -> Result<StartResult> {
         if let Some(p) = o.attach_pid {
             let actual = apps::bundle_id_of(p);
@@ -1422,7 +1452,7 @@ mod imp {
                 target.name
             );
         }
-        // 창을 가상 디스플레이로 옮기기 전까지는 숨김 상태를 지킨다
+        // keep it hidden until its windows are moved to the virtual display
         let guard = ExposureGuard::start(pid);
         let mut exposure = watch_exposure(pid, Duration::from_millis(2500), t0);
         exposure.extend(guard.take_events());
@@ -1479,7 +1509,7 @@ mod imp {
             eprintln!("[ghostdesk] 경고: {m}");
             first_notes.push(m);
         }
-        let st = start_app(&opts, &target)?; // 실패하면 vd drop → 디스플레이 제거
+        let st = start_app(&opts, &target)?; // on failure vd is dropped → display removed
         let vd_id = vd.display_id();
         let bounds = vd.bounds();
         let mut report: Vec<String> = vd.notes.clone();
@@ -1508,7 +1538,8 @@ mod imp {
             watchdog: Mutex::new(None),
             input_lock: Mutex::new(()),
         });
-        // 이후 오류는 inner drop → shutdown_sync 로 정리된다 (프로세스 종료/복원 + 디스플레이 제거)
+        // later errors are cleaned up by inner drop → shutdown_sync (process ended/restored + display
+        // removed)
         for n in first_notes {
             inner.note(n);
         }
@@ -1532,7 +1563,8 @@ mod imp {
         Ok(inner)
     }
 
-    /// 감시기: 50ms 마다 사용자 디스플레이로 나간 창을 되돌리고, 250ms 마다 상태(디스플레이·front·프로세스)를 본다
+    /// Watchdog: every 50 ms brings back windows that went onto user displays, every 250 ms checks
+    /// state (display, front app, process).
     fn watchdog(weak: std::sync::Weak<Inner>, stop: Arc<AtomicBool>) {
         let mut tick = 0u64;
         while !stop.load(Ordering::SeqCst) {
@@ -1542,7 +1574,7 @@ mod imp {
             if i.shut.load(Ordering::SeqCst) {
                 break;
             }
-            // 이 스레드는 작업공간이 끝날 때까지 살므로 틱마다 autorelease 풀을 비운다
+            // this thread lives as long as the workspace, so drain the autorelease pool every tick
             objc2::rc::autoreleasepool(|_| {
                 i.fix_strays("감시기");
                 if tick.is_multiple_of(5) {
@@ -1557,8 +1589,8 @@ mod imp {
     }
 
     impl VirtualDisplayDesk {
-        /// TCC 확인 → 가상 디스플레이 생성 → 앱 숨김 실행(또는 동의 하 연결) → 창을 가상 디스플레이로 이동 →
-        /// 활성화 없이 표시 → 감시기 시작.
+        /// TCC check → create the virtual display → launch the app hidden (or attach with consent) → move
+        /// its windows to the virtual display → show without activating → start the watchdog.
         pub async fn launch(opts: VirtualDisplayOptions, sink: FrameSink) -> Result<Arc<VirtualDisplayDesk>> {
             crate::macos::preflight()?;
             let fps = opts.live_fps;
@@ -1581,11 +1613,11 @@ mod imp {
         pub fn display_id(&self) -> u32 {
             self.inner.vd_id
         }
-        /// 가상 디스플레이 영역 (전역 포인트)
+        /// Virtual display region (global points).
         pub fn display_bounds(&self) -> geom::Rect {
             *self.inner.vd_bounds.lock()
         }
-        /// 생성·종료 과정의 기록 (사용자 창 비교 결과 포함)
+        /// Records from creation and shutdown (including the user window comparison).
         pub fn report(&self) -> Vec<String> {
             self.inner.report.lock().clone()
         }
@@ -1636,7 +1668,8 @@ mod imp {
             blocking(move || i.scroll(pos, dx, dy, mods)).await?
         }
 
-        /// 실행 중인 사용자 앱을 쓰는 모드(Attached)에서는 앱 종료·창 닫기 단축키를 막는다.
+        /// In the mode that uses the user's running app (Attached), blocks app quit and window close
+        /// shortcuts.
         fn guard_quit(&self, combo: &str) -> Result<()> {
             if self.mode() == VdMode::Attached {
                 let c = combo.to_ascii_lowercase().replace(' ', "");
@@ -1674,7 +1707,7 @@ mod imp {
             self.inner.state.lock().mouse
         }
 
-        /// 창 목록 (감시기가 1초마다 갱신; 여기서는 IPC 를 하지 않는다)
+        /// Window list (refreshed every second by the watchdog; no IPC here).
         pub fn views(&self) -> (Vec<ViewInfo>, Option<String>) {
             let st = self.inner.state.lock();
             let b = *self.inner.vd_bounds.lock();
@@ -1719,7 +1752,8 @@ mod imp {
             let _ = blocking(move || i.shutdown_sync()).await;
         }
 
-        /// LLM `app_control` 도구 (list_windows / switch_window / ui_tree / press / set_value / focus / read / menus / menu)
+        /// LLM `app_control` tool (list_windows / switch_window / ui_tree / press / set_value / focus /
+        /// read / menus / menu).
         pub async fn app_control(&self, input: &Value) -> Result<String> {
             let i = self.inner.clone();
             let input = input.clone();
@@ -1733,8 +1767,9 @@ mod imp {
         }
     }
 
-    /// shutdown() 없이 버려지면 (async 문맥에서 drop 될 수 있으므로) 정리를 별도 스레드에서 한다 —
-    /// 앱 종료·디스플레이 제거 대기(수 초)로 tokio 작업 스레드를 막지 않기 위함.
+    /// If dropped without shutdown() (which can happen in an async context), cleanup runs on a
+    /// separate thread, so waiting for the app to exit and the display to go away (several seconds)
+    /// doesn't block a tokio worker.
     impl Drop for VirtualDisplayDesk {
         fn drop(&mut self) {
             if self.inner.shut.load(Ordering::SeqCst) {
@@ -1770,7 +1805,7 @@ mod imp {
             *self.vd_bounds.lock()
         }
 
-        /// AX 창 목록 갱신 (announce = 새 창/닫힌 창을 노트로)
+        /// Refreshes the AX window list (announce = leave notes for new/closed windows).
         fn refresh_windows(&self, announce: bool) {
             let mut list = vec![];
             for w in self.app().elements("AXWindows") {
@@ -1801,7 +1836,8 @@ mod imp {
             st.windows = list;
         }
 
-        /// 앱의 모든 AX 창을 가상 디스플레이 안으로 옮긴다 (숨김 상태에서). first = 첫 준비(창이 생길 때까지 기다림)
+        /// Moves all of the app's AX windows onto the virtual display (while hidden). first = initial
+        /// preparation (waits for windows to appear).
         fn prepare_windows(&self, first: bool) -> Result<()> {
             let t = Instant::now();
             loop {
@@ -1838,13 +1874,13 @@ mod imp {
             Ok(())
         }
 
-        /// 현재 화면에 보이는 우리 창 중 사용자 디스플레이에 걸친 것
+        /// Our currently visible windows that overlap a user display.
         fn strays(&self) -> Vec<apps::CgWin> {
             let others = other_display_rects(self.vd_id);
             apps::visible_windows(&[self.pid]).into_iter().filter(|w| geom::is_stray(&r(w.bounds), &others)).collect()
         }
 
-        /// 활성화 없이 앱을 표시하고 모든 창이 가상 디스플레이 위에만 있는지 확인한다.
+        /// Shows the app without activating it and checks every window is only on the virtual display.
         fn show(&self) -> Result<()> {
             if let Some(mut g) = self.guard.lock().take() {
                 g.stop();
@@ -1881,7 +1917,7 @@ mod imp {
                     self.app_name
                 );
             }
-            // 창이 화면에 올라올 때까지 기다리며 사용자 디스플레이로 나간 창이 없는지 확인
+            // wait for the windows to come on screen and check none went onto a user display
             for attempt in 0..2 {
                 let t = Instant::now();
                 while apps::visible_windows(&[self.pid]).is_empty() && t.elapsed() < Duration::from_millis(1500) {
@@ -1911,12 +1947,14 @@ mod imp {
             bail!("{} 의 창을 가상 디스플레이에만 두지 못해 숨겼습니다", self.app_name)
         }
 
-        /// 사용자 디스플레이에 걸친 우리 창을 가상 디스플레이로 옮긴다. 못 옮기면 앱을 숨긴다. 반환: 문제가 없거나 해결됨
+        /// Moves our windows overlapping a user display onto the virtual display, hiding the app if that
+        /// fails. Returns whether there was no problem or it was resolved.
         fn fix_strays(&self, ctx: &str) -> bool {
             if self.shut.load(Ordering::SeqCst) {
                 return true;
             }
-            // Mode B 에서 사용자가 앱을 직접 쓰기 시작했으면 사용자가 옮긴 창을 빼앗거나 앱을 숨기지 않는다
+            // in Mode B, once the user starts using the app themselves, don't take back windows they moved or
+            // hide the app
             if self.mode == VdMode::Attached && self.state.lock().user_active {
                 return true;
             }
@@ -1960,7 +1998,7 @@ mod imp {
             false
         }
 
-        /// 디스플레이·front 앱·프로세스 상태 점검
+        /// Checks display, front app and process state.
         fn check_health(&self) {
             if self.shut.load(Ordering::SeqCst) {
                 return;
@@ -1991,7 +2029,7 @@ mod imp {
                 self.log("경고: 가상 디스플레이가 주 디스플레이가 되었습니다 (사용자가 바꿨을 수 있음). 작업을 멈추고 확인하세요");
                 self.closed.store(true, Ordering::SeqCst);
             }
-            // 우리 앱이 front(활성)가 되면 사용자의 키보드 입력이 우리 앱으로 간다
+            // if our app becomes frontmost (active), the user's keyboard input goes to it
             if skylight::front_pid() == self.pid {
                 match self.mode {
                     VdMode::Launched => {
@@ -2021,7 +2059,8 @@ mod imp {
             }
         }
 
-        /// 복구 없이 입력 가능 여부만 본다 (호버·창 전환·app_control 의 상태 변경 동작용)
+        /// Only checks whether input is possible, without recovery (for hover, window switching and
+        /// state-changing app_control actions).
         fn check_open(&self) -> Result<()> {
             if self.shut.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
                 bail!("작업공간이 닫혔습니다");
@@ -2032,7 +2071,7 @@ mod imp {
             Ok(())
         }
 
-        /// 픽셀 입력 전 점검: 숨겨져 있으면 (최대 3번) 다시 가상 디스플레이에 표시한다
+        /// Check before pixel input: if hidden, shows it on the virtual display again (up to 3 times).
         fn ensure_input(&self) -> Result<()> {
             if self.shut.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
                 bail!("작업공간이 닫혔습니다");
@@ -2059,7 +2098,7 @@ mod imp {
             Ok(())
         }
 
-        /// 입력 직후 잠깐 동안 새 창이 사용자 디스플레이에 뜨는지 촘촘히 감시한다
+        /// Watches closely right after input for new windows appearing on a user display.
         fn settle(&self, dur: Duration) {
             let t = Instant::now();
             while t.elapsed() < dur {
@@ -2070,7 +2109,8 @@ mod imp {
             }
         }
 
-        /// 에이전트 좌표 → 이벤트를 받을 우리 창 (CGWindowList 앞→뒤). 남의 창이 덮고 있으면 오류.
+        /// Agent coordinates → our window that receives the event (CGWindowList front to back). Errors if
+        /// someone else's window covers it.
         fn hit(&self, x: f64, y: f64) -> Result<(Target, CGPoint)> {
             let b = self.bounds();
             let (gx, gy) = geom::agent_to_global(&b, self.agent, x, y);
@@ -2094,7 +2134,7 @@ mod imp {
                     }
                     return Ok((Target { pid: w.pid, wid: w.wid, win: wr }, CGPoint { x: gx, y: gy }));
                 }
-                // 디스플레이 전체를 덮는 시스템 오버레이는 무시하고, 그 밖의 남의 창은 가리개로 기록
+                // ignore system overlays covering the whole display; record any other foreign window as a blocker
                 if blocker.is_none() && !geom::covers_display(&wr, &b) {
                     blocker = Some(w);
                 }
@@ -2105,7 +2145,8 @@ mod imp {
             }
         }
 
-        /// 점 아래 요소가 사용자 화면에 영향을 주는 것(링크·최소화·전체 화면)이면 오류
+        /// Errors if the element under the point affects the user's screen (links, minimize, full
+        /// screen).
         fn check_element(&self, g: CGPoint) -> Result<()> {
             let Some(el) = self.app().element_at(g.x as f32, g.y as f32) else { return Ok(()) };
             let mut cur = Some(el);
@@ -2124,7 +2165,7 @@ mod imp {
             Ok(())
         }
 
-        /// 대상 PSN 에만 키 창 레코드 (1.5초 안에 같은 창에 보냈으면 생략)
+        /// Key window record for the target PSN only (skipped if sent to the same window within 1.5 s).
         fn key_records(&self, t: &Target, force: bool) {
             {
                 let st = self.state.lock();
@@ -2142,7 +2183,8 @@ mod imp {
             st.key_target = Some((t.pid, t.wid));
         }
 
-        /// 키 입력 대상 창: 마지막으로 클릭/전환한 창(아직 보이면), 아니면 우리 창 중 맨 앞
+        /// Key input target window: the last clicked/switched window (if still visible), else our
+        /// frontmost window.
         fn key_target(&self) -> Result<Target> {
             let wins: Vec<apps::CgWin> = apps::visible_windows(&[self.pid]).into_iter().filter(|w| w.layer == 0).collect();
             let want = self.state.lock().key_target;
@@ -2222,7 +2264,7 @@ mod imp {
                     post_mouse(&t, dragged, g, button, 1, mods)
                 }
                 None => {
-                    // 호버: 우리 창 위일 때만 이동 이벤트 (아니면 위치만 기록)
+                    // hover: send move events only over our windows (otherwise just record the position)
                     if let Ok((t, g)) = self.hit(x, y) {
                         post_mouse(&t, CGEventType::MouseMoved, g, MouseButton::Left, 0, mods)?;
                     }
@@ -2321,7 +2363,7 @@ mod imp {
             Ok(format!("키 입력 대상 창을 '{}' 로 바꿨습니다 (창 순서는 바꾸지 않음)", w.title))
         }
 
-        // ───────── 캡처 ─────────
+        // ---- capture ----
 
         fn sc_filter(&self) -> Result<Retained<SCContentFilter>> {
             if let Some(f) = self.filter.lock().as_ref() {
@@ -2689,7 +2731,7 @@ mod imp {
             Ok(out)
         }
 
-        // ───────── 종료 ─────────
+        // ---- shutdown ----
 
         fn shutdown_sync(&self) {
             if self.shut.swap(true, Ordering::SeqCst) {
@@ -2715,7 +2757,7 @@ mod imp {
                         (None, Some(_)) => true,
                     };
                     if same {
-                        // 창이 사용자 디스플레이로 튀지 않도록 먼저 숨긴 뒤 종료
+                        // hide first so windows don't jump onto a user display, then quit
                         apps::hide(self.pid);
                         apps::kill_process(self.pid);
                         rep.push(format!("앱 인스턴스 종료: pid={}", self.pid));
@@ -2772,7 +2814,8 @@ mod imp {
         }
     }
 
-    /// 라이브 뷰: ~fps 로 우리 앱 창만 담긴 가상 디스플레이를 캡처해 JPEG 로 싱크에 보낸다.
+    /// Live view: captures the virtual display (containing only our app's windows) at ~fps and sends
+    /// JPEGs to the sink.
     async fn live_loop(weak: std::sync::Weak<Inner>, fps: f64) {
         let period = Duration::from_secs_f64(1.0 / fps.clamp(0.2, 10.0));
         loop {
@@ -2797,7 +2840,7 @@ mod imp {
         }
     }
 
-    // ───────────────────────── selftest (실제 디스플레이를 만든다 — 사용자 동의 후에만) ─────────────────────────
+    // ---- selftest (creates a real display; only with the user's consent) ----
 
     struct TestLog {
         ok: Vec<String>,
@@ -2820,7 +2863,7 @@ mod imp {
         args.iter().position(|a| a == key).and_then(|i| args.get(i + 1).cloned())
     }
 
-    /// ui_tree 출력에서 조건에 맞는 첫 줄의 (id, 사각형[x,y,w,h])
+    /// (id, rect [x,y,w,h]) of the first ui_tree line matching the predicate.
     fn find_in_tree(tree: &str, pred: impl Fn(&str) -> bool) -> Option<(usize, [f64; 4])> {
         for line in tree.lines() {
             let t = line.trim_start();
@@ -2842,10 +2885,10 @@ mod imp {
         read.lines().find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
     }
 
-    /// (경과 ms, 커서 위치, front pid, 주 디스플레이 id)
+    /// (elapsed ms, cursor position, front pid, main display id)
     type Sample = (u128, CGPoint, i32, u32);
 
-    /// 사용자 커서·front 앱·주 디스플레이를 10ms 간격으로 기록하는 샘플러
+    /// Sampler recording the user's cursor, front app and main display every 10 ms.
     struct Sampler {
         stop: Arc<AtomicBool>,
         h: Option<std::thread::JoinHandle<Vec<Sample>>>,
@@ -2875,9 +2918,10 @@ mod imp {
 
     /// `--selftest-vdisplay --yes [--app com.apple.TextEdit] [--out DIR] [--width 1280 --height 800]`
     ///
-    /// **실제로 가상 디스플레이를 만들고 앱을 띄운다.** 사용자 동의 후에만 실행할 것 (`--yes` 없으면 거부).
-    /// 자체 TextEdit 인스턴스로 클릭·입력·단축키·더블클릭·드래그·우클릭·스크롤을 검사하고,
-    /// 그동안 사용자 커서·front 앱·주 디스플레이를 계속 기록해 영향이 없었는지 보고한다.
+    /// **Actually creates a virtual display and launches an app.** Only run with the user's consent
+    /// (refused without `--yes`). Checks clicks, typing, shortcuts, double clicks, drags, right clicks
+    /// and scrolling on our own TextEdit instance, while continuously recording the user's cursor,
+    /// front app and main display to report that nothing was affected.
     pub async fn selftest(args: &[String]) -> Result<()> {
         if !args.iter().any(|a| a == "--yes") {
             bail!(
@@ -2951,7 +2995,7 @@ mod imp {
         let to_g = |x: f64, y: f64| geom::agent_to_global(&vb, (width, height), x, y);
 
         let result: Result<()> = async {
-            // 1. 스크린샷
+            // 1. screenshot
             let png = desk.screenshot().await?;
             let _ = std::fs::write(out_dir.join("01-start.png"), &png);
             let img = image::load_from_memory(&png)?.to_rgb8();
@@ -2962,7 +3006,7 @@ mod imp {
                 format!("{}x{}, 검지 않은 픽셀 {}", img.width(), img.height(), nonblack),
             );
 
-            // 2. 텍스트 영역 찾기 + 픽셀 클릭
+            // 2. find the text area + pixel click
             let tree = desk.app_control(&serde_json::json!({"action": "ui_tree"})).await?;
             let Some((tid, tr)) = find_in_tree(&tree, |l| l.contains("AXTextArea")) else {
                 log.check("텍스트 영역 찾기", false, short(&tree, 300));
@@ -2975,13 +3019,13 @@ mod imp {
             let tree2 = desk.app_control(&serde_json::json!({"action": "ui_tree"})).await?;
             let focused = tree2.lines().any(|l| l.contains("AXTextArea") && l.contains("focused"));
             log.check("픽셀 클릭으로 포커스", focused, format!("텍스트 영역 [{:.0},{:.0},{:.0},{:.0}]", tr[0], tr[1], tr[2], tr[3]));
-            // ui_tree 를 다시 불렀으므로 id 를 갱신
+            // ui_tree was called again, so refresh the id
             let tid = find_in_tree(&tree2, |l| l.contains("AXTextArea")).map(|x| x.0).unwrap_or(tid);
             let read_now = |d: Arc<VirtualDisplayDesk>| async move {
                 d.app_control(&serde_json::json!({"action": "read", "id": tid})).await.unwrap_or_default()
             };
 
-            // 3. 입력 (끝으로 이동 후)
+            // 3. typing (after moving to the end)
             desk.key("cmd+Down", 1).await?;
             let marker = " 가상디스플레이ABC123";
             desk.type_text(marker).await?;
@@ -2990,7 +3034,7 @@ mod imp {
             let value = r1.split_once("value:\n").map(|x| x.1.to_string()).unwrap_or_default();
             log.check("유니코드 입력", value.contains(marker.trim()), short(&value, 80));
 
-            // 4. cmd+A (단축키 — 키 창 레코드 필요)
+            // 4. cmd+A (a shortcut; needs the key window record)
             desk.key("cmd+a", 1).await?;
             tokio::time::sleep(Duration::from_millis(250)).await;
             let r2 = read_now(desk.clone()).await;
@@ -2999,7 +3043,7 @@ mod imp {
                 .unwrap_or(0);
             log.check("cmd+A 전체 선택", sel_len > 40, format!("선택 길이 {sel_len}"));
 
-            // 5. 더블클릭 (첫 줄 첫 단어)
+            // 5. double click (first word of the first line)
             let (wx, wy) = (tr[0] + 30.0, tr[1] + 12.0);
             posted_points.push(to_g(wx, wy));
             desk.click(Some((wx, wy)), MouseButton::Left, 2, 0).await?;
@@ -3008,7 +3052,7 @@ mod imp {
             let sel = read_field(&r3, "selected text:").unwrap_or_default();
             log.check("더블클릭 단어 선택", !sel.is_empty() && !sel.contains('\n') && sel.len() < 40, format!("선택 '{sel}'"));
 
-            // 6. 드래그 선택 (첫 줄 안에서 오른쪽으로)
+            // 6. drag selection (rightward within the first line)
             let (dx0, dy0, dx1) = (tr[0] + 8.0, tr[1] + 12.0, tr[0] + 160.0);
             posted_points.push(to_g(dx0, dy0));
             posted_points.push(to_g(dx1, dy0));
@@ -3018,7 +3062,7 @@ mod imp {
             let dsel = read_field(&r4, "selected text:").unwrap_or_default();
             log.check("드래그 선택", dsel.chars().count() >= 5, format!("선택 '{}'", short(&dsel, 40)));
 
-            // 7. 우클릭 → 컨텍스트 메뉴가 가상 디스플레이 위 우리 창으로 뜨는가 → Escape
+            // 7. right click → does the context menu appear as our window on the virtual display → Escape
             posted_points.push(to_g(cx, cy));
             desk.click(Some((cx, cy)), MouseButton::Right, 1, 0).await?;
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -3032,7 +3076,7 @@ mod imp {
             let left = apps::visible_windows(&[pid]).into_iter().filter(|w| w.layer >= 100).count();
             log.check("Escape 로 메뉴 닫기", left == 0, format!("남은 메뉴 창 {left}"));
 
-            // 8. 스크롤 — 긴 글을 넣고 위로 스크롤
+            // 8. scrolling: insert a long text and scroll up
             desk.key("cmd+Down", 1).await?;
             let long: String = (1..=120).map(|i| format!("\nline {i}")).collect();
             desk.type_text(&long).await?;
@@ -3044,11 +3088,11 @@ mod imp {
             let after_vis = read_field(&read_now(desk.clone()).await, "visible range:").unwrap_or_default();
             log.check("스크롤", !before_vis.is_empty() && before_vis != after_vis, format!("보이는 범위 {before_vis} → {after_vis}"));
 
-            // 9. 메뉴 실행 (app_control) — 편집 > 모두 선택 (지역화 이름은 menus 로 확인)
+            // 9. menu action (app_control): Edit > Select All (localized names checked via menus)
             let menus_txt = desk.app_control(&serde_json::json!({"action": "menus"})).await?;
             log.check("메뉴 목록", menus_txt.lines().count() >= 3, format!("{}줄", menus_txt.lines().count()));
 
-            // 10. 빈 영역 클릭은 오류여야 함 (가상 디스플레이 오른쪽 아래 구석)
+            // 10. clicking an empty area must error (bottom-right corner of the virtual display)
             let e = desk.click(Some((width as f64 - 3.0, height as f64 - 3.0)), MouseButton::Left, 1, 0).await;
             log.check("빈 영역 클릭 거부", e.as_ref().is_err_and(|e| e.to_string().contains(NO_WINDOW)), format!("{e:?}"));
 
@@ -3079,7 +3123,7 @@ mod imp {
         let moved = geom::diff_windows(&user_before, &snapshot_user_windows(&[me]), 1.0);
         log.check("사용자 창 위치 유지", moved.is_empty(), if moved.is_empty() { "변화 없음".into() } else { moved.join(" / ") });
 
-        // 샘플러 분석
+        // analyze the sampler
         let front_ours = samples.iter().filter(|s| s.2 == pid).count();
         log.check("front 앱 유지 (우리 앱이 활성화되지 않음)", front_ours == 0, format!("샘플 {}개 중 우리 앱 front {front_ours}", samples.len()));
         let main_changed = samples.iter().filter(|s| s.3 != main_before).count();
@@ -3113,7 +3157,7 @@ mod imp {
 
 }
 
-// ═════════════════════════════════════════ 다른 OS ═════════════════════════════════════════
+// ---- other OSes ----
 
 #[cfg(not(target_os = "macos"))]
 mod stub {
@@ -3127,8 +3171,9 @@ mod stub {
     use crate::browser::{FrameSink, MouseButton};
     use crate::desk::ViewInfo;
 
-    /// 공통 안내. 이 OS 에 일반 앱 백엔드(화면 밖 창)가 있으면 그쪽으로 안내한다.
-    /// (CGVirtualDisplay 에 해당하는 공개 API 가 Windows 에는 없다 — 서명된 IddCx 드라이버가 필요)
+    /// Common notice, pointing to this OS's regular app backend (off-screen windows) if it has one.
+    ///
+    /// Windows has no public API equivalent to CGVirtualDisplay (it needs a signed IddCx driver).
     fn msg() -> String {
         use crate::platform::text::{unsupported, APP_ICON, LOCAL_APPS};
         let mut m = unsupported("가상 디스플레이");
@@ -3258,7 +3303,7 @@ mod stub {
     }
 }
 
-// ═════════════════════════════════════════ 테스트 ═════════════════════════════════════════
+// ---- tests ----
 
 #[cfg(test)]
 mod tests {
@@ -3273,11 +3318,11 @@ mod tests {
         let b = Rect::new(1728.0, 317.0, 1280.0, 800.0);
         assert!(close(agent_to_global(&b, (1280, 800), 0.0, 0.0), (1728.0, 317.0)));
         assert!(close(agent_to_global(&b, (1280, 800), 100.0, 50.0), (1828.0, 367.0)));
-        // 화면 밖은 가장자리로
+        // off-screen goes to the edge
         assert!(close(agent_to_global(&b, (1280, 800), -5.0, 9999.0), (1728.0, 317.0 + 799.0)));
         let g = agent_to_global(&b, (1280, 800), 640.5, 400.25);
         assert!(close(global_to_agent(&b, (1280, 800), g.0, g.1), (640.5, 400.25)));
-        // 포인트 640x400 디스플레이를 1280x800 에이전트 픽셀로 볼 때 (배율 0.5)
+        // a 640x400 point display seen as 1280x800 agent pixels (scale 0.5)
         let half = Rect::new(-640.0, 0.0, 640.0, 400.0);
         assert!(close(agent_to_global(&half, (1280, 800), 200.0, 100.0), (-540.0, 50.0)));
         assert_eq!(rect_to_agent(&half, (1280, 800), &Rect::new(-600.0, 10.0, 100.0, 50.0)), [80, 20, 200, 100]);
@@ -3290,27 +3335,27 @@ mod tests {
         assert!(Rect::new(1800.0, 400.0, 600.0, 400.0).inside(&vd, 0.0));
         assert!(!Rect::new(1700.0, 400.0, 600.0, 400.0).inside(&vd, 0.0));
         assert!(Rect::new(1727.0, 400.0, 600.0, 400.0).inside(&vd, 2.0));
-        // 사용자 디스플레이에 걸친 창 = stray
+        // a window overlapping a user display = stray
         assert!(is_stray(&Rect::new(1700.0, 400.0, 600.0, 400.0), &[main]));
         assert!(!is_stray(&Rect::new(1728.0, 400.0, 600.0, 400.0), &[main]));
-        // 디스플레이 바깥(아무 디스플레이에도 없음)은 stray 아님
+        // outside every display (on none of them) isn't stray
         assert!(!is_stray(&Rect::new(3100.0, 400.0, 600.0, 400.0), &[main]));
-        // 1pt² 이하 접촉은 무시
+        // contact of 1 pt² or less is ignored
         assert!(!is_stray(&Rect::new(1727.5, 400.0, 600.0, 1.0), &[main]));
     }
 
     #[test]
     fn fit_window_moves_and_shrinks() {
         let vd = Rect::new(1728.0, 317.0, 1280.0, 800.0);
-        // 이미 안에 있으면 그대로
+        // already inside: unchanged
         let inside = Rect::new(1800.0, 400.0, 600.0, 400.0);
         assert_eq!(fit_window(&inside, &vd, 30.0), inside);
-        // 주 디스플레이에 있던 창 → 가운데로
+        // a window that was on the main display → centered
         let f = fit_window(&Rect::new(100.0, 100.0, 600.0, 400.0), &vd, 30.0);
         assert!(f.inside(&vd, 0.0));
         assert_eq!((f.w, f.h), (600.0, 400.0));
         assert!(f.y >= vd.y + 30.0);
-        // 너무 크면 줄인다
+        // too large: shrunk
         let f = fit_window(&Rect::new(0.0, 0.0, 2000.0, 1500.0), &vd, 30.0);
         assert!(f.inside(&vd, 0.0));
         assert_eq!((f.w, f.h), (1280.0, 770.0));
@@ -3319,32 +3364,34 @@ mod tests {
     #[test]
     fn arrangement_far_right_bottom_aligned() {
         let main = Rect::new(0.0, 0.0, 1728.0, 1117.0);
-        // 디스플레이 하나
+        // a single display
         assert_eq!(arrangement_origin(&[main], &main, (1280.0, 800.0), Side::Right), (1728, 317));
         assert_eq!(arrangement_origin(&[main], &main, (1280.0, 800.0), Side::Left), (-1280, 317));
-        // 오른쪽에 외부 모니터 (위로 치우침): 가장 오른쪽 가장자리, 주 디스플레이 아래쪽 정렬
+        // external monitor on the right (shifted up): rightmost edge, bottom-aligned with the main display
         let ext = Rect::new(1728.0, -500.0, 2560.0, 1440.0);
         assert_eq!(arrangement_origin(&[main, ext], &main, (1280.0, 800.0), Side::Right), (4288, 317));
-        // 외부 모니터가 주 디스플레이 높이와 세로로 겹치지 않으면 외부 모니터에 아래쪽 정렬
+        // if the external monitor doesn't overlap the main display's height vertically, bottom-align with
+        // the external monitor
         let high = Rect::new(1728.0, -1440.0, 2560.0, 1440.0);
         assert_eq!(arrangement_origin(&[main, high], &main, (1280.0, 800.0), Side::Right), (4288, -800));
-        // 왼쪽에 모니터가 있으면 오른쪽 배치는 영향 없음
+        // a monitor on the left doesn't affect right-side placement
         let left = Rect::new(-1920.0, 0.0, 1920.0, 1080.0);
         assert_eq!(arrangement_origin(&[left, main], &main, (1280.0, 800.0), Side::Right), (1728, 317));
         assert_eq!(arrangement_origin(&[left, main], &main, (1280.0, 800.0), Side::Left), (-3200, 317));
-        // 주 디스플레이보다 키가 큰 가상 디스플레이: y 가 음수가 되어도 아래쪽 정렬
+        // a virtual display taller than the main one: bottom-aligned even if y goes negative
         assert_eq!(arrangement_origin(&[main], &main, (1600.0, 1200.0), Side::Right), (1728, -83));
-        // 오른쪽 끝이 같은 두 디스플레이(세로로 쌓임) — 주 디스플레이 높이와 더 겹치는 쪽을 기준으로
+        // two displays with the same right edge (stacked vertically): use the one overlapping more of the
+        // main display's height
         let top = Rect::new(1728.0, -1080.0, 1920.0, 1080.0);
         let bottom = Rect::new(1728.0, 0.0, 1920.0, 1080.0);
         assert_eq!(arrangement_origin(&[main, top, bottom], &main, (1280.0, 800.0), Side::Right), (3648, 317));
-        // 결과가 어떤 디스플레이와도 겹치지 않는다
+        // the result overlaps no display
         for ds in [vec![main], vec![main, ext], vec![main, high], vec![left, main], vec![main, top, bottom]] {
             for side in [Side::Right, Side::Left] {
                 let (x, y) = arrangement_origin(&ds, &main, (1280.0, 800.0), side);
                 let me = Rect::new(x as f64, y as f64, 1280.0, 800.0);
                 assert!(ds.iter().all(|d| d.intersection_area(&me) == 0.0), "{ds:?} {side:?}");
-                // 어떤 디스플레이와 가장자리를 맞대고 있다 (틈 없음)
+                // it shares an edge with some display (no gap)
                 assert!(ds.iter().any(|d| {
                     let touch_x = (d.max_x() - me.x).abs() < 0.5 || (me.max_x() - d.x).abs() < 0.5;
                     let ov = (me.max_y().min(d.max_y()) - me.y.max(d.y)) > 0.0;
@@ -3396,7 +3443,7 @@ mod tests {
         assert!(d[0].contains("창 2"));
     }
 
-    /// 읽기 전용: 비공개 클래스/셀렉터/심볼 존재 확인 (디스플레이를 만들지 않음)
+    /// Read only: checks the private classes/selectors/symbols exist (no display is created).
     #[cfg(target_os = "macos")]
     #[test]
     fn private_api_available_readonly() {
@@ -3411,7 +3458,7 @@ mod tests {
         }
     }
 
-    /// 다른 OS: 모든 진입점이 공통 안내 오류를 돌려준다 (패닉하지 않음)
+    /// Other OSes: every entry point returns the common notice error (no panic).
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn stub_reports_unsupported() {

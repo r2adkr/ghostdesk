@@ -1,24 +1,27 @@
-//! Claude Messages API. 대화가 이미 Claude 형식이라 그대로 보낸다.
+//! Claude Messages API. The conversation is already in Claude format, so it is sent as is.
 //!
-//! - computer use: `computer_toolset_20260801` (GA, beta 헤더 없음)
-//! - adaptive thinking + `display: "updates"` 로 도구 호출 사이의 진행 메모를 받는다
-//! - 오래된 도구 결과는 서버 측 context editing(`clear_tool_uses_20250919`)으로도 정리한다
-//!   (스크린샷은 에이전트가 먼저 덜어 내므로 주로 긴 글 결과가 대상)
-//! - 안전 분류기 거절 시 서버 측 fallback(`fallbacks: "default"`)
+//! - Computer use: `computer_toolset_20260801` (GA, no beta header).
+//! - Adaptive thinking with `display: "updates"` returns progress notes between tool calls.
+//! - Old tool results are also trimmed server-side with context editing
+//!   (`clear_tool_uses_20250919`). The agent already drops old screenshots itself, so this
+//!   mostly catches long text results.
+//! - Safety-classifier refusals fall back server-side (`fallbacks: "default"`).
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::Llm;
 
-/// 서버 측 정리가 결과를 남겨 두는 최근 도구 호출 수. 에이전트는 이 범위 안에서만 같은 화면을 다시 보내지 않는다.
+/// Number of recent tool calls whose results survive server-side clearing. The agent only skips
+/// resending an unchanged screen within this window.
 pub(crate) const KEEP_TOOL_USES: usize = 6;
-/// 입력 토큰이 이만큼 쌓이면 오래된 도구 결과를 지운다 (Claude 는 서버가, 다른 회사는 `agent::history` 가 직접)
+/// Input-token count at which old tool results are cleared (by the server for Claude, by
+/// `agent::history` for other providers).
 pub(crate) const CLEAR_TOOL_USES_AT: u64 = 60_000;
 
 impl Llm {
     pub(super) async fn send_anthropic(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
-        // Haiku 는 진행 메모·서버 fallback 을 지원하지 않는다
+        // Haiku supports neither progress notes nor server-side fallback
         let haiku = self.model.contains("haiku");
         let mut betas = vec!["context-management-2025-06-27"];
         let mut thinking = json!({ "type": "adaptive" });
@@ -37,7 +40,7 @@ impl Llm {
                 }]
             },
             "messages": messages,
-            // 자동 프롬프트 캐싱: 매 턴 늘어나는 대화의 앞부분을 캐시해 지연·비용을 줄인다
+            // automatic prompt caching: cache the growing conversation prefix to cut latency and cost
             "cache_control": { "type": "ephemeral" },
         });
         if !haiku {

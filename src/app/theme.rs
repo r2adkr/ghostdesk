@@ -1,10 +1,12 @@
-//! GhostDesk 화면 테마: 색·글자 크기·간격·모서리, 그리고 여러 화면에서 쓰는 작은 위젯 모양.
+//! GhostDesk's UI theme: colors, type sizes, spacing, corners, and small widgets shared across
+//! screens.
 //!
-//! 방향: Meta Astryx 의 Neutral 테마를 따른다. 회색 단계로 면을 나누고, 강조색은 무채색 하나
-//! (어두운 테마에서는 거의 흰색, 밝은 테마에서는 거의 검은색 — 주 버튼·선택·포커스),
-//! 색은 상태(초록 일하는 중·노랑 질문·빨강 오류·주황 직접 조작·파랑 정보)에만 쓴다.
-//! 마우스를 올리거나 누를 때는 반투명 겹침색으로 바탕을 살짝 바꾼다. 그라데이션·유리 효과 없음.
-//! 밝은·어두운 테마는 Windows/macOS 설정을 따른다 (`sync` 가 매 프레임 지금 테마를 고른다).
+//! Direction: follows Meta Astryx's Neutral theme. Surfaces are separated by gray steps, with a
+//! single achromatic accent (near white in dark mode, near black in light mode) for primary
+//! buttons, selection and focus. Color is reserved for status (green working, yellow question,
+//! red error, orange takeover, blue info). Hover and press tint the background with translucent
+//! overlays. No gradients or glass effects. Light/dark follows the Windows/macOS setting (`sync`
+//! picks the current theme every frame).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,52 +17,52 @@ use eframe::egui::{
     Vec2,
 };
 
-// ───────────────────────── 색 ─────────────────────────
+// ---- colors ----
 
-/// 한 테마의 색 묶음. 값은 Astryx Neutral 의 팔레트 단계(neutral.dark/light[n])에서 가져왔다.
+/// One theme's colors, taken from the Astryx Neutral palette steps (neutral.dark/light[n]).
 struct Palette {
-    /// 가운데 작업 영역 바탕
+    /// Background of the central work area.
     bg: Color32,
-    /// 사이드바·옆 패널·제목 표시줄 (작업 영역보다 한 단계 가라앉은 면)
+    /// Sidebar, side panels and title bar (one step below the work area).
     surface: Color32,
-    /// 카드·타일
+    /// Cards and tiles.
     card: Color32,
     card_hover: Color32,
-    /// 창(모달)·떠 있는 막대 바탕
+    /// Modal windows and floating bars.
     raised: Color32,
     border: Color32,
     border_hover: Color32,
-    /// 창(모달) 가장자리 (어두운 테마: 빛이 닿은 테두리처럼 옅은 흰 선)
+    /// Modal edge (dark theme: a faint white line, like light catching the rim).
     rim: Color32,
     text: Color32,
-    /// 보통 글 (라벨)
+    /// Regular text (labels).
     body: Color32,
     muted: Color32,
-    /// 주 버튼·선택 테두리 (무채색)
+    /// Primary buttons and selection borders (achromatic).
     accent: Color32,
     accent_hover: Color32,
-    /// 강조색 위의 글
+    /// Text on the accent color.
     on_accent: Color32,
-    /// 선택된 항목 바탕
+    /// Background of a selected item.
     accent_tint: Color32,
-    /// 보조 버튼·선택된 줄의 반투명 바탕
+    /// Translucent background of secondary buttons and selected rows.
     neutral: Color32,
     overlay_hover: Color32,
     overlay_pressed: Color32,
-    /// 입력칸 바탕
+    /// Input field background.
     field: Color32,
     info: Color32,
-    /// 정보 색 글 (링크·외부 에이전트·내가 보낸 지시)
+    /// Info-colored text (links, external agents, instructions you sent).
     info_text: Color32,
     selection: Color32,
     success: Color32,
     warn: Color32,
     danger: Color32,
-    /// 사람이 직접 조작 중일 때의 표시
+    /// Marker for a person taking over.
     takeover: Color32,
     switch_off: Color32,
     knob_off: Color32,
-    /// 창 그림자 진하기 (0~255)
+    /// Window shadow strength (0–255).
     shadow: u8,
     popup_shadow: u8,
 }
@@ -68,7 +70,7 @@ struct Palette {
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
-/// 흰색·검은색을 `a`(0~255) 만큼 비치게 (egui 는 미리 곱한 알파를 쓴다)
+/// White/black at opacity `a` (0–255); egui uses premultiplied alpha.
 const fn white(a: u8) -> Color32 {
     Color32::from_rgba_premultiplied(a, a, a, a)
 }
@@ -84,7 +86,7 @@ const DARK: Palette = Palette {
     raised: rgb(0x1b1b1b),      // --color-background-popover
     border: white(0x1A),        // --color-border
     border_hover: rgb(0x525252), // --color-border-emphasized
-    rim: white(0x26),           // --shadow-high 의 흰 테두리 (15%)
+    rim: white(0x26), // white rim of --shadow-high (15%)
     text: rgb(0xf1f1f1),
     body: rgb(0xd4d4d4),
     muted: rgb(0x9e9e9e),       // --color-text-secondary
@@ -132,7 +134,7 @@ const LIGHT: Palette = Palette {
     info: rgb(0x0074e2),
     info_text: rgb(0x0067ce),   // blue.light[45]
     selection: rgb(0xb9d7ff),   // blue.light[85]
-    // 상태색은 밝은 바탕 위 글로도 읽히게 한 단계 진한 값 (--color-text-<status>)
+    // status colors one step darker so they read as text on light backgrounds (--color-text-<status>)
     success: rgb(0x2f7d33),
     warn: rgb(0x836700),
     danger: rgb(0xc0262c),
@@ -143,7 +145,7 @@ const LIGHT: Palette = Palette {
     popup_shadow: 26,
 };
 
-/// 지금 어두운 테마인가 (`sync` 가 매 프레임 갱신)
+/// Whether the dark theme is active (updated every frame by `sync`).
 static DARK_MODE: AtomicBool = AtomicBool::new(true);
 
 fn pal() -> &'static Palette {
@@ -154,7 +156,8 @@ fn pal() -> &'static Palette {
     }
 }
 
-/// 매 프레임 맨 앞에서 부른다: 운영체제 설정에 따라 egui 가 고른 테마를 색 토큰에도 맞춘다.
+/// Call first thing every frame: matches the color tokens to the theme egui picked from the OS
+/// setting.
 pub fn sync(ctx: &egui::Context) {
     DARK_MODE.store(ctx.theme() == egui::Theme::Dark, Ordering::Relaxed);
 }
@@ -180,14 +183,15 @@ pub fn warn() -> Color32 { pal().warn }
 pub fn danger() -> Color32 { pal().danger }
 pub fn takeover() -> Color32 { pal().takeover }
 
-/// 버튼·입력칸 모서리 (Astryx --radius-element)
+/// Corner radius of buttons and fields (Astryx --radius-element).
 pub const RADIUS: u8 = 10;
-/// 카드·타일 (--radius-container)
+/// Cards and tiles (--radius-container).
 pub const CARD_RADIUS: u8 = 12;
-/// 창(모달)·큰 틀의 모서리
+/// Corner radius of modals and large frames.
 pub const MODAL_RADIUS: u8 = 16;
 
-/// 앱 전체에 테마를 적용한다. 밝은·어두운 두 벌을 모두 만들어 두고, 어느 쪽을 쓸지는 운영체제 설정을 따른다.
+/// Applies the theme to the whole app. Both light and dark variants are built; which one is used
+/// follows the OS setting.
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::System);
     for (theme, p) in [(egui::Theme::Dark, &DARK), (egui::Theme::Light, &LIGHT)] {
@@ -196,7 +200,7 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 fn style(s: &mut egui::Style, p: &Palette, dark: bool) {
-    // Astryx Neutral 의 글자 크기: 기준 14, 비율 1.2
+    // Astryx Neutral type scale: base 14, ratio 1.2
     s.text_styles = [
         (TextStyle::Heading, FontId::new(20.0, FontFamily::Proportional)),
         (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
@@ -205,7 +209,7 @@ fn style(s: &mut egui::Style, p: &Palette, dark: bool) {
         (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
     ]
     .into();
-    // Astryx Neutral 의 빠른 움직임(125ms)
+    // Astryx Neutral fast motion (125 ms)
     s.animation_time = 0.125;
 
     let sp = &mut s.spacing;
@@ -248,7 +252,8 @@ fn style(s: &mut egui::Style, p: &Palette, dark: bool) {
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.body);
     w.noninteractive.corner_radius = r;
 
-    // 보조 버튼은 반투명 바탕(--color-neutral)이라 어느 면 위에서도 같은 단계만큼 떠 보인다
+    // secondary buttons use a translucent background (--color-neutral), so they lift by the same step
+    // on any surface
     w.inactive.weak_bg_fill = p.neutral;
     w.inactive.bg_fill = p.switch_off;
     w.inactive.bg_stroke = Stroke::new(1.0, p.border);
@@ -263,7 +268,7 @@ fn style(s: &mut egui::Style, p: &Palette, dark: bool) {
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;
 
-    // 누르면 살짝 작아진다 (Astryx: scale 0.98 + 눌림 겹침색)
+    // shrinks slightly when pressed (Astryx: scale 0.98 + pressed overlay)
     w.active.weak_bg_fill = over(p.neutral, p.overlay_pressed);
     w.active.bg_fill = p.border_hover;
     w.active.bg_stroke = Stroke::new(1.0, p.accent);
@@ -278,7 +283,7 @@ fn style(s: &mut egui::Style, p: &Palette, dark: bool) {
     w.open.corner_radius = r;
 }
 
-/// 반투명 색 두 개를 겹친 색 (미리 곱한 알파끼리의 source-over)
+/// Two translucent colors composited (source-over on premultiplied alpha).
 fn over(below: Color32, above: Color32) -> Color32 {
     let k = 255 - above.a() as u16;
     let mix = |b: u8, a: u8| (a as u16 + b as u16 * k / 255) as u8;
@@ -290,9 +295,9 @@ fn over(below: Color32, above: Color32) -> Color32 {
     )
 }
 
-// ───────────────────────── 틀 ─────────────────────────
+// ---- frames ----
 
-/// 둥근 카드
+/// Rounded card.
 pub fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(card())
@@ -301,7 +306,7 @@ pub fn card_frame() -> egui::Frame {
         .inner_margin(Margin::same(16))
 }
 
-/// 색을 살짝 입힌 안내 카드 (질문·외부 에이전트·경고)
+/// Lightly tinted notice card (question, external agent, warning).
 pub fn tinted(color: Color32) -> egui::Frame {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.10))
@@ -310,7 +315,7 @@ pub fn tinted(color: Color32) -> egui::Frame {
         .inner_margin(Margin::symmetric(12, 10))
 }
 
-/// 모달 창의 틀
+/// Frame of a modal window.
 pub fn modal_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(raised())
@@ -320,7 +325,7 @@ pub fn modal_frame() -> egui::Frame {
         .shadow(Shadow { offset: [0, 12], blur: 24, spread: 0, color: Color32::from_black_alpha(pal().shadow) })
 }
 
-/// 떠 있는 작은 막대 (화면 모아보기의 단추 묶음 등)
+/// A small floating bar (e.g. the button group on the screen wall).
 pub fn floating_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(raised())
@@ -330,19 +335,19 @@ pub fn floating_frame() -> egui::Frame {
         .shadow(Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(pal().popup_shadow) })
 }
 
-// ───────────────────────── 글 ─────────────────────────
+// ---- text ----
 
-/// 묶음 이름 (작고 흐린 글)
+/// Section label (small, dimmed text).
 pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(muted()).strong());
 }
 
-/// 흐린 보조 설명
+/// Dimmed secondary text.
 pub fn hint(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).size(12.0).color(muted())
 }
 
-/// 모달 머리: 제목 + 닫기(✕). 닫기를 누르면 true.
+/// Modal header: title + close (✕). Returns true when close is clicked.
 pub fn modal_header(ui: &mut egui::Ui, title: &str) -> bool {
     let mut close = false;
     ui.horizontal(|ui| {
@@ -355,10 +360,10 @@ pub fn modal_header(ui: &mut egui::Ui, title: &str) -> bool {
     close
 }
 
-// ───────────────────────── 버튼 ─────────────────────────
+// ---- buttons ----
 
-/// 바탕색이 정해진 버튼. 마우스를 올리면 바탕을 바꾼다 (egui 는 직접 정한 바탕을 바꾸지 않으므로
-/// 지난 프레임의 같은 버튼이 마우스 아래 있었는지로 고른다).
+/// A button with a fixed fill that changes on hover. egui won't change an explicit fill, so the
+/// hover state comes from whether the same button was under the pointer last frame.
 fn filled(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8) -> Response {
     let id = ui.next_auto_id();
     let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered() && r.enabled());
@@ -367,17 +372,17 @@ fn filled(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8) -> Respons
     ui.add(egui::Button::new(label.color(on_accent()).strong()).fill(fill).stroke(Stroke::NONE).corner_radius(radius).min_size(size))
 }
 
-/// 주 동작 버튼 (강조색)
+/// Primary action button (accent color).
 pub fn primary(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
     filled(ui, RichText::new(text.into()), Vec2::new(0.0, 32.0), RADIUS)
 }
 
-/// 보조 버튼 (반투명 바탕)
+/// Secondary button (translucent background).
 pub fn secondary(ui: &mut egui::Ui, label: impl Into<String>) -> Response {
     ui.add(egui::Button::new(RichText::new(label.into()).color(text())).min_size(Vec2::new(0.0, 32.0)))
 }
 
-/// 아이콘만 있는 버튼 (마우스를 올릴 때만 바탕이 보임)
+/// Icon-only button (background only on hover).
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> Response {
     ui.add(
         egui::Button::new(RichText::new(icon).size(16.0).color(body()))
@@ -387,14 +392,15 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> Response {
     .on_hover_text(tip)
 }
 
-/// 켜고 끄는 버튼 (켜지면 색을 입힘)
+/// On/off button (tinted when on).
 pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, color: Color32) -> Response {
     let b = egui::Button::new(RichText::new(label).color(if on { color } else { text() })).min_size(Vec2::new(0.0, 32.0));
     let b = if on { b.fill(color.gamma_multiply(0.14)).stroke(Stroke::new(1.0, color)) } else { b };
     ui.add(b)
 }
 
-/// 켜고 끄는 스위치 (체크박스 대신). `ui.add(theme::switch(&mut on, "글"))`, `add_enabled` 와도 같이 쓴다.
+/// On/off switch, in place of a check box. Use as `ui.add(theme::switch(&mut on, "text"))`; works
+/// with `add_enabled` too.
 pub fn switch(on: &mut bool, text: impl Into<String>) -> Switch<'_> {
     Switch { on, text: text.into() }
 }
@@ -442,16 +448,17 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
-/// 아이콘 켜고 끄기 (켜지면 선택 바탕, 꺼지면 마우스를 올릴 때만 바탕)
+/// Icon toggle (selected background when on, background only on hover when off).
 pub fn icon_toggle(ui: &mut egui::Ui, on: bool, icon: &str, tip: &str) -> Response {
     let b = egui::Button::new(RichText::new(icon).size(15.0).color(if on { text() } else { muted() })).min_size(Vec2::splat(32.0));
     let b = if on { b.fill(pal().accent_tint).stroke(Stroke::NONE) } else { b.frame_when_inactive(false) };
     ui.add(b).on_hover_text(tip)
 }
 
-// ───────────────────────── 사이드바 ─────────────────────────
+// ---- sidebar ----
 
-/// 사이드바 한 줄: 아이콘 · 글 · (오른쪽 상태 점). 선택되면 옅은 바탕, 마우스를 올리면 더 옅은 바탕.
+/// One sidebar row: icon · text · (status dot on the right). A light background when selected, a
+/// lighter one on hover.
 pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badge: Option<Color32>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
@@ -474,7 +481,7 @@ pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badg
     resp
 }
 
-/// 보내기 버튼: 강조색 동그라미 안에 Enter 아이콘 (Lucide corner-down-left)
+/// Send button: an Enter icon (Lucide corner-down-left) in an accent-colored circle.
 pub fn enter_button(ui: &mut egui::Ui, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip));
@@ -489,7 +496,8 @@ pub fn enter_button(ui: &mut egui::Ui, tip: &str) -> Response {
     resp.on_hover_text(tip)
 }
 
-/// 큰 입력 상자의 틀 (처음 화면의 '맡길 일' 입력). `focus`: 0(평소)~1(입력 중), 테두리가 서서히 진해진다
+/// Frame of the large input box (the task box on the home screen). `focus` goes 0 (idle) to 1
+/// (typing) and the border darkens gradually.
 pub fn composer_frame(focus: f32) -> egui::Frame {
     egui::Frame::new()
         .fill(card())
@@ -499,16 +507,17 @@ pub fn composer_frame(focus: f32) -> egui::Frame {
         .shadow(Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(pal().popup_shadow / 2) })
 }
 
-// ───────────────────────── 작은 표시 ─────────────────────────
+// ---- small markers ----
 
-/// 동그란 점 (상태·에이전트 색)
+/// A round dot (status or agent color).
 pub fn dot(ui: &mut egui::Ui, color: Color32, radius: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(radius * 2.0 + 2.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), radius, color);
     resp
 }
 
-/// 상태 칩: ● 글 (색을 옅게 깐 알약 모양). 점과 글을 한 덩어리 글로 그려 주변 정렬 방향과 상관없이 같은 모양.
+/// Status chip: ● text in a lightly tinted pill. The dot and text are one text run, so it looks
+/// the same regardless of the surrounding layout direction.
 pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
     let fmt = |size: f32| egui::TextFormat {
         font_id: FontId::proportional(size),
@@ -529,8 +538,11 @@ pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
         .response
 }
 
-/// 작은 개수 배지 (예: 사이드바 '에이전트' 옆의 숫자). 글자 크기에 맞춘 알약 모양을 줄 가운데에 그린다.
-/// Frame 으로 감싸면 가로 줄의 높이만큼 위아래로 늘어나므로, 크기를 정해 두고 직접 그린다.
+/// Small count badge (e.g. the number next to "Agents" in the sidebar). Draws a pill sized to the
+/// text, vertically centered in the row.
+///
+/// Wrapping it in a Frame would stretch it to the row's height, so it's sized and painted by
+/// hand.
 pub fn count_badge(ui: &mut egui::Ui, text: &str) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), muted());
     let pad = Vec2::new(6.0, 2.0);
@@ -543,7 +555,7 @@ pub fn count_badge(ui: &mut egui::Ui, text: &str) -> Response {
     resp
 }
 
-/// 고를 수 있는 낮은 타일 (아이콘 + 제목을 가운데 한 줄로). 누르면 clicked.
+/// A low, selectable tile (icon + title centered on one line). Clicked when pressed.
 pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Vec2) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let p = pal();
@@ -553,7 +565,7 @@ pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Ve
     let stroke = Stroke::new(1.0, p.border.lerp_to_gamma(p.border_hover, h).lerp_to_gamma(p.accent, sel));
     let painter = ui.painter();
     painter.rect(rect, CARD_RADIUS, fill, stroke, StrokeKind::Inside);
-    // 아이콘과 제목을 한 덩어리로 보고 가운데에 둔다 (칸 폭이 좁아도 글자가 잘리지 않게)
+    // treat icon and title as one unit and center it (so text doesn't get cut in a narrow cell)
     let ig = painter.layout_no_wrap(icon.to_owned(), FontId::proportional(17.0), if selected { p.text } else { p.body });
     let tg = painter.layout_no_wrap(title.to_owned(), FontId::proportional(14.0), p.text);
     let (is, ts, gap) = (ig.size(), tg.size(), 8.0);
@@ -565,19 +577,20 @@ pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Ve
     resp
 }
 
-/// 모달 안의 세로 스크롤 영역. 높이가 아직 내용(최대 max_h)에 맞지 않으면(처음 열 때·내용이 바뀔 때 몇 프레임)
-/// 다시 그리도록 해서, 입력이 없어도 창이 내용 크기에 맞게 자리 잡게 한다.
+/// Vertical scroll area inside a modal. While its height doesn't match the content yet (capped at
+/// `max_h`; a few frames when first opened or when the content changes), it requests repaints so
+/// the window settles to the content size without any input.
 pub fn modal_scroll<R>(ui: &mut egui::Ui, max_h: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let out = egui::ScrollArea::vertical()
         .max_height(max_h)
         .min_scrolled_height(max_h)
         .auto_shrink([false, true])
         .show(ui, add);
-    // 내용이 늘거나 줄었는데(예: 다른 종류를 고름) 아직 높이가 맞지 않으면 한 번 더 그려 맞춘다
-    // (화면이 아주 작아 끝내 맞출 수 없는 경우 계속 다시 그리지 않게 연속 10번까지만)
+    // content grew or shrank (e.g. picked another kind) and the height doesn't match yet: draw once
+    // more (at most 10 times in a row, so a tiny screen that can never fit doesn't repaint forever)
     let shown = out.inner_rect.height();
     let want = out.content_size.y.min(max_h);
-    // (내용 높이가 바뀌면 새로 맞추는 것이므로 횟수를 다시 센다)
+    // (a new content height is a new fit, so the count restarts)
     let tries_id = out.id.with("settle");
     let (tries, last_want): (u32, f32) = ui.data(|d| d.get_temp(tries_id)).unwrap_or((0, want));
     let tries = if (last_want - want).abs() > 1.0 { 0 } else { tries };
@@ -590,21 +603,22 @@ pub fn modal_scroll<R>(ui: &mut egui::Ui, max_h: f32, add: impl FnOnce(&mut egui
     out.inner
 }
 
-// ───────────────────────── 움직임 ─────────────────────────
+// ---- motion ----
 //
-// 모든 움직임은 짧고(0.12~0.25초) 끝에서 느려진다. 계속 도는 표시(스피너·반짝이는 글)는
-// 초당 30번만 다시 그려 CPU 를 아낀다.
+// All motion is short (0.12–0.25 s) and eases out. Continuous indicators (spinner, shimmering
+// text) repaint only 30 times a second to save CPU.
 
-/// 계속 움직이는 표시의 다시 그리기 간격 (약 30fps)
+/// Repaint interval for continuous indicators (about 30 fps).
 const TICK: std::time::Duration = std::time::Duration::from_millis(33);
 
-/// 끝에서 부드럽게 멈추는 곡선 (0..=1 → 0..=1)
+/// Easing curve that slows to a stop (0..=1 → 0..=1).
 pub fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
-/// 0 에서 1 로 차오르는 '나타나기' 값. 처음 그릴 때, `key` 가 바뀔 때, 또는 지난 패스에 그리지 않았다가
-/// 다시 그릴 때 0 부터 시작한다. 화면 전환 · 새 기록 줄 · 알림을 서서히 보이게 할 때 쓴다.
+/// An "appear" value rising from 0 to 1. Starts at 0 on first draw, when `key` changes, or when
+/// drawn again after being skipped last pass. Used to fade in view changes, new log rows and
+/// toasts.
 pub fn appear(ctx: &egui::Context, id: egui::Id, key: u64, dur: f32) -> f32 {
     let now = ctx.input(|i| i.time);
     let pass = ctx.cumulative_pass_nr();
@@ -623,12 +637,13 @@ pub fn appear(ctx: &egui::Context, id: egui::Id, key: u64, dur: f32) -> f32 {
     ease_out(t)
 }
 
-/// 마우스를 올리고 뗄 때 0↔1 로 부드럽게 바뀌는 값 (바탕·테두리 색을 서서히 바꿀 때)
+/// A value that moves smoothly between 0 and 1 on hover in/out (for fading background and border
+/// colors).
 pub fn hover_t(ctx: &egui::Context, resp: &Response) -> f32 {
     ctx.animate_bool_with_time(resp.id.with("hover_t"), resp.hovered() || resp.has_focus(), 0.12)
 }
 
-/// 일하는 중 표시: 여덟 갈래 빛살이 돌면서 뒤쪽부터 옅어진다
+/// Working indicator: eight rays rotating, fading from the tail.
 pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -638,10 +653,12 @@ pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
     resp
 }
 
-/// `spinner` 를 정해진 자리에 그린다 (화면 준비 중 자리 등). 다시 그리기는 부르는 쪽이 요청한다.
+/// Draws a `spinner` at a given spot (placeholders while a screen prepares, …). The caller
+/// requests repaints.
 pub fn paint_spinner(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32, time: f64) {
     const RAYS: usize = 8;
-    // 한 바퀴 0.9초. 빛살이 이어서 도는 것처럼 보이게 정수 단위가 아니라 연속으로 옅어진다
+    // one turn per 0.9 s; rays fade continuously rather than in whole steps so the rotation looks
+    // smooth
     let head = ((time / 0.9).fract() * RAYS as f64) as f32;
     let width = (size * 0.1).max(1.4);
     for k in 0..RAYS {
@@ -653,11 +670,11 @@ pub fn paint_spinner(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32
     }
 }
 
-/// 밝은 띠가 글자 위를 지나가는 글 ('생각 중…' 처럼 지금 일하는 중인 상태)
+/// Text with a bright band sweeping across it (statuses like "Thinking…" while working).
 pub fn shimmer(ui: &mut egui::Ui, text: &str, size: f32) -> Response {
     let (base, hi) = (muted(), pal().text);
     let n = text.chars().count() as f32;
-    // 띠가 글 앞뒤로 조금 벗어났다가 다시 들어온다 (한 번 지나가는 데 1.6초)
+    // the band runs a little past either end before coming back (1.6 s per sweep)
     let head = ((ui.input(|i| i.time) / 1.6).fract() as f32) * (n + 8.0) - 4.0;
     let mut job = egui::text::LayoutJob::default();
     let mut buf = [0u8; 4];
@@ -670,7 +687,7 @@ pub fn shimmer(ui: &mut egui::Ui, text: &str, size: f32) -> Response {
     ui.add(egui::Label::new(job).selectable(false))
 }
 
-/// 얇은 진행 막대 (0..=1). 값이 바뀌면 막대가 부드럽게 늘어난다.
+/// Thin progress bar (0..=1). Changes animate smoothly.
 pub fn progress(ui: &mut egui::Ui, id: egui::Id, frac: f32, width: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 4.0), egui::Sense::hover());
     let f = ui.ctx().animate_value_with_time(id, frac.clamp(0.0, 1.0), 0.25);
@@ -687,7 +704,7 @@ pub fn progress(ui: &mut egui::Ui, id: egui::Id, frac: f32, width: f32) -> Respo
 mod tests {
     use super::*;
 
-    /// 대비 (WCAG): 글은 4.5:1 이상
+    /// Contrast ratio (WCAG): text needs at least 4.5:1.
     fn contrast(a: Color32, b: Color32) -> f32 {
         let lum = |c: Color32| {
             let ch = |v: u8| {

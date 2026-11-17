@@ -1,25 +1,28 @@
-//! 연결 패키지: '외부 연결' 목록에 없는 AI 에이전트도 GhostDesk 를 쓰게 하는 파일 묶음.
+//! Connection kit: files that let AI agents not listed under Connections use GhostDesk too.
 //!
-//! GhostDesk 는 MCP 서버(`ghostdesk --mcp`)이므로, MCP 를 지원하는 에이전트라면 어디든 붙일 수 있다.
-//! 에이전트마다 설정 방식이 달라 세 가지 모양으로 내보낸다:
-//! - `ghostdesk.mcp.json` — 대부분의 앱이 읽는 표준 `mcpServers` 설정 (Cursor·VS Code·Gemini CLI·Windsurf·Cline 등의 '커넥터')
-//! - `skills/ghostdesk/SKILL.md` — Agent Skills 형식의 사용 설명서 (스킬을 읽는 에이전트용)
-//! - `claude-plugin/` — 위 두 가지를 묶은 Claude 형식 플러그인 (`.claude-plugin/plugin.json` + `.mcp.json` + `skills/`)
+//! GhostDesk is an MCP server (`ghostdesk --mcp`), so any agent with MCP support can use it.
+//! Agents are configured differently, so the kit comes in three shapes:
+//! - `ghostdesk.mcp.json`: the standard `mcpServers` config most apps read (connectors in
+//!   Cursor, VS Code, Gemini CLI, Windsurf, Cline, …)
+//! - `skills/ghostdesk/SKILL.md`: a usage guide in Agent Skills format, for agents that read
+//!   skills
+//! - `claude-plugin/`: both of the above as a Claude plugin (`.claude-plugin/plugin.json` +
+//!   `.mcp.json` + `skills/`)
 //!
-//! 스킬 내용은 MCP 서버가 에이전트에게 주는 안내문·모드·도구 목록(`mcp`)에서 그대로 만든다.
-//! 그래서 도구가 바뀌어도 이 파일을 따로 고칠 필요가 없다.
+//! The skill text is generated from the instructions, modes and tool list the MCP server gives
+//! agents (`mcp`), so this file doesn't need updating when the tools change.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-/// 패키지 폴더 이름 (내려받기 폴더 아래에 만든다)
+/// Kit folder name (created under Downloads).
 pub const KIT_DIR: &str = "GhostDesk 연결 패키지";
-/// MCP 서버가 GhostDesk 창에 알리는 클라이언트 이름 (어떤 앱인지 모를 때)
+/// Client name the MCP server reports to the GhostDesk window when the app is unknown.
 const CLIENT_NAME: &str = "외부 에이전트";
 
-/// 표준 `mcpServers` 설정. 거의 모든 MCP 클라이언트가 이 모양을 그대로 받는다.
+/// The standard `mcpServers` config. Nearly every MCP client accepts it as is.
 pub fn mcp_config(exe: &Path) -> Value {
     json!({ "mcpServers": { "ghostdesk": server_entry(exe) } })
 }
@@ -32,7 +35,7 @@ fn server_entry(exe: &Path) -> Value {
     })
 }
 
-/// Agent Skills 형식의 SKILL.md
+/// SKILL.md in Agent Skills format.
 pub fn skill_markdown(exe: &Path) -> String {
     let tools = crate::mcp::tools();
     let tool_lines: String = tools
@@ -66,7 +69,7 @@ GhostDesk starts by itself when a tool is called. No API key is needed.\n\n\
     )
 }
 
-/// 플러그인 설명 파일 (`.claude-plugin/plugin.json`)
+/// Plugin manifest (`.claude-plugin/plugin.json`).
 fn plugin_manifest() -> Value {
     json!({
         "name": "ghostdesk",
@@ -76,7 +79,7 @@ fn plugin_manifest() -> Value {
     })
 }
 
-/// 사람이 읽는 안내 (패키지 폴더의 README)
+/// Human-readable instructions (the kit folder's README).
 fn readme(exe: &Path) -> String {
     format!(
         "GhostDesk 연결 패키지\n\
@@ -97,7 +100,7 @@ GhostDesk 를 다른 곳으로 옮겼다면 연결 창에서 이 패키지를 �
     )
 }
 
-/// `parent` 아래에 패키지 폴더를 만들고(있으면 새로 쓴다) 그 경로를 돌려준다.
+/// Creates the kit folder under `parent` (rewriting it if present) and returns its path.
 pub fn write_kit(parent: &Path, exe: &Path) -> Result<PathBuf> {
     let root = parent.join(KIT_DIR);
     let config = serde_json::to_string_pretty(&mcp_config(exe))? + "\n";
@@ -119,12 +122,12 @@ pub fn write_kit(parent: &Path, exe: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// 패키지를 둘 기본 위치: 내려받기 폴더 (없으면 홈)
+/// Default location for the kit: Downloads, or home if there is none.
 pub fn default_parent() -> PathBuf {
     dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 만든 폴더를 Finder / 탐색기에서 연다
+/// Reveals the folder in Finder / Explorer.
 pub fn reveal(dir: &Path) {
     let opener = if cfg!(windows) {
         "explorer"
@@ -136,7 +139,7 @@ pub fn reveal(dir: &Path) {
     let _ = std::process::Command::new(opener).arg(dir).spawn();
 }
 
-/// `ghostdesk --export-kit [폴더]` — GhostDesk 를 설치하고 패키지를 만든 뒤 경로를 출력한다
+/// `ghostdesk --export-kit [dir]`: installs GhostDesk, builds the kit and prints its path.
 pub fn cli(args: &[String]) -> Result<()> {
     let exe = crate::install::install_app()?;
     let parent = args.first().map(PathBuf::from).unwrap_or_else(default_parent);
@@ -145,7 +148,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 도구 설명의 첫 문장 (스킬의 도구 목록은 한 줄씩만)
+/// First sentence of a tool description (the skill lists one line per tool).
 fn first_sentence(s: &str) -> &str {
     let end = s.find(". ").map(|i| i + 1).or_else(|| s.find('\n')).unwrap_or(s.len());
     s[..end].trim()
@@ -162,13 +165,13 @@ mod tests {
         let root = write_kit(&dir, exe).unwrap();
         let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
 
-        // MCP 설정: 표준 모양이고 플러그인 안의 것과 같다
+        // MCP config: the standard shape, identical to the one inside the plugin
         let config: Value = serde_json::from_str(&read("ghostdesk.mcp.json")).unwrap();
         assert_eq!(config["mcpServers"]["ghostdesk"]["command"], exe.display().to_string());
         assert_eq!(config["mcpServers"]["ghostdesk"]["args"], json!(["--mcp"]));
         assert_eq!(read("ghostdesk.mcp.json"), read("claude-plugin/.mcp.json"));
 
-        // 스킬: 앞머리(name·description)가 있고, 모든 도구와 모드를 알린다
+        // skill: has front matter (name, description) and mentions every tool and mode
         let skill = read("skills/ghostdesk/SKILL.md");
         assert!(skill.starts_with("---\nname: ghostdesk\ndescription: "), "{skill}");
         assert_eq!(skill, read("claude-plugin/skills/ghostdesk/SKILL.md"));
@@ -184,13 +187,13 @@ mod tests {
         assert_eq!(manifest["name"], "ghostdesk");
         assert!(read("README.txt").contains(&exe.display().to_string()));
 
-        // 다시 만들어도 된다 (덮어쓰기)
+        // rebuilding is fine (overwrites)
         write_kit(&dir, exe).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 패키지 미리보기 (설치본을 건드리지 않고 내용을 볼 때):
-    /// `GHOSTDESK_KIT_OUT=<폴더> cargo test write_sample_kit -- --ignored`
+    /// Builds a sample kit to inspect without touching the installed copy:
+    /// `GHOSTDESK_KIT_OUT=<dir> cargo test write_sample_kit -- --ignored`
     #[test]
     #[ignore]
     fn write_sample_kit() {

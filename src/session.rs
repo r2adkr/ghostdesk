@@ -1,33 +1,37 @@
-//! 별도 macOS 로그인 세션(전용 에이전트 계정) 백엔드 — "RDP 같은" 격리 화면.
+//! Separate macOS login session (dedicated agent account) backend: an "RDP-like" isolated screen.
 //!
-//! macOS 는 사용자당 GUI 세션 하나만 허용하므로, 사용자가 전용 표준 계정(예: `ghostdesk-agent`)을
-//! 만들고 빠른 사용자 전환으로 한 번 로그인한 뒤 원래 계정으로 돌아온다. 에이전트 세션은
-//! 백그라운드에서 계속 살아 있다. 그 세션 안에서 LaunchAgent 로 헬퍼
-//! (`ghostdesk --session-helper --allow-uid <사용자 uid>`)가 돌며 에이전트 세션의 **화면 전체**를
-//! Unix 도메인 소켓(`/Users/Shared/GhostDesk/session-<계정>.sock`)으로 내보낸다.
-//! 사용자 세션의 GhostDesk 는 [`SessionDesk`] 로 접속하는 클라이언트일 뿐이고, 사용자 화면·커서·
-//! 키보드에는 아무것도 하지 않는다.
+//! macOS allows only one GUI session per user, so the user creates a dedicated standard account
+//! (e.g. `ghostdesk-agent`), logs into it once with fast user switching, and switches back. The
+//! agent session stays alive in the background. Inside it, a LaunchAgent runs the helper
+//! (`ghostdesk --session-helper --allow-uid <user uid>`), which exposes the agent session's
+//! **entire screen** over a Unix domain socket (`/Users/Shared/GhostDesk/session-<account>.sock`).
+//! GhostDesk in the user's session is just a client connecting through [`SessionDesk`]; it does
+//! nothing to the user's screen, cursor or keyboard.
 //!
-//! 구성:
-//! - [`SessionPlatform`]: 캡처/입력 플랫폼 계층 (실제 = ScreenCaptureKit + 전역 CGEventPost,
-//!   테스트 = 합성 프레임버퍼 + 입력 기록 mock)
-//! - 서버: [`spawn_server`] / [`run_helper`] — JSON-lines RPC, `getpeereid()` 로 접속자 uid 인증
-//! - 클라이언트: [`SessionDesk`] — BrowserWorkspace 와 같은 이름/시그니처의 백엔드 계약 메서드
-//! - 설치: [`launch_agent_plist`], [`SETUP_GUIDE_KO`]
+//! Layout:
+//! - [`SessionPlatform`]: capture/input platform layer (real = ScreenCaptureKit + global
+//!   CGEventPost, tests = synthetic framebuffer + input-recording mock)
+//! - Server: [`spawn_server`] / [`run_helper`]: JSON-lines RPC, client uid authenticated with
+//!   `getpeereid()`
+//! - Client: [`SessionDesk`]: backend contract methods with the same names/signatures as
+//!   BrowserWorkspace
+//! - Setup: [`launch_agent_plist`], [`SETUP_GUIDE_KO`]
 //!
-//! 안전 장치 (헬퍼가 사용자 본인의 화면을 조작하는 일이 없도록):
-//! 1. 헬퍼의 uid 가 `--allow-uid` 목록에 있으면 거부 (= 사용자 본인 세션에서 실행된 것)
-//! 2. 헬퍼 계정이 관리자(admin 그룹)면 거부 (전용 표준 계정 전제, `--allow-admin-account` 로 해제)
-//! 3. root 로 실행되면 거부
-//! 4. 헬퍼의 세션이 지금 실제 모니터에 표시 중(콘솔 세션)이면 캡처·입력을 보류
-//!    (사람이 그 화면을 보고 있을 수 있음, `--allow-on-console` 로 해제)
+//! Safeguards (so the helper never drives the user's own screen):
+//! 1. Refuses if the helper's uid is in the `--allow-uid` list (= it's running in the user's own
+//!    session).
+//! 2. Refuses if the helper account is an administrator (admin group); a dedicated standard
+//!    account is assumed (`--allow-admin-account` lifts this).
+//! 3. Refuses to run as root.
+//! 4. Holds off capture and input while the helper's session is on the physical display (console
+//!    session), since a person may be looking at it (`--allow-on-console` lifts this).
 //!
-//! RPC (한 줄 = 한 JSON, 요청마다 `id`):
+//! RPC (one JSON per line, `id` on every request):
 //! - `hello{version,max_long_edge}` → `{version,label,display,frame:[w,h],on_console}`
 //! - `screenshot{max_long_edge,format:"png"|"jpeg",quality}` → `{data(base64),format,w,h,cursor:[x,y]}`
-//! - `zoom{region:[fx0,fy0,fx1,fy1](0~1 비율),out_w,out_h}` → `{data,w,h}`
-//! - `pointer{action:"move"|"down"|"up",button(0=왼,1=오른,2=가운데),x,y,fw,fh,count,mods}`
-//!   (x,y 는 fw×fh 프레임 픽셀 좌표 → 헬퍼가 디스플레이 포인트로 변환)
+//! - `zoom{region:[fx0,fy0,fx1,fy1](0-1 fractions),out_w,out_h}` → `{data,w,h}`
+//! - `pointer{action:"move"|"down"|"up",button(0=left,1=right,2=middle),x,y,fw,fh,count,mods}`
+//!   (x,y are pixel coordinates in an fw×fh frame; the helper converts them to display points)
 //! - `scroll{x?,y?,fw,fh,dx,dy,mods}`, `key{combo,repeat}`, `hold_key{combo,secs}`, `type{text}`,
 //!   `cursor{fw,fh}`, `ping`
 #![allow(dead_code)]
@@ -55,42 +59,45 @@ use crate::browser::{FrameSink, MouseButton};
 use crate::desk::ViewInfo;
 use crate::platform::ipc::{Reader, Writer};
 
-/// RPC 프로토콜 버전 (호환되지 않게 바뀌면 올린다)
+/// RPC protocol version (bump on incompatible changes).
 pub const PROTO_VERSION: u64 = 1;
-/// 소켓 디렉터리 (모든 사용자가 접근 가능, sticky 1777)
+/// Socket directory (accessible to all users, sticky 1777).
 #[cfg(unix)]
 pub const SOCKET_DIR: &str = "/Users/Shared/GhostDesk";
-/// LaunchAgent 라벨 (에이전트 계정의 ~/Library/LaunchAgents/<라벨>.plist)
+/// LaunchAgent label (~/Library/LaunchAgents/<label>.plist in the agent account).
 #[cfg(unix)]
 pub const LAUNCH_AGENT_LABEL: &str = "com.ghostdesk.session-helper";
-/// 에이전트 좌표계(스크린샷) 긴 변 기본값
+/// Default long edge of the agent coordinate space (screenshots).
 pub const DEFAULT_MAX_LONG_EDGE: u32 = 1280;
 const MAX_REQUEST_BYTES: u64 = 8 << 20;
 const MAX_RESPONSE_BYTES: u64 = 256 << 20;
-/// type 요청 하나에 담는 최대 글자 수 (긴 텍스트는 나눠 보내 라이브 뷰가 멈추지 않게)
+/// Maximum characters per type request (long text is split so the live view doesn't stall).
 const TYPE_CHUNK_CHARS: usize = 400;
 
-/// 계정 이름 → 소켓 경로
+/// Account name → socket path.
 #[cfg(unix)]
 pub fn socket_path_for(username: &str) -> PathBuf {
     Path::new(SOCKET_DIR).join(format!("session-{username}.sock"))
 }
 
-// ───────────────────────── 디스플레이 좌표 ─────────────────────────
+// ---- display coordinates ----
 
-/// 헬퍼 세션의 메인 디스플레이 (포인트 단위, 전역 좌표)
+/// Main display of the helper session (in points, global coordinates).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub origin_x: f64,
     pub origin_y: f64,
     pub width_pt: f64,
     pub height_pt: f64,
-    /// 포인트 → 픽셀 배율 (레티나 2.0)
+    /// Points → pixels scale (2.0 on Retina).
     pub scale: f64,
 }
 
-/// 긴 변이 max_long_edge 이하가 되도록 (비율 유지) 출력 픽셀 크기를 정한다. 0 = 원본 픽셀.
-/// (`macos::capture::fit_size` 와 같은 식 — 헬퍼가 실제로 찍는 크기와 일치해야 한다)
+/// Picks the output pixel size so the long edge is at most max_long_edge (keeping the aspect
+/// ratio). 0 = native pixels.
+///
+/// Same formula as `macos::capture::fit_size`; it must match the size the helper actually
+/// captures.
 pub fn fit_size(w_pt: f64, h_pt: f64, scale: f64, max_long_edge: u32) -> (u32, u32) {
     let (fw, fh) = ((w_pt * scale).max(1.0), (h_pt * scale).max(1.0));
     let k = if max_long_edge == 0 { 1.0 } else { (max_long_edge as f64 / fw.max(fh)).min(1.0) };
@@ -98,15 +105,15 @@ pub fn fit_size(w_pt: f64, h_pt: f64, scale: f64, max_long_edge: u32) -> (u32, u
 }
 
 impl DisplayInfo {
-    /// 원본 픽셀 크기
+    /// Native pixel size.
     pub fn pixel_size(&self) -> (u32, u32) {
         fit_size(self.width_pt, self.height_pt, self.scale, 0)
     }
-    /// max_long_edge 로 찍었을 때의 프레임 크기
+    /// Frame size when captured at max_long_edge.
     pub fn frame_size(&self, max_long_edge: u32) -> (u32, u32) {
         fit_size(self.width_pt, self.height_pt, self.scale, max_long_edge)
     }
-    /// fw×fh 프레임의 픽셀 좌표 → 전역 포인트 좌표 (디스플레이 안으로 clamp)
+    /// Pixel coordinates in an fw×fh frame → global point coordinates (clamped to the display).
     pub fn to_points(&self, x: f64, y: f64, fw: u32, fh: u32) -> (f64, f64) {
         let fw = fw.max(1) as f64;
         let fh = fh.max(1) as f64;
@@ -114,7 +121,7 @@ impl DisplayInfo {
         let py = (y * self.height_pt / fh).clamp(0.0, (self.height_pt - 1.0).max(0.0));
         (self.origin_x + px, self.origin_y + py)
     }
-    /// 전역 포인트 좌표 → fw×fh 프레임 픽셀 좌표
+    /// Global point coordinates → pixel coordinates in an fw×fh frame.
     pub fn to_frame(&self, x: f64, y: f64, fw: u32, fh: u32) -> (f64, f64) {
         let w = self.width_pt.max(1.0);
         let h = self.height_pt.max(1.0);
@@ -122,31 +129,33 @@ impl DisplayInfo {
     }
 }
 
-// ───────────────────────── 플랫폼 계층 ─────────────────────────
+// ---- platform layer ----
 
-/// 헬퍼가 쓰는 캡처/입력 기능. 모든 메서드는 블로킹 (서버가 spawn_blocking 안에서 부른다).
-/// 좌표는 전역 포인트 단위.
+/// Capture and input used by the helper. Every method blocks (the server calls them inside
+/// spawn_blocking).
+///
+/// Coordinates are global points.
 pub trait SessionPlatform: Send + Sync + 'static {
     fn name(&self) -> String;
     fn display(&self) -> Result<DisplayInfo>;
-    /// 메인 디스플레이 캡처 (긴 변 제한, 0 = 원본 픽셀)
+    /// Captures the main display (long edge capped, 0 = native pixels).
     fn capture(&self, max_long_edge: u32) -> Result<RgbImage>;
-    /// 커서 이동. pressed = 누르고 있는 버튼 (드래그 이벤트로 보냄)
+    /// Moves the cursor. pressed = the button being held (sent as drag events).
     fn mouse_move(&self, x: f64, y: f64, pressed: Option<u8>, mods: i64) -> Result<()>;
     fn mouse_button(&self, x: f64, y: f64, button: u8, down: bool, count: i64, mods: i64) -> Result<()>;
-    /// 픽셀(포인트) 단위 스크롤, dy>0 = 아래
+    /// Scrolls in pixels (points); dy > 0 = down.
     fn scroll(&self, dx: f64, dy: f64, mods: i64) -> Result<()>;
-    /// xdotool 스타일 조합 키를 hold 동안 누른다
+    /// Presses an xdotool-style key combo for `hold`.
     fn key(&self, combo: &str, hold: Duration, check: &dyn Fn() -> Result<()>) -> Result<()>;
-    /// 유니코드 텍스트 (한글 포함, 줄바꿈/탭은 서버가 키로 바꿔 보낸다)
+    /// Unicode text (Korean included; the server turns newlines and tabs into keys).
     fn type_unicode(&self, text: &str, check: &dyn Fn() -> Result<()>) -> Result<()>;
-    /// 현재 커서 위치 (전역 포인트)
+    /// Current cursor position (global points).
     fn cursor(&self) -> Result<(f64, f64)>;
-    /// 이 세션이 지금 실제 모니터에 표시 중인가 (콘솔 세션)
+    /// Whether this session is currently on the physical display (console session).
     fn on_console(&self) -> bool;
 }
 
-// ───────────────────────── 사용자/세션 정보 (libc) ─────────────────────────
+// ---- user / session info (libc) ----
 
 #[cfg(unix)]
 pub fn getuid() -> u32 {
@@ -166,7 +175,7 @@ fn passwd_by_uid(uid: u32) -> Option<(String, u32)> {
     Some((name, pw.pw_gid))
 }
 
-/// 계정 이름 → uid
+/// Account name → uid.
 #[cfg(unix)]
 pub fn uid_of(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
@@ -196,7 +205,7 @@ fn group_gid(name: &str) -> Option<u32> {
     }
 }
 
-/// uid 가 admin 그룹 구성원인가 (판별 실패 시 안전하게 true)
+/// Whether the uid is in the admin group (true on lookup failure, to be safe).
 #[cfg(unix)]
 pub fn is_admin(uid: u32) -> bool {
     let Some((name, base_gid)) = passwd_by_uid(uid) else { return true };
@@ -219,14 +228,15 @@ pub fn is_admin(uid: u32) -> bool {
     groups[..(n.max(0) as usize).min(groups.len())].iter().any(|g| *g as u32 == admin_gid)
 }
 
-/// 현재 실제 모니터를 차지한 콘솔 사용자 uid (/dev/console 의 소유자). 로그인 창이면 0.
+/// uid of the console user currently on the physical display (owner of /dev/console). 0 at the
+/// login window.
 #[cfg(unix)]
 pub fn console_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/dev/console").ok().map(|m| m.uid())
 }
 
-/// 소켓 상대방의 uid (getpeereid)
+/// uid of the socket peer (getpeereid).
 #[cfg(unix)]
 pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     #[cfg(any(
@@ -258,7 +268,8 @@ pub fn peer_uid(s: &UnixStream) -> io::Result<u32> {
     }
 }
 
-/// 헬퍼 실행을 거부해야 하는 이유 (None = 실행 가능). 순수 함수 — 셀프테스트로 검증한다.
+/// Reason the helper must refuse to run (None = OK to run). A pure function, checked by the
+/// self-test.
 #[cfg(unix)]
 pub fn refusal_reason(me: u32, allow_uids: &[u32], me_is_admin: bool, allow_admin: bool) -> Option<String> {
     if allow_uids.is_empty() {
@@ -282,7 +293,7 @@ pub fn refusal_reason(me: u32, allow_uids: &[u32], me_is_admin: bool, allow_admi
     None
 }
 
-// ───────────────────────── 줄 단위 I/O ─────────────────────────
+// ---- line I/O ----
 
 async fn read_line_limited<R: AsyncBufRead + Unpin>(rd: &mut R, limit: u64) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
@@ -320,17 +331,17 @@ fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-// ───────────────────────── 서버 ─────────────────────────
+// ---- server ----
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ServerConfig {
-    /// 접속을 허용할 클라이언트 uid 목록
+    /// Client uids allowed to connect.
     pub allow_uids: Vec<u32>,
-    /// 이 세션이 콘솔(실제 모니터)에 표시 중일 때도 캡처·입력을 허용
+    /// Allow capture and input even while this session is on the console (physical display).
     pub allow_on_console: bool,
-    /// hello 로 알려줄 이름 (보통 에이전트 계정 이름)
+    /// Name reported in hello (usually the agent account name).
     pub label: String,
     pub log: LogFn,
 }
@@ -338,12 +349,12 @@ pub struct ServerConfig {
 struct Server {
     platform: Arc<dyn SessionPlatform>,
     cfg: ServerConfig,
-    /// 입력은 연결이 여러 개여도 한 번에 하나씩
+    /// Input runs one at a time, even across multiple connections.
     input_lock: tokio::sync::Mutex<()>,
 }
 
-/// 실행 중인 서버. stop() 하면 모든 연결을 닫고 (누른 버튼을 놓은 뒤) 끝난다.
-/// 핸들을 그냥 drop 해도 서버가 멈춘다.
+/// A running server. stop() closes every connection (after releasing pressed buttons) and ends
+/// it; simply dropping the handle also stops the server.
 pub struct ServerHandle {
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
@@ -356,20 +367,21 @@ impl ServerHandle {
     }
 }
 
-/// 연결별 상태 (끊기면 누른 버튼을 놓는다)
+/// Per-connection state (pressed buttons are released on disconnect).
 #[derive(Default)]
 struct ConnState {
     pressed: Vec<u8>,
     last_pt: Option<(f64, f64)>,
 }
 
-/// 헬퍼가 연결을 받는 리스너. Unix = 소켓(접속자 uid 확인), Windows = 명명 파이프(`platform::ipc` 가 같은 사용자만 받는다)
+/// Listener the helper accepts connections on. Unix = socket (client uid checked), Windows =
+/// named pipe (`platform::ipc` only lets the same user in).
 #[cfg(unix)]
 pub type HelperListener = UnixListener;
 #[cfg(windows)]
 pub type HelperListener = crate::platform::ipc::Listener;
 
-/// 연결 하나를 받는다: (읽기, 쓰기, 접속자 uid — Windows 는 None)
+/// Accepts one connection: (read half, write half, client uid; None on Windows).
 #[cfg(unix)]
 async fn accept_conn(l: &mut HelperListener) -> io::Result<(Reader, Writer, Option<u32>)> {
     let (stream, _) = l.accept().await?;
@@ -383,7 +395,7 @@ async fn accept_conn(l: &mut HelperListener) -> io::Result<(Reader, Writer, Opti
     Ok((r, w, None))
 }
 
-/// 이미 bind 된 리스너로 서버를 띄운다.
+/// Starts the server on an already bound listener.
 pub fn spawn_server(mut listener: HelperListener, platform: Arc<dyn SessionPlatform>, cfg: ServerConfig) -> ServerHandle {
     let (stop_tx, stop_rx) = watch::channel(false);
     let srv = Arc::new(Server { platform, cfg, input_lock: tokio::sync::Mutex::new(()) });
@@ -422,7 +434,7 @@ fn uint_or(v: &Value, k: &str, d: u64) -> u64 {
     v[k].as_u64().unwrap_or(d)
 }
 
-/// 텍스트를 유니코드 덩어리와 특수키(Return/Tab)로 나눈다
+/// Splits text into Unicode chunks and special keys (Return/Tab).
 #[derive(Debug, PartialEq)]
 enum Seg {
     Text(String),
@@ -497,7 +509,7 @@ impl Server {
         tokio::task::spawn_blocking(move || f(&*p)).await.map_err(|e| anyhow!("작업 스레드 오류: {e}"))?
     }
 
-    /// 이 세션이 실제 모니터에 표시 중이면 캡처·입력을 보류한다
+    /// Holds off capture and input while this session is on the physical display.
     fn gate(&self) -> Result<()> {
         console_gate(&*self.platform, self.cfg.allow_on_console)
     }
@@ -515,7 +527,8 @@ impl Server {
     }
 
     async fn handle(self: Arc<Self>, rd: Reader, mut wr: Writer, uid: Option<u32>, mut stop: watch::Receiver<bool>) {
-        // Unix 만 uid 허용 목록을 본다 (Windows 는 명명 파이프 DACL·소유자 확인이 같은 사용자만 들인다)
+        // only Unix checks the uid allowlist (on Windows the named pipe DACL and owner check already
+        // admit only the same user)
         if let Some(uid) = uid {
             if !self.cfg.allow_uids.contains(&uid) {
                 self.log(&format!("인증 거부: uid {uid} 는 허용 목록 {:?} 에 없습니다", self.cfg.allow_uids));
@@ -569,7 +582,7 @@ impl Server {
         self.log(&format!("클라이언트 연결 종료 (uid {uid})"));
     }
 
-    /// 연결이 끊기면 그 연결이 누르고 있던 마우스 버튼을 놓는다
+    /// Releases any mouse buttons the connection was holding when it drops.
     async fn release(&self, cs: &mut ConnState) {
         if cs.pressed.is_empty() {
             return;
@@ -680,8 +693,8 @@ impl Server {
             "pointer" => {
                 let action = v["action"].as_str().unwrap_or("move").to_string();
                 let button = (uint_or(v, "button", 0) as u8).min(2);
-                // 이 연결이 눌러 둔 버튼을 놓는 것은 콘솔 보류 중에도 허용한다
-                // (down 직후 사람이 에이전트 세션으로 전환하면 버튼이 눌린 채로 남지 않도록)
+                // releasing a button this connection pressed is allowed even while held off for the console (so a
+                // button isn't left stuck if someone switches to the agent session right after a down)
                 let releasing = action == "up" && cs.pressed.contains(&button);
                 if !releasing {
                     self.gate()?;
@@ -743,7 +756,7 @@ impl Server {
                 let dy = num_or(v, "dy", 0.0);
                 let mods = v["mods"].as_i64().unwrap_or(0);
                 let d = self.blocking(|p| p.display()).await?;
-                // 프레임 픽셀 → 포인트 배율로 스크롤 양을 맞춘다
+                // scale the scroll amount by the frame pixel → point ratio
                 let (sx, sy) = (d.width_pt / fw as f64, d.height_pt / fh as f64);
                 let pos = match (v["x"].as_f64(), v["y"].as_f64()) {
                     (Some(x), Some(y)) => Some(d.to_points(x, y, fw, fh)),
@@ -819,7 +832,7 @@ impl Server {
     }
 }
 
-// ───────────────────────── 실제 macOS 플랫폼 (헬퍼 전용) ─────────────────────────
+// ---- real macOS platform (helper only) ----
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -828,8 +841,8 @@ mod mac {
     use crate::macos::input::global;
     use objc2_core_graphics::{CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGEvent, CGMainDisplayID};
 
-    /// **전용 에이전트 로그인 세션 안에서만 쓰는** 실제 플랫폼:
-    /// ScreenCaptureKit 디스플레이 캡처 + 세션 전역 CGEventPost.
+    /// The real platform, **only used inside the dedicated agent login session**: ScreenCaptureKit
+    /// display capture + session-global CGEventPost.
     pub struct MacPlatform {
         filter: Mutex<Option<(Filter, Instant)>>,
     }
@@ -867,8 +880,8 @@ mod mac {
         fn name(&self) -> String {
             "macos".into()
         }
-        /// 디스플레이 정보는 CGDisplay API 로만 구한다 (ScreenCaptureKit 을 건드리지 않음 —
-        /// 콘솔 보류 중에도 hello 가 화면 내용·창 목록에 접근하지 않도록)
+        /// Display info comes from the CGDisplay API only, without touching ScreenCaptureKit (so hello
+        /// doesn't access screen contents or the window list while held off for the console).
         fn display(&self) -> Result<DisplayInfo> {
             let id = CGMainDisplayID();
             let b = CGDisplayBounds(id);
@@ -903,7 +916,8 @@ mod mac {
             if mods == 0 {
                 return global::post_scroll(dx, dy);
             }
-            // 수정키 + 스크롤 (예: ctrl+스크롤 확대). global::post_scroll 과 같은 이벤트에 flags 만 더한다.
+            // modifiers + scroll (e.g. ctrl+scroll to zoom): the same event as global::post_scroll with flags
+            // added
             use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGScrollEventUnit};
             let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
             let ev = CGEvent::new_scroll_wheel_event2(
@@ -936,7 +950,7 @@ mod mac {
     }
 }
 
-// ───────────────────────── 헬퍼 실행 (--session-helper) ─────────────────────────
+// ---- helper process (--session-helper) ----
 
 #[cfg(unix)]
 struct HelperArgs {
@@ -972,9 +986,10 @@ fn parse_helper_args(args: &[String]) -> Result<HelperArgs> {
     Ok(h)
 }
 
-/// 헬퍼 로그: stderr + 에이전트 계정의 로그 폴더(macOS: ~/Library/Logs/GhostDesk)/session-helper.log
+/// Helper log: stderr + session-helper.log in the agent account's log folder (macOS:
+/// ~/Library/Logs/GhostDesk).
 pub(crate) fn helper_logger() -> LogFn {
-    // 홈 폴더를 알 수 없으면 (예전과 같이) 파일 로그 없이 stderr 만 쓴다
+    // if the home folder is unknown, log to stderr only, without a file (as before)
     let file = dirs::home_dir().map(|_| crate::platform::paths::logs_dir().join("session-helper.log"));
     if let Some(f) = &file {
         if let Some(d) = f.parent() {
@@ -998,7 +1013,7 @@ pub(crate) fn helper_logger() -> LogFn {
     })
 }
 
-/// 소켓 디렉터리를 만들고 (1777), 남아 있는 죽은 소켓을 지운 뒤 bind (0666)
+/// Creates the socket directory (1777), removes a stale dead socket, then binds (0666).
 #[cfg(unix)]
 fn bind_socket(path: &Path, log: &LogFn) -> Result<UnixListener> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1015,7 +1030,7 @@ fn bind_socket(path: &Path, log: &LogFn) -> Result<UnixListener> {
         }
     }
     if path.exists() {
-        // 살아 있는 헬퍼가 있으면 거부, 아니면 죽은 소켓 파일을 지운다
+        // refuse if a live helper is there, otherwise remove the dead socket file
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             bail!("다른 세션 헬퍼가 이미 {} 에서 실행 중입니다", path.display());
         }
@@ -1028,17 +1043,18 @@ fn bind_socket(path: &Path, log: &LogFn) -> Result<UnixListener> {
     Ok(l)
 }
 
-/// 다른 macOS 사용자(전용 에이전트 계정) 세션 안에서 실행되는 헬퍼 서버.
-/// `ghostdesk --session-helper --allow-uid <사용자 uid>`
+/// Helper server running inside another macOS user's (the dedicated agent account's) session.
+///
+/// `ghostdesk --session-helper --allow-uid <user uid>`
 #[cfg(unix)]
 pub async fn run_helper(args: &[String]) -> Result<()> {
     let h = parse_helper_args(args)?;
     let me = getuid();
     let user = username_of(me).ok_or_else(|| anyhow!("현재 사용자(uid {me}) 이름을 알 수 없습니다"))?;
-    // ── 안전 검사: 어떤 화면·입력 API 도 부르기 전에 ──
+    // ---- safety checks, before calling any screen or input API ----
     let admin = is_admin(me);
     if let Some(reason) = refusal_reason(me, &h.allow_uids, admin, h.allow_admin) {
-        // 거부 시에는 파일 로그도 만들지 않는다 (사용자 홈에 아무것도 쓰지 않음)
+        // on refusal, don't even create the log file (nothing is written to the user's home)
         eprintln!("[ghostdesk-session-helper] 실행 거부: {reason}");
         bail!("세션 헬퍼 실행 거부: {reason}");
     }
@@ -1099,17 +1115,17 @@ pub async fn run_helper(args: &[String]) -> Result<()> {
 #[cfg(windows)]
 pub use crate::winapp::child::{run_helper, selftest, SETUP_GUIDE_KO};
 
-// ───────────────────────── 클라이언트 ─────────────────────────
+// ---- client ----
 
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
-    /// 에이전트 좌표계(스크린샷) 긴 변
+    /// Long edge of the agent coordinate space (screenshots).
     pub max_long_edge: u32,
-    /// 라이브 뷰 폴링 fps (0 = 끔)
+    /// Live view polling fps (0 = off).
     pub live_fps: f64,
-    /// 라이브 뷰 JPEG 긴 변
+    /// Long edge of live view JPEGs.
     pub live_max_long_edge: u32,
-    /// 연결이 끊겼을 때 재접속을 시도하는 시간
+    /// How long to keep trying to reconnect after the connection drops.
     pub reconnect_window: Duration,
 }
 
@@ -1129,7 +1145,7 @@ struct Conn {
     wr: Writer,
 }
 
-/// 헬퍼 연결 지점. Unix = 소켓 경로, Windows = 명명 파이프
+/// Helper endpoint. Unix = socket path, Windows = named pipe.
 #[cfg(unix)]
 pub type Target = PathBuf;
 #[cfg(windows)]
@@ -1147,7 +1163,7 @@ struct ClientState {
     server_label: String,
 }
 
-/// 전용 에이전트 로그인 세션의 화면 전체를 조작하는 백엔드 (세션 헬퍼 클라이언트).
+/// Backend driving the entire screen of the dedicated agent login session (session helper client).
 pub struct SessionDesk {
     path: Target,
     label: String,
@@ -1159,16 +1175,17 @@ pub struct SessionDesk {
     sink: FrameSink,
     next_id: AtomicU64,
     poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// 지금 연결에서 입력 누출 검사(카나리 이동)를 통과했는가 — (재)접속마다 false 로 돌아간다
+    /// Whether the current connection passed the input leak check (canary move); reset to false on
+    /// every (re)connect.
     canary_ok: AtomicBool,
-    /// 사용자(클라이언트) 세션의 커서 위치를 읽는 함수 (셀프테스트에서 바꿔 끼운다)
+    /// Reads the cursor position in the user's (client) session (swapped out by the self-test).
     local_cursor: Mutex<LocalCursorFn>,
 }
 
-/// 사용자(클라이언트) 세션의 현재 커서 위치를 읽는 함수 — 입력 누출 감지용
+/// Reads the current cursor position in the user's (client) session, for input leak detection.
 type LocalCursorFn = Arc<dyn Fn() -> Option<(f64, f64)> + Send + Sync>;
 
-/// 사용자 세션의 커서 위치 (읽기만 한다)
+/// Cursor position in the user's session (read only).
 fn real_local_cursor() -> Option<(f64, f64)> {
     #[cfg(target_os = "macos")]
     {
@@ -1187,9 +1204,12 @@ fn real_local_cursor() -> Option<(f64, f64)> {
     }
 }
 
-/// 헬퍼에 보낸 포인터 입력이 **사용자 화면으로 새어 들어온** 흔적인가:
-/// 요청하는 동안 사용자 세션의 커서가 움직였고, 지금 위치가 헬퍼가 옮긴 포인트 좌표와 거의 같다.
-/// (백그라운드 세션의 전역 CGEventPost 가 콘솔 세션으로 전달되는 macOS 동작이 있다면 여기서 잡는다)
+/// Whether pointer input sent to the helper looks like it **leaked into the user's screen**: the
+/// user session's cursor moved during the request and now sits almost exactly on the point the
+/// helper moved to.
+///
+/// Catches macOS behavior where a background session's global CGEventPost reaches the console
+/// session, should it exist.
 fn leak_suspected(before: (f64, f64), after: (f64, f64), target: (f64, f64)) -> bool {
     let moved = (before.0 - after.0).abs() > 0.5 || (before.1 - after.1).abs() > 0.5;
     let hit = (after.0 - target.0).abs() <= 0.75 && (after.1 - target.1).abs() <= 0.75;
@@ -1204,7 +1224,7 @@ fn button_code(b: MouseButton) -> u8 {
     }
 }
 
-/// "ghostdesk-agent" 또는 소켓 경로 → (경로, 기대하는 헬퍼 uid, 표시 이름)
+/// "ghostdesk-agent" or a socket path → (path, expected helper uid, display name).
 #[cfg(unix)]
 pub fn resolve_target(username_or_socket: &str) -> Result<(PathBuf, Option<u32>, String)> {
     let s = username_or_socket.trim();
@@ -1224,18 +1244,21 @@ pub fn resolve_target(username_or_socket: &str) -> Result<(PathBuf, Option<u32>,
 }
 
 impl SessionDesk {
-    /// 에이전트 계정 이름(예: "ghostdesk-agent") 또는 소켓 경로로 접속한다.
-    /// 계정 이름으로 접속하면 소켓 상대방(헬퍼)의 uid 가 그 계정인지 확인한다 (위조 소켓 방지).
+    /// Connects by agent account name (e.g. "ghostdesk-agent") or socket path.
+    ///
+    /// When connecting by account name, checks that the socket peer (helper) uid is that account
+    /// (guards against a spoofed socket).
     pub async fn connect(username_or_socket: &str, sink: FrameSink) -> Result<Arc<SessionDesk>> {
         Self::connect_with(username_or_socket, sink, SessionOptions::default()).await
     }
 
-    /// Windows: 계정 이름은 쓰지 않는다. 같은 사용자의 자식 세션(PiP)을 띄우고 그 안의 헬퍼에 접속한다.
+    /// Windows: the account name isn't used. Launches a child session (PiP) for the same user and
+    /// connects to the helper inside it.
     #[cfg(windows)]
     pub async fn connect_with(_account: &str, sink: FrameSink, opts: SessionOptions) -> Result<Arc<SessionDesk>> {
         crate::winapp::child::ensure_connected().await?;
         let ep = crate::winapp::child::endpoint();
-        // 자식 세션이 막 로그온했다면 헬퍼(RunOnce)가 뜰 때까지 조금 걸린다
+        // if the child session just logged on, the helper (RunOnce) takes a moment to start
         let deadline = Instant::now() + crate::winapp::child::HELPER_WAIT;
         loop {
             match Self::connect_target(ep.clone(), None, "자식 세션", sink.clone(), opts.clone()).await {
@@ -1254,7 +1277,7 @@ impl SessionDesk {
         Self::connect_path(&path, expect, &label, sink, opts).await
     }
 
-    /// 소켓 경로로 직접 접속. expect_peer_uid 가 있으면 헬퍼 uid 를 확인한다.
+    /// Connects directly by socket path, checking the helper uid if expect_peer_uid is given.
     #[cfg(unix)]
     pub async fn connect_path(
         path: &Path,
@@ -1310,7 +1333,7 @@ impl SessionDesk {
         }
     }
 
-    /// 헬퍼에 연결 (Unix: 소켓 + 상대 uid 확인)
+    /// Connects to the helper (Unix: socket + peer uid check).
     #[cfg(unix)]
     async fn dial(&self) -> Result<(Reader, Writer)> {
         let stream = tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(&self.path))
@@ -1332,7 +1355,8 @@ impl SessionDesk {
         Ok((Box::new(rd), Box::new(wr)))
     }
 
-    /// 헬퍼에 연결 (Windows: 명명 파이프 — `platform::ipc` 가 파이프 소유자가 같은 사용자인지·무결성 수준을 확인한다)
+    /// Connects to the helper (Windows: named pipe; `platform::ipc` checks the pipe owner is the same
+    /// user and its integrity level).
     #[cfg(windows)]
     async fn dial(&self) -> Result<(Reader, Writer)> {
         tokio::time::timeout(Duration::from_secs(3), crate::platform::ipc::connect(&self.path))
@@ -1341,13 +1365,14 @@ impl SessionDesk {
             .map_err(|e| anyhow!("세션 헬퍼 파이프에 연결할 수 없습니다: {} ({e})", self.path.display()))
     }
 
-    /// 연결 + hello
+    /// Connect + hello.
     async fn open(&self) -> Result<(Conn, Value)> {
         let (rd, wr) = self.dial().await?;
         let mut c = Conn { rd: BufReader::new(rd), wr };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let hello = json!({"id": id, "op": "hello", "version": PROTO_VERSION, "max_long_edge": self.opts.max_long_edge});
-        // 인증 거부 시 헬퍼가 먼저 오류 줄을 쓰고 닫으므로, 전송이 실패해도 응답 줄을 읽어 본다
+        // on an auth refusal the helper writes an error line before closing, so read the response even if
+        // the write failed
         let _ = write_line(&mut c.wr, &hello).await;
         let line = tokio::time::timeout(Duration::from_secs(10), read_line_limited(&mut c.rd, MAX_RESPONSE_BYTES))
             .await
@@ -1393,7 +1418,7 @@ impl SessionDesk {
         }
     }
 
-    /// 재접속 (reconnect_window 동안 반복 시도)
+    /// Reconnects (retrying for reconnect_window).
     async fn reopen(&self) -> Result<Conn> {
         let deadline = Instant::now() + self.opts.reconnect_window;
         let mut last = anyhow!("재접속 시도 안 함");
@@ -1417,7 +1442,7 @@ impl SessionDesk {
         }
     }
 
-    /// RPC 한 번. idempotent 요청은 연결이 끊기면 재접속 후 한 번 다시 보낸다.
+    /// One RPC. Idempotent requests are resent once after reconnecting if the connection drops.
     async fn call(&self, req: Value, idempotent: bool, tmo: Duration) -> Result<Value> {
         if self.closed.load(Ordering::SeqCst) {
             bail!("세션 헬퍼 연결이 닫혔습니다 ({})", self.path.display());
@@ -1449,7 +1474,7 @@ impl SessionDesk {
                         retried = true;
                         continue;
                     }
-                    // 입력 요청은 다시 보내지 않는다 (두 번 입력될 수 있음). 재접속만 해 둔다.
+                    // input requests aren't resent (they could be applied twice); just reconnect
                     match self.reopen().await {
                         Ok(c) => {
                             *g = Some(c);
@@ -1480,14 +1505,14 @@ impl SessionDesk {
         }
     }
 
-    // ───────────── 백엔드 계약 메서드 ─────────────
+    // ---- backend contract methods ----
 
-    /// 스크린샷 픽셀 크기 (에이전트 좌표계)
+    /// Screenshot pixel size (agent coordinate space).
     pub fn size(&self) -> (u32, u32) {
         self.agent_frame()
     }
 
-    /// 에이전트 세션 화면 전체 PNG (정확히 size()). 라이브 뷰에도 보낸다.
+    /// PNG of the entire agent session screen (exactly size()). Also sent to the live view.
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         let r = self
             .call(
@@ -1502,7 +1527,7 @@ impl SessionDesk {
         let (aw, ah) = self.size();
         let bytes = if (w, h) != (aw, ah) {
             if w.abs_diff(aw) <= 2 && h.abs_diff(ah) <= 2 {
-                // 반올림 차이 — 에이전트 좌표계를 유지하도록 맞춘다
+                // rounding differences: resize to keep the agent coordinate space
                 let img = image::load_from_memory(&bytes)?.to_rgb8();
                 encode_png(&image::imageops::resize(&img, aw, ah, image::imageops::FilterType::Triangle))?
             } else {
@@ -1523,7 +1548,7 @@ impl SessionDesk {
         Ok(bytes)
     }
 
-    /// 영역 [x0,y0,x1,y1] (에이전트 좌표)을 원본 해상도에서 잘라 확대한 PNG
+    /// PNG of region [x0,y0,x1,y1] (agent coordinates) cropped at native resolution and scaled up.
     pub async fn zoom(&self, region: [f64; 4]) -> Result<Vec<u8>> {
         let (aw, ah) = self.size();
         if aw == 0 || ah == 0 {
@@ -1546,9 +1571,12 @@ impl SessionDesk {
         (x.clamp(0.0, aw.saturating_sub(1) as f64), y.clamp(0.0, ah.saturating_sub(1) as f64))
     }
 
-    /// 포인터 요청. 좌표는 항상 에이전트가 마지막으로 옮긴 위치(mouse_pos)를 싣는다 — 헬퍼는 그 위치가
-    /// 자기가 기억하는 마지막 위치와 다르면(예: 재접속 직후) 먼저 옮긴 뒤 누른다.
-    /// mouse_pos 는 에이전트 동작으로만 바뀐다 (라이브 뷰 폴링의 커서 값과 경쟁하지 않도록).
+    /// Pointer request. Always carries the position the agent last moved to (mouse_pos); if it
+    /// differs from the last position the helper remembers (e.g. right after reconnecting), the
+    /// helper moves there before pressing.
+    ///
+    /// mouse_pos only changes through agent actions (so it doesn't race with cursor values from live
+    /// view polling).
     async fn pointer(&self, action: &str, button: u8, count: i64, mods: i64, idempotent: bool) -> Result<()> {
         let (fw, fh) = self.size();
         let (x, y) = self.mouse_pos();
@@ -1558,7 +1586,7 @@ impl SessionDesk {
         let before = if check { self.read_local_cursor() } else { None };
         let r = self.call(req, idempotent, Duration::from_secs(10)).await?;
         if check {
-            // 연결마다 첫 검사는 이벤트가 반영될 시간을 조금 기다린다
+            // the first check on each connection waits a little for the event to take effect
             let wait = !self.canary_ok.load(Ordering::SeqCst);
             self.check_leak(before, &r, wait).await?;
             self.canary_ok.store(true, Ordering::SeqCst);
@@ -1566,7 +1594,7 @@ impl SessionDesk {
         Ok(())
     }
 
-    /// 사용자 세션 커서를 읽는 함수를 바꾼다 (셀프테스트에서 누출 상황을 흉내 낼 때)
+    /// Swaps the function that reads the user session's cursor (for the self-test to simulate a leak).
     fn set_local_cursor_reader(&self, f: LocalCursorFn) {
         *self.local_cursor.lock() = f;
     }
@@ -1576,8 +1604,9 @@ impl SessionDesk {
         f()
     }
 
-    /// 포인터 요청 뒤 사용자 세션 커서가 헬퍼 쪽 목표 좌표로 옮겨졌다면 입력이 사용자 화면으로 새고 있는
-    /// 것이므로 즉시 연결을 닫는다 (헬퍼는 연결이 끊기면 눌린 버튼을 놓는다).
+    /// If the user session's cursor moved to the helper-side target after a pointer request, input is
+    /// leaking into the user's screen, so the connection is closed immediately (the helper releases
+    /// pressed buttons on disconnect).
     async fn check_leak(&self, before: Option<(f64, f64)>, r: &Value, wait: bool) -> Result<()> {
         let (Some(before), Some(tx), Some(ty)) = (before, r["x"].as_f64(), r["y"].as_f64()) else {
             return Ok(());
@@ -1609,8 +1638,9 @@ impl SessionDesk {
         Ok(())
     }
 
-    /// 이 연결에서 아직 누출 검사를 하지 않았다면, 키·버튼 입력 전에 에이전트 커서를 현재 위치로 옮겨
-    /// (에이전트 세션에서는 무해) 사용자 커서가 따라 움직이지 않는지 확인한다.
+    /// If this connection hasn't been leak-checked yet, moves the agent cursor to its current position
+    /// before any key or button input (harmless in the agent session) and checks the user's cursor
+    /// doesn't follow.
     async fn ensure_canary(&self) -> Result<()> {
         if self.canary_ok.load(Ordering::SeqCst) {
             return Ok(());
@@ -1672,10 +1702,11 @@ impl SessionDesk {
         self.mouse_up(MouseButton::Left, 1, mods).await
     }
 
-    /// dy>0 = 아래, 픽셀 단위 (휠 한 칸 ≈ 100)
+    /// dy > 0 = down, in pixels (one wheel notch ≈ 100).
     pub async fn scroll(&self, pos: Option<(f64, f64)>, dx: f64, dy: f64, mods: i64) -> Result<()> {
         if let Some((x, y)) = pos {
-            // 위치 이동은 move 로 먼저 보내 누출 검사를 거친다 (scroll 요청은 위치 없이)
+            // position changes go out as a move first so they pass the leak check (the scroll request carries
+            // no position)
             self.mouse_move(x, y, mods).await?;
         } else {
             self.ensure_canary().await?;
@@ -1686,7 +1717,7 @@ impl SessionDesk {
         Ok(())
     }
 
-    /// xdotool 스타일 ("Return", "ctrl+a", "cmd+shift+z")
+    /// xdotool style ("Return", "ctrl+a", "cmd+shift+z").
     pub async fn key(&self, combo: &str, repeat: u32) -> Result<()> {
         let repeat = repeat.clamp(1, 100);
         self.ensure_canary().await?;
@@ -1711,13 +1742,13 @@ impl SessionDesk {
         Ok(())
     }
 
-    /// 텍스트 입력 (한글 포함 — 유니코드 키 이벤트로 IME 를 거치지 않고 들어간다)
+    /// Types text (Korean included; Unicode key events bypass the IME).
     pub async fn type_text(&self, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
         self.ensure_canary().await?;
-        // \r\n 이 덩어리 경계에서 갈리면 Return 이 두 번 들어가므로 먼저 \n 으로 바꾼다
+        // a \r\n split across a chunk boundary would give two Returns, so normalize to \n first
         let text = text.replace("\r\n", "\n");
         let chars: Vec<char> = text.chars().collect();
         for chunk in chars.chunks(TYPE_CHUNK_CHARS) {
@@ -1769,7 +1800,7 @@ impl SessionDesk {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// 연결만 닫는다 (에이전트 세션과 헬퍼는 계속 실행)
+    /// Only closes the connection (the agent session and helper keep running).
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         if let Some(h) = self.poller.lock().take() {
@@ -1791,7 +1822,8 @@ impl Drop for SessionDesk {
     }
 }
 
-/// 요청 하나를 보내고 같은 id 의 응답을 기다린다. 바깥 Err = 전송 계층 오류(연결 끊김/시간 초과).
+/// Sends one request and waits for the response with the same id. The outer Err is a transport
+/// error (disconnect/timeout).
 async fn rpc(conn: &mut Conn, id: u64, req: &Value, tmo: Duration) -> Result<std::result::Result<Value, String>> {
     let mut msg = req.clone();
     msg["id"] = json!(id);
@@ -1819,7 +1851,7 @@ async fn rpc(conn: &mut Conn, id: u64, req: &Value, tmo: Duration) -> Result<std
         .map_err(|_| anyhow!("세션 헬퍼 응답 시간 초과 ({:.0}초)", tmo.as_secs_f64()))?
 }
 
-/// 라이브 뷰: 에이전트가 최근에 찍지 않았다면 작은 JPEG 를 받아 sink 로 보낸다
+/// Live view: fetches a small JPEG and sends it to the sink if the agent hasn't captured recently.
 async fn live_poller(weak: Weak<SessionDesk>, period: Duration) {
     loop {
         tokio::time::sleep(period).await;
@@ -1841,7 +1873,8 @@ async fn live_poller(weak: Weak<SessionDesk>, period: Duration) {
         if let Ok(r) = r {
             if let Ok(bytes) = B64.decode(r["data"].as_str().unwrap_or_default()) {
                 let (w, h) = (r["w"].as_u64().unwrap_or(0) as u32, r["h"].as_u64().unwrap_or(0) as u32);
-                // 커서 위치는 반영하지 않는다 (에이전트의 move 와 경쟁) — 콘솔 표시 상태만 갱신
+                // the cursor position isn't applied (it would race with the agent's moves); only the console
+                // state is updated
                 let _ = (w, h);
                 me.update_console(&r);
                 (me.sink)(&bytes);
@@ -1850,15 +1883,17 @@ async fn live_poller(weak: Weak<SessionDesk>, period: Duration) {
     }
 }
 
-// ───────────────────────── 설치 도우미 ─────────────────────────
+// ---- setup helpers ----
 
 #[cfg(unix)]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-/// 에이전트 계정의 `~/Library/LaunchAgents/com.ghostdesk.session-helper.plist` 내용.
-/// exe_path 는 에이전트 계정이 읽고 실행할 수 있는 위치여야 한다 (예: /Users/Shared/GhostDesk/bin/ghostdesk).
+/// Contents of `~/Library/LaunchAgents/com.ghostdesk.session-helper.plist` in the agent account.
+///
+/// exe_path must be somewhere the agent account can read and execute (e.g.
+/// /Users/Shared/GhostDesk/bin/ghostdesk).
 #[cfg(unix)]
 pub fn launch_agent_plist(exe_path: &str, allow_uid: u32) -> String {
     format!(
@@ -1897,8 +1932,8 @@ pub fn launch_agent_plist(exe_path: &str, allow_uid: u32) -> String {
     )
 }
 
-/// `ghostdesk --print-session-plist <허용 uid> [헬퍼 실행 파일 경로]` — plist 를 표준 출력으로.
-/// 경로를 생략하면 지금 실행 중인 바이너리 경로를 쓴다.
+/// `ghostdesk --print-session-plist <allowed uid> [helper executable path]`: prints the plist to
+/// stdout. Without a path, the currently running binary is used.
 #[cfg(unix)]
 pub fn print_session_plist(args: &[String]) -> Result<()> {
     let uid: u32 = args
@@ -1914,7 +1949,7 @@ pub fn print_session_plist(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// README 에 붙일 설정 안내 (Markdown)
+/// Setup guide for the README (Markdown).
 #[cfg(unix)]
 pub const SETUP_GUIDE_KO: &str = r#"## 별도 로그인 세션 모드 (전용 에이전트 계정)
 
@@ -1976,9 +2011,10 @@ GhostDesk 에서 백엔드로 '별도 로그인 세션'을 고르고 계정 이�
   않습니다. 필요한 서비스는 에이전트 계정에서 따로 로그인하세요.
 "#;
 
-// ───────────────────────── 셀프테스트 (mock 플랫폼) ─────────────────────────
+// ---- self-test (mock platform) ----
 
-/// 합성 프레임버퍼: 픽셀 색 = 위치 (R = x 비율, G = y 비율, B = 77). 입력은 문자열로 기록한다.
+/// Synthetic framebuffer: pixel color = position (R = x fraction, G = y fraction, B = 77). Input
+/// is recorded as strings.
 struct MockPlatform {
     disp: DisplayInfo,
     events: Mutex<Vec<String>>,
@@ -2095,8 +2131,10 @@ async fn wait_for(mut f: impl FnMut() -> bool, tmo: Duration) -> bool {
     f()
 }
 
-/// `ghostdesk --selftest-session [--dir <임시 디렉터리>]`
-/// mock 플랫폼으로 클라이언트↔서버 RPC 전체를 임시 소켓에서 검증한다. 실제 캡처·입력은 하지 않는다.
+/// `ghostdesk --selftest-session [--dir <temp dir>]`
+///
+/// Exercises the whole client↔server RPC on a temp socket with the mock platform. No real capture
+/// or input.
 #[cfg(unix)]
 pub async fn selftest(args: &[String]) -> anyhow::Result<()> {
     let mut base: Option<PathBuf> = None;
@@ -2122,7 +2160,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     let mut c = Checker { fails: vec![], passes: 0 };
     let me = getuid();
 
-    // ── 1. 순수 함수 ──
+    // ---- 1. pure functions ----
     println!("[1] 순수 함수: 좌표 변환, 텍스트 분할, 거부 규칙, plist");
     let d = MockPlatform::new().disp;
     c.check("frame_size(1280) = 1280x831", d.frame_size(1280) == (1280, 831), format!("{:?}", d.frame_size(1280)));
@@ -2195,7 +2233,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         "오탐",
     );
 
-    // ── 2. 서버 + 클라이언트 ──
+    // ---- 2. server + client ----
     println!("[2] mock 서버 ↔ SessionDesk RPC");
     let sock = dir.join("s.sock");
     let mock = Arc::new(MockPlatform::new());
@@ -2211,7 +2249,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     let (views, active) = desk.views();
     c.check("views 하나 + active", views.len() == 1 && active.as_deref() == Some("session"), format!("{views:?}"));
 
-    // 스크린샷
+    // screenshot
     let png = desk.screenshot().await?;
     let img = image::load_from_memory(&png)?.to_rgb8();
     c.check("screenshot PNG = size()", img.dimensions() == desk.size(), format!("{:?}", img.dimensions()));
@@ -2220,7 +2258,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     c.check("screenshot 픽셀 내용", px == want, format!("{px:?} != {want:?}"));
     c.check("sink 에 PNG 전달", frames.lock().iter().any(|f| f.starts_with(&[0x89, b'P', b'N', b'G'])), "없음");
 
-    // 클릭 좌표 변환
+    // click coordinate conversion
     mock.take();
     desk.click(Some((640.0, 400.0)), MouseButton::Left, 2, crate::keys::MOD_SHIFT).await?;
     let (ex, ey) = d.to_points(640.0, 400.0, 1280, 831);
@@ -2235,12 +2273,12 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     c.check("더블클릭 (shift) → 포인트 좌표 756.00,472.68", ev == want && ex == 756.0, format!("{ev:?}"));
     c.check("mouse_pos = (640,400)", desk.mouse_pos() == (640.0, 400.0), format!("{:?}", desk.mouse_pos()));
 
-    // 오른쪽 클릭
+    // right click
     desk.click(Some((0.0, 0.0)), MouseButton::Right, 1, 0).await?;
     let ev = mock.take();
     c.check("오른쪽 클릭", ev.iter().any(|e| e.starts_with("down1 0.00,0.00")) && ev.iter().any(|e| e.starts_with("up1")), format!("{ev:?}"));
 
-    // 드래그
+    // drag
     desk.drag((100.0, 100.0), (400.0, 300.0), 0).await?;
     let ev = mock.take();
     let (dx0, dy0) = d.to_points(100.0, 100.0, 1280, 831);
@@ -2255,7 +2293,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         format!("{ev:?}"),
     );
 
-    // 스크롤
+    // scroll
     desk.scroll(Some((640.0, 400.0)), 0.0, 300.0, 0).await?;
     let ev = mock.take();
     let sy = 300.0 * 982.0 / 831.0;
@@ -2265,7 +2303,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         format!("{ev:?}"),
     );
 
-    // 키
+    // keys
     desk.key("cmd+shift+z", 2).await?;
     desk.hold_key("shift", 0.2).await?;
     let ev = mock.take();
@@ -2281,7 +2319,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         format!("{e:?}"),
     );
 
-    // 한글 텍스트
+    // Korean text
     desk.type_text("안녕하세요 GhostDesk 👋\n둘째 줄\t끝").await?;
     let ev = mock.take();
     c.check(
@@ -2303,7 +2341,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         format!("{ev:?}"),
     );
 
-    // 확대
+    // zoom
     let z = desk.zoom([100.0, 100.0, 300.0, 200.0]).await?;
     let zi = image::load_from_memory(&z)?.to_rgb8();
     c.check("zoom 크기 1280x640", zi.dimensions() == (1280, 640), format!("{:?}", zi.dimensions()));
@@ -2312,7 +2350,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     let close = (0..3).all(|k| (zc[k] as i32 - want[k] as i32).abs() <= 3);
     c.check("zoom 중심 픽셀 = 영역 중심", close, format!("{zc:?} vs {want:?}"));
 
-    // 라이브 뷰 + 폴링이 mouse_pos 를 덮어쓰지 않음 (헬퍼 쪽 커서가 다른 곳에 있어도)
+    // live view + polling doesn't overwrite mouse_pos (even when the helper-side cursor is elsewhere)
     desk.mouse_move(640.0, 400.0, 0).await?;
     *mock.cursor.lock() = (378.0, 245.5);
     frames.lock().clear();
@@ -2329,7 +2367,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
         format!("{ev:?}"),
     );
 
-    // 콘솔 표시 중 보류 — 단, 이미 눌러 둔 버튼을 놓는 것은 허용
+    // held off while on the console, except releasing a button already pressed
     desk.mouse_down(MouseButton::Left, 1, 0).await?;
     mock.take();
     mock.console.store(true, Ordering::SeqCst);
@@ -2354,7 +2392,7 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     mock.console.store(false, Ordering::SeqCst);
     c.check("보류 해제 후 정상", desk.screenshot().await.is_ok() && !desk.is_closed(), "실패");
 
-    // ── 3. 인증 ──
+    // ---- 3. authentication ----
     println!("[3] 인증");
     let sock2 = dir.join("deny.sock");
     let cfg2 = ServerConfig { allow_uids: vec![me + 4242], ..cfg.clone() };
@@ -2369,17 +2407,17 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     let r = SessionDesk::connect_path(&dir.join("none.sock"), None, "x", sink.clone(), opts.clone()).await;
     c.check("소켓 없음 → 안내 오류", r.as_ref().err().map(|e| format!("{e:#}").contains("헬퍼")).unwrap_or(false), format!("{:?}", r.err()));
 
-    // ── 4. 연결 끊김 / 재접속 / 닫힘 ──
+    // ---- 4. disconnect / reconnect / close ----
     println!("[4] 연결 끊김 처리");
     desk.mouse_move(200.0, 200.0, 0).await?;
     desk.mouse_down(MouseButton::Left, 1, 0).await?;
     mock.take();
-    srv.stop().await; // 헬퍼 종료 (launchd 재시작 상황 흉내)
+    srv.stop().await; // helper exits (simulating a launchd restart)
     let ev = mock.take();
     let (rx, ry) = d.to_points(200.0, 200.0, 1280, 831);
     c.check("연결 종료 시 서버가 눌린 버튼을 놓음", ev == vec![format!("up0 {rx:.2},{ry:.2} c1 m0")], format!("{ev:?}"));
     let _ = std::fs::remove_file(&sock);
-    // 400ms 뒤 헬퍼 재시작
+    // restart the helper after 400 ms
     let sock_r = sock.clone();
     let mock_r = mock.clone();
     let cfg_r = cfg.clone();
@@ -2423,13 +2461,13 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(600)).await;
     c.check("shutdown 후 폴러 정지", frames.lock().len() == n_frames, "프레임 계속 옴");
 
-    // shutdown 동작 (새 서버)
+    // shutdown behavior (new server)
     let srv4 = spawn_server(UnixListener::bind(&sock)?, mock.clone(), cfg.clone());
     let d2 = SessionDesk::connect_with(sock.to_str().unwrap(), sink.clone(), SessionOptions { live_fps: 0.0, ..opts.clone() }).await?;
     d2.shutdown().await;
     c.check("shutdown → is_closed, 이후 호출 오류", d2.is_closed() && d2.key("a", 1).await.is_err(), "실패");
 
-    // ── 5. 입력 누출 감지 (사용자 커서가 헬퍼 쪽 목표로 움직이는 상황을 mock 커서로 흉내) ──
+    // ---- 5. input leak detection (a mock cursor simulates the user's cursor moving to the helper-side target) ----
     println!("[5] 입력 누출 감지");
     let d3 = SessionDesk::connect_with(sock.to_str().unwrap(), sink.clone(), SessionOptions { live_fps: 0.0, ..opts.clone() }).await?;
     let mc = mock.clone();
@@ -2457,7 +2495,8 @@ async fn selftest_inner(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows `--selftest-session`·테스트: mock 헬퍼 ↔ SessionDesk 를 임시 명명 파이프로 왕복 (실제 캡처·입력 없음)
+/// Windows `--selftest-session` and tests: round trip between a mock helper and SessionDesk over
+/// a temp named pipe (no real capture or input).
 #[cfg(windows)]
 pub(crate) async fn pipe_roundtrip() -> Result<()> {
     let ep = crate::platform::ipc::Endpoint::custom(&format!("ghostdesk-sess-test-{}", std::process::id()));

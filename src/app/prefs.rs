@@ -1,11 +1,13 @@
-//! 사용자 설정 저장: 언어 · AI 연결 목록(회사·이름·주소·모델·키) · 지금 쓰는 연결 · 생각 깊이 · 가상 마우스 ·
-//! 화면이 잠겨도 계속 작업.
+//! User preferences: language, AI connections (provider, name, URL, model, key), current
+//! connection, thinking depth, virtual mouse, and keep working while locked.
 //!
-//! 파일은 <데이터 루트>/prefs.json (자동 연결 설정인 settings.json 과는 따로 — install.rs 가 그 파일을 쓴다).
-//! API 키는 Windows 에서만, 그 Windows 계정으로만 풀 수 있게 DPAPI 로 암호화해 둔다.
-//! 다른 OS 는 키를 저장하지 않는다 (환경변수로 채우거나 켤 때마다 넣는다).
+//! Stored in `<data root>/prefs.json`, separate from settings.json (auto-connect, written by
+//! install.rs). API keys are only stored on Windows, encrypted with DPAPI so only that Windows
+//! account can decrypt them. Other OSes don't store keys (fill them from the environment or
+//! enter them each launch).
 //!
-//! 예전 형식(회사마다 키·모델 한 칸, OpenAI 호환 주소 하나)도 읽어서 연결 목록으로 옮긴다 (`migrate`).
+//! The old format (one key and model per provider, a single OpenAI-compatible URL) is still read
+//! and migrated to the connection list (`migrate`).
 
 use std::collections::BTreeMap;
 
@@ -15,44 +17,45 @@ use super::ai::AiConn;
 use super::i18n::Lang;
 use super::*;
 
-/// 키를 이 PC 에 기억할 수 있는가 (암호화 저장소가 있는 OS 만)
+/// Whether keys can be remembered on this PC (only on OSes with encrypted storage).
 pub(super) const CAN_REMEMBER_KEYS: bool = cfg!(windows);
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(default)]
 pub(super) struct Prefs {
-    /// 화면 언어 코드 (ko·en·ja·zh). 비어 있으면 한국어
+    /// UI language code (ko, en, ja, zh). Empty means Korean.
     lang: String,
-    /// AI 연결 목록 (None 이면 예전 형식의 파일)
+    /// AI connections (`None` for an old-format file).
     conns: Option<Vec<SavedConn>>,
-    /// 지금 쓰는 연결의 순서 (conns 안)
+    /// Index of the current connection in `conns`.
     current: Option<usize>,
     effort: Option<usize>,
     show_cursor: Option<bool>,
     remember_keys: Option<bool>,
-    /// 화면이 잠겨도 계속 작업 (작업 중 잠자기 방지)
+    /// Keep working while the screen is locked (prevents sleep during work).
     keep_awake: Option<bool>,
-    /// 처음 켤 때의 사용 설명을 이미 봤는가
+    /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
-    // ── 예전 형식 (읽기만 한다) ──
-    /// 지금 쓰는 AI 회사 (`Provider::short_name`)
+    // ---- old format (read only) ----
+    /// Current AI provider (`Provider::short_name`).
     #[serde(skip_serializing)]
     provider: String,
-    /// 회사 → 고른 모델
+    /// Provider → chosen model.
     #[serde(skip_serializing)]
     models: BTreeMap<String, String>,
-    /// 회사 → 암호화한 API 키 (base64)
+    /// Provider → encrypted API key (base64).
     #[serde(skip_serializing)]
     keys: BTreeMap<String, String>,
-    /// 'OpenAI 호환 API' 의 주소
+    /// URL of the OpenAI-compatible API.
     #[serde(skip_serializing)]
     custom_url: String,
-    /// 이 버전이 모르는 칸 (나중 버전이 쓴 것). 그대로 다시 써서, 예전 버전으로 한 번 켰다가 돌아와도 지워지지 않게 한다
+    /// Fields this version doesn't know (written by a newer one). Written back as is, so launching
+    /// an older version once doesn't wipe them.
     #[serde(flatten)]
     other: serde_json::Map<String, serde_json::Value>,
 }
 
-/// 저장하는 연결 하나 (키는 암호화한 값, 기억하지 않으면 빈 글)
+/// One saved connection (key is encrypted; empty if not remembered).
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq, Clone)]
 #[serde(default)]
 struct SavedConn {
@@ -72,8 +75,9 @@ fn provider_named(name: &str) -> Option<Provider> {
     Provider::ALL.into_iter().find(|p| p.short_name() == name)
 }
 
-/// 예전 형식 → 연결 목록: 키가 있거나(저장·환경변수) 지금 쓰던 회사, 그리고 주소를 넣어 둔 OpenAI 호환.
-/// 지금 쓰던 회사의 순서도 돌려준다.
+/// Old format → connection list: providers with a key (saved or from the environment) or in
+/// use, plus the OpenAI-compatible one if it has a URL. Also returns the index of the provider in
+/// use.
 fn migrate(p: &Prefs) -> (Vec<SavedConn>, Option<usize>) {
     let mut out = Vec::new();
     let mut current = None;
@@ -100,7 +104,7 @@ fn migrate(p: &Prefs) -> (Vec<SavedConn>, Option<usize>) {
 }
 
 impl GhostApp {
-    /// 켤 때 한 번: 저장해 둔 설정을 적용한다 (없거나 깨졌으면 기본값 그대로)
+    /// Applies saved preferences once at startup (defaults stay if missing or broken).
     pub(super) fn load_prefs(&mut self) {
         let Ok(bytes) = std::fs::read(path()) else { return };
         let Ok(p) = serde_json::from_slice::<Prefs>(&bytes) else { return };
@@ -125,14 +129,14 @@ impl GhostApp {
                 if !s.model.trim().is_empty() {
                     c.model = s.model.clone();
                 }
-                // 저장한 키가 환경변수보다 앞선다 (설정에서 직접 넣은 값이 최신)
+                // a saved key wins over the environment (a value entered in Settings is newer)
                 if let Some(k) = secret::open(&s.key) {
                     c.key = k;
                 }
                 Some(c)
             })
             .collect();
-        // 예전 파일에 쓸 만한 것이 하나도 없으면 처음 목록(환경변수·Claude)을 그대로 둔다
+        // if the old file had nothing usable, keep the initial list (environment, Claude)
         if p.conns.is_some() || !conns.is_empty() {
             self.ai_current = current.and_then(|i| conns.get(i)).or(conns.first()).map_or(0, |c| c.id);
             self.ai = conns;
@@ -159,7 +163,7 @@ impl GhostApp {
                 name: c.name.trim().into(),
                 url: c.url.trim().into(),
                 model: c.model.trim().into(),
-                // 환경변수에서 온 키와 같으면 저장하지 않는다 (그 자리에 이미 있으므로)
+                // don't store a key equal to the one from the environment (it's already there)
                 key: if self.remember_keys && !c.key.trim().is_empty() && c.key != c.provider.env_key() {
                     secret::seal(c.key.trim()).unwrap_or_default()
                 } else {
@@ -181,14 +185,15 @@ impl GhostApp {
         }
     }
 
-    /// 지금 설정을 파일에 쓴다. 설정 창을 닫을 때 · 모델을 고를 때 · 언어를 바꿀 때 · 끌 때 부른다.
+    /// Writes the current preferences. Called when Settings closes, a model is picked, the language
+    /// changes, and on quit.
     pub(super) fn save_prefs(&self) {
         let p = path();
         let json = match serde_json::to_vec_pretty(&self.to_prefs()) {
             Ok(j) => j,
             Err(_) => return,
         };
-        // 쓰다가 꺼져도 파일이 반쯤 남지 않게 옆에 쓰고 바꿔 끼운다
+        // write next to it and swap in, so quitting mid-write never leaves half a file
         let tmp = p.with_extension("json.tmp");
         let ok = p.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
             && std::fs::write(&tmp, json).is_ok()
@@ -199,7 +204,8 @@ impl GhostApp {
     }
 }
 
-/// API 키 봉인: Windows 는 DPAPI(그 사용자 계정으로만 풀림), 그 밖의 OS 는 저장하지 않는다.
+/// API key sealing: DPAPI on Windows (only that user account can decrypt); not stored on other
+/// OSes.
 mod secret {
     use base64::Engine as _;
 
@@ -223,7 +229,7 @@ mod secret {
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
         use std::ptr::{null, null_mut};
-        // UI_FORBIDDEN: 암호화·복호화 중에 어떤 창도 띄우지 않는다
+        // UI_FORBIDDEN: never show any window while encrypting or decrypting
         let ok = unsafe {
             if protect {
                 CryptProtectData(&input, null(), null(), null(), null(), CRYPTPROTECT_UI_FORBIDDEN, &mut out)
@@ -239,7 +245,7 @@ mod secret {
         Some(v)
     }
 
-    // ponytail: macOS 는 키를 저장하지 않는다. 필요해지면 Keychain(Security.framework)으로.
+    // ponytail: macOS doesn't store keys. Use the Keychain (Security.framework) if that's ever needed.
     #[cfg(not(windows))]
     fn dpapi(_data: &[u8], _protect: bool) -> Option<Vec<u8>> {
         None
@@ -267,19 +273,21 @@ mod tests {
         .unwrap();
         let (conns, current) = migrate(&p);
         let names: Vec<&str> = conns.iter().map(|c| c.provider.as_str()).collect();
-        // 키를 저장해 둔 Claude, 쓰던 Gemini, 주소를 넣어 둔 OpenAI 호환 (환경변수에 키가 있는 회사는 더 붙을 수 있다)
+        // Claude with a saved key, Gemini in use, OpenAI-compatible with a URL (providers with an
+        // environment key may be added too)
         for n in ["Claude", "Gemini", "Custom"] {
             assert!(names.contains(&n), "{names:?}");
         }
         let cur = &conns[current.unwrap()];
         assert_eq!((cur.provider.as_str(), cur.model.as_str()), ("Gemini", "gemini-y"));
         assert_eq!(conns.iter().find(|c| c.provider == "Custom").unwrap().url, "http://localhost:1234/v1");
-        // 새 형식으로 쓸 때 예전 칸은 남기지 않는다
+        // writing the new format leaves no old fields behind
         let json = serde_json::to_string(&Prefs { conns: Some(conns), ..Default::default() }).unwrap();
         assert!(!json.contains("custom_url") && !json.contains("\"models\""), "{json}");
     }
 
-    /// 이 버전이 모르는 칸은 읽었다가 그대로 다시 쓴다 (나중 버전의 설정을 지우지 않게)
+    /// Fields this version doesn't know are read and written back unchanged (so a newer version's
+    /// settings survive).
     #[test]
     fn unknown_fields_survive_a_save() {
         let p: Prefs = serde_json::from_str(r#"{"lang":"en","future_flag":true,"future_list":[1,2]}"#).unwrap();
@@ -287,7 +295,7 @@ mod tests {
         let again: serde_json::Value = serde_json::to_value(&Prefs { lang: p.lang.clone(), other: p.other.clone(), ..Default::default() }).unwrap();
         assert_eq!(again["future_flag"], serde_json::json!(true));
         assert_eq!(again["future_list"], serde_json::json!([1, 2]));
-        // 이 버전이 아는 예전 칸은 모르는 칸으로 섞여 들어가지 않는다
+        // old fields this version knows don't leak into the unknown fields
         let old: Prefs = serde_json::from_str(r#"{"provider":"Claude","custom_url":"x"}"#).unwrap();
         assert!(old.other.is_empty(), "{:?}", old.other);
     }
@@ -298,7 +306,7 @@ mod tests {
         assert_eq!(p.lang, "ja");
         assert_eq!(p.models.get("Claude").map(String::as_str), Some("claude-x"));
         assert_eq!(p.effort, None);
-        // 모르는 칸이 있어도 읽힌다 (나중 버전의 파일)
+        // unknown fields still parse (a newer version's file)
         assert!(serde_json::from_str::<Prefs>(r#"{"future":1}"#).is_ok());
         assert!(Provider::ALL.iter().all(|p| provider_named(p.short_name()) == Some(*p)));
     }

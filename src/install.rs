@@ -1,19 +1,22 @@
-//! 설치와 자동 연결.
+//! Installation and auto-connect.
 //!
-//! - GhostDesk 를 고정 위치에 설치한다 (관리자 권한 불필요).
-//!   - macOS: ~/Applications/GhostDesk.app (앱 번들)
-//!   - Windows: %LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe (실행 파일 하나)
-//! - Claude Code · Claude 앱 · Codex · Kimi Code · OpenCode · pi 에 GhostDesk MCP 서버를 자동으로 등록한다.
-//!   클라이언트의 자체 CLI(`claude mcp add`)가 있으면 그것을 먼저 쓰고,
-//!   없거나 실패하면 설정 파일을 서식·키 순서를 보존하며 직접 고친다 (처음 고치기 전의 원본을 백업).
-//!   `ghostdesk` 항목 외의 설정은 건드리지 않는다.
-//! - 설정 파일을 직접 고칠 때는 원래 권한(예: 0600)과 심볼릭 링크를 그대로 둔다
-//!   (Windows 에는 권한 비트가 없어 새 파일은 폴더의 ACL 을 물려받는다). UTF-8 BOM 이 있던 파일은 BOM 도 그대로 둔다.
-//!   읽을 수 없거나 해석할 수 없는 파일은 빈 설정으로 덮어쓰지 않고 오류로 멈춘다.
-//! - JSON·TOML 은 문자열을 이어 붙이지 않고 serde_json·toml_edit 값으로 만든다
-//!   (Windows 경로의 `\` 가 올바르게 이스케이프되도록).
+//! - Installs GhostDesk to a fixed location (no admin rights needed).
+//!   - macOS: ~/Applications/GhostDesk.app (app bundle)
+//!   - Windows: %LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe (a single executable)
+//! - Registers the GhostDesk MCP server with Claude Code, the Claude app, Codex, Kimi Code,
+//!   OpenCode and pi automatically. The client's own CLI (`claude mcp add`) is used first when
+//!   present; if it's missing or fails, the config file is edited directly, preserving formatting
+//!   and key order (the original is backed up before the first edit). Settings other than the
+//!   `ghostdesk` entry are left alone.
+//! - Direct edits keep the original permissions (e.g. 0600) and symlinks (Windows has no
+//!   permission bits, so new files inherit the folder's ACL). Files that had a UTF-8 BOM keep it.
+//!   Files that can't be read or parsed stop with an error instead of being overwritten with an
+//!   empty config.
+//! - JSON and TOML are built as serde_json/toml_edit values rather than by string concatenation
+//!   (so the `\` in Windows paths is escaped correctly).
 //!
-//! 이렇게 해 두면 사람이 따로 연결하지 않아도, 에이전트에게 "GhostDesk 로 …해줘" 라고만 하면 된다.
+//! With this in place, nobody has to wire anything up by hand: just tell the agent "do … with
+//! GhostDesk".
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -34,23 +37,25 @@ pub const SERVER_NAME: &str = "ghostdesk";
 #[cfg(not(windows))]
 pub(crate) const BUNDLE_ID: &str = "dev.ghostdesk.app";
 
-/// Codex 의 MCP 도구 호출 시간 제한(초). 기본값 60초로는 desk_open 이 끝나기 전에 끊긴다
-/// (사용자 승인 대기 최대 180초 + GUI 실행 대기 + 프로필·앱 데이터 복제).
+/// Codex's MCP tool call timeout (seconds). The 60 s default cuts desk_open off before it finishes
+/// (up to 180 s waiting for user approval + GUI launch + profile/app data cloning).
 const CODEX_TOOL_TIMEOUT_SEC: i64 = 600;
-/// Codex 의 MCP 서버 시작(initialize) 시간 제한(초).
+/// Codex's MCP server startup (initialize) timeout (seconds).
 const CODEX_STARTUP_TIMEOUT_SEC: i64 = 30;
-/// OpenCode 의 도구 목록 가져오기 시간 제한(밀리초). 기본 5초로는 `--mcp` 가 GUI 를 띄우는 동안 끊길 수 있다.
+/// OpenCode's tool list fetch timeout (milliseconds). The 5 s default can cut off while `--mcp`
+/// launches the GUI.
 const OPENCODE_TIMEOUT_MS: i64 = CODEX_STARTUP_TIMEOUT_SEC * 1000;
 
-// ───────────────────────── 사용자 폴더 ─────────────────────────
+// ---- user folders ----
 
-/// 설치 위치·설정 파일 위치를 정하는 사용자 폴더와 환경변수.
-/// 실제 실행에서는 OS 에서 읽고, 테스트에서는 임시 폴더 아래의 가짜로 바꿔 끼운다.
-/// (Windows 의 `dirs::home_dir()` 는 HOME·USERPROFILE 환경변수를 보지 않으므로 환경변수로는 돌릴 수 없다.
-///  그래서 명시적으로 바꿔 끼우는 방식을 쓴다.)
+/// User folders and environment variables that determine install and config file locations.
+///
+/// Read from the OS in real runs and swapped for fakes under a temp folder in tests. (On Windows,
+/// `dirs::home_dir()` ignores the HOME/USERPROFILE environment variables, so environment
+/// variables can't redirect it; hence the explicit swap.)
 #[derive(Clone, Debug)]
 struct Bases {
-    /// 홈 폴더 (~, %USERPROFILE%)
+    /// Home folder (~, %USERPROFILE%).
     home: PathBuf,
     /// %LOCALAPPDATA%
     #[cfg(windows)]
@@ -58,9 +63,9 @@ struct Bases {
     /// %APPDATA%
     #[cfg(windows)]
     roaming: PathBuf,
-    /// GhostDesk 자체 설정 파일 (자동 연결 등)
+    /// GhostDesk's own settings file (auto-connect, …).
     settings: PathBuf,
-    /// Some 이면 프로세스 환경변수 대신 이 목록만 본다 (테스트)
+    /// When Some, only this list is consulted instead of the process environment (tests).
     env: Option<Vec<(String, OsString)>>,
 }
 
@@ -69,7 +74,8 @@ impl Bases {
     fn real() -> Bases {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         Bases {
-            // dirs 는 Windows 에서 SHGetKnownFolderPath 를 쓰므로 MCP 호스트가 환경변수를 지워도 같은 위치가 나온다
+            // dirs uses SHGetKnownFolderPath on Windows, so the location is the same even if the MCP host
+            // cleared the environment
             #[cfg(windows)]
             local: dirs::data_local_dir().unwrap_or_else(|| home.join("AppData").join("Local")),
             #[cfg(windows)]
@@ -91,7 +97,7 @@ impl Bases {
         }
     }
 
-    /// 비어 있지 않은 환경변수를 경로로
+    /// A non-empty environment variable as a path.
     fn var_path(&self, name: &str) -> Option<PathBuf> {
         self.var(name).filter(|v| !v.is_empty()).map(PathBuf::from)
     }
@@ -99,13 +105,13 @@ impl Bases {
 
 #[cfg(test)]
 thread_local! {
-    /// 테스트가 지정한 가짜 사용자 폴더 (스레드마다 따로)
+    /// Fake user folders set by tests (per thread).
     static TEST_BASES: std::cell::RefCell<Option<Bases>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 impl Bases {
-    /// `root` 아래의 가짜 사용자 폴더 (환경변수도 비어 있음)
+    /// Fake user folders under `root` (with an empty environment too).
     fn under(root: &Path) -> Bases {
         Bases {
             home: root.join("home"),
@@ -120,7 +126,8 @@ impl Bases {
 }
 
 fn bases() -> Bases {
-    // 테스트에서는 실제 사용자 폴더·환경변수를 절대 보지 않는다: 가짜를 지정하지 않았으면 빈 임시 폴더
+    // tests never look at the real user folders or environment: without a fake set, it's an empty
+    // temp folder
     #[cfg(test)]
     {
         TEST_BASES.with(|b| b.borrow().clone()).unwrap_or_else(|| {
@@ -138,7 +145,7 @@ fn home() -> PathBuf {
     bases().home
 }
 
-/// 테스트에서만: 임시 폴더 아래 경로인가
+/// Tests only: whether the path is under the temp folder.
 #[cfg(test)]
 fn is_test_path(p: &Path) -> bool {
     let key = |x: &Path| {
@@ -159,7 +166,8 @@ fn is_test_path(p: &Path) -> bool {
     })
 }
 
-/// 쓰기 전에 부른다. 테스트에서 임시 폴더 밖(실제 사용자 파일)을 고치려 하면 아무것도 쓰기 전에 멈춘다.
+/// Called before writing. In tests, trying to modify anything outside the temp folder (real user
+/// files) stops before anything is written.
 fn guard_write(p: &Path) {
     #[cfg(test)]
     assert!(is_test_path(p), "테스트가 임시 폴더 밖의 파일을 고치려 했습니다: {}", p.display());
@@ -167,7 +175,7 @@ fn guard_write(p: &Path) {
     let _ = p;
 }
 
-/// 사람에게 보여 줄 경로 (Unix: 홈 아래면 ~/…)
+/// Path for display (Unix: ~/… when under home).
 fn show_path(p: &Path) -> String {
     #[cfg(unix)]
     {
@@ -178,7 +186,8 @@ fn show_path(p: &Path) -> String {
     crate::platform::paths::simplify(p).display().to_string()
 }
 
-/// 설치 위치. macOS: ~/Applications/GhostDesk.app, Windows: %LOCALAPPDATA%\Programs\GhostDesk
+/// Install location. macOS: ~/Applications/GhostDesk.app, Windows:
+/// %LOCALAPPDATA%\Programs\GhostDesk.
 pub fn stable_app() -> PathBuf {
     #[cfg(windows)]
     {
@@ -190,12 +199,12 @@ pub fn stable_app() -> PathBuf {
     }
 }
 
-/// 설치본 실행 파일 (클라이언트 연결 설정에 쓰는 경로)
+/// Installed executable (the path used in client connection configs).
 pub fn stable_exe() -> PathBuf {
     installed_exe(&stable_app())
 }
 
-/// 설치 폴더(번들) 안의 실행 파일
+/// Executable inside the install folder (bundle).
 fn installed_exe(app: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -211,14 +220,14 @@ fn settings_path() -> PathBuf {
     bases().settings
 }
 
-/// GhostDesk 설정 파일을 읽는다 (BOM 이 있어도 읽음). (값, BOM 이 있었는지)
+/// Reads the GhostDesk settings file (BOM tolerated). (value, whether it had a BOM)
 fn read_settings(p: &Path) -> Option<(Value, bool)> {
     let s = std::fs::read_to_string(p).ok()?;
     let (body, bom) = fsx::strip_bom(&s);
     serde_json::from_str::<Value>(body).ok().map(|v| (v, bom))
 }
 
-/// 자동 연결 설정 (기본 켜짐). GHOSTDESK_NO_AUTOCONNECT=1 이면 이번 실행은 끔.
+/// Auto-connect setting (on by default). GHOSTDESK_NO_AUTOCONNECT=1 turns it off for this run.
 pub fn auto_connect_enabled() -> bool {
     if std::env::var("GHOSTDESK_NO_AUTOCONNECT").map(|v| v == "1").unwrap_or(false) {
         return false;
@@ -245,7 +254,7 @@ pub fn set_auto_connect(on: bool) -> Result<()> {
     Ok(())
 }
 
-// ───────────────────────── 설치 ─────────────────────────
+// ---- installation ----
 
 #[cfg(not(windows))]
 fn current_bundle() -> Option<PathBuf> {
@@ -253,7 +262,7 @@ fn current_bundle() -> Option<PathBuf> {
     exe.ancestors().find(|p| p.extension().map(|e| e == "app").unwrap_or(false)).map(|p| p.to_path_buf())
 }
 
-/// 번들의 Info.plist (버전은 이 빌드의 Cargo.toml 버전)
+/// The bundle's Info.plist (version = this build's Cargo.toml version).
 #[cfg(not(windows))]
 fn info_plist() -> String {
     let v = env!("CARGO_PKG_VERSION");
@@ -276,8 +285,10 @@ fn info_plist() -> String {
     )
 }
 
-/// 번들을 마무리한다: 원본 지문을 적고(서명 봉인에 들어가야 하므로 서명 전에) ad-hoc 서명.
-/// 지문을 못 구했으면 옛 지문이 남지 않게 지운다.
+/// Finalizes the bundle: writes the source fingerprint (before signing, so it's part of the
+/// signature seal) and ad-hoc signs it.
+///
+/// Without a fingerprint, any old one is removed so it doesn't linger.
 #[cfg(not(windows))]
 fn seal_bundle(bundle: &Path, src_hash: Option<&str>) -> Result<()> {
     match src_hash {
@@ -293,8 +304,10 @@ fn seal_bundle(bundle: &Path, src_hash: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// 실행 파일 `exe` 하나로 GhostDesk.app 번들을 `dest` 에 새로 만든다 (Info.plist · 실행 파일 · 원본 지문 · 서명).
-/// 설치(번들 밖에서 실행했을 때)와 릴리스 패키징(`package_macos`)이 같이 쓴다.
+/// Builds a fresh GhostDesk.app bundle at `dest` from the single executable `exe` (Info.plist,
+/// executable, source fingerprint, signature).
+///
+/// Shared by installation (when run outside a bundle) and release packaging (`package_macos`).
 #[cfg(not(windows))]
 pub fn build_bundle(exe: &Path, dest: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(dest);
@@ -305,8 +318,11 @@ pub fn build_bundle(exe: &Path, dest: &Path) -> Result<()> {
     seal_bundle(dest, sha256_file(exe).ok().as_deref())
 }
 
-/// `ghostdesk --package-macos <실행 파일> <출력.zip>` — 릴리스용 GhostDesk.app 을 만들어 zip 으로 묶는다
-/// (zip 안에는 GhostDesk.app 하나. 앱 안 업데이트(`update.rs`)가 이 모양을 풀어 바꿔 넣는다).
+/// `ghostdesk --package-macos <executable> <output.zip>`: builds a release GhostDesk.app and zips
+/// it.
+///
+/// The zip contains just GhostDesk.app; in-app updates (`update.rs`) unpack this layout and swap
+/// it in.
 #[cfg(not(windows))]
 pub fn package_macos(args: &[String]) -> Result<()> {
     let [exe, out] = args else { anyhow::bail!("사용법: ghostdesk --package-macos <실행 파일> <출력.zip>") };
@@ -322,23 +338,27 @@ pub fn package_macos(args: &[String]) -> Result<()> {
     res
 }
 
-/// 설치본 안에 "어떤 원본 실행 파일에서 설치했는지" 를 적어 두는 파일.
-/// macOS: codesign 이 설치본의 실행 파일을 다시 쓰므로 설치본과 원본을 바이트로 비교할 수는 없다.
-/// 그래서 서명하기 전 원본의 SHA-256 을 여기에 적어 두고, 다음 실행 때 그것과 비교한다.
-/// Windows: 서명은 하지 않지만, 시작할 때마다 설치본까지 다시 해시하지 않도록 같은 방식을 쓴다.
+/// File inside the installed copy recording "which source executable it was installed from".
+///
+/// macOS: codesign rewrites the installed executable, so it can't be compared byte for byte with
+/// the source. Instead the source's SHA-256 before signing is written here and compared on the
+/// next run. Windows: nothing is signed, but the same scheme avoids rehashing the installed copy
+/// on every start.
 const SOURCE_STAMP: &str = if cfg!(windows) { "ghostdesk.src-sha256" } else { "Contents/Resources/ghostdesk.src-sha256" };
 
 fn source_stamp_path(app: &Path) -> PathBuf {
     app.join(SOURCE_STAMP)
 }
 
-/// `app` 이 원본 해시 `src_hash` 로 설치된 것인가 (실행 파일이 있고 기록된 지문이 같음)
+/// Whether `app` was installed from source hash `src_hash` (the executable exists and the recorded
+/// fingerprint matches).
 fn installed_from(app: &Path, src_hash: &str) -> bool {
     installed_exe(app).is_file()
         && std::fs::read_to_string(source_stamp_path(app)).map(|s| s.trim() == src_hash).unwrap_or(false)
 }
 
-/// 설치본(macOS 는 staging 번들) 안에 원본 지문을 적는다. macOS 는 codesign 전에 불러야 서명 봉인에 포함된다.
+/// Writes the source fingerprint into the installed copy (on macOS, the staging bundle). On macOS
+/// it must be called before codesign to be covered by the signature seal.
 fn write_source_stamp(app: &Path, src_hash: &str) -> Result<()> {
     let p = source_stamp_path(app);
     guard_write(&p);
@@ -349,14 +369,14 @@ fn write_source_stamp(app: &Path, src_hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// 앱 번들의 버전 (Info.plist 의 CFBundleShortVersionString)
+/// The app bundle's version (CFBundleShortVersionString in Info.plist).
 #[cfg(target_os = "macos")]
 fn bundle_version(app: &Path) -> Option<String> {
     let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).ok()?;
     plist_string(&plist, "CFBundleShortVersionString")
 }
 
-/// XML plist 에서 `<key>{key}</key>` 다음 `<string>` 값
+/// The `<string>` value after `<key>{key}</key>` in an XML plist.
 #[cfg(not(windows))]
 fn plist_string(plist: &str, key: &str) -> Option<String> {
     let rest = &plist[plist.find(&format!("<key>{key}</key>"))?..];
@@ -365,10 +385,13 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
     Some(rest[start..end].trim().to_string())
 }
 
-/// 내려받은 새 GhostDesk 를 압축을 푼 자리에서 바로 열었을 때 (macOS 가 읽기 전용 임시 위치에서 실행):
-/// 설치본(~/Applications/GhostDesk.app)이 없거나 이것보다 오래됐으면 떠 있는 옛 설치본을 정상 종료하고
-/// 이 앱으로 바꿔 넣은 뒤, 설치본을 연다. 그랬으면 true (이 프로세스는 창을 띄우지 않고 끝낸다).
-/// 설치본이 더 새 버전이거나, 따로 둔 데이터로 실행 중이거나, 자동 연결을 껐으면 아무것도 하지 않는다.
+/// When a freshly downloaded GhostDesk is opened right where it was unpacked (macOS runs it from a
+/// read-only translocated location): if the installed copy (~/Applications/GhostDesk.app) is
+/// missing or older, gracefully quits the running old copy, swaps this app in and opens the
+/// installed copy. Returns true if so (this process then exits without opening a window).
+///
+/// Does nothing if the installed copy is newer, when running with separate data, or when
+/// auto-connect is off.
 #[cfg(target_os = "macos")]
 pub fn take_over_install() -> bool {
     if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() || !auto_connect_enabled() {
@@ -395,9 +418,12 @@ pub fn take_over_install() -> bool {
     Command::new("/usr/bin/open").arg("-n").arg(&target).status().map(|s| s.success()).unwrap_or(false)
 }
 
-/// 지금 실행 중인 GhostDesk 를 고정 위치(`stable_app`)에 설치(또는 갱신)하고 그 실행 파일 경로를 돌려준다.
-/// 이미 같은 원본에서 설치한 것이면 아무것도 하지 않는다. 실행 중인 설치본도 안전하게 갱신한다
-/// (macOS: 새 번들 폴더로 바꿔치기, Windows: 실행 중인 exe 를 옆으로 옮긴 뒤 새 exe 를 제자리에).
+/// Installs (or updates) the running GhostDesk at the fixed location (`stable_app`) and returns
+/// its executable path.
+///
+/// Does nothing if it was already installed from the same source. A running installed copy is
+/// updated safely too (macOS: swapped for a new bundle folder; Windows: the running exe is moved
+/// aside and the new one put in its place).
 pub fn install_app() -> Result<PathBuf> {
     let me = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
     #[cfg(windows)]
@@ -411,14 +437,14 @@ pub fn install_app() -> Result<PathBuf> {
         if me.canonicalize().ok() == target_exe.canonicalize().ok() {
             return Ok(target_exe);
         }
-        // 서명되지 않은 원본의 지문으로 비교 (설치본은 codesign 으로 바이트가 바뀌어 있음)
+        // compare the fingerprint of the unsigned source (codesign changed the installed copy's bytes)
         let src_hash = sha256_file(&me).ok();
         if let Some(h) = &src_hash {
             if installed_from(&target_app, h) {
                 return Ok(target_exe);
             }
         }
-        // 설치본이 더 새 버전이면 옛 버전으로 덮어쓰지 않는다 (예전에 받은 옛 앱을 다시 연 경우)
+        // don't overwrite a newer installed copy with an older version (e.g. reopening an old download)
         #[cfg(target_os = "macos")]
         if bundle_version(&target_app).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION"))) {
             return Ok(target_exe);
@@ -430,14 +456,17 @@ pub fn install_app() -> Result<PathBuf> {
         let _ = std::fs::remove_dir_all(&staging);
         match current_bundle() {
             Some(bundle) => {
-                // --noqtn: 내려받은 앱의 격리 표시를 옮기지 않는다 (남아 있으면 설치본을 열 때도 macOS 가 임시 위치로 옮겨 실행한다)
+                // --noqtn: don't carry over the downloaded app's quarantine flag (if left, macOS would translocate
+                // the installed copy too when opening it)
                 run(Command::new("/usr/bin/ditto").arg("--noqtn").arg(&bundle).arg(&staging), Duration::from_secs(120))?;
-                // 지문은 서명 전에 기록한다 (서명 뒤에 Resources 를 바꾸면 번들 봉인이 깨짐)
+                // the fingerprint is written before signing (changing Resources after signing breaks the bundle
+                // seal)
                 seal_bundle(&staging, src_hash.as_deref())?;
             }
             None => build_bundle(&me, &staging)?,
         }
-        // 바꿔치기: 기존 설치본을 옆으로 옮긴 뒤 새 것을 제자리에 (실행 중인 기존 프로세스는 옛 파일을 계속 씀)
+        // swap: move the existing installed copy aside, then put the new one in place (running processes
+        // keep using the old files)
         let old = parent.join(".GhostDesk.app.old");
         let _ = std::fs::remove_dir_all(&old);
         if target_app.exists() {
@@ -445,7 +474,7 @@ pub fn install_app() -> Result<PathBuf> {
         }
         std::fs::rename(&staging, &target_app).context("새 설치본을 옮기지 못했습니다")?;
         let _ = std::fs::remove_dir_all(&old);
-        // LaunchServices 에 등록 (Spotlight·open 에서 찾을 수 있게)
+        // register with LaunchServices (so Spotlight and open can find it)
         let _ = run(
             Command::new("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
                 .arg("-f")
@@ -456,18 +485,19 @@ pub fn install_app() -> Result<PathBuf> {
     }
 }
 
-/// Windows 설치: 실행 파일 `me` 를 `dir` 에 `ghostdesk.exe` 로 넣는다.
+/// Windows install: puts executable `me` into `dir` as `ghostdesk.exe`.
 ///
-/// 설치본이 실행 중일 수 있다 (GhostDesk 창, 또는 Claude·Codex 가 띄운 `ghostdesk.exe --mcp`).
-/// 실행 중인 exe 는 지우거나 덮어쓸 수 없지만 이름은 바꿀 수 있으므로, 옆으로 옮긴 뒤
-/// (`ghostdesk.exe.old-<시각>`) 새 exe 를 제자리에 놓는다. 폴더 통째 바꿔치기는 하지 않는다
-/// (실행 중인 파일이 든 폴더는 옮길 수 없어 연결 전체가 실패한다). 옮겨 둔 옛 exe 는 그 프로세스가
-/// 끝난 뒤 다음 설치 때 지운다.
+/// The installed copy may be running (the GhostDesk window, or `ghostdesk.exe --mcp` started by
+/// Claude/Codex). A running exe can't be deleted or overwritten but can be renamed, so it's moved
+/// aside (`ghostdesk.exe.old-<time>`) and the new exe put in its place. The whole folder isn't
+/// swapped (a folder holding a running file can't be moved, which would fail the whole connect).
+/// The moved-aside old exe is deleted on the next install once its process has exited.
 #[cfg(windows)]
 fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
     let target = installed_exe(dir);
     if target.is_file() && (crate::platform::paths::same_path(me, &target) || is_displaced_copy(me, dir)) {
-        // 설치본 자신이거나, 바꿔치기로 옆에 옮겨진 옛 설치본에서 실행 중 (새 설치본을 옛것으로 되돌리지 않음)
+        // running as the installed copy itself, or as an old copy moved aside by a swap (don't roll the
+        // new installed copy back)
         return Ok(target);
     }
     let src_hash = sha256_file(me).ok();
@@ -477,28 +507,29 @@ fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
             return Ok(target);
         }
     }
-    // 설치본이 더 새 버전이면 옛 버전으로 덮어쓰지 않는다 (예전에 받은 옛 exe 를 다시 실행한 경우)
+    // don't overwrite a newer installed copy with an older version (e.g. rerunning an old download)
     if target.is_file() && installed_version(dir).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION"))) {
         return Ok(target);
     }
     guard_write(dir);
     std::fs::create_dir_all(dir).with_context(|| format!("설치 폴더 {} 을(를) 만들지 못했습니다", dir.display()))?;
     sweep_install_leftovers(dir);
-    // 같은 폴더에 먼저 복사해 둔다 (바꿔치기는 이름 바꾸기만으로 끝나도록). 동시에 설치하는 다른 GhostDesk 와
-    // 겹치지 않게 pid 를 붙인다.
+    // copy into the same folder first (so the swap is just a rename). The pid is appended so it
+    // doesn't collide with another GhostDesk installing at the same time.
     let staging = with_suffix(&target, &format!(".installing-{}", std::process::id()));
     let _ = fsx::remove_file_retry(&staging);
     if let Err(e) = std::fs::copy(me, &staging) {
         let _ = std::fs::remove_file(&staging);
         return Err(e).with_context(|| format!("{} 을(를) {} 로 복사하지 못했습니다", me.display(), staging.display()));
     }
-    // 옛 지문을 먼저 지운다 (바꿔치기 도중 끊기면 다음 실행 때 다시 설치하도록)
+    // remove the old fingerprint first (so an interrupted swap reinstalls on the next run)
     let _ = fsx::remove_file_retry(&source_stamp_path(dir));
     if let Err(e) = swap_in(&staging, &target) {
         let _ = std::fs::remove_file(&staging);
         return Err(e);
     }
-    // 지문·버전 기록은 실패해도 설치는 끝난 것 (다음 실행 때 한 번 더 복사할 뿐)
+    // failing to record the fingerprint/version doesn't undo the install (the next run just copies
+    // once more)
     if let Some(h) = &src_hash {
         let _ = write_source_stamp(dir, h);
     }
@@ -507,32 +538,32 @@ fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// `staging` 을 `target` 자리에 놓는다 (Windows).
+/// Puts `staging` in place of `target` (Windows).
 #[cfg(windows)]
 pub(crate) fn swap_in(staging: &Path, target: &Path) -> Result<()> {
-    // 실행 중이 아니면 한 번에 바꿔치기 (MoveFileExW + REPLACE_EXISTING, 원자적)
+    // if it isn't running, swap in one go (MoveFileExW + REPLACE_EXISTING, atomic)
     let first = match std::fs::rename(staging, target) {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
     if std::fs::symlink_metadata(target).is_err() {
-        // 대상이 없는데 실패: 백신 검사 등으로 새 파일이 잠깐 잠긴 경우 → 재시도
+        // failed with no target present: the new file was briefly locked (antivirus scan, …), so retry
         return fsx::rename_replace(staging, target)
             .with_context(|| format!("새 설치본을 {} 로 옮기지 못했습니다 ({first})", target.display()));
     }
-    // 실행 중인 설치본: 이름만 바꿔 옆으로 치운다 (실행 중인 exe 도 이름 바꾸기는 허용됨)
+    // running installed copy: just rename it aside (renaming is allowed even for a running exe)
     let old = old_exe_name(target);
     fsx::rename_replace(target, &old)
         .with_context(|| format!("기존 설치본 {} 을(를) 옆으로 옮기지 못했습니다 ({first})", target.display()))?;
     if let Err(e) = fsx::rename_replace(staging, target) {
-        // 되돌린다 (설치본이 없는 채로 두지 않음)
+        // roll back (never leave things without an installed copy)
         let _ = std::fs::rename(&old, target);
         return Err(e).with_context(|| format!("새 설치본을 {} 로 옮기지 못했습니다", target.display()));
     }
     Ok(())
 }
 
-/// 옆으로 옮길 옛 설치본 이름: ghostdesk.exe.old-<밀리초>
+/// Name for the old installed copy moved aside: ghostdesk.exe.old-<milliseconds>.
 #[cfg(windows)]
 fn old_exe_name(target: &Path) -> PathBuf {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
@@ -542,7 +573,8 @@ fn old_exe_name(target: &Path) -> PathBuf {
         .unwrap_or_else(|| with_suffix(target, ".old"))
 }
 
-/// 설치 폴더에 적어 두는 설치본의 버전 (exe 에는 버전 정보가 없어서). 0.4.1 전 설치본에는 없다.
+/// Installed copy's version, recorded in the install folder (the exe carries no version info).
+/// Missing for installs from before 0.4.1.
 #[cfg(windows)]
 const VERSION_STAMP: &str = "ghostdesk.version";
 
@@ -553,10 +585,14 @@ fn installed_version(dir: &Path) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
-/// 새로 내려받은 GhostDesk exe 를 실행했을 때 (Windows): 설치본(%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe)과
-/// 다른 빌드이고 설치본이 더 새 버전이 아니면, 떠 있는 옛 GhostDesk 창을 닫고(창의 닫기 단추와 같음) 이 exe 로
-/// 바꿔 넣은 뒤 설치본을 실행한다. 그랬으면 true (이 프로세스는 창을 띄우지 않고 끝낸다).
-/// 설치본 자신이거나 같은 빌드이거나, 따로 둔 데이터로 실행 중이거나, 자동 연결을 껐으면 아무것도 하지 않는다.
+/// When a freshly downloaded GhostDesk exe runs (Windows): if it's a different build from the
+/// installed copy (%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe) and the installed copy isn't
+/// newer, closes the running old GhostDesk window (like its close button), swaps this exe in and
+/// launches the installed copy. Returns true if so (this process then exits without opening a
+/// window).
+///
+/// Does nothing when running as the installed copy, the same build, with separate data, or with
+/// auto-connect off.
 #[cfg(windows)]
 pub fn take_over_install() -> bool {
     if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() || !auto_connect_enabled() {
@@ -570,7 +606,8 @@ pub fn take_over_install() -> bool {
     }
     if target.is_file() {
         if installed_version(&dir).is_some_and(|v| !crate::update::newer(env!("CARGO_PKG_VERSION"), &v)) {
-            // 설치본이 같거나 더 새 버전: 바꿀 것이 없다 (같은 버전의 다른 빌드는 평소처럼 켤 때 설치가 맞춘다)
+            // installed copy is the same or newer: nothing to replace (a different build of the same version
+            // gets synced by the regular install on startup)
             return false;
         }
         if sha256_file(&me).ok().is_some_and(|h| installed_from(&dir, &h) && same_len(&me, &target)) {
@@ -597,8 +634,8 @@ pub fn take_over_install() -> bool {
         .is_ok()
 }
 
-/// 이 사용자의 다른 GhostDesk 창(제목 "GhostDesk", 실행 파일 이름이 ghostdesk 로 시작)에 닫기를 보내고
-/// 최대 `wait` 동안 그 프로세스가 끝나기를 기다린다. 아직 남은 것이 있으면 false.
+/// Sends close to this user's other GhostDesk windows (title "GhostDesk", executable name starting
+/// with ghostdesk) and waits up to `wait` for those processes to exit. false if any remain.
 #[cfg(windows)]
 fn close_gui_windows(wait: Duration) -> bool {
     use crate::platform::win;
@@ -630,7 +667,7 @@ fn close_gui_windows(wait: Duration) -> bool {
     false
 }
 
-/// `me` 가 설치 폴더 안의 옆으로 옮겨진 옛 설치본(ghostdesk.exe.old-*)인가
+/// Whether `me` is an old installed copy moved aside in the install folder (ghostdesk.exe.old-*).
 #[cfg(windows)]
 fn is_displaced_copy(me: &Path, dir: &Path) -> bool {
     let name = me.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -646,8 +683,9 @@ fn same_len(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// 지난 설치가 남긴 파일 정리 (Windows, 실패는 무시):
-/// 옆으로 옮겨 둔 옛 실행 파일(아직 실행 중이면 지워지지 않으므로 다음에 다시)과 중단된 복사본.
+/// Cleans up files left by earlier installs (Windows, failures ignored): old executables moved
+/// aside (still-running ones can't be deleted, so they're retried next time) and interrupted
+/// copies.
 #[cfg(windows)]
 fn sweep_install_leftovers(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -659,7 +697,7 @@ fn sweep_install_leftovers(dir: &Path) {
         if name.starts_with(&old_prefix) {
             let _ = std::fs::remove_file(e.path());
         } else if let Some(pid) = name.strip_prefix(&staging_prefix) {
-            // 다른 GhostDesk 가 지금 설치 중인 복사본은 건드리지 않는다
+            // leave copies another GhostDesk is installing right now alone
             let busy = pid.parse::<u32>().map(|p| p != std::process::id() && crate::platform::proc::pid_alive(p)).unwrap_or(false);
             if !busy {
                 let _ = std::fs::remove_file(e.path());
@@ -668,8 +706,8 @@ fn sweep_install_leftovers(dir: &Path) {
     }
 }
 
-// ───────────────────────── SHA-256 ─────────────────────────
-// 의존성을 늘리지 않으려고 직접 구현 (설치 여부 판단용 지문).
+// ---- SHA-256 ----
+// hand-rolled to avoid another dependency (a fingerprint for deciding whether to install)
 
 struct Sha256 {
     h: [u32; 8],
@@ -781,9 +819,9 @@ pub(crate) fn sha256_file(p: &Path) -> std::io::Result<String> {
     Ok(h.finish_hex())
 }
 
-// ───────────────────────── 보조 ─────────────────────────
+// ---- helpers ----
 
-/// 명령을 시간 제한과 함께 실행하고 stdout 을 돌려준다.
+/// Runs a command with a timeout and returns its stdout.
 #[cfg(not(windows))]
 fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
@@ -806,11 +844,14 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
     }
 }
 
-/// 명령을 시간 제한과 함께 실행하고 stdout 을 돌려준다 (Windows).
-/// - 콘솔 창을 띄우지 않고(CREATE_NO_WINDOW) Job 객체에 넣어 띄운다: 시간 초과 때 cmd.exe 뿐 아니라
-///   그 아래 node 같은 자손까지 함께 끝낸다. 정상 종료 뒤 남은 자손도 정리한다.
-/// - 출력은 따로 읽는다 (출력이 많아 파이프가 차면 자식이 멈추므로).
-/// - cmd.exe 의 오류 문구는 UTF-8 이 아니라 OEM 코드 페이지(한국어 Windows: CP949)이므로 맞게 풀어 쓴다.
+/// Runs a command with a timeout and returns its stdout (Windows).
+///
+/// - Launched without a console window (CREATE_NO_WINDOW) inside a Job object: on timeout this
+///   ends not just cmd.exe but descendants like node too. Leftover descendants are also cleaned up
+///   after a normal exit.
+/// - Output is read separately (a full pipe would stall the child).
+/// - cmd.exe error messages are in the OEM code page (CP949 on Korean Windows), not UTF-8, so
+///   they're decoded accordingly.
 #[cfg(windows)]
 fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
     use crate::platform::proc;
@@ -844,10 +885,11 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
             Err(e) => break Err(e.into()),
         }
     };
-    // 끝났든 시간 초과든 Job 을 닫아 남은 자손까지 정리한다 (그래야 파이프도 닫힌다)
+    // finished or timed out, close the Job to clean up remaining descendants (which also closes the
+    // pipes)
     proc::kill_group(&mut child);
     let (mut so, mut se) = (Vec::new(), Vec::new());
-    // Job 을 벗어난 손자가 파이프를 쥐고 있어도 무한정 기다리지 않는다
+    // don't wait forever if a grandchild that escaped the Job still holds the pipe
     let deadline = Instant::now() + Duration::from_secs(3);
     for _ in 0..2 {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -864,7 +906,8 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<String> {
     bail!("{}", decode_output(&se).trim().to_string() + &so)
 }
 
-/// 자식 프로세스 출력 → 문자열. UTF-8 이 아니면 OEM 코드 페이지(cmd.exe 의 오류 문구 등)로 풀어 본다.
+/// Child process output → string. Non-UTF-8 is decoded with the OEM code page (cmd.exe error
+/// messages, …).
 #[cfg(windows)]
 fn decode_output(b: &[u8]) -> String {
     match std::str::from_utf8(b) {
@@ -875,7 +918,8 @@ fn decode_output(b: &[u8]) -> String {
 
 #[cfg(windows)]
 fn oem_to_string(b: &[u8]) -> Option<String> {
-    // windows-sys 의 Win32_Globalization 기능을 따로 켜지 않으려고 이 함수 하나만 직접 선언한다
+    // declared by hand so the Win32_Globalization feature of windows-sys doesn't have to be enabled
+    // for this one function
     #[link(name = "kernel32")]
     extern "system" {
         fn MultiByteToWideChar(codepage: u32, flags: u32, src: *const u8, src_len: i32, dst: *mut u16, dst_len: i32) -> i32;
@@ -897,10 +941,12 @@ fn oem_to_string(b: &[u8]) -> Option<String> {
     }
 }
 
-/// 클라이언트 CLI 를 실행할 때 쓸 PATH.
-/// Finder·Dock·`open -g` 로 실행한 GUI 는 launchd 의 PATH(/usr/bin:/bin:/usr/sbin:/sbin)만 받는다.
-/// 그러면 `#!/usr/bin/env node` 로 시작하는 claude CLI(npm 설치)가 node 를 찾지 못해 실패하므로,
-/// CLI 자신의 폴더(nvm 등은 node 가 같은 폴더에 있음)와 흔한 설치 위치를 앞에 붙인다.
+/// PATH for running client CLIs.
+///
+/// A GUI launched from Finder, the Dock or `open -g` only gets launchd's PATH
+/// (/usr/bin:/bin:/usr/sbin:/sbin). Then the claude CLI (npm install), which starts with
+/// `#!/usr/bin/env node`, can't find node and fails, so the CLI's own folder (nvm and friends keep
+/// node next to it) and common install locations are prepended.
 #[cfg(not(windows))]
 fn cli_path_env(cli: &Path) -> OsString {
     let b = bases();
@@ -926,10 +972,12 @@ fn cli_path_env(cli: &Path) -> OsString {
     std::env::join_paths(dirs).unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-/// 클라이언트 CLI 를 실행할 때 쓸 PATH (Windows).
-/// CLI 자신의 폴더(npm 의 claude.cmd 는 같은 폴더의 node.exe 를 먼저 찾음) + 물려받은 PATH
-/// + 이 사용자의 현재 PATH(레지스트리 기준: GhostDesk 를 켠 뒤 설치한 node 도 찾도록, 그리고 MCP 호스트가
-/// 줄인 환경으로 GhostDesk 가 떴어도 되도록). Unix 의 고정 폴더(/usr/bin 등)는 Windows 에서 의미가 없다.
+/// PATH for running client CLIs (Windows).
+///
+/// The CLI's own folder (npm's claude.cmd looks for node.exe in the same folder first) + the
+/// inherited PATH + this user's current PATH from the registry (so node installed after GhostDesk
+/// started is found, and so it works even when an MCP host launched GhostDesk with a trimmed
+/// environment). Unix fixed folders (/usr/bin, …) mean nothing on Windows.
 #[cfg(windows)]
 fn cli_path_env(cli: &Path) -> OsString {
     let b = bases();
@@ -940,7 +988,7 @@ fn cli_path_env(cli: &Path) -> OsString {
     if let Some(cur) = b.var("PATH") {
         dirs.extend(std::env::split_paths(&cur));
     }
-    // 테스트(가짜 환경)에서는 실제 사용자 환경을 섞지 않는다
+    // tests (fake environment) don't mix in the real user environment
     if b.env.is_none() {
         if let Some(env) = crate::platform::win::user_environment() {
             if let Some((_, p)) = env.iter().find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("PATH")) {
@@ -956,19 +1004,23 @@ fn cli_path_env(cli: &Path) -> OsString {
     std::env::join_paths(&dirs).unwrap_or_else(|_| b.var("PATH").unwrap_or_default())
 }
 
-/// CLI 실행 명령 (PATH 를 명시적으로 지정).
-/// Windows: npm 이 설치한 `claude.cmd` 같은 배치 파일은 Rust std 가 `cmd.exe /e:ON /v:OFF /d /c "…"` 로 실행하며
-/// 인자를 cmd 규칙에 맞게 따옴표·`%` 이스케이프한다 (Rust 1.77+, CVE-2024-24576 대응. 줄바꿈 등 안전하게
-/// 넘길 수 없는 인자는 실행하지 않고 오류). cmd.exe 는 PATH 가 아니라 시스템 폴더의 것을 쓴다. 콘솔 창은 띄우지 않는다.
+/// Command for running a CLI (with PATH set explicitly).
+///
+/// Windows: batch files like npm's `claude.cmd` are run by Rust std as
+/// `cmd.exe /e:ON /v:OFF /d /c "…"`, quoting and `%`-escaping arguments per cmd rules (Rust
+/// 1.77+, the CVE-2024-24576 fix; arguments that can't be passed safely, like newlines, error out
+/// instead of running). cmd.exe comes from the system folder, not PATH. No console window is
+/// shown.
 fn cli_command(cli: &Path) -> Command {
     let mut c = Command::new(cli);
     c.env("PATH", cli_path_env(cli));
     #[cfg(windows)]
     {
-        // cmd.exe 는 이름만 적힌 명령(npm 의 claude.cmd 가 부르는 "node" 등)을 PATH 보다 현재 폴더에서 먼저 찾는다.
-        // GhostDesk 가 물려받은 현재 폴더(처음 실행한 Downloads, --connect 를 실행한 폴더 등)에 심어 둔
-        // node.exe / node.cmd 가 실행되지 않게, CLI 자신의 폴더에서 실행하고 현재 폴더 검색도 끈다.
-        // (CLI 폴더는 cli_path_env 가 PATH 맨 앞에 넣으므로 그 폴더의 프로그램은 그대로 찾는다)
+        // cmd.exe looks up bare command names (like the "node" that npm's claude.cmd calls) in the current
+        // folder before PATH. So that a node.exe/node.cmd planted in the current folder GhostDesk
+        // inherited (the Downloads folder it first ran from, the folder --connect ran in, …) never runs,
+        // run from the CLI's own folder and turn off current-folder lookup. (cli_path_env puts the CLI
+        // folder first in PATH, so programs there are still found.)
         let dir = cli.parent().filter(|d| d.is_dir()).map(Path::to_path_buf).or_else(|| Some(bases().home).filter(|h| h.is_dir()));
         if let Some(dir) = dir {
             c.current_dir(dir);
@@ -986,26 +1038,28 @@ fn find_cli(name: &str) -> Option<PathBuf> {
     let mut cands = vec![
         h.join(".local/bin").join(name),
         h.join(format!(".{name}/local/{name}")),
-        h.join(format!(".{name}/bin/{name}")), // opencode 설치 스크립트 (~/.opencode/bin)
+        h.join(format!(".{name}/bin/{name}")), // opencode install script (~/.opencode/bin)
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
     ];
-    // 터미널에서 실행했다면 PATH 에도 있을 수 있음 (nvm, ~/.npm-global, bun 등)
+    // launched from a terminal, it may also be on PATH (nvm, ~/.npm-global, bun, …)
     if let Some(cur) = b.var("PATH") {
         cands.extend(std::env::split_paths(&cur).filter(|d| d.is_absolute()).map(|d| d.join(name)));
     }
-    // 테스트에서는 실제로 설치된 CLI 를 절대 실행하지 않는다 (실제 설정을 고치게 되므로)
+    // tests never run an actually installed CLI (it would modify the real config)
     #[cfg(test)]
     cands.retain(|p| is_test_path(p));
     cands.into_iter().find(|p| p.is_file())
 }
 
-/// 실행할 수 있는 확장자, 고르는 순서. 이 중 PATHEXT 에 있는 것만 본다.
-/// 확장자 없는 파일(npm 이 함께 까는 sh 스크립트 `claude`)과 .ps1 은 CreateProcess 로 실행할 수 없으므로 고르지 않는다.
+/// Runnable extensions, in preference order. Only those in PATHEXT are considered.
+///
+/// Extensionless files (the `claude` sh script npm installs alongside) and .ps1 can't be run with
+/// CreateProcess, so they're never picked.
 #[cfg(windows)]
 const CLI_EXTS: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
 
-/// Windows: 흔한 설치 위치와 PATH 에서 `name.exe` → `name.cmd` → `name.bat` 순으로 찾는다.
+/// Windows: looks for `name.exe` → `name.cmd` → `name.bat` in common install locations and PATH.
 #[cfg(windows)]
 fn find_cli(name: &str) -> Option<PathBuf> {
     let b = bases();
@@ -1013,19 +1067,19 @@ fn find_cli(name: &str) -> Option<PathBuf> {
         .var("PATHEXT")
         .map(|v| v.to_string_lossy().to_lowercase())
         .filter(|v| !v.trim().is_empty())
-        // MCP 호스트가 환경을 줄여 PATHEXT 가 없을 수 있다 → cmd.exe 의 기본값
+        // an MCP host may have trimmed the environment so PATHEXT is missing: use cmd.exe's default
         .unwrap_or_else(|| ".com;.exe;.bat;.cmd".into());
     let exts: Vec<&str> = CLI_EXTS.iter().copied().filter(|e| pathext.split(';').any(|x| x.trim() == *e)).collect();
     let mut dirs = vec![
-        b.home.join(".local").join("bin"),                       // Claude Code 기본 설치 (claude.exe)
+        b.home.join(".local").join("bin"), // Claude Code default install (claude.exe)
         b.roaming.join("npm"),                                   // npm -g (claude.cmd, codex.cmd)
         b.local.join("Microsoft").join("WinGet").join("Links"),  // winget
         b.home.join("scoop").join("shims"),                      // scoop
         b.local.join("pnpm"),                                    // pnpm -g
         b.home.join(".bun").join("bin"),                         // bun
         b.local.join("Volta").join("bin"),                       // volta
-        b.home.join(format!(".{name}")).join("local"),           // claude 의 예전 로컬 설치
-        b.home.join(format!(".{name}")).join("bin"),             // opencode 설치 스크립트 (~/.opencode/bin)
+        b.home.join(format!(".{name}")).join("local"), // claude's old local install
+        b.home.join(format!(".{name}")).join("bin"), // opencode install script (~/.opencode/bin)
     ];
     if let Some(cur) = b.var("PATH") {
         dirs.extend(std::env::split_paths(&cur).filter(|d| d.is_absolute()));
@@ -1033,7 +1087,7 @@ fn find_cli(name: &str) -> Option<PathBuf> {
     for d in dirs {
         for e in &exts {
             let p = d.join(format!("{name}{e}"));
-            // 테스트에서는 실제로 설치된 CLI 를 절대 실행하지 않는다 (실제 설정을 고치게 되므로)
+            // tests never run an actually installed CLI (it would modify the real config)
             #[cfg(test)]
             if !is_test_path(&p) {
                 continue;
@@ -1046,20 +1100,22 @@ fn find_cli(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// `p` 의 경로 끝에 접미사를 붙인 형제 경로 (확장자를 바꾸지 않음)
+/// Sibling path with a suffix appended to `p` (the extension is kept).
 fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
 }
 
-/// 심볼릭 링크를 끝까지 따라간 실제 파일 경로 (dotfiles 링크 보존용). 파일이 없으면 링크가 가리키는 경로.
-/// (Windows 에서도 `\\?\` 접두사 없는 보통 경로를 돌려준다)
+/// Real file path with symlinks followed all the way (to preserve dotfile links). If the file
+/// doesn't exist, the path the link points to.
+///
+/// Returns a plain path without the `\\?\` prefix on Windows too.
 fn resolve_target(p: &Path) -> PathBuf {
     if let Ok(r) = crate::platform::paths::canonicalize(p) {
         return r;
     }
-    // 대상이 아직 없는 (끊어진) 링크: 직접 따라간다
+    // a (dangling) link whose target doesn't exist yet: follow it by hand
     let mut cur = p.to_path_buf();
     for _ in 0..32 {
         match std::fs::read_link(&cur) {
@@ -1072,8 +1128,11 @@ fn resolve_target(p: &Path) -> PathBuf {
     cur
 }
 
-/// 원래 파일의 권한 (없으면 0600: 비밀이 들어 있을 수 있는 설정 파일이므로 좁게).
-/// Windows 에는 권한 비트가 없다 (새 파일은 폴더의 ACL — 본인·SYSTEM·Administrators — 을 물려받음).
+/// Permissions of the original file (0600 if missing: config files may hold secrets, so keep it
+/// tight).
+///
+/// Windows has no permission bits (new files inherit the folder's ACL: the user, SYSTEM,
+/// Administrators).
 fn file_mode(real: &Path) -> u32 {
     #[cfg(unix)]
     {
@@ -1086,7 +1145,7 @@ fn file_mode(real: &Path) -> u32 {
     }
 }
 
-/// 새 파일을 만든다 (Unix: 주어진 권한으로, Windows: 폴더의 ACL 을 물려받음)
+/// Creates a new file (Unix: with the given mode; Windows: inheriting the folder's ACL).
 fn create_new_with_mode(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -1097,7 +1156,7 @@ fn create_new_with_mode(path: &Path, mode: u32) -> std::io::Result<std::fs::File
     o.open(path)
 }
 
-/// umask 영향 제거 (원래 권한 그대로) — Unix 만
+/// Undoes the umask's effect (keeps the original mode). Unix only.
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1110,7 +1169,7 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// 파일 내용을 읽는다. 없으면 None. 그 밖의 오류(권한, 디렉터리 등)는 오류로 돌려준다.
+/// Reads file contents. None if missing; other errors (permissions, a directory, …) are returned.
 fn read_bytes_opt(p: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(p) {
         Ok(b) => Ok(Some(b)),
@@ -1123,8 +1182,10 @@ fn bytes_to_str<'a>(p: &Path, b: &'a [u8]) -> Result<&'a str> {
     std::str::from_utf8(b).with_context(|| format!("{} 이(가) 올바른 UTF-8 텍스트가 아닙니다 (고치지 않음)", p.display()))
 }
 
-/// 설정 파일을 처음 고치기 전의 원본을 같은 폴더에 `.ghostdesk-backup` 으로 남긴다.
-/// 이미 백업이 있으면 덮어쓰지 않는다 (처음 원본을 보존). 백업도 원본과 같은 권한으로 만든다.
+/// Leaves the original, from before the first edit, as `.ghostdesk-backup` in the same folder.
+///
+/// An existing backup is never overwritten (the first original is kept). The backup gets the same
+/// permissions as the original.
 fn backup(p: &Path) -> Result<()> {
     let b = with_suffix(p, ".ghostdesk-backup");
     if std::fs::symlink_metadata(&b).is_ok() {
@@ -1146,12 +1207,14 @@ fn backup(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `p` 를 `contents` 로 원자적으로 바꾼다.
-/// - 심볼릭 링크면 링크를 그대로 두고 실제 대상 파일을 바꾼다.
-/// - 원래 권한을 그대로 쓴다 (새 파일은 0600). 넓히지 않는다.
-/// - `expect` 가 주어지면, 바꿔치기 직전에 파일을 다시 읽어 그 내용과 다르면(그 사이 다른 프로그램이 고침)
-///   쓰지 않고 false 를 돌려준다.
-/// - Windows: 다른 프로그램(백신, 실행 중인 클라이언트)이 파일을 잠깐 쥐고 있으면 몇 번 다시 시도한다.
+/// Atomically replaces `p` with `contents`.
+///
+/// - For a symlink, the link stays and the real target file is replaced.
+/// - The original permissions are kept (new files get 0600), never widened.
+/// - With `expect`, the file is reread right before the swap; if it differs (another program
+///   changed it meanwhile), nothing is written and false is returned.
+/// - Windows: retries a few times if another program (antivirus, a running client) briefly holds
+///   the file.
 fn write_atomic(p: &Path, contents: &[u8], expect: Option<&Option<Vec<u8>>>) -> Result<bool> {
     let real = resolve_target(p);
     guard_write(p);
@@ -1166,7 +1229,7 @@ fn write_atomic(p: &Path, contents: &[u8], expect: Option<&Option<Vec<u8>>>) -> 
             f.write_all(contents)?;
             f.sync_all()?;
         }
-        // umask 영향 제거 (원래 권한 그대로)
+        // undo the umask's effect (keep the original mode)
         set_mode(&tmp, mode)?;
         if let Some(exp) = expect {
             if read_bytes_opt(p)? != *exp {
@@ -1182,10 +1245,13 @@ fn write_atomic(p: &Path, contents: &[u8], expect: Option<&Option<Vec<u8>>>) -> 
     res
 }
 
-/// 설정 파일을 읽고 → `edit` 으로 고친 뒤 → 바로 다시 읽어 그 사이 바뀌지 않았을 때만 쓴다.
-/// (실행 중인 Claude Code 등이 같은 파일을 수시로 다시 쓰므로, 바뀌었으면 새 내용으로 처음부터 다시 함)
-/// `edit` 은 원래 텍스트(파일이 없으면 None, BOM 은 뗀 것)를 받아 새 텍스트를 돌려준다. None 을 돌려주면 고칠 것이 없음.
-/// 원래 파일에 UTF-8 BOM 이 있었으면 새 내용에도 붙인다 (그 파일을 쓰는 프로그램이 같은 인코딩을 보도록).
+/// Reads a config file → modifies it with `edit` → rereads it right away and writes only if it
+/// didn't change in between.
+///
+/// A running Claude Code and the like rewrite the same file frequently, so on a change it starts
+/// over with the new contents. `edit` gets the original text (None if the file is missing, BOM
+/// stripped) and returns the new text; None means nothing to change. If the original had a UTF-8
+/// BOM, the new contents get one too (so programs using the file see the same encoding).
 fn update_file(p: &Path, edit: &dyn Fn(Option<&str>) -> Result<Option<String>>) -> Result<()> {
     for _ in 0..5 {
         let orig = read_bytes_opt(p)?;
@@ -1210,8 +1276,11 @@ fn update_file(p: &Path, edit: &dyn Fn(Option<&str>) -> Result<Option<String>>) 
     bail!("{} 이(가) 다른 프로그램에 의해 계속 바뀌고 있어 고치지 못했습니다. 잠시 뒤 다시 시도하세요", p.display())
 }
 
-/// JSON 텍스트 해석. 비어 있으면 {}. 해석할 수 없으면 오류 (빈 설정으로 덮어쓰지 않도록).
-/// 앞의 UTF-8 BOM 은 무시한다 (Windows PowerShell 5.1 의 `Set-Content -Encoding UTF8` 등이 붙임).
+/// Parses JSON text. Empty means {}. Unparseable text is an error (so it isn't overwritten with an
+/// empty config).
+///
+/// A leading UTF-8 BOM is ignored (added by Windows PowerShell 5.1's
+/// `Set-Content -Encoding UTF8`, among others).
 fn parse_json(p: &Path, text: Option<&str>) -> Result<Value> {
     match text.map(|s| fsx::strip_bom(s).0) {
         None => Ok(json!({})),
@@ -1235,8 +1304,10 @@ fn read_json(p: &Path) -> Result<Value> {
     parse_json(p, s)
 }
 
-/// JSON 설정의 `<key>.ghostdesk` 를 `entry` 로 바꾼다 (None 이면 지움). 다른 키·순서는 그대로.
-/// `key` 는 서버 목록 객체의 이름 (대부분 "mcpServers", OpenCode 는 "mcp").
+/// Sets `<key>.ghostdesk` in a JSON config to `entry` (None removes it). Other keys and their
+/// order are untouched.
+///
+/// `key` is the name of the server list object (mostly "mcpServers"; "mcp" for OpenCode).
 fn json_set_server(p: &Path, key: &str, entry: Option<Value>) -> Result<()> {
     update_file(p, &|text| {
         let mut v = parse_json(p, text)?;
@@ -1266,7 +1337,7 @@ fn json_set_server(p: &Path, key: &str, entry: Option<Value>) -> Result<()> {
     })
 }
 
-/// Codex config.toml 해석 (서식·주석 보존). 해석할 수 없으면 오류.
+/// Parses Codex's config.toml (preserving formatting and comments). Unparseable is an error.
 fn parse_toml(p: &Path, text: Option<&str>) -> Result<toml_edit::DocumentMut> {
     fsx::strip_bom(text.unwrap_or(""))
         .0
@@ -1274,13 +1345,13 @@ fn parse_toml(p: &Path, text: Option<&str>) -> Result<toml_edit::DocumentMut> {
         .with_context(|| format!("{} 이(가) 올바른 TOML 이 아닙니다 (고치지 않음)", p.display()))
 }
 
-/// Codex config.toml 을 읽기만 한다 (BOM 무시). 없거나 해석할 수 없으면 None.
+/// Only reads Codex's config.toml (BOM ignored). None if missing or unparseable.
 fn read_toml(p: &Path) -> Option<toml_edit::DocumentMut> {
     let b = read_bytes_opt(p).ok()??;
     fsx::strip_bom(&String::from_utf8_lossy(&b)).0.parse::<toml_edit::DocumentMut>().ok()
 }
 
-/// Codex 용 [mcp_servers.ghostdesk] 테이블
+/// The [mcp_servers.ghostdesk] table for Codex.
 fn codex_table(exe: &str, client_name: &str) -> toml_edit::Table {
     let mut t = toml_edit::Table::new();
     t["command"] = toml_edit::value(exe);
@@ -1290,13 +1361,15 @@ fn codex_table(exe: &str, client_name: &str) -> toml_edit::Table {
     let mut env = toml_edit::InlineTable::new();
     env.insert("GHOSTDESK_CLIENT_NAME", client_name.into());
     t["env"] = toml_edit::value(env);
-    // desk_open 은 승인 대기·GUI 실행·프로필 복제로 Codex 기본 시간 제한(60초)을 넘길 수 있다
+    // desk_open can exceed Codex's default timeout (60 s) with approval waits, GUI launch and profile
+    // cloning
     t["startup_timeout_sec"] = toml_edit::value(CODEX_STARTUP_TIMEOUT_SEC);
     t["tool_timeout_sec"] = toml_edit::value(CODEX_TOOL_TIMEOUT_SEC);
     t
 }
 
-/// 등록된 Codex 항목에 시간 제한이 들어 있는가 (예전 버전이 등록한 항목은 없음 → 다시 씀)
+/// Whether the registered Codex entry has timeouts (entries registered by older versions don't →
+/// rewritten).
 fn codex_has_timeouts(p: &Path) -> bool {
     let Some(doc) = read_toml(p) else { return false };
     let Some(t) = doc.get("mcp_servers").and_then(|m| m.get(SERVER_NAME)) else { return false };
@@ -1330,7 +1403,7 @@ fn codex_set_server(p: &Path, entry: Option<toml_edit::Table>) -> Result<()> {
     })
 }
 
-// ───────────────────────── 클라이언트 ─────────────────────────
+// ---- clients ----
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Client {
@@ -1339,7 +1412,8 @@ pub enum Client {
     Codex,
     KimiCode,
     OpenCode,
-    /// pi 는 MCP 를 기본 지원하지 않는다. MCP 확장(pi-mcp-adapter 등)이 읽는 ~/.pi/agent/mcp.json 에 등록한다.
+    /// pi has no built-in MCP support. Registered in ~/.pi/agent/mcp.json, which MCP extensions
+    /// (pi-mcp-adapter, …) read.
     Pi,
 }
 
@@ -1355,10 +1429,12 @@ impl Client {
             Client::Pi => "pi",
         }
     }
-    /// 운영체제와 상관없이 홈 기준인 클라이언트의 설정 파일 (나머지는 None)
-    /// - Kimi Code: %KIMI_CODE_HOME% 또는 ~/.kimi-code 의 mcp.json
-    /// - OpenCode: %XDG_CONFIG_HOME% 또는 ~/.config 의 opencode/opencode.json (없고 opencode.jsonc 만 있으면 그것)
-    /// - pi: %PI_CODING_AGENT_DIR% 또는 ~/.pi/agent 의 mcp.json
+    /// Config file for clients that are home-relative on every OS (None for the rest).
+    ///
+    /// - Kimi Code: mcp.json in %KIMI_CODE_HOME% or ~/.kimi-code
+    /// - OpenCode: opencode/opencode.json in %XDG_CONFIG_HOME% or ~/.config (or opencode.jsonc if
+    ///   only that exists)
+    /// - pi: mcp.json in %PI_CODING_AGENT_DIR% or ~/.pi/agent
     fn home_config(self, b: &Bases) -> Option<PathBuf> {
         match self {
             Client::KimiCode => Some(kimi_home(b).join("mcp.json")),
@@ -1371,10 +1447,12 @@ impl Client {
             _ => None,
         }
     }
-    /// 이 클라이언트가 읽는 설정 파일 (등록할 때 실제로 고치는 경로).
-    /// - macOS: ~/.claude.json, ~/Library/Application Support/Claude/claude_desktop_config.json, ~/.codex/config.toml
-    /// - Windows: %CLAUDE_CONFIG_DIR% 또는 %USERPROFILE% 의 .claude.json, Claude 앱 데이터 폴더(`claude_app_config`),
-    ///   %CODEX_HOME% 또는 %USERPROFILE%\.codex 의 config.toml
+    /// The config file this client reads (the path actually modified on registration).
+    ///
+    /// - macOS: ~/.claude.json, ~/Library/Application Support/Claude/claude_desktop_config.json,
+    ///   ~/.codex/config.toml
+    /// - Windows: .claude.json in %CLAUDE_CONFIG_DIR% or %USERPROFILE%, the Claude app data folder
+    ///   (`claude_app_config`), config.toml in %CODEX_HOME% or %USERPROFILE%\.codex
     pub fn config(self) -> PathBuf {
         let b = bases();
         if let Some(p) = self.home_config(&b) {
@@ -1398,7 +1476,7 @@ impl Client {
             }
         }
     }
-    /// 이 컴퓨터에 설치되어 있는가
+    /// Whether it's installed on this computer.
     pub fn installed(self) -> bool {
         let b = bases();
         match self {
@@ -1412,7 +1490,7 @@ impl Client {
             match self {
                 Client::ClaudeCode => find_cli("claude").is_some() || self.config().exists(),
                 Client::ClaudeApp => claude_app_installed(&b),
-                // Codex 데스크톱 앱(MSIX)도 CLI 와 같은 ~/.codex 를 쓴다
+                // the Codex desktop app (MSIX) uses the same ~/.codex as the CLI
                 _ => find_cli("codex").is_some() || codex_home(&b).exists() || !package_ids(&b, "OpenAI.Codex").is_empty(),
             }
         }
@@ -1425,34 +1503,35 @@ impl Client {
             }
         }
     }
-    /// 현재 등록된 ghostdesk 명령 경로 (없으면 None)
+    /// The currently registered ghostdesk command path (None if not registered).
     pub fn registered(self) -> Option<String> {
         registered_in(self, &self.config())
     }
 }
 
-/// Codex 설정 폴더 (Windows): %CODEX_HOME% 또는 %USERPROFILE%\.codex
+/// Codex config folder (Windows): %CODEX_HOME% or %USERPROFILE%\.codex.
 #[cfg(windows)]
 fn codex_home(b: &Bases) -> PathBuf {
     b.var_path("CODEX_HOME").unwrap_or_else(|| b.home.join(".codex"))
 }
 
-/// Kimi Code 설정 폴더: %KIMI_CODE_HOME% 또는 ~/.kimi-code
+/// Kimi Code config folder: %KIMI_CODE_HOME% or ~/.kimi-code.
 fn kimi_home(b: &Bases) -> PathBuf {
     b.var_path("KIMI_CODE_HOME").unwrap_or_else(|| b.home.join(".kimi-code"))
 }
 
-/// OpenCode 전역 설정 폴더: %XDG_CONFIG_HOME%/opencode 또는 ~/.config/opencode (Windows 도 같은 규칙)
+/// OpenCode global config folder: %XDG_CONFIG_HOME%/opencode or ~/.config/opencode (same rule on
+/// Windows).
 fn opencode_dir(b: &Bases) -> PathBuf {
     b.var_path("XDG_CONFIG_HOME").unwrap_or_else(|| b.home.join(".config")).join("opencode")
 }
 
-/// pi 에이전트 폴더: %PI_CODING_AGENT_DIR% 또는 ~/.pi/agent
+/// pi agent folder: %PI_CODING_AGENT_DIR% or ~/.pi/agent.
 fn pi_agent_dir(b: &Bases) -> PathBuf {
     b.var_path("PI_CODING_AGENT_DIR").unwrap_or_else(|| b.home.join(".pi").join("agent"))
 }
 
-/// JSON 설정에서 MCP 서버 목록이 들어 있는 키
+/// Key holding the MCP server list in the JSON config.
 fn servers_key(c: Client) -> &'static str {
     if c == Client::OpenCode {
         "mcp"
@@ -1461,7 +1540,8 @@ fn servers_key(c: Client) -> &'static str {
     }
 }
 
-/// 설치된 MSIX 패키지 `<이름>_<게시자 ID>` 의 게시자 ID 들 (%LOCALAPPDATA%\Packages 기준, 소문자, 정렬)
+/// Publisher IDs of installed MSIX packages `<name>_<publisher ID>` (from %LOCALAPPDATA%\Packages,
+/// lowercase, sorted).
 #[cfg(windows)]
 fn package_ids(b: &Bases, name: &str) -> Vec<String> {
     let prefix = format!("{name}_").to_lowercase();
@@ -1480,7 +1560,8 @@ fn package_ids(b: &Bases, name: &str) -> Vec<String> {
     ids
 }
 
-/// Claude 앱(MSIX) 데이터 폴더들: %LOCALAPPDATA%\Claude-Data\claude_<게시자 ID> → (ID 소문자, 폴더). 이름순.
+/// Claude app (MSIX) data folders: %LOCALAPPDATA%\Claude-Data\claude_<publisher ID> → (lowercase
+/// ID, folder). Sorted by name.
 #[cfg(windows)]
 fn claude_data_dirs(b: &Bases) -> Vec<(String, PathBuf)> {
     let mut v: Vec<(String, PathBuf)> = std::fs::read_dir(b.local.join("Claude-Data"))
@@ -1498,7 +1579,8 @@ fn claude_data_dirs(b: &Bases) -> Vec<(String, PathBuf)> {
     v
 }
 
-/// 예전 Claude 데이터 폴더(%APPDATA%\Claude)에 "데이터를 옮겨 갔다" 는 표식(.user-data-left.*)이 있는가
+/// Whether the old Claude data folder (%APPDATA%\Claude) carries the "data moved away" marker
+/// (.user-data-left.*).
 #[cfg(windows)]
 fn has_left_marker(legacy: &Path) -> bool {
     std::fs::read_dir(legacy)
@@ -1508,14 +1590,18 @@ fn has_left_marker(legacy: &Path) -> bool {
         .any(|e| e.file_name().to_string_lossy().to_lowercase().starts_with(".user-data-left"))
 }
 
-/// Claude 앱의 claude_desktop_config.json 위치 (Windows).
-/// 1. 지금의 Claude 앱(MSIX)은 %LOCALAPPDATA%\Claude-Data\claude_<게시자 ID>\ 를 쓴다. 설치된 패키지
-///    (%LOCALAPPDATA%\Packages\Claude_<ID>)와 ID 가 같은 폴더 → 설정 파일이 이미 있는 폴더 → 첫 폴더 순으로 고른다.
-/// 2. %APPDATA%\Claude 는 예전 설치본의 폴더다. MSIX 앱이 데이터를 옮겨 간 뒤에는 표식(.user-data-left.*)만
-///    남고 더는 읽지 않으므로, 표식이 없을 때만 쓴다 (예전 설치본이거나, 아직 옮기기 전이면 앱이 처음 켜질 때
-///    이 파일도 함께 옮겨 간다).
-/// 3. 데이터 폴더가 아직 없고 패키지만 있으면(설치 후 한 번도 켜지 않음) 앱이 쓸 폴더를 고른다.
-/// 4. 아무것도 없으면 %APPDATA%\Claude (공식 문서의 기본 위치).
+/// Location of the Claude app's claude_desktop_config.json (Windows).
+///
+/// 1. The current Claude app (MSIX) uses %LOCALAPPDATA%\Claude-Data\claude_<publisher ID>\. Picks
+///    the folder whose ID matches the installed package (%LOCALAPPDATA%\Packages\Claude_<ID>) →
+///    a folder that already has the config file → the first folder.
+/// 2. %APPDATA%\Claude is the old install's folder. Once the MSIX app has moved the data out, only
+///    the marker (.user-data-left.*) is left and it's no longer read, so it's only used without
+///    the marker (an old install, or not migrated yet, in which case the app moves this file along
+///    on first launch).
+/// 3. With no data folder yet but the package present (installed, never launched), picks the
+///    folder the app will use.
+/// 4. With nothing at all, %APPDATA%\Claude (the default location in the official docs).
 #[cfg(windows)]
 fn claude_app_config(b: &Bases) -> PathBuf {
     const FILE: &str = "claude_desktop_config.json";
@@ -1539,8 +1625,8 @@ fn claude_app_config(b: &Bases) -> PathBuf {
     legacy.join(FILE)
 }
 
-/// Claude 앱이 설치되어 있는가 (Windows): MSIX 데이터 폴더·패키지, 예전 설치 프로그램(Squirrel)의 폴더,
-/// 또는 옮겨 가지 않은 예전 데이터 폴더
+/// Whether the Claude app is installed (Windows): MSIX data folder or package, the old installer's
+/// (Squirrel) folder, or an old data folder that hasn't been migrated.
 #[cfg(windows)]
 fn claude_app_installed(b: &Bases) -> bool {
     let legacy = b.roaming.join("Claude");
@@ -1553,7 +1639,7 @@ fn claude_app_installed(b: &Bases) -> bool {
 fn registered_in(c: Client, p: &Path) -> Option<String> {
     match c {
         Client::OpenCode => {
-            // OpenCode 는 command 가 [실행 파일, 인자…] 배열
+            // in OpenCode, command is an array [executable, args…]
             let v = read_json(p).ok()?;
             v["mcp"][SERVER_NAME]["command"][0].as_str().map(String::from)
         }
@@ -1582,13 +1668,15 @@ pub fn status_all() -> Vec<ClientStatus> {
         .collect()
 }
 
-/// JSON 설정을 쓰는 클라이언트의 ghostdesk 항목.
-/// 참고: Claude Code 에는 서버별 도구 시간 제한 필드가 없다 (전역 환경 변수 MCP_TOOL_TIMEOUT 으로만 조절).
+/// The ghostdesk entry for clients with JSON configs.
+///
+/// Note: Claude Code has no per-server tool timeout field (only the global MCP_TOOL_TIMEOUT
+/// environment variable).
 fn json_entry(c: Client, exe: &str) -> Value {
     let env = json!({ "GHOSTDESK_CLIENT_NAME": c.name() });
     match c {
         Client::ClaudeCode => json!({ "type": "stdio", "command": exe, "args": ["--mcp"], "env": env }),
-        // desk_open 은 승인 대기·GUI 실행으로 오래 걸릴 수 있어 Codex 와 같은 시간 제한을 준다
+        // desk_open can take a while (approval wait, GUI launch), so give it the same timeout as Codex
         Client::KimiCode => json!({
             "command": exe, "args": ["--mcp"], "env": env,
             "startupTimeoutMs": CODEX_STARTUP_TIMEOUT_SEC * 1000,
@@ -1597,28 +1685,30 @@ fn json_entry(c: Client, exe: &str) -> Value {
         Client::OpenCode => json!({
             "type": "local", "command": [exe, "--mcp"], "environment": env, "enabled": true, "timeout": OPENCODE_TIMEOUT_MS,
         }),
-        // pi-mcp-adapter 는 쉬는 서버를 10분 뒤 끊는데, 연결이 끊기면 GhostDesk 가 그 연결의 화면을 닫는다 → 계속 유지
+        // pi-mcp-adapter disconnects idle servers after 10 minutes, and GhostDesk closes a connection's
+        // screens when it drops, so keep it alive
         Client::Pi => json!({ "command": exe, "args": ["--mcp"], "env": env, "lifecycle": "lazy-keep-alive" }),
         _ => json!({ "command": exe, "args": ["--mcp"], "env": env }),
     }
 }
 
-/// pi 등록 뒤의 안내 (pi 자체에는 MCP 가 없다)
+/// Notice after registering pi (pi itself has no MCP).
 const PI_NOTE: &str = "pi 에는 MCP 확장이 필요: pi install npm:pi-mcp-adapter";
 
-/// Claude 앱 설정을 바꾼 뒤의 안내 (Windows 의 Claude 앱은 창을 닫아도 트레이에 남아 있다)
+/// Notice after changing the Claude app's config (on Windows the Claude app stays in the tray
+/// after its window closes).
 const CLAUDE_APP_RESTART: &str = if cfg!(windows) {
     "Claude 앱을 트레이 아이콘에서 완전히 종료한 뒤 다시 실행하면 적용"
 } else {
     "Claude 앱 재시작 후 적용"
 };
 
-/// 한 클라이언트에 ghostdesk 를 등록한다 (이미 같은 경로면 그대로).
+/// Registers ghostdesk with one client (left as is if the path is already the same).
 pub fn register(c: Client, exe: &Path) -> Result<String> {
     let exe_s = exe.display().to_string();
     let up_to_date = match c {
         Client::Codex => codex_has_timeouts(&c.config()),
-        // 시간 제한 등 항목 전체가 같아야 그대로 둔다
+        // only left as is if the whole entry, timeouts included, matches
         Client::KimiCode | Client::OpenCode | Client::Pi => {
             read_json(&c.config()).map(|v| v[servers_key(c)][SERVER_NAME] == json_entry(c, &exe_s)).unwrap_or(false)
         }
@@ -1630,7 +1720,7 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
     let label = format!("GHOSTDESK_CLIENT_NAME={}", c.name());
     match c {
         Client::ClaudeCode => {
-            // claude CLI 를 먼저 쓴다 (Claude Code 가 실행 중이어도 자기 설정을 안전하게 고침)
+            // use the claude CLI first (it safely edits its own config even while Claude Code is running)
             let mut cli_err = None;
             if let Some(cli) = find_cli("claude") {
                 if c.registered().is_some() {
@@ -1641,12 +1731,12 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
                     Duration::from_secs(40),
                 ) {
                     Ok(_) => return Ok("claude mcp add 로 연결".into()),
-                    // CLI 실행 실패(예: node 를 못 찾음) → 아래 JSON 직접 수정으로 대체
+                    // the CLI failed to run (e.g. node not found) → fall back to editing the JSON directly below
                     Err(e) => cli_err = Some(e),
                 }
             }
             let p = c.config();
-            // CLAUDE_CONFIG_DIR 로 지정한 폴더가 아직 없을 수 있다
+            // the folder set by CLAUDE_CONFIG_DIR may not exist yet
             if let Some(d) = p.parent().filter(|d| !d.exists()) {
                 guard_write(d);
                 std::fs::create_dir_all(d)?;
@@ -1665,12 +1755,14 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
                 std::fs::create_dir_all(d)?;
             }
             json_set_server(&p, "mcpServers", Some(json_entry(c, &exe_s)))?;
-            // macOS 는 위치가 하나뿐이라 파일 이름만, Windows 는 앱 버전마다 위치가 달라 실제 경로를 보여 준다
+            // macOS has a single location so just the file name; on Windows it varies by app version, so show
+            // the real path
             let shown = if cfg!(windows) { show_path(&p) } else { "claude_desktop_config.json".to_string() };
             Ok(format!("{shown} 에 추가 ({CLAUDE_APP_RESTART})"))
         }
         Client::Codex => {
-            // codex CLI 는 config.toml 을 다시 쓰며 주석을 지우고 시간 제한도 못 넣으므로, 서식을 보존하는 직접 수정만 쓴다
+            // the codex CLI rewrites config.toml dropping comments and can't add timeouts, so only the
+            // format-preserving direct edit is used
             let _ = &label;
             let p = c.config();
             if let Some(d) = p.parent() {
@@ -1680,7 +1772,8 @@ pub fn register(c: Client, exe: &Path) -> Result<String> {
             codex_set_server(&p, Some(codex_table(&exe_s, c.name())))?;
             Ok(format!("{} 에 추가", show_path(&p)))
         }
-        // 세 클라이언트 모두 CLI 없이 JSON 파일을 직접 고친다 (kimi/opencode CLI 는 대화형이거나 시간 제한을 못 넣음)
+        // all three edit the JSON file directly without a CLI (the kimi/opencode CLIs are interactive or
+        // can't set timeouts)
         Client::KimiCode | Client::OpenCode | Client::Pi => {
             let p = c.config();
             if let Some(d) = p.parent() {
@@ -1701,7 +1794,8 @@ fn first_line(s: &str) -> String {
     l.chars().take(120).collect()
 }
 
-/// 해제 결과 문구. Windows 는 고친 설정 파일 경로도 보여 준다 (macOS 는 기존 문구 그대로).
+/// Message for an unregister result. Windows also shows the modified config path (macOS keeps the
+/// existing wording).
 fn removed_msg(p: &Path, note: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if cfg!(windows) {
@@ -1717,7 +1811,7 @@ fn removed_msg(p: &Path, note: Option<&str>) -> String {
     }
 }
 
-/// 한 클라이언트에서 ghostdesk 등록을 지운다.
+/// Removes the ghostdesk registration from one client.
 pub fn unregister(c: Client) -> Result<String> {
     if c.registered().is_none() {
         return Ok("연결되어 있지 않음".into());
@@ -1748,7 +1842,7 @@ pub fn unregister(c: Client) -> Result<String> {
     }
 }
 
-/// 설치 + 설치된 모든 클라이언트에 등록. 결과를 (클라이언트, 메시지) 로 돌려준다.
+/// Installs and registers with every installed client. Returns (client, message) results.
 pub fn connect_all() -> Result<(PathBuf, Vec<(Client, Result<String>)>)> {
     let exe = install_app()?;
     let res = Client::ALL
@@ -1763,7 +1857,7 @@ pub fn disconnect_all() -> Vec<(Client, Result<String>)> {
     Client::ALL.iter().map(|c| (*c, unregister(*c))).collect()
 }
 
-/// `ghostdesk --connect` / `--disconnect` (터미널용)
+/// `ghostdesk --connect` / `--disconnect` (for the terminal).
 pub fn cli(args: &[String], connect: bool) -> Result<()> {
     let _ = args;
     if connect {
@@ -1793,8 +1887,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    /// 테스트용 가짜 사용자 폴더. 살아 있는 동안 이 스레드의 `bases()` 가 여기를 가리킨다
-    /// (실제 홈·%APPDATA%·%LOCALAPPDATA%·환경변수는 보지도 고치지도 않는다).
+    /// Fake user folders for tests. While alive, this thread's `bases()` points here (the real home,
+    /// %APPDATA%, %LOCALAPPDATA% and environment are neither read nor modified).
     struct FakeHome(PathBuf);
     impl FakeHome {
         fn new(tag: &str) -> Self {
@@ -1807,7 +1901,7 @@ mod tests {
         fn path(&self, rel: &str) -> PathBuf {
             self.0.join(rel)
         }
-        /// 가짜 환경변수 (나중에 넣은 값이 이김)
+        /// Fake environment variables (later values win).
         #[cfg_attr(not(windows), allow(dead_code))]
         fn set_env(&self, k: &str, v: impl Into<OsString>) {
             let v = v.into();
@@ -1842,7 +1936,7 @@ mod tests {
         std::fs::write(app.join("Contents/MacOS/ghostdesk"), "newer build").unwrap();
         std::fs::write(app.join("Contents/Info.plist"), info_plist().replace(env!("CARGO_PKG_VERSION"), "999.0.0")).unwrap();
         assert_eq!(bundle_version(&app).as_deref(), Some("999.0.0"));
-        // 더 새 설치본은 그대로 두고 그 경로를 쓴다
+        // a newer installed copy is left as is and its path is used
         assert_eq!(install_app().unwrap(), stable_exe());
         assert_eq!(std::fs::read_to_string(app.join("Contents/MacOS/ghostdesk")).unwrap(), "newer build");
     }
@@ -1857,13 +1951,13 @@ mod tests {
         std::fs::write(&src, "new build").unwrap();
         install_exe_into(&src, &dir).unwrap();
         assert_eq!(installed_version(&dir).as_deref(), Some(env!("CARGO_PKG_VERSION")));
-        // 설치본이 더 새 버전이면 다른(옛) exe 로 덮어쓰지 않는다
+        // a newer installed copy isn't overwritten by a different (older) exe
         std::fs::write(dir.join(VERSION_STAMP), "999.0.0\n").unwrap();
         let old = h.path("GhostDesk-old.exe");
         std::fs::write(&old, "older build").unwrap();
         assert_eq!(install_exe_into(&old, &dir).unwrap(), installed_exe(&dir));
         assert_eq!(std::fs::read_to_string(installed_exe(&dir)).unwrap(), "new build");
-        // 버전 기록이 없는 옛 설치본은 바꾼다
+        // old installed copies without a version record are replaced
         std::fs::remove_file(dir.join(VERSION_STAMP)).unwrap();
         install_exe_into(&old, &dir).unwrap();
         assert_eq!(std::fs::read_to_string(installed_exe(&dir)).unwrap(), "older build");
@@ -1914,7 +2008,7 @@ mod tests {
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         assert_eq!(hx(&vec![b'a'; 1_000_000]), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
-        // 조각으로 나눠 넣어도 같은 결과
+        // feeding it in pieces gives the same result
         let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 + 3) as u8).collect();
         for step in [1usize, 3, 63, 64, 65, 1000] {
             let mut h = Sha256::new();
@@ -1934,7 +2028,7 @@ mod tests {
         let app = h.path("Applications/GhostDesk.app");
         let exe = installed_exe(&app);
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        // (macOS) 설치본 실행 파일은 codesign 으로 바뀐 바이트 (원본과 다름)
+        // (macOS) the installed executable's bytes were changed by codesign (they differ from the source)
         std::fs::write(&exe, b"signed binary v1 (different bytes)").unwrap();
         let hash = sha256_file(&src).unwrap();
         assert!(!installed_from(&app, &hash), "지문이 없으면 다시 설치");
@@ -1950,7 +2044,7 @@ mod tests {
     #[test]
     fn write_preserves_mode_and_symlink() {
         let h = FakeHome::new("mode");
-        // 일반 파일 0600 유지
+        // a regular file keeps 0600
         let p = h.path(".claude.json");
         std::fs::write(&p, "{\"a\":1}").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1960,20 +2054,20 @@ mod tests {
         assert_eq!(mode_of(&with_suffix(&p, ".ghostdesk-backup")), 0o600, "백업도 같은 권한");
         assert!(!with_suffix(&p, ".ghostdesk-tmp").exists());
 
-        // 0640 같은 다른 권한도 그대로 (좁히지도 넓히지도 않음)
+        // other modes like 0640 are kept too (neither narrowed nor widened)
         let q = h.path("other.json");
         std::fs::write(&q, "{}").unwrap();
         std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o640)).unwrap();
         json_set_server(&q, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(mode_of(&q), 0o640);
 
-        // 새 파일은 0600
+        // new files get 0600
         let n = h.path("new/claude_desktop_config.json");
         std::fs::create_dir_all(n.parent().unwrap()).unwrap();
         json_set_server(&n, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(mode_of(&n), 0o600);
 
-        // 심볼릭 링크: 링크는 그대로, 실제 대상 파일이 바뀜
+        // symlink: the link stays, the real target file changes
         let dot = h.path("dotfiles/claude.json");
         std::fs::create_dir_all(dot.parent().unwrap()).unwrap();
         std::fs::write(&dot, "{\"keep\":true}").unwrap();
@@ -1987,7 +2081,7 @@ mod tests {
         assert_eq!(v["mcpServers"][SERVER_NAME]["command"], "/x/ghostdesk");
         assert_eq!(mode_of(&dot), 0o600);
 
-        // Codex config.toml 도 같은 방식
+        // Codex config.toml works the same way
         let c = h.path(".codex/config.toml");
         std::fs::create_dir_all(c.parent().unwrap()).unwrap();
         std::fs::write(&c, "model = \"x\"\n").unwrap();
@@ -2005,31 +2099,31 @@ mod tests {
         assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), broken, "해석 못 하는 파일은 덮어쓰지 않음");
 
-        // 잘못된 UTF-8
+        // invalid UTF-8
         std::fs::write(&p, b"{\"a\": \"\xff\xfe\"}").unwrap();
         assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\": \"\xff\xfe\"}");
 
-        // 최상위가 객체가 아님 / mcpServers 가 객체가 아님 → 패닉 없이 오류
+        // top level isn't an object / mcpServers isn't an object → an error, not a panic
         std::fs::write(&p, "[1,2]").unwrap();
         assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         std::fs::write(&p, "{\"mcpServers\": \"x\"}").unwrap();
         assert!(json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"mcpServers\": \"x\"}");
 
-        // 읽을 수 없는 경로 (디렉터리)
+        // unreadable path (a directory)
         let d = h.path("dir.json");
         std::fs::create_dir_all(&d).unwrap();
         assert!(json_set_server(&d, "mcpServers", Some(json!({"command": "c"}))).is_err());
 
-        // Codex: 해석 못 하는 TOML 은 그대로
+        // Codex: unparseable TOML is left as is
         let c = h.path("config.toml");
         std::fs::write(&c, "[[[ not toml").unwrap();
         assert!(codex_set_server(&c, Some(codex_table("/x", "Codex"))).is_err());
         assert!(codex_set_server(&c, None).is_err());
         assert_eq!(std::fs::read_to_string(&c).unwrap(), "[[[ not toml");
 
-        // 없는 파일은 빈 설정으로 시작
+        // a missing file starts from an empty config
         let missing = h.path("missing.json");
         json_set_server(&missing, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         assert_eq!(read_json(&missing).unwrap()["mcpServers"][SERVER_NAME]["command"], "c");
@@ -2047,11 +2141,11 @@ mod tests {
         json_set_server(&p, "mcpServers", None).unwrap();
         json_set_server(&p, "mcpServers", Some(json!({"command": "/b"}))).unwrap();
         assert_eq!(std::fs::read_to_string(&b).unwrap(), original, "백업은 처음 원본 그대로");
-        // 바꿀 것이 없으면 쓰지 않음
+        // nothing to change → nothing written
         let before = std::fs::read_to_string(&p).unwrap();
         json_set_server(&p, "mcpServers", Some(json!({"command": "/b"}))).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
-        // 해제하면 다른 키는 남고 ghostdesk 만 빠짐
+        // unregistering removes only ghostdesk, other keys stay
         json_set_server(&p, "mcpServers", None).unwrap();
         let v = read_json(&p).unwrap();
         assert_eq!(v["original"], true);
@@ -2100,7 +2194,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cli_runs_with_explicit_path() {
-        // `#!/usr/bin/env fakenode` 스크립트: CLI 와 같은 폴더의 fakenode 를 PATH 로 찾아야 실행됨
+        // a `#!/usr/bin/env fakenode` script: it only runs if PATH finds fakenode in the CLI's folder
         let h = FakeHome::new("path");
         let bin = h.path("nvm/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2119,18 +2213,18 @@ mod tests {
         assert!(dirs.contains(&home().join(".local/bin")));
         let out = run(&mut cli_command(&cli), Duration::from_secs(10)).unwrap();
         assert_eq!(out.trim(), "ran-with-node");
-        // PATH 를 지정하지 않으면 (GUI 의 launchd PATH) 실패하는 상황을 재현
+        // reproduces the failure without an explicit PATH (the GUI's launchd PATH)
         let fail = run(Command::new(&cli).env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"), Duration::from_secs(10));
         assert!(fail.is_err());
     }
 
-    // ───────── BOM · 이스케이프 · 전체 흐름 (모든 OS) ─────────
+    // ---- BOM, escaping, full flow (all OSes) ----
 
     #[test]
     fn bom_is_tolerated_and_preserved() {
         let h = FakeHome::new("bom");
         let exe = r"C:\g\ghostdesk.exe";
-        // Windows PowerShell 5.1 의 Set-Content -Encoding UTF8 처럼 BOM 이 붙은 .claude.json
+        // a .claude.json with a BOM, as written by Windows PowerShell 5.1's Set-Content -Encoding UTF8
         let p = h.path(".claude.json");
         std::fs::write(&p, "\u{FEFF}{\n  \"numStartups\": 3,\n  \"mcpServers\": {\"other\": {\"command\": \"x\"}}\n}").unwrap();
         assert!(read_json(&p).is_ok(), "BOM 이 있어도 읽음");
@@ -2149,7 +2243,7 @@ mod tests {
         assert!(registered_in(Client::ClaudeCode, &p).is_none());
         assert_eq!(read_json(&p).unwrap()["mcpServers"]["other"]["command"], "x");
 
-        // BOM 없는 파일에는 붙이지 않음
+        // files without a BOM don't get one
         let q = h.path("plain.json");
         std::fs::write(&q, "{}").unwrap();
         json_set_server(&q, "mcpServers", Some(json!({"command": "c"}))).unwrap();
@@ -2186,7 +2280,7 @@ mod tests {
         if std::env::var("GHOSTDESK_NO_AUTOCONNECT").as_deref() != Ok("1") {
             assert!(auto_connect_enabled());
         }
-        // 객체가 아닌 설정 파일이어도 패닉 없이 새로 쓴다
+        // even a config file that isn't an object is rewritten without panicking
         std::fs::write(&p, "[1, 2]").unwrap();
         set_auto_connect(false).unwrap();
         assert!(!auto_connect_enabled());
@@ -2198,7 +2292,7 @@ mod tests {
         for (i, exe) in [
             r"C:\Users\홍 길동\AppData\Local\Programs\GhostDesk\ghostdesk.exe",
             r"C:\Users\O'Brien & Co (x)\AppData\Local\Programs\GhostDesk\ghostdesk.exe",
-            // \u0041 · \n · \t 를 이스케이프로 잘못 해석하면 다른 경로가 된다
+            // misreading A, \n or \t as escapes would yield a different path
             r"\\server\share\u0041\new\tools\ghostdesk.exe",
         ]
         .into_iter()
@@ -2221,7 +2315,8 @@ mod tests {
         }
     }
 
-    /// 가짜 사용자 폴더 안에서 등록 → 확인 → 해제 전체 흐름 (설치된 CLI 가 없으면 설정 파일을 직접 고친다)
+    /// Full register → check → unregister flow inside fake user folders (config files are edited
+    /// directly when no CLI is installed).
     #[test]
     fn register_end_to_end_in_sandbox() {
         let h = FakeHome::new("e2e");
@@ -2233,7 +2328,7 @@ mod tests {
             assert!(c.registered().is_none());
             let msg = register(c, &exe).unwrap();
             assert_eq!(c.registered().as_deref(), Some(exe.display().to_string().as_str()), "{c:?}");
-            // 메시지에 실제로 고친 파일이 보인다
+            // the message shows the file actually modified
             let name = p.file_name().unwrap().to_string_lossy().to_string();
             assert!(msg.contains(&name), "{msg}");
             #[cfg(windows)]
@@ -2246,7 +2341,7 @@ mod tests {
             assert!(c.registered().is_none());
             assert_eq!(unregister(c).unwrap(), "연결되어 있지 않음");
         }
-        // Claude Code 항목은 type: stdio, Codex 는 시간 제한 포함
+        // Claude Code entries have type: stdio, Codex ones include timeouts
         register(Client::ClaudeCode, &exe).unwrap();
         assert_eq!(read_json(&Client::ClaudeCode.config()).unwrap()["mcpServers"][SERVER_NAME]["type"], "stdio");
         register(Client::Codex, &exe).unwrap();
@@ -2255,7 +2350,8 @@ mod tests {
         assert!(st.iter().any(|s| s.client == Client::Codex && s.installed && s.registered.is_some()));
     }
 
-    /// Kimi Code · OpenCode · pi: 위치, 항목 모양, 다른 설정 보존, 환경변수
+    /// Kimi Code, OpenCode, pi: location, entry shape, other settings preserved, environment
+    /// variables.
     #[test]
     fn kimi_opencode_pi_entries() {
         let h = FakeHome::new("harness");
@@ -2266,7 +2362,7 @@ mod tests {
         assert_eq!(Client::Pi.config(), home.join(".pi").join("agent").join("mcp.json"));
         assert!(!Client::KimiCode.installed() && !Client::OpenCode.installed() && !Client::Pi.installed());
 
-        // OpenCode: opencode.jsonc 만 있으면 그 파일을 고치고, 다른 설정은 그대로
+        // OpenCode: if only opencode.jsonc exists, that file is edited and other settings stay
         let oc = home.join(".config").join("opencode");
         mkdir(&oc);
         std::fs::write(oc.join("opencode.jsonc"), r#"{"$schema":"https://opencode.ai/config.json","provider":{"p":{}}}"#).unwrap();
@@ -2279,12 +2375,12 @@ mod tests {
         assert_eq!((g["type"].as_str(), g["command"].clone()), (Some("local"), json!(["/x/ghostdesk", "--mcp"])));
         assert_eq!(g["environment"]["GHOSTDESK_CLIENT_NAME"], "OpenCode");
         assert_eq!(Client::OpenCode.registered().as_deref(), Some("/x/ghostdesk"));
-        // 주석이 있는 JSONC 는 해석하지 못하므로 덮어쓰지 않는다
+        // JSONC with comments can't be parsed, so it isn't overwritten
         std::fs::write(oc.join("opencode.jsonc"), "{ // 주석\n}").unwrap();
         assert!(register(Client::OpenCode, Path::new("/y")).is_err());
         assert_eq!(std::fs::read_to_string(oc.join("opencode.jsonc")).unwrap(), "{ // 주석\n}");
 
-        // Kimi: 시간 제한, 예전 항목(시간 제한 없음)은 다시 쓴다
+        // Kimi: timeouts; old entries (without timeouts) are rewritten
         let kp = Client::KimiCode.config();
         mkdir(kp.parent().unwrap());
         std::fs::write(&kp, r#"{"mcpServers":{"other":{"command":"a"},"ghostdesk":{"command":"/x/ghostdesk"}}}"#).unwrap();
@@ -2294,11 +2390,11 @@ mod tests {
         assert_eq!(v["mcpServers"][SERVER_NAME]["toolTimeoutMs"], CODEX_TOOL_TIMEOUT_SEC * 1000);
         assert_eq!(register(Client::KimiCode, exe).unwrap(), "이미 연결됨");
 
-        // pi: 연결 유지 + 확장 안내
+        // pi: keep-alive + extension notice
         assert!(register(Client::Pi, exe).unwrap().contains("pi-mcp-adapter"));
         assert_eq!(read_json(&Client::Pi.config()).unwrap()["mcpServers"][SERVER_NAME]["lifecycle"], "lazy-keep-alive");
 
-        // 환경변수로 바꾼 위치
+        // location changed through an environment variable
         h.set_env("KIMI_CODE_HOME", h.path("k"));
         h.set_env("XDG_CONFIG_HOME", h.path("xdg"));
         h.set_env("PI_CODING_AGENT_DIR", h.path("pi"));
@@ -2307,10 +2403,11 @@ mod tests {
         assert_eq!(Client::Pi.config(), h.path("pi").join("mcp.json"));
     }
 
-    /// 테스트는 실제 사용자 파일을 절대 건드리지 않는다
+    /// Tests never touch real user files.
     #[test]
     fn tests_never_touch_real_user_files() {
-        // 1) 가짜 폴더를 지정하지 않은 스레드도 실제 폴더·환경변수가 아니라 빈 임시 폴더를 본다
+        // 1) threads without fake folders still see an empty temp folder, not the real folders or
+        // environment
         std::thread::spawn(|| {
             let mut paths = vec![stable_app(), stable_exe(), settings_path()];
             paths.extend(Client::ALL.iter().map(|c| c.config()));
@@ -2328,8 +2425,8 @@ mod tests {
         .join()
         .unwrap();
 
-        // 2) 임시 폴더 밖에 쓰려 하면 아무것도 쓰기 전에 멈춘다
-        //    (부모 폴더가 없는 경로라, 혹시 막지 못했어도 실제로 파일이 생기지는 않는다)
+        // 2) writing outside the temp folder stops before anything is written (the path has no parent
+        // folder, so even if it weren't caught, no file would actually be created)
         let outside = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join("ghostdesk-test-must-not-exist").join("x.json");
         assert!(!is_test_path(&outside));
         let o = outside.clone();
@@ -2372,14 +2469,15 @@ mod tests {
     #[test]
     fn claude_app_config_resolution() {
         const F: &str = "claude_desktop_config.json";
-        // 아무것도 없음 → 설치 안 됨, 기본 위치는 %APPDATA%\Claude
+        // nothing at all → not installed, default location is %APPDATA%\Claude
         {
             let _h = FakeHome::new("capp0");
             let b = bases();
             assert!(!Client::ClaudeApp.installed());
             assert_eq!(Client::ClaudeApp.config(), b.roaming.join("Claude").join(F));
         }
-        // 지금의 MSIX 앱: 패키지 ID 와 같은 Claude-Data 폴더 (설정 파일이 다른 폴더에 있어도)
+        // the current MSIX app: the Claude-Data folder matching the package ID (even if the config file is
+        // in another folder)
         {
             let _h = FakeHome::new("capp1");
             let b = bases();
@@ -2396,7 +2494,7 @@ mod tests {
             assert!(Client::ClaudeApp.installed());
             let want = data.join("claude_pzs8sxrjxfjjc").join(F);
             assert_eq!(Client::ClaudeApp.config(), want);
-            // 등록하면 그 파일만 생기고, 예전 폴더·다른 데이터 폴더는 건드리지 않는다
+            // registering creates only that file, leaving the old folder and other data folders alone
             let exe = stable_exe();
             let msg = register(Client::ClaudeApp, &exe).unwrap();
             assert!(msg.contains(&want.display().to_string()) && msg.contains("트레이"), "{msg}");
@@ -2404,7 +2502,7 @@ mod tests {
             assert!(!legacy.join(F).exists());
             assert_eq!(std::fs::read_to_string(data.join("claude_aaaaaaaaaaaaa").join(F)).unwrap(), "{}");
         }
-        // 패키지 정보 없이 데이터 폴더만: 설정 파일이 있는 폴더 → 없으면 이름순 첫 폴더
+        // data folders without package info: the folder with the config file → else the first by name
         {
             let _h = FakeHome::new("capp2");
             let b = bases();
@@ -2417,7 +2515,7 @@ mod tests {
             std::fs::write(data.join("claude_bbb").join(F), "{}").unwrap();
             assert_eq!(Client::ClaudeApp.config(), data.join("claude_bbb").join(F));
         }
-        // 예전 설치 프로그램(Squirrel): %APPDATA%\Claude (표식 없음)
+        // old installer (Squirrel): %APPDATA%\Claude (no marker)
         {
             let _h = FakeHome::new("capp3");
             let b = bases();
@@ -2426,7 +2524,8 @@ mod tests {
             mkdir(b.roaming.join("Claude"));
             assert_eq!(Client::ClaudeApp.config(), b.roaming.join("Claude").join(F));
         }
-        // MSIX 를 설치했지만 아직 데이터를 옮기기 전 (예전 폴더에 표식 없음) → 예전 폴더 (처음 켤 때 함께 옮겨 감)
+        // MSIX installed but data not migrated yet (no marker in the old folder) → old folder (moved along
+        // on first launch)
         {
             let _h = FakeHome::new("capp4");
             let b = bases();
@@ -2434,7 +2533,8 @@ mod tests {
             mkdir(b.roaming.join("Claude"));
             assert_eq!(Client::ClaudeApp.config(), b.roaming.join("Claude").join(F));
         }
-        // 설치 후 한 번도 켜지 않음 (데이터 폴더 없음, 예전 폴더에는 표식만) → 앱이 만들 Claude-Data 폴더
+        // installed but never launched (no data folder, only the marker in the old folder) → the
+        // Claude-Data folder the app will create
         {
             let _h = FakeHome::new("capp5");
             let b = bases();
@@ -2445,7 +2545,7 @@ mod tests {
             assert!(Client::ClaudeApp.installed());
             assert_eq!(Client::ClaudeApp.config(), b.local.join("Claude-Data").join("claude_xyz0123456789").join(F));
         }
-        // 표식만 남은 예전 폴더는 설치된 것으로 보지 않는다
+        // an old folder with only the marker doesn't count as installed
         {
             let _h = FakeHome::new("capp6");
             let b = bases();
@@ -2465,18 +2565,18 @@ mod tests {
             assert_eq!(Client::ClaudeCode.config(), b.home.join(".claude.json"));
             assert_eq!(Client::Codex.config(), b.home.join(".codex").join("config.toml"));
             assert!(!Client::Codex.installed());
-            // 빈 값은 무시
+            // empty values are ignored
             h.set_env("CLAUDE_CONFIG_DIR", "");
             h.set_env("CODEX_HOME", "");
             assert_eq!(Client::ClaudeCode.config(), b.home.join(".claude.json"));
             assert_eq!(Client::Codex.config(), b.home.join(".codex").join("config.toml"));
             let cc = h.path("claude cfg");
             let cx = h.path("codex home");
-            h.set_env("claude_config_dir", cc.as_os_str()); // Windows 환경변수 이름은 대소문자 무시
+            h.set_env("claude_config_dir", cc.as_os_str()); // Windows environment variable names are case-insensitive
             h.set_env("CODEX_HOME", cx.as_os_str());
             assert_eq!(Client::ClaudeCode.config(), cc.join(".claude.json"));
             assert_eq!(Client::Codex.config(), cx.join("config.toml"));
-            // 아직 없는 폴더도 만들어 등록
+            // a folder that doesn't exist yet is created and registered
             let exe = stable_exe();
             register(Client::ClaudeCode, &exe).unwrap();
             register(Client::Codex, &exe).unwrap();
@@ -2484,7 +2584,7 @@ mod tests {
             assert!(Client::Codex.installed() && Client::ClaudeCode.installed());
             assert!(!b.home.join(".claude.json").exists() && !b.home.join(".codex").exists());
         }
-        // Codex 데스크톱 앱(MSIX)만 있어도 설치된 것으로 본다
+        // the Codex desktop app (MSIX) alone counts as installed
         {
             let _h = FakeHome::new("envdirs-msix");
             assert!(!Client::Codex.installed());
@@ -2500,35 +2600,35 @@ mod tests {
         let b = bases();
         let npm = b.roaming.join("npm");
         mkdir(&npm);
-        // npm 이 함께 까는 확장자 없는 sh 스크립트와 PowerShell 스크립트는 실행할 수 없다
+        // the extensionless sh script and PowerShell script npm installs alongside can't be run
         std::fs::write(npm.join("claude"), "#!/bin/sh\n").unwrap();
         std::fs::write(npm.join("claude.ps1"), "").unwrap();
         assert_eq!(find_cli("claude"), None);
         std::fs::write(npm.join("claude.cmd"), "@echo off\r\n").unwrap();
         assert_eq!(find_cli("claude"), Some(npm.join("claude.cmd")));
         assert!(Client::ClaudeCode.installed());
-        // 같은 폴더면 .exe 가 먼저, .cmd 가 .bat 보다 먼저
+        // in the same folder, .exe comes first, and .cmd before .bat
         std::fs::write(npm.join("claude.bat"), "").unwrap();
         assert_eq!(find_cli("claude"), Some(npm.join("claude.cmd")));
         std::fs::write(npm.join("claude.exe"), "").unwrap();
         assert_eq!(find_cli("claude"), Some(npm.join("claude.exe")));
         std::fs::remove_file(npm.join("claude.exe")).unwrap();
-        // 기본 설치(~/.local/bin)가 npm 보다 먼저
+        // the default install (~/.local/bin) comes before npm
         let local_bin = b.home.join(".local").join("bin");
         mkdir(&local_bin);
         std::fs::write(local_bin.join("claude.exe"), "").unwrap();
         assert_eq!(find_cli("claude"), Some(local_bin.join("claude.exe")));
         std::fs::remove_file(local_bin.join("claude.exe")).unwrap();
-        // PATHEXT 에 없는 확장자는 고르지 않음
+        // extensions not in PATHEXT aren't picked
         h.set_env("PATHEXT", ".COM;.EXE");
         assert_eq!(find_cli("claude"), None);
         h.set_env("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.JS");
         assert_eq!(find_cli("claude"), Some(npm.join("claude.cmd")));
-        // PATH 에만 있는 것 (따옴표로 감싼 항목, 공백 포함 폴더)
+        // only on PATH (a quoted entry, a folder with spaces)
         let custom = h.path("my tools");
         mkdir(&custom);
         std::fs::write(custom.join("codex.bat"), "@echo off\r\n").unwrap();
-        mkdir(custom.join("codex.exe")); // 폴더는 실행 파일이 아님
+        mkdir(custom.join("codex.exe")); // a folder isn't an executable
         assert_eq!(find_cli("codex"), None);
         h.set_env("Path", format!("relative\\dir;\"{}\"", custom.display()));
         assert_eq!(find_cli("codex"), Some(custom.join("codex.bat")));
@@ -2543,11 +2643,12 @@ mod tests {
         h.set_env("Path", r"C:\A;C:\B\;c:\a;;C:\npm-dup");
         let dirs: Vec<PathBuf> = std::env::split_paths(&cli_path_env(&cli)).collect();
         assert_eq!(dirs[0], h.path("npm"), "CLI 자신의 폴더가 맨 앞");
-        // 물려받은 PATH (대소문자 무시하고 중복 제거). Unix 폴더(/usr/bin 등)는 넣지 않는다
+        // inherited PATH (deduplicated case-insensitively). Unix folders (/usr/bin, …) aren't added
         assert_eq!(dirs[1..], [PathBuf::from(r"C:\A"), PathBuf::from(r"C:\B\"), PathBuf::from(r"C:\npm-dup")]);
     }
 
-    /// npm 의 claude.cmd 같은 배치 파일에 인자가 그대로 전달된다 (공백·&·괄호·% 가 든 경로, 한글 폴더)
+    /// Arguments reach batch files like npm's claude.cmd intact (paths with spaces, &, parentheses
+    /// and %, Korean folder names).
     #[cfg(windows)]
     #[test]
     fn cmd_shim_receives_args_intact() {
@@ -2555,7 +2656,7 @@ mod tests {
         let dir = h.path("npm 폴더 & (x)");
         mkdir(&dir);
         let cli = dir.join("claude.cmd");
-        // 받은 인자 줄(%*)을 그대로 파일에 적는다 (npm 의 claude.cmd 는 이 %* 를 node 에 넘긴다)
+        // write the received argument line (%*) to a file as is (npm's claude.cmd passes this %* to node)
         std::fs::write(&cli, "@echo off\r\n>\"%~dp0args.txt\" echo(%*\r\necho ran-ok\r\n").unwrap();
         assert_eq!(find_cli("claude"), None, "가짜 PATH 에 없으면 못 찾음");
         h.set_env("PATH", dir.as_os_str());
@@ -2576,7 +2677,8 @@ mod tests {
         );
     }
 
-    /// 시간 초과면 CLI 와 그 자손(cmd → node 등)을 모두 끝내고, 출력 파이프를 기다리며 멈추지 않는다
+    /// On timeout, the CLI and all its descendants (cmd → node, …) are ended, without hanging on the
+    /// output pipe.
     #[cfg(windows)]
     #[test]
     fn cli_timeout_kills_whole_tree() {
@@ -2585,7 +2687,8 @@ mod tests {
         let dir = h.path("bin");
         mkdir(&dir);
         let cli = dir.join("claude.cmd");
-        // 손자를 따로 띄워 두고 오래 기다리는 CLI 흉내. 손자가 살아남으면 3초 뒤 leak.txt 를 남긴다.
+        // mimics a CLI that spawns a separate grandchild and waits a long time. If the grandchild
+        // survives, it leaves leak.txt after 3 s.
         std::fs::write(
             &cli,
             "@echo off\r\ncd /d \"%~dp0\"\r\nstart \"\" /b cmd /d /c \"ping -n 4 127.0.0.1 >NUL & echo leaked>leak.txt\"\r\nping -n 30 127.0.0.1\r\necho finished>finished.txt\r\n",
@@ -2600,8 +2703,8 @@ mod tests {
         assert!(!dir.join("finished.txt").exists());
     }
 
-    /// CLI 는 자기 폴더에서 실행되고, cmd.exe 가 이름만 적힌 명령을 현재 폴더에서 찾지 않는다
-    /// (GhostDesk 가 물려받은 현재 폴더에 심어 둔 node.cmd 등이 실행되지 않게)
+    /// The CLI runs from its own folder, and cmd.exe doesn't look up bare command names in the current
+    /// folder (so a node.cmd planted in the current folder GhostDesk inherited never runs).
     #[cfg(windows)]
     #[test]
     fn cli_runs_in_own_folder_without_cwd_lookup() {
@@ -2629,13 +2732,13 @@ mod tests {
             .any(|(k, v)| k == "NoDefaultCurrentDirectoryInExePath" && v == Some(std::ffi::OsStr::new("1"))));
         let out = run(&mut cli_command(&cli), Duration::from_secs(30)).unwrap();
         assert!(out.to_lowercase().contains(&format!("cwd={}", dir.display()).to_lowercase()), "{out}");
-        // CLI 자신의 폴더(PATH 맨 앞)의 프로그램은 그대로 찾는다
+        // programs in the CLI's own folder (first in PATH) are still found
         assert!(out.contains("own-ran"), "{out}");
-        // 현재 폴더에만 있는 프로그램은 실행되지 않는다
+        // programs only in the current folder don't run
         assert!(!out.contains("planted-ran"), "{out}");
     }
 
-    /// 실패한 CLI 의 오류 문구 (cmd.exe 는 OEM 코드 페이지로 쓴다)
+    /// Error message of a failed CLI (cmd.exe writes in the OEM code page).
     #[cfg(windows)]
     #[test]
     fn cli_errors_are_decoded() {
@@ -2658,7 +2761,7 @@ mod tests {
         }
     }
 
-    /// 설정 파일을 다른 프로그램이 열어 둔 상태에서 고치기
+    /// Editing a config file while another program has it open.
     #[cfg(windows)]
     #[test]
     fn windows_replace_while_file_is_open() {
@@ -2666,14 +2769,14 @@ mod tests {
         let h = FakeHome::new("winopen");
         let p = h.path(".claude.json");
         std::fs::write(&p, "{\"a\":1}").unwrap();
-        // 보통처럼 열어 둔 상태 (삭제 공유 허용: Node·Rust 의 기본값)
+        // opened the usual way (delete sharing allowed: the Node and Rust default)
         {
             let _reader = std::fs::File::open(&p).unwrap();
             json_set_server(&p, "mcpServers", Some(json!({"command": "c"}))).unwrap();
         }
         assert_eq!(read_json(&p).unwrap()["mcpServers"][SERVER_NAME]["command"], "c");
         assert_eq!(read_json(&p).unwrap()["a"], 1);
-        // 삭제 공유 없이 잠가 둔 상태: 잠시 재시도한 뒤 원본을 그대로 두고 오류
+        // locked without delete sharing: retries briefly, then errors leaving the original untouched
         {
             let _lock = std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ */).open(&p).unwrap();
             let before = std::fs::read(&p).unwrap();
@@ -2685,7 +2788,9 @@ mod tests {
         json_set_server(&p, "mcpServers", Some(json!({"command": "d"}))).unwrap();
     }
 
-    /// 이 컴퓨터의 실제 위치를 보여 주기만 한다 (읽기 전용: 폴더 목록·존재 여부만 보고 파일 내용은 읽지 않는다).
+    /// Only shows this computer's real locations (read only: looks at folder listings and existence,
+    /// never file contents).
+    ///
     /// `cargo test install::tests::show_real_locations -- --ignored --nocapture`
     #[cfg(windows)]
     #[test]
@@ -2699,7 +2804,8 @@ mod tests {
         println!("Codex 설정: {} (MSIX: {:?})", codex_home(&b).join("config.toml").display(), package_ids(&b, "OpenAI.Codex"));
     }
 
-    /// 설치본이 실행 중이어도 (Claude 가 띄운 ghostdesk.exe --mcp 등) 새 버전으로 바꿀 수 있다
+    /// The installed copy can be replaced with a new version even while running (ghostdesk.exe --mcp
+    /// started by Claude, …).
     #[cfg(windows)]
     #[test]
     fn windows_install_replaces_running_exe() {
@@ -2713,7 +2819,7 @@ mod tests {
             v.sort();
             v
         };
-        // 실행 중인 설치본 흉내: cmd.exe 를 설치본 이름으로 복사해 창 없이 실행해 둔다
+        // mimic a running installed copy: copy cmd.exe under the installed name and run it windowless
         std::fs::copy(system32().join("cmd.exe"), &target).unwrap();
         let mut running = proc::spawn_group(
             Command::new(&target).args(["/d", "/c", "ping -n 10 127.0.0.1 >NUL"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()),
@@ -2722,7 +2828,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert!(proc::peek_exit(&running).is_none(), "설치본이 실행 중이어야 함");
         assert!(std::fs::write(&target, b"x").is_err(), "실행 중인 exe 는 덮어쓸 수 없음 (그래서 옆으로 옮긴다)");
-        // 중단된 다른 설치의 복사본: 끝난 프로세스 것은 지우고, 살아 있는 프로세스 것은 둔다
+        // copies from other interrupted installs: those of exited processes are deleted, those of live
+        // ones are kept
         let dead = with_suffix(&target, ".installing-4000000000");
         let busy = with_suffix(&target, &format!(".installing-{}", running.id()));
         std::fs::write(&dead, b"partial").unwrap();
@@ -2739,25 +2846,28 @@ mod tests {
         assert!(!dead.exists() && busy.exists(), "{:?}", names());
         assert_eq!(std::fs::read_to_string(source_stamp_path(&dir)).unwrap().trim(), sha256_file(&src).unwrap());
 
-        // 같은 원본이면 다시 복사하지 않음
+        // the same source isn't copied again
         let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(50));
         install_exe_into(&src, &dir).unwrap();
         assert_eq!(std::fs::metadata(&target).unwrap().modified().unwrap(), mtime);
-        // 설치본 자신, 또는 옆으로 옮겨진 옛 설치본에서 실행 중이면 아무것도 하지 않음 (새 설치본을 되돌리지 않음)
+        // running as the installed copy itself or as an old copy moved aside does nothing (the new
+        // installed copy isn't rolled back)
         install_exe_into(&target, &dir).unwrap();
         install_exe_into(&dir.join(&olds[0]), &dir).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new build v2");
 
-        // 옛 프로세스가 끝나면 다음 설치 때 옛 파일을 지운다. 실행 중이 아니면 한 번에 바꿔치기 (옛 파일 안 남김)
+        // once the old process exits, the next install deletes the old file. If not running, it's swapped
+        // in one go (no old file left)
         proc::kill_group(&mut running);
         std::thread::sleep(Duration::from_millis(500));
         std::fs::write(&src, b"new build v3 (longer)").unwrap();
         install_exe_into(&src, &dir).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new build v3 (longer)");
-        // 설치 폴더에는 설치본 · 원본 지문 · 설치한 버전(옛 exe 가 새 설치본을 덮지 않게)만 남는다
+        // the install folder holds only the installed copy, the source fingerprint and the installed
+        // version (so an old exe can't overwrite a newer installed copy)
         assert_eq!(names(), vec!["ghostdesk.exe".to_string(), "ghostdesk.src-sha256".to_string(), "ghostdesk.version".to_string()]);
-        // 지문은 맞는데 설치본이 바뀌었으면(크기 다름) 다시 설치
+        // fingerprint matches but the installed copy changed (different size): reinstall
         std::fs::write(&target, b"tampered").unwrap();
         install_exe_into(&src, &dir).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new build v3 (longer)");

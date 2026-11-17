@@ -1,12 +1,17 @@
-//! 새 버전 알림: GitHub 릴리스에서 최신판을 찾아 지금 버전보다 새로우면 화면에 알린다.
+//! Update notifications: looks up the latest GitHub release and announces it if it's newer than
+//! the running version.
 //!
-//! '업데이트' 를 누르면 지금 OS·CPU 에 맞는 릴리스 파일(`asset_suffixes`)을 내려받아 SHA256SUMS 로 확인한 뒤
-//! 지금 실행 중인 것 자리에 바꿔 넣고, '다시 시작' 을 누르면 앱이 완전히 끝난 뒤 새 버전을 띄운다.
-//! 실행 중인 것 자체를 바꾸므로 사용자가 다음에 같은 것(내려받은 exe 든 설치본이든)을 열어도 새 버전이 뜬다.
-//! - Windows: `GhostDesk-<버전>-windows-<x64|arm64>.exe` → 실행 중인 exe 를 옆으로 옮기고 새 exe 를 제자리에
-//! - macOS: `GhostDesk-<버전>-macos-<arm64|x64|universal>.zip` (안에 GhostDesk.app) → 실행 중인 .app 번들을 통째로 바꿈
+//! "Update" downloads the release file for this OS and CPU (`asset_suffixes`), verifies it
+//! against SHA256SUMS and swaps it in place of the running copy; "Restart" launches the new
+//! version once the app has fully exited. Since the running copy itself is replaced, whatever the
+//! user opens next time (the downloaded exe or the installed one) is the new version.
+//! - Windows: `GhostDesk-<version>-windows-<x64|arm64>.exe`; the running exe is moved aside and
+//!   the new one put in its place
+//! - macOS: `GhostDesk-<version>-macos-<arm64|x64|universal>.zip` (containing GhostDesk.app);
+//!   the running .app bundle is replaced as a whole
 //!
-//! 이 OS·CPU 용 파일이 릴리스에 없거나, macOS 에서 .app 번들 밖에서 실행 중이면 릴리스 페이지를 연다.
+//! If the release has no file for this OS and CPU, or on macOS we're running outside an .app
+//! bundle, the release page is opened instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,12 +23,14 @@ use eframe::egui;
 use serde_json::Value;
 use tokio::runtime::Handle;
 
-/// 릴리스를 올리는 저장소
+/// Repository releases are published to.
 const REPO: &str = "r2adkr/ghostdesk";
-/// 설정의 '릴리스 노트' 링크
+/// The "Release notes" link in Settings.
 pub const RELEASES_PAGE: &str = "https://github.com/r2adkr/ghostdesk/releases";
-/// 이 OS·CPU 에서 받을 릴리스 파일의 이름 끝. 앞의 것부터 찾는다 (macOS 는 이 CPU 전용이 없으면 유니버설).
-/// 릴리스 파일 이름은 .github/workflows/release.yml 과 같아야 한다.
+/// Release file name endings to download on this OS and CPU, in order of preference (macOS falls
+/// back to universal when there's no CPU-specific build).
+///
+/// Must match the file names in .github/workflows/release.yml.
 fn asset_suffixes() -> &'static [&'static str] {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => &["-windows-x64.exe"],
@@ -33,14 +40,14 @@ fn asset_suffixes() -> &'static [&'static str] {
         _ => &[],
     }
 }
-/// 켜 둔 채 오래 쓰는 앱이라 하루에 한 번 다시 확인한다
+/// The app tends to stay open for a long time, so check again once a day.
 const RECHECK: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
-    /// "0.2.0" (앞의 v 는 뺀다)
+    /// "0.2.0" (leading v stripped).
     pub version: String,
-    /// 릴리스 페이지 (새 소식 · 직접 내려받기)
+    /// Release page (what's new, manual download).
     pub page: String,
     asset: Option<Asset>,
 }
@@ -50,12 +57,12 @@ struct Asset {
     name: String,
     url: String,
     size: u64,
-    /// 같은 릴리스의 SHA256SUMS.txt (없으면 크기만 확인)
+    /// SHA256SUMS.txt of the same release (size check only if missing).
     sums_url: Option<String>,
 }
 
 impl Release {
-    /// 앱 안에서 바로 바꿔 넣을 수 있는가 (아니면 릴리스 페이지를 연다)
+    /// Whether it can be swapped in from inside the app (otherwise the release page opens).
     pub fn installable(&self) -> bool {
         self.asset.is_some()
     }
@@ -63,20 +70,22 @@ impl Release {
 
 #[derive(Clone, Default, PartialEq)]
 pub enum State {
-    /// 확인 전 · 이미 최신 · 확인 실패 (네트워크가 없을 때 귀찮게 하지 않도록 조용히 넘어간다)
+    /// Not checked yet, already up to date, or the check failed (quietly, so being offline isn't a
+    /// nuisance).
     #[default]
     None,
     Available(Release),
-    /// 내려받는 중 (0..=1)
+    /// Downloading (0..=1).
     Downloading(Release, f32),
-    /// 새 exe 를 제자리에 넣었다: 다시 시작하면 적용된다
+    /// The new exe is in place; restart to apply.
     Ready(Release),
     Failed(Release, String),
 }
 
 pub type Shared = Arc<parking_lot::Mutex<State>>;
 
-/// 켤 때 한 번, 그 뒤로 하루에 한 번 최신 릴리스를 확인한다. 지난 업데이트가 남긴 파일도 치운다.
+/// Checks for the latest release at startup and once a day after that. Also cleans up files left
+/// by the previous update.
 pub fn start(rt: &Handle, ctx: &egui::Context) -> Shared {
     let st = Shared::default();
     let (s, ctx) = (st.clone(), ctx.clone());
@@ -85,7 +94,7 @@ pub fn start(rt: &Handle, ctx: &egui::Context) -> Shared {
         loop {
             if let Ok(Some(r)) = latest(env!("CARGO_PKG_VERSION")).await {
                 let mut g = s.lock();
-                // 내려받는 중이거나 이미 받아 둔 것은 그대로 둔다
+                // leave a download in progress or one already done alone
                 if !matches!(*g, State::Downloading(..) | State::Ready(_)) {
                     *g = State::Available(r);
                     ctx.request_repaint();
@@ -97,7 +106,8 @@ pub fn start(rt: &Handle, ctx: &egui::Context) -> Shared {
     st
 }
 
-/// '업데이트': 새 exe 를 내려받아 실행 중인 exe 자리에 넣는다 (진행률은 `State::Downloading`)
+/// "Update": downloads the new exe and puts it where the running one is (progress in
+/// `State::Downloading`).
 pub fn download(rt: &Handle, st: Shared, ctx: egui::Context) {
     let r = match &*st.lock() {
         State::Available(r) | State::Failed(r, _) => r.clone(),
@@ -124,7 +134,7 @@ pub fn download(rt: &Handle, st: Shared, ctx: egui::Context) {
     });
 }
 
-/// '다시 시작': 창을 닫은 뒤 main 이 `relaunch_if_requested` 로 새 exe 를 띄운다
+/// "Restart": after the window closes, main launches the new exe via `relaunch_if_requested`.
 static RELAUNCH: AtomicBool = AtomicBool::new(false);
 
 pub fn request_relaunch(ctx: &egui::Context) {
@@ -132,12 +142,14 @@ pub fn request_relaunch(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
-/// main 이 GUI 를 끝내고 단일 실행 뮤텍스를 놓은 뒤 부른다 (먼저 띄우면 새 창이 옛 창을 보고 그냥 끝난다)
+/// Called by main after the GUI exits and the single-instance mutex is released (launching
+/// earlier would make the new window see the old one and just exit).
 pub fn relaunch_if_requested() {
     if !RELAUNCH.load(Ordering::SeqCst) {
         return;
     }
-    // macOS: 바꿔 넣은 .app 번들을 LaunchServices 로 새로 띄운다 (-n: 끝나 가는 지금 프로세스와 따로)
+    // macOS: launch the swapped-in .app bundle through LaunchServices (-n: separate from the
+    // exiting process)
     #[cfg(target_os = "macos")]
     let mut cmd = match update_target() {
         Ok(bundle) => {
@@ -155,7 +167,7 @@ pub fn relaunch_if_requested() {
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
-        // 콘솔 프로그램이라 그냥 띄우면 콘솔 창이 생긴다
+        // it's a console program, so a plain launch would open a console window
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -165,7 +177,7 @@ pub fn relaunch_if_requested() {
 }
 
 fn client() -> Result<reqwest::Client> {
-    // GitHub API 는 User-Agent 가 꼭 있어야 한다 (앱 이름과 버전만 보낸다)
+    // the GitHub API requires a User-Agent (only the app name and version are sent)
     Ok(reqwest::Client::builder()
         .user_agent(concat!("GhostDesk/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
@@ -173,7 +185,7 @@ fn client() -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// `current` 보다 새 정식 릴리스 (없으면 None)
+/// A stable release newer than `current`, if any.
 async fn latest(current: &str) -> Result<Option<Release>> {
     let v: Value = client()?
         .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
@@ -184,12 +196,13 @@ async fn latest(current: &str) -> Result<Option<Release>> {
         .error_for_status()?
         .json()
         .await?;
-    // 바꿔 넣을 곳이 없으면(macOS 에서 번들 밖 실행) 파일을 고르지 않는다 → 릴리스 페이지를 연다
+    // with nowhere to swap into (macOS, running outside a bundle) pick no file, so the release
+    // page opens
     let suffixes = if update_target().is_ok() { asset_suffixes() } else { &[] };
     Ok(parse_release(&v, current, suffixes))
 }
 
-/// 업데이트로 바꿔 넣을 것: Windows 는 실행 중인 exe, macOS 는 그것을 담은 .app 번들
+/// What an update replaces: the running exe on Windows, the .app bundle containing it on macOS.
 fn update_target() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
     if cfg!(target_os = "macos") {
@@ -204,8 +217,11 @@ fn update_target() -> Result<PathBuf> {
     }
 }
 
-/// 내려받은 zip 에서 바로 연 앱은 macOS 가 읽기 전용 임시 위치(AppTranslocation)에서 실행한다.
-/// 그 자리는 바꿔 넣을 수 없으므로 설치 위치(~/Applications/GhostDesk.app)에 새 버전을 넣고 거기서 다시 연다.
+/// An app opened straight from a downloaded zip runs from a read-only temporary location
+/// (AppTranslocation) on macOS.
+///
+/// That can't be replaced, so the new version goes to the install location
+/// (~/Applications/GhostDesk.app) and is reopened from there.
 fn mac_target(bundle: &Path) -> PathBuf {
     if bundle.to_string_lossy().contains("/AppTranslocation/") {
         crate::install::stable_app()
@@ -214,7 +230,8 @@ fn mac_target(bundle: &Path) -> PathBuf {
     }
 }
 
-/// GitHub 릴리스 JSON → 지금(`current`)보다 새 정식 릴리스. `suffixes` 의 앞에서부터 처음 맞는 파일을 고른다.
+/// GitHub release JSON → a stable release newer than `current`. Picks the first file matching
+/// `suffixes`, in order.
 fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release> {
     if v["draft"].as_bool() == Some(true) || v["prerelease"].as_bool() == Some(true) {
         return None;
@@ -234,7 +251,8 @@ fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release>
     Some(Release { version, page, asset })
 }
 
-/// `candidate` 가 `current` 보다 새 버전인가 ("0.2.0" > "0.1.10", "0.2" == "0.2.0", 꼬리표 -beta 등은 무시)
+/// Whether `candidate` is newer than `current` ("0.2.0" > "0.1.10", "0.2" == "0.2.0", suffixes
+/// like -beta ignored).
 pub(crate) fn newer(candidate: &str, current: &str) -> bool {
     let parts = |s: &str| -> Vec<u64> {
         s.split(['-', '+']).next().unwrap_or("").split('.').map(|p| p.trim().parse().unwrap_or(0)).collect()
@@ -246,7 +264,7 @@ pub(crate) fn newer(candidate: &str, current: &str) -> bool {
     a > b
 }
 
-/// SHA256SUMS.txt ("<해시>  <파일 이름>" 줄들) 에서 `name` 의 해시
+/// The hash for `name` in SHA256SUMS.txt (lines of "<hash>  <file name>").
 fn sum_for(sums: &str, name: &str) -> Option<String> {
     sums.lines().find_map(|l| {
         let (hash, file) = l.trim().split_once(char::is_whitespace)?;
@@ -254,7 +272,8 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// 내려받기 → 크기·해시 확인 → `target`(실행 중인 exe 또는 .app 번들) 과 바꿔치기. 실패하면 받던 파일은 지운다.
+/// Download → verify size and hash → swap with `target` (the running exe or .app bundle). The
+/// partial download is deleted on failure.
 async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let me = target.to_path_buf();
@@ -266,7 +285,7 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
         }
         None => None,
     };
-    // 같은 폴더에 받아야 이름 바꾸기만으로 바꿔 넣을 수 있다
+    // download into the same folder so a rename is enough to swap it in
     let staging = sibling(&me, &format!(".update-{}", std::process::id()));
     if let Some(dir) = me.parent() {
         tokio::fs::create_dir_all(dir).await.with_context(|| format!("{} 폴더를 만들 수 없습니다", dir.display()))?;
@@ -304,12 +323,15 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
 
 #[cfg(windows)]
 fn swap(staging: &Path, me: &Path) -> Result<()> {
-    // 실행 중인 exe 는 이름만 바꿀 수 있다: 옆(<이름>.old-<시각>)으로 옮기고 새 파일을 제자리에
+    // a running exe can only be renamed: move it aside (<name>.old-<time>) and put the new file in
+    // its place
     crate::install::swap_in(staging, me)
 }
 
-/// macOS: 받은 zip 을 옆 폴더에 풀어 그 안의 GhostDesk.app 을 확인한 뒤, 실행 중인 번들을 옆(`<이름>.old-<시각>`)으로
-/// 옮기고 새 번들을 제자리에 넣는다 (실행 중인 프로세스는 옮겨진 옛 파일을 계속 쓴다). 넣다가 실패하면 되돌린다.
+/// macOS: unpacks the zip into a sibling folder, checks the GhostDesk.app inside, moves the
+/// running bundle aside (`<name>.old-<time>`) and puts the new one in its place.
+///
+/// The running process keeps using the moved old files. Rolls back if putting it in place fails.
 #[cfg(target_os = "macos")]
 fn swap(zip: &Path, bundle: &Path) -> Result<()> {
     let unpacked = sibling(bundle, &format!(".update-{}.d", std::process::id()));
@@ -320,7 +342,8 @@ fn swap(zip: &Path, bundle: &Path) -> Result<()> {
         let new_app = unpacked.join("GhostDesk.app");
         anyhow::ensure!(new_app.join("Contents/MacOS/ghostdesk").is_file(), "받은 파일 안에 GhostDesk.app 이 없습니다");
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        // 설치 위치에 아직 앱이 없으면(옮겨 둔 적 없이 내려받은 곳에서 연 경우) 새 앱만 넣는다
+        // no app at the install location yet (opened from the download location without moving it):
+        // just put the new one there
         let old = sibling(bundle, &format!(".old-{secs}"));
         let had = bundle.exists();
         if had {
@@ -344,15 +367,18 @@ fn swap(_staging: &Path, _me: &Path) -> Result<()> {
     anyhow::bail!("이 OS 에서는 앱 안에서 업데이트할 수 없습니다")
 }
 
-/// `p` 와 같은 폴더의 `<p 이름><suffix>`
+/// `<file name of p><suffix>` in the same folder as `p`.
 fn sibling(p: &Path, suffix: &str) -> PathBuf {
     let mut name = p.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
     p.with_file_name(name)
 }
 
-/// 지난 업데이트가 남긴 것 (옆으로 옮긴 옛 exe·번들 · 받다 만 파일·폴더). 아직 실행 중인 옛 exe 는 지워지지 않아 다음에 다시.
-/// 바꿔 넣는 대상(exe 또는 .app) 이름으로 시작하는, 업데이트가 만든 이름의 것만 지운다.
+/// Leftovers from the previous update (old exe or bundle moved aside, partial downloads). An old
+/// exe that's still running can't be deleted and is retried next time.
+///
+/// Only removes items named by the updater that start with the update target's (exe or .app)
+/// name.
 fn sweep_leftovers() {
     let Ok(me) = update_target() else { return };
     let (Some(dir), Some(name)) = (me.parent(), me.file_name()) else { return };
@@ -399,16 +425,16 @@ mod tests {
         assert!(r.installable());
         let a = r.asset.unwrap();
         assert_eq!((a.size, a.url.as_str(), a.sums_url.as_deref()), (123, "https://x/a.exe", Some("https://x/SHA256SUMS.txt")));
-        // 내려받을 파일이 없는 OS: 알리기만 (페이지 열기)
+        // OS without a downloadable file: notify only (opens the page)
         assert!(!parse_release(&v, "0.2.0", &[]).unwrap().installable());
-        // 같은 버전 · 미리보기 · 초안은 알리지 않는다
+        // same version, prereleases and drafts aren't announced
         assert_eq!(parse_release(&v, "0.3.0", &[]), None);
         let mut pre = v.clone();
         pre["prerelease"] = json!(true);
         assert_eq!(parse_release(&pre, "0.2.0", &[]), None);
     }
 
-    /// macOS: 이 CPU 전용 파일이 있으면 그것, 없으면 유니버설. Windows 파일은 고르지 않는다
+    /// macOS: the CPU-specific file if present, otherwise universal. Never picks the Windows file.
     #[test]
     fn picks_the_mac_build_for_this_cpu() {
         let rel = |names: &[&str]| {
@@ -424,7 +450,7 @@ mod tests {
         assert_eq!(parse_release(&universal, "0.2.0", &arm).unwrap().asset.unwrap().name, "GhostDesk-0.3.0-macos-universal.zip");
         let win_only = rel(&["GhostDesk-0.3.0-windows-x64.exe"]);
         assert!(!parse_release(&win_only, "0.2.0", &arm).unwrap().installable(), "macOS 파일이 없으면 페이지만 연다");
-        // 지금 실행 환경의 목록이 비어 있지 않다 (지원하는 OS·CPU)
+        // the list for the current platform isn't empty (supported OS and CPU)
         if cfg!(any(windows, target_os = "macos")) {
             assert!(!asset_suffixes().is_empty());
         }
@@ -438,8 +464,9 @@ mod tests {
         assert_eq!(sum_for(sums, "missing.exe"), None);
     }
 
-    /// 실제 GitHub 최신 릴리스를 받아 가짜 exe 자리에 바꿔 넣는다 (네트워크 필요, 약 30MB):
-    /// cargo test --bin ghostdesk live_update_roundtrip -- --ignored
+    /// Downloads the real latest GitHub release and swaps it in for a fake exe (needs network,
+    /// about 30 MB):
+    /// `cargo test --bin ghostdesk live_update_roundtrip -- --ignored`
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     #[ignore]
@@ -460,7 +487,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// macOS: 받은 zip(안에 GhostDesk.app)을 풀어 실행 중인 번들 자리에 넣고, 옛 번들은 옆으로 옮기고, 받은 것들은 치운다
+    /// macOS: unpacks the zip (with GhostDesk.app inside) into the running bundle's place, moves the
+    /// old bundle aside and cleans up the download.
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_swap_replaces_the_bundle() {
@@ -484,14 +512,15 @@ mod tests {
         assert!(left.iter().any(|n| n.starts_with("GhostDesk.app.old-")), "{left:?}");
         assert!(!left.iter().any(|n| n.contains(".update-")), "받은 zip·푼 폴더가 남으면 안 됨: {left:?}");
 
-        // zip 안에 GhostDesk.app 이 없으면 아무것도 바꾸지 않는다
+        // nothing is replaced if the zip has no GhostDesk.app
         let bad = dir.join("bad.zip");
         std::fs::write(dir.join("x.txt"), "x").unwrap();
         std::process::Command::new("/usr/bin/ditto").args(["-c", "-k"]).arg(dir.join("x.txt")).arg(&bad).status().unwrap();
         assert!(swap(&bad, &target).is_err());
         assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/ghostdesk")).unwrap(), "new");
 
-        // 설치 위치에 아직 앱이 없어도 (내려받은 곳에서 바로 연 앱의 업데이트) 새 앱을 넣는다
+        // installs the new app even with nothing at the install location yet (updating an app opened
+        // straight from the download location)
         let fresh = dir.join("fresh").join("GhostDesk.app");
         std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
         let zip2 = dir.join("again.zip");

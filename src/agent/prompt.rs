@@ -1,5 +1,7 @@
-//! 시스템 프롬프트: 화면 종류별 환경 설명 + 공통 규칙.
-//! 대화 내내 고정해야 한다 (프롬프트 캐시와 사고 블록 보존).
+//! System prompt: an environment section per screen type plus the common rules.
+//!
+//! It must stay fixed for the whole conversation, both for prompt caching and so earlier
+//! thinking blocks remain valid.
 
 use std::borrow::Cow;
 
@@ -49,7 +51,7 @@ const RULES: &str = r#"Rules
 - Work efficiently: batch several actions per turn when you are confident about the layout.
 - Only the latest few screenshots stay visible; older ones are replaced by a note. If the screen did not change since the last screenshot you get a short note instead of a new image, and the tab/window list is only repeated when it changes."#;
 
-/// macOS 밖(Windows 등)의 브라우저 환경 설명. ENV_BROWSER 와 같고, 단축키가 ctrl 기반임을 알려 준다.
+/// Browser environment outside macOS. Same as `ENV_BROWSER`, but mentions ctrl-based shortcuts.
 fn env_browser_pc() -> String {
     use crate::platform::text::OS_NAME;
     format!(
@@ -63,7 +65,7 @@ fn env_browser_pc() -> String {
     )
 }
 
-/// macOS 밖(Windows 등)의 Electron 앱 환경 설명. ENV_ELECTRON 과 같은 규칙을 그 OS 의 단축키로 설명한다.
+/// Electron environment outside macOS. Same rules as `ENV_ELECTRON`, with that OS's shortcuts.
 fn env_electron_pc() -> String {
     use crate::platform::text::OS_NAME;
     format!(
@@ -79,8 +81,9 @@ fn env_electron_pc() -> String {
     )
 }
 
-/// 화면 종류별 Environment 절. macOS 에서는 기존 문구 그대로, 그 밖에서는 그 OS 의 단축키·화면 구성으로 설명한다.
-/// (원격·별도 세션·가상 디스플레이는 상대 화면/macOS 전용 기능이라 OS 와 상관없이 같다.)
+/// The Environment section for a screen type. On macOS this is the original text; elsewhere it
+/// describes that OS's shortcuts and screen setup. Remote, separate-session and virtual-display
+/// screens are the same on every OS (they describe the other machine or are macOS-only).
 fn env_section(kind: DeskKind) -> Cow<'static, str> {
     let mac = cfg!(target_os = "macos");
     match kind {
@@ -89,20 +92,21 @@ fn env_section(kind: DeskKind) -> Cow<'static, str> {
         DeskKind::Remote => Cow::Borrowed(ENV_REMOTE),
         DeskKind::Electron if !mac => Cow::Owned(env_electron_pc()),
         DeskKind::Electron => Cow::Borrowed(ENV_ELECTRON),
-        // 로컬 앱 백엔드는 OS 마다 구현이 다르므로 그 백엔드가 설명을 준다 (None 이면 macOS 설명)
+        // local-app backends differ per OS, so the backend supplies the text (None = the macOS text)
         DeskKind::Native => Cow::Borrowed(crate::native::env_prompt().unwrap_or(ENV_NATIVE)),
         DeskKind::VDisplay => Cow::Borrowed(crate::vdisplay::ENV_VDISPLAY),
         DeskKind::Session => Cow::Borrowed(ENV_SESSION),
     }
 }
 
-/// `lang`: 사람에게 쓸 언어의 영어 이름 (화면 언어를 따른다)
+/// `lang` is the English name of the language to address the user in (follows the UI language).
 pub(super) fn system_prompt(kind: DeskKind, lang: &str) -> String {
     let env = env_section(kind);
     format!("You are an autonomous computer-use agent running inside GhostDesk.\n\n{env}\n\n{RULES}\n{}", done_rule(lang))
 }
 
-/// 마지막 규칙: 사람에게 쓰는 글(질문·보고)은 그 사람의 언어로, 끝나면 짧게 보고한다
+/// The final rule: write questions and reports in the user's language, and finish with a short
+/// summary.
 fn done_rule(lang: &str) -> String {
     format!(
         "- Write everything meant for the human (questions via `ask_user` and your replies) in {lang}. \
@@ -136,14 +140,14 @@ mod tests {
         for k in [DeskKind::Browser, DeskKind::Remote, DeskKind::Electron, DeskKind::VDisplay, DeskKind::Session] {
             assert!(env_section(k).starts_with("Environment\n"), "{k:?}");
         }
-        // OS 와 상관없는 화면은 항상 같은 문구
+        // OS-independent screens always get the same text
         assert!(system_prompt(DeskKind::Remote).contains(ENV_REMOTE));
         assert!(system_prompt(DeskKind::Session).contains(ENV_SESSION));
         assert!(system_prompt(DeskKind::VDisplay).contains(crate::vdisplay::ENV_VDISPLAY));
-        // 로컬 앱은 그 OS 의 백엔드가 준 설명 (없으면 macOS 설명)
+        // local apps get the OS backend's text (or the macOS one)
         assert!(system_prompt(DeskKind::Native).contains(crate::native::env_prompt().unwrap_or(ENV_NATIVE)));
         if cfg!(target_os = "macos") {
-            // macOS 는 기존 문구 그대로
+            // macOS keeps the original text
             assert_eq!(
                 system_prompt(DeskKind::Browser),
                 format!("You are an autonomous computer-use agent running inside GhostDesk.\n\n{ENV_BROWSER}\n\n{RULES}\n{}", done_rule("Korean"))
@@ -163,7 +167,7 @@ mod tests {
                 }
             }
             assert!(system_prompt(DeskKind::Electron).contains("shift+Insert"), "Windows 클립보드 키도 막힌다고 알림");
-            // 템플릿에 중괄호가 남지 않음 (format! 자리표시자 누락 방지)
+            // no braces left in the templates (catches a missing format! argument)
             assert!(!env_browser_pc().contains('{') && !env_electron_pc().contains('{'));
         }
     }

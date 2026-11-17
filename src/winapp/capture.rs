@@ -1,7 +1,9 @@
-//! 화면 밖 창 캡처: PrintWindow(PW_RENDERFULLCONTENT) → 32비트 DIB → 내용 영역만 잘라 → 긴 변 제한으로 축소.
+//! Off-screen window capture: PrintWindow(PW_RENDERFULLCONTENT) → 32-bit DIB → crop to the
+//! client area → downscale to a maximum long edge.
 //!
-//! PrintWindow 는 DWM 이 가진 창 표면을 그려 주므로 창이 어느 모니터에도 걸치지 않아도(화면 밖) 찍힌다.
-//! 단, 창이 **보이는 상태**(WS_VISIBLE, 최소화 아님)여야 한다 — 그래서 숨기지 않고 화면 밖에 둔다.
+//! PrintWindow renders the window surface held by DWM, so it works even when the window isn't
+//! on any monitor. The window does have to be *visible* (WS_VISIBLE, not minimized), which is
+//! why windows are parked off-screen rather than hidden.
 
 use anyhow::{bail, Result};
 use image::RgbImage;
@@ -14,22 +16,23 @@ use super::w32::{self, Hwnd};
 
 const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 
-/// 캡처 한 장과 그 시점의 좌표 정보
+/// One capture and the coordinate info at the time it was taken.
 pub struct Shot {
     pub img: RgbImage,
-    /// 내용 영역 크기 (실제 픽셀)
+    /// Client area size in physical pixels.
     pub client_w: u32,
     pub client_h: u32,
 }
 
-/// 긴 변이 max_long_edge 이하가 되도록 (비율 유지) 출력 크기를 정한다. 0 = 원본.
+/// Output size with the long edge at most `max_long_edge`, keeping the aspect ratio.
+/// 0 means original size.
 pub fn fit_size(w: u32, h: u32, max_long_edge: u32) -> (u32, u32) {
     let (fw, fh) = (w.max(1) as f64, h.max(1) as f64);
     let k = if max_long_edge == 0 { 1.0 } else { (max_long_edge as f64 / fw.max(fh)).min(1.0) };
     (((fw * k).round() as u32).max(1), ((fh * k).round() as u32).max(1))
 }
 
-/// BGRA(위→아래) 버퍼에서 (x, y, w, h) 영역을 RGB 이미지로
+/// Crops `(x, y, w, h)` out of a top-down BGRA buffer into an RGB image.
 pub fn crop_bgra(buf: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: usize) -> RgbImage {
     let mut img = RgbImage::new(w as u32, h as u32);
     for row in 0..h {
@@ -44,7 +47,7 @@ pub fn crop_bgra(buf: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: 
     img
 }
 
-/// 창 전체를 PrintWindow 로 그려 BGRA 버퍼로: (버퍼, 너비, 높이)
+/// Renders the whole window with PrintWindow into a BGRA buffer: `(buffer, width, height)`.
 fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
     let (l, t, r, b) = w32::window_rect(h);
     let (ww, wh) = ((r - l).max(0) as usize, (b - t).max(0) as usize);
@@ -52,13 +55,13 @@ fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
         bail!("창 크기가 올바르지 않습니다 ({ww}x{wh})");
     }
     unsafe {
-        // 화면 DC(GetDC(NULL))는 숨은 데스크톱 스레드에서 실패하므로 쓰지 않는다
+        // don't use the screen DC (GetDC(NULL)); it fails on a hidden desktop's thread
         let mem = CreateCompatibleDC(std::ptr::null_mut());
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: ww as i32,
-            biHeight: -(wh as i32), // 위→아래
+            biHeight: -(wh as i32), // top-down
             biPlanes: 1,
             biBitCount: 32,
             biCompression: 0, // BI_RGB
@@ -84,7 +87,7 @@ fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
     }
 }
 
-/// 창의 내용 영역을 캡처한다 (긴 변 ≤ max_long_edge, 0 이면 원본 픽셀)
+/// Captures the window's client area (long edge ≤ `max_long_edge`, 0 = original pixels).
 pub fn capture_client(h: Hwnd, max_long_edge: u32) -> Result<Shot> {
     if !w32::is_window(h) {
         bail!("창이 닫혔습니다");
@@ -119,7 +122,7 @@ pub fn capture_client(h: Hwnd, max_long_edge: u32) -> Result<Shot> {
     Ok(Shot { img, client_w: w as u32, client_h: hh as u32 })
 }
 
-/// 이미지가 거의 한 색인가 (그리기 실패 감지용)
+/// Whether the image is nearly a single color, which means painting failed.
 pub fn is_blank(img: &RgbImage) -> bool {
     let Some(first) = img.pixels().next().copied() else { return true };
     let step = ((img.width() * img.height()) as usize / 4000).max(1);
@@ -151,7 +154,7 @@ mod tests {
         assert_eq!(fit_size(800, 600, 1280), (800, 600));
         assert_eq!(fit_size(1000, 3000, 1000), (333, 1000));
         assert_eq!(fit_size(500, 400, 0), (500, 400));
-        // 3x2 BGRA, (1,1) 에서 2x1 자르기
+        // 3x2 BGRA, crop 2x1 at (1,1)
         let mut buf = vec![0u8; 3 * 2 * 4];
         let i = (3 + 1) * 4;
         buf[i] = 10; // B

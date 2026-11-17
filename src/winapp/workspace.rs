@@ -1,9 +1,14 @@
-//! Windows 일반 앱 작업공간 — [`crate::native::NativeAppWorkspace`] 의 Windows 구현.
+//! Windows workspace for regular apps: the Windows implementation of
+//! [`crate::native::NativeAppWorkspace`].
 //!
-//! - Mode A: 숨김(SW_HIDE)·일시정지 상태로 띄워 Job 에 넣고, 창을 화면 밖에 둔 채 SW_SHOWNOACTIVATE 로 보이게 한다.
-//! - Mode B: 사용자의 실행 중인 앱에 동의 하에 붙어, 작업하는 동안 그 앱의 창을 화면 밖으로 옮겨 두고 끝나면 되돌린다.
-//! - 화면 = 현재 창의 내용 영역 (PrintWindow). 뷰 = 앱의 최상위 창들 (새 대화상자는 자동으로 전환).
-//! - 입력 = 창 메시지 (사용자의 커서·포커스·클립보드는 건드리지 않음). 의미 기반 조작 = UI Automation (app_control).
+//! - Mode A: launched hidden (SW_HIDE) and suspended into a Job, with its windows kept off-screen
+//!   and shown via SW_SHOWNOACTIVATE.
+//! - Mode B: attaches with consent to a running user app, parks its windows off-screen while
+//!   working and puts them back when done.
+//! - Screen = the current window's client area (PrintWindow). Views = the app's top-level windows
+//!   (new dialogs are switched to automatically).
+//! - Input = window messages (the user's cursor, focus and clipboard are untouched). Semantic
+//!   control = UI Automation (`app_control`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,7 +45,7 @@ struct Down {
     target: Hwnd,
     top: Hwnd,
     mk: usize,
-    /// 누른 자리 (스크린샷 좌표 / target 기준 좌표)
+    /// Where the button went down (screenshot coordinates / coordinates relative to `target`).
     start: (f64, f64),
     pt: (i32, i32),
 }
@@ -55,9 +60,9 @@ struct State {
     notes: Vec<String>,
     ui_ids: Vec<uia::Node>,
     ui_for: Option<Hwnd>,
-    /// 내부 클립보드 (사용자의 시스템 클립보드는 쓰지 않는다)
+    /// Internal clipboard (the user's system clipboard is never used).
     clipboard: String,
-    /// 마지막으로 클릭한 컨트롤 (키보드 대상 후보)
+    /// Last clicked control (keyboard target candidate).
     last_target: Option<Hwnd>,
     reclaim_noted: bool,
 }
@@ -75,13 +80,15 @@ struct Inner {
     shut: AtomicBool,
     sink: FrameSink,
     exposure: Mutex<Vec<String>>,
-    /// 숨은 데스크톱에서 띄웠으면 그 데스크톱과 작업 스레드 (None = 사용자 데스크톱의 화면 밖 창 / 붙은 앱)
+    /// The hidden desktop and its worker thread, if launched there (`None` = off-screen window on the
+    /// user's desktop, or an attached app).
     desk: Option<Arc<DeskHost>>,
-    /// Mode A: 실행 전부터 돌던 같은 앱의 프로세스 (단일 인스턴스 감지용)
+    /// Mode A: processes of the same app already running before launch (for single-instance
+    /// detection).
     before_same: Mutex<Vec<u32>>,
 }
 
-/// Windows 일반 앱 작업공간
+/// Workspace for regular Windows apps.
 pub struct NativeAppWorkspace {
     inner: Arc<Inner>,
 }
@@ -90,7 +97,8 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| anyhow!("작업 스레드 오류: {e}"))
 }
 
-/// 창을 다루는 작업을 돌린다: 숨은 데스크톱이면 그 전용 스레드에서, 아니면 tokio 작업 스레드에서
+/// Runs window work: on the dedicated thread for a hidden desktop, otherwise on a tokio worker
+/// thread.
 async fn exec<T: Send + 'static>(desk: &Option<Arc<DeskHost>>, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     match desk {
         Some(d) => d.thread.run_async(f).await,
@@ -98,7 +106,8 @@ async fn exec<T: Send + 'static>(desk: &Option<Arc<DeskHost>>, f: impl FnOnce() 
     }
 }
 
-/// 숨은 데스크톱에서 그려지지 않아 화면 밖 호스트로 띄워야 하는 실행 파일 (이 GhostDesk 실행 동안 기억)
+/// Executables that don't paint on a hidden desktop and must use the off-screen host
+/// (remembered for this GhostDesk run).
 fn offscreen_verdicts() -> &'static Mutex<std::collections::HashMap<String, String>> {
     static V: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
     V.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -108,7 +117,8 @@ fn verdict_key(app: &str) -> String {
     super::apps::resolve_app_query(app).map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_else(|| app.to_lowercase())
 }
 
-/// 숨은 데스크톱 실행 실패: `retry_offscreen` 이면 화면 밖 호스트로 다시 띄워 볼 만하다
+/// Hidden desktop launch failure. With `retry_offscreen`, relaunching on the off-screen host is
+/// worth a try.
 struct LaunchFail {
     err: anyhow::Error,
     retry_offscreen: bool,
@@ -124,12 +134,14 @@ const RIGHT_ERR: &str = "오른쪽 클릭(컨텍스트 메뉴)은 할 수 없습
     메뉴 막대 항목은 app_control menu, 요소 동작은 app_control press 를 쓰세요.";
 
 impl NativeAppWorkspace {
-    /// 앱을 숨은 데스크톱(기본) 또는 화면 밖 창으로 띄우거나(Mode A), 동의 하에 실행 중인 앱에 붙는다(Mode B).
+    /// Launches the app on a hidden desktop (default) or as an off-screen window (mode A), or
+    /// attaches to a running app with consent (mode B).
     pub async fn launch(opts: NativeOptions, sink: FrameSink) -> Result<Arc<Self>> {
         if opts.host == NativeHost::CurrentSession && (opts.attach_pid.is_some() || opts.attach_consent) {
             bail!("current_session 은 기존 로그인으로 새로 실행하는 모드입니다. attach 없이 쓰고, 실행 중인 앱은 먼저 직접 종료하세요.");
         }
-        // 창 좌표·캡처를 실제 픽셀로 (GUI 는 winit 이 이미 설정했으므로 무시된다)
+        // window coordinates and captures in physical pixels (ignored in the GUI, where winit already set
+        // it)
         pw::set_dpi_aware();
         let attaching = opts.attach_pid.is_some();
         let key = verdict_key(&opts.app);
@@ -183,8 +195,9 @@ impl NativeAppWorkspace {
     }
 
     async fn launch_on(opts: NativeOptions, sink: FrameSink, desk: Option<Arc<DeskHost>>) -> std::result::Result<Arc<Inner>, LaunchFail> {
-        // 실행은 보통 작업 스레드에서 (붙기 판단은 사용자 데스크톱의 창을 봐야 한다).
-        // 이 future 가 취소되어도 결과(Arc<Inner>)가 버려지면서 Inner::drop → shutdown_sync 가 돌아 띄운 프로세스가 남지 않는다.
+        // launch on a regular worker thread (the attach decision has to look at user desktop windows).
+        // If this future is cancelled, dropping the result (Arc<Inner>) runs Inner::drop → shutdown_sync,
+        // so no launched process is left behind.
         let d2 = desk.clone();
         let inner = blocking(move || -> Result<Arc<Inner>> {
             let st = start_app(&opts, d2.as_deref())?;
@@ -207,14 +220,15 @@ impl NativeAppWorkspace {
             }))
         })
         .await??;
-        // 첫 창 대기·렌더링 검사는 창이 있는 데스크톱의 스레드에서
+        // wait for the first window and check rendering on the thread of the desktop that has the windows
         let i2 = inner.clone();
         let hidden = inner.desk.is_some();
         let r = exec(&inner.desk.clone(), move || -> std::result::Result<(), LaunchFail> {
             let before = i2.before_same.lock().clone();
             match i2.wait_first_window(before) {
                 Ok(()) => {}
-                // 숨은 데스크톱에서 창 없이 끝났다: 레거시 D3D9 처럼 그 데스크톱에서 장치를 못 만드는 앱일 수 있다
+                // exited without a window on the hidden desktop: may be an app that can't create a device there,
+                // like legacy D3D9
                 Err(e) if hidden && i2.process_gone() => return Err(LaunchFail { err: e, retry_offscreen: true }),
                 Err(e) => return Err(e.into()),
             }
@@ -249,13 +263,14 @@ impl NativeAppWorkspace {
         self.inner.app_name.clone()
     }
 
-    /// 실행 이후 측정된 창 노출·포커스 기록 (비어 있으면 노출 없음)
+    /// Window exposure and focus events measured since launch (empty = no exposure).
     pub fn exposure_report(&self) -> Vec<String> {
         self.inner.collect_guard_events();
         self.inner.exposure.lock().clone()
     }
 
-    /// 앱 프로세스들의 최상위 창 (앱이 있는 데스크톱에서 열거) — 자체 시험·진단용
+    /// Top-level windows of the app's processes (enumerated on the app's desktop), for self-tests
+    /// and diagnostics.
     pub fn app_top_windows(&self) -> Vec<pw::TopWindow> {
         let pids = self.inner.pids();
         let f = move || pw::windows_of(&pids);
@@ -265,7 +280,7 @@ impl NativeAppWorkspace {
         }
     }
 
-    /// 숨은 데스크톱에서 실행 중인가
+    /// Whether it runs on a hidden desktop.
     pub fn on_hidden_desktop(&self) -> bool {
         self.inner.desk.is_some()
     }
@@ -411,14 +426,14 @@ impl NativeAppWorkspace {
         let _ = exec(&self.inner.desk, move || i.shutdown_sync()).await;
     }
 
-    /// LLM `app_control` 도구 실행. 결과 텍스트를 돌려준다.
+    /// Runs the LLM `app_control` tool and returns the result text.
     pub async fn app_control(&self, input: &Value) -> Result<String> {
         let i = self.inner.clone();
         let input = input.clone();
         exec(&self.inner.desk, move || i.app_control(&input)).await?
     }
 
-    /// (진단용) 흉내 없이 키 메시지(WM_KEYDOWN/UP)만 보낸다.
+    /// (Diagnostics) Sends only key messages (WM_KEYDOWN/UP), without emulation.
     pub async fn raw_key(&self, combo: &str) -> Result<String> {
         let i = self.inner.clone();
         let combo = combo.to_string();
@@ -435,25 +450,27 @@ fn check_button(b: MouseButton) -> Result<()> {
 }
 
 impl Drop for Inner {
-    /// shutdown 을 부르지 않고 버려져도 우리가 띄운 프로세스는 반드시 정리한다 (Mode B 는 창을 되돌린다)
+    /// Processes we launched are always cleaned up, even if dropped without `shutdown` (mode B puts
+    /// windows back).
     fn drop(&mut self) {
         self.shutdown_sync();
     }
 }
 
-// ───────────────────────── 실행 / 연결 ─────────────────────────
+// ---- launch / attach ----
 
 struct Started {
     proc_: Proc,
     mode: NativeMode,
     name: String,
     guard: Guard,
-    /// Mode A: 실행 전부터 돌던 같은 앱의 프로세스 (단일 인스턴스 감지용)
+    /// Mode A: processes of the same app already running before launch (for single-instance
+    /// detection).
     before_same: Vec<u32>,
 }
 
 fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
-    // 지난번 비정상 종료로 화면 밖에 남은 사용자 창(Mode B)이 있으면 먼저 되돌린다
+    // first put back any user windows (mode B) left off-screen by a previous crash
     super::recovery::recover();
     let exe = super::apps::resolve_app_query(&o.app).ok_or_else(|| {
         anyhow!(
@@ -464,7 +481,8 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
     launch::preflight(&exe)?;
     let name = launch::display_name(&exe);
     if let Some(p) = o.attach_pid {
-        // attach_pid 가 지정한 앱과 다른 프로세스(사용자의 다른 앱)를 가리키면 거부한다
+        // refuse if attach_pid points at a process other than the requested app (another of the user's
+        // apps)
         match pw::process_path(p as u32) {
             None => bail!("pid {p} 는 실행 중인 앱이 아닙니다"),
             Some(path) if !crate::platform::paths::same_path(&path, &exe) => {
@@ -473,7 +491,8 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
             _ => {}
         }
     }
-    // 원본 프로필을 쓰는 current_session 의 확인과 실행 사이에 다른 요청이 끼지 않게 한다.
+    // keep other requests from slipping in between current_session's check and launch (it uses the
+    // original profile)
     static APP_LAUNCH: Mutex<()> = Mutex::new(());
     let _launch = APP_LAUNCH.lock();
     let running = match o.attach_pid {
@@ -491,7 +510,7 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
                  또는 별도 인스턴스(new_instance)를 선택하세요."
             );
         }
-        // 보이는 창이 있는 인스턴스를 우선
+        // prefer an instance with a visible window
         let pid = running
             .iter()
             .copied()
@@ -499,7 +518,8 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
             .unwrap_or(running[0]);
         launch::check_attachable(pid)?;
         let process = launch::open_process(pid).ok_or_else(|| anyhow!("pid {pid} 프로세스를 열지 못했습니다"))?;
-        // 최소화된 창을 화면 밖에서 되살리는 동안 앱이 전경을 가져가지 못하게 먼저 잠근다
+        // lock first so the app can't take the foreground while its minimized window is restored
+        // off-screen
         let locked = w32::lock_foreground(true);
         let guard = Guard::start(NativeMode::Attached, vec![pid], None);
         guard.adopt_lock(locked);
@@ -514,8 +534,9 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
         });
     }
     if let Some(d) = desk {
-        // 숨은 데스크톱: 앱은 보통 창으로 뜨지만 사용자 화면에는 나타나지 않는다. 감시기는 사용자 데스크톱에서
-        // 돌며, 앱이 혹시 사용자 데스크톱에 창을 만들면(새어 나오면) 그 창을 화면 밖으로 옮긴다.
+        // hidden desktop: the app starts as a normal window but never appears on the user's screen. The
+        // guard runs on the user's desktop and moves off-screen any window the app does create there (if
+        // it leaks out).
         let mut args = o.extra_args.clone();
         if hdesk::is_chromium_family(&exe) {
             for a in hdesk::CHROMIUM_HIDDEN_ARGS {
@@ -534,11 +555,12 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
     }
     let (proc_, thread) = launch::spawn_suspended_hidden(&exe, &o.extra_args, &o.open_files)?;
     let guard = Guard::start(NativeMode::Launched, vec![proc_.pid], proc_.job.clone());
-    // 실행 단계: 숨김으로 시작한 주 창을 화면 밖에서 보이게 하고, 앱이 전경을 가져가지 못하게 잠근다
+    // launch phase: show the main window that started hidden, off-screen, and lock so the app can't
+    // take the foreground
     guard.reveal_for(Duration::from_secs(20));
     guard.adopt_lock(w32::lock_foreground(true));
     guard.lease(Duration::from_secs(12));
-    // 감시기가 훅을 걸 시간을 주고 재개
+    // give the guard time to install its hooks, then resume
     std::thread::sleep(Duration::from_millis(40));
     launch::resume(&thread);
     drop(thread);
@@ -546,7 +568,7 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
     Ok(Started { proc_, mode: NativeMode::Launched, name, guard, before_same: running })
 }
 
-// ───────────────────────── 내부 구현 ─────────────────────────
+// ---- internals ----
 
 impl Inner {
     fn note(&self, s: impl Into<String>) {
@@ -571,9 +593,9 @@ impl Inner {
         }
     }
 
-    /// 입력을 보내기 전: 앱이 전경을 가져가지 못하게 잠시 잠근다
+    /// Before sending input: briefly lock so the app can't take the foreground.
     fn lease(&self) {
-        // 숨은 데스크톱의 앱은 사용자 화면의 전경을 가져갈 수 없다 (입력 데스크톱이 아님)
+        // apps on a hidden desktop can't take the user's foreground (it isn't the input desktop)
         if self.desk.is_some() {
             return;
         }
@@ -585,13 +607,14 @@ impl Inner {
         }
     }
 
-    /// 앞서 보낸 메시지(와 그로부터 앱이 만든 메시지)를 앱이 다 처리할 때까지 짧게 기다린다
+    /// Waits briefly until the app has processed the messages sent so far (and any messages it
+    /// generated from them).
     fn flush_input(&self) {
         self.proc_.wait_idle(300);
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    /// 보낸 입력을 앱이 처리할 때까지 잠깐 기다린다
+    /// Waits briefly for the app to process the input sent.
     fn settle(&self, ms: u32) {
         self.proc_.wait_idle(ms);
         std::thread::sleep(Duration::from_millis(30));
@@ -633,7 +656,7 @@ impl Inner {
             }
             if self.mode == NativeMode::Launched && self.process_gone() {
                 let code = self.proc_.exit_code();
-                // 실행 전부터 돌던 같은 앱이 있으면 그쪽으로 넘긴 단일 인스턴스 앱
+                // a single-instance app that handed off to a copy of itself already running before launch
                 let others: Vec<u32> = before_same.iter().copied().filter(|p| crate::platform::proc::pid_alive(*p)).collect();
                 return Err(launch::err_exit_message(&self.app_name, code, &others));
             }
@@ -652,14 +675,17 @@ impl Inner {
                 ),
             }
         }
-        // 화면 밖 주 창이 완전히 그려지도록 잠깐
+        // give the off-screen main window a moment to finish painting
         self.settle(2000);
         self.ensure_current();
         Ok(())
     }
 
-    /// 숨은 데스크톱에서 GPU 프레임이 버려지는가 (blt 모델 DXGI·WPF 하드웨어 렌더링 등).
-    /// 현재 창의 내용 영역이 3초 넘게 한 색이고, 앱이 응답하며, GPU DLL 을 올렸을 때만 그렇다고 본다.
+    /// Whether GPU frames are being dropped on the hidden desktop (blt-model DXGI, WPF hardware
+    /// rendering, …).
+    ///
+    /// Only assumed when the current window's client area has been a single color for over 3 s, the
+    /// app is responsive, and it has GPU DLLs loaded.
     fn gpu_frames_lost(&self) -> Option<String> {
         let t = Instant::now();
         let mut blank_since: Option<Instant> = None;
@@ -693,7 +719,8 @@ impl Inner {
         None
     }
 
-    /// 숨은 데스크톱에서 띄운 앱이 사용자 데스크톱에 창을 만들었는지 (감시기가 화면 밖으로 옮기지만 기록은 남긴다)
+    /// Whether an app launched on the hidden desktop created windows on the user's desktop (the
+    /// guard moves them off-screen, but it's still logged).
     fn check_escaped(&self) {
         if self.desk.is_none() {
             return;
@@ -706,7 +733,8 @@ impl Inner {
         }
     }
 
-    /// 창 목록 갱신. 새 창이 생기면 노트를 남기고 그 창으로 전환한다 (모달 대화상자 우선).
+    /// Refreshes the window list. When a new window appears, leaves a note and switches to it (modal
+    /// dialogs first).
     fn refresh_windows(&self, announce: bool) {
         let pids = self.pids();
         let list: Vec<WinEntry> = pw::windows_of(&pids)
@@ -754,7 +782,8 @@ impl Inner {
         }
     }
 
-    /// 현재 창이 없으면: 앱 스레드의 활성 창(모달 대화상자 등) → 활성화된 소유자 없는 창 → 첫 창
+    /// With no current window: the app thread's active window (modal dialog, …) → an activated
+    /// unowned window → the first window.
     fn ensure_current(&self) -> Option<WinEntry> {
         {
             let st = self.state.lock();
@@ -790,7 +819,7 @@ impl Inner {
         let shot = match capture::capture_client(w.hwnd, max_long_edge) {
             Ok(s) => s,
             Err(e) => {
-                // 창이 방금 닫혔을 수 있다 → 목록을 새로 보고 한 번 더
+                // the window may have just closed, so refresh the list and try once more
                 self.refresh_windows(true);
                 let w2 = self.current_window()?;
                 if w2.hwnd == w.hwnd {
@@ -857,9 +886,10 @@ impl Inner {
         Ok(format!("창 [{index}] '{}' 로 전환했습니다", w.title))
     }
 
-    // ───────────── 마우스 ─────────────
+    // ---- mouse ----
 
-    /// 입력용 좌표계. 에이전트가 마지막으로 본 스크린샷의 창이 지금 창과 같아야 한다.
+    /// Coordinate system for input. The window in the agent's last screenshot must be the current
+    /// window.
     fn input_geom(&self) -> Result<Geom> {
         if self.guard.lock().as_ref().map(|g| g.reclaimed()).unwrap_or(false) {
             bail!("사용자가 앱을 다시 화면에 가져와 쓰는 중이라 입력을 보내지 않았습니다. 작업을 멈추고 사용자에게 확인하세요.");
@@ -882,7 +912,8 @@ impl Inner {
         Ok(g)
     }
 
-    /// 클릭하면 사용자 화면에 무언가를 띄우거나 시스템 클립보드를 쓰는 컨트롤이면 거부 이유
+    /// Reason to refuse if clicking the control would show something on the user's screen or use the
+    /// system clipboard.
     fn click_block_reason(&self, target: Hwnd) -> Option<String> {
         let class = w32::class_name(target);
         let lc = class.to_lowercase();
@@ -898,8 +929,8 @@ impl Inner {
                 return Some(format!("'{}' 단추는 — {}", w32::strip_mnemonic(&text), menu::R_HELP));
             }
         }
-        // 드롭다운 목록·달력은 사용자 화면 안으로 끌려 들어와 그려진다.
-        // 이름에 포함되는지로 본다: ComboBoxEx32, WinForms(WindowsForms10.COMBOBOX…), Delphi(TComboBox·TDateTimePicker) 등
+        // drop-down lists and calendars get pulled onto the user's screen. Matched by substring:
+        // ComboBoxEx32, WinForms (WindowsForms10.COMBOBOX…), Delphi (TComboBox, TDateTimePicker), …
         if dropdown_kind(&class) == Some(Dropdown::Combo) {
             let items = w32::combo_items(target);
             return Some(format!(
@@ -947,7 +978,7 @@ impl Inner {
         ))
     }
 
-    /// 동작 뒤 새 창(대화상자)이 생겼는지 본다
+    /// Checks whether a new window (dialog) appeared after an action.
     fn after_action(&self) {
         self.guard_exposure();
         self.refresh_windows(true);
@@ -985,7 +1016,7 @@ impl Inner {
             let moved = (x - d.start.0).abs() > 4.0 || (y - d.start.1).abs() > 4.0;
             self.lease();
             if moved && !drag_safe(&w32::class_name(d.target)) {
-                // 누른 자리에서 떼어 눌림 상태만 풀고, 끌기는 하지 않았다고 알린다
+                // release at the press point to clear the pressed state, and report that no drag happened
                 input::post_button(d.target, d.pt, false, d.mk);
                 self.settle(500);
                 bail!("{}", drag_refusal(&w32::class_name(d.target)));
@@ -1004,7 +1035,8 @@ impl Inner {
             None => return Ok(()),
         };
         if !drag_safe(&w32::class_name(target)) {
-            // 끌어서 놓기(OLE)를 시작할 수 있는 컨트롤에는 누른 채 움직임을 보내지 않는다 (mouse_up 에서 안내)
+            // controls that can start an OLE drag and drop don't get moves with the button held (mouse_up
+            // explains)
             return Ok(());
         }
         let _dpi = w32::DpiScope::for_window(top);
@@ -1071,7 +1103,7 @@ impl Inner {
         let bars = [(nv, find_scrollbar(target, g.hwnd, true)), (nh, find_scrollbar(target, g.hwnd, false))];
         let before: Vec<Option<i32>> = bars.iter().map(|(_, b)| b.map(|(_, _, pw, bar)| w32::scroll_pos(pw, bar))).collect();
         self.lease();
-        // 아래로(dy>0) = 휠 음수, 오른쪽(dx>0) = 가로 휠 양수
+        // down (dy > 0) = negative wheel, right (dx > 0) = positive horizontal wheel
         for _ in 0..nv.abs() {
             input::post_wheel(target, screen, if nv > 0 { -120 } else { 120 }, false, mk);
         }
@@ -1080,7 +1112,8 @@ impl Inner {
         }
         self.settle(500);
         let mut out = vec![format!("스크롤 → {} (세로 {}칸, 가로 {}칸)", w32::class_name(target), -nv, nh)];
-        // 휠을 처리하지 않는 컨트롤(스크롤 막대가 형제 컨트롤인 경우 등)은 스크롤 막대에 줄 단위 스크롤을 보낸다
+        // controls that don't handle the wheel (e.g. with a sibling scroll bar) get line scrolls sent to
+        // the scroll bar
         for (i, (n, bar)) in bars.iter().enumerate() {
             let (Some((recv, ctl, posw, kind)), Some(b0)) = (*bar, before[i]) else { continue };
             if *n == 0 || w32::scroll_pos(posw, kind) != b0 {
@@ -1103,9 +1136,10 @@ impl Inner {
         Ok(out.join(" / "))
     }
 
-    // ───────────── 키보드 ─────────────
+    // ---- keyboard ----
 
-    /// 키보드 대상: 앱 스레드의 포커스 창(현재 창 안) → 마지막으로 클릭한 컨트롤 → 현재 창
+    /// Keyboard target: the app thread's focus window (inside the current window) → the last clicked
+    /// control → the current window.
     fn focus_target(&self, top: Hwnd) -> Hwnd {
         let tid = w32::thread_pid(top).0;
         if let Some((_, f)) = w32::thread_focus(tid) {
@@ -1126,7 +1160,7 @@ impl Inner {
             bail!("사용자가 앱을 다시 화면에 가져와 쓰는 중이라 입력을 보내지 않았습니다. 작업을 멈추고 사용자에게 확인하세요.");
         }
         let w = self.current_window()?;
-        // 목록의 enabled 는 마지막 갱신 때 값이므로 지금 상태도 함께 본다
+        // the list's `enabled` is from the last refresh, so check the current state too
         if !w.enabled || !w32::is_enabled(w.hwnd) {
             bail!("창 '{}' 은(는) 지금 비활성입니다 (모달 대화상자가 열려 있음). 대화상자로 전환(switch_view)한 뒤 다시 하세요.", w.title);
         }
@@ -1141,7 +1175,7 @@ impl Inner {
         let top = self.key_top()?;
         let target = self.focus_target(top);
         let editable = is_edit_class(&w32::class_name(target));
-        // 앞서 보낸 입력이 다 처리된 뒤의 글자와 비교한다
+        // compare against the text after earlier input has been processed
         self.settle(500);
         let before = if editable { w32::control_text(target) } else { None };
         self.lease();
@@ -1164,7 +1198,8 @@ impl Inner {
                 if now != before {
                     notes.push("입력은 반영되었지만 내용이 예상과 다를 수 있습니다 — 스크린샷으로 확인하세요".into());
                 } else {
-                    // 글자 메시지가 먹지 않았다 → 선택 영역 바꾸기(EM_REPLACESEL, 시스템이 문자열을 옮겨 줌)
+                    // character messages didn't take, so replace the selection instead (EM_REPLACESEL; the system
+                    // marshals the string)
                     let _ = w32::send_str(target, w32::EM_REPLACESEL, 1, &t.replace('\n', "\r\n"), 2000);
                     std::thread::sleep(Duration::from_millis(80));
                     let after = w32::control_text(target).unwrap_or_default();
@@ -1202,7 +1237,8 @@ impl Inner {
                 }
                 self.lease();
                 if shift && vk == menu::VK_TAB && w32::class_name(top) == "#32770" {
-                    // 대화상자의 이전 컨트롤로 (Shift 상태는 메시지로 흉내 낼 수 없으므로 WM_NEXTDLGCTL)
+                    // to the dialog's previous control (Shift state can't be faked with messages, hence
+                    // WM_NEXTDLGCTL)
                     for _ in 0..repeat {
                         w32::post(top, w32::WM_NEXTDLGCTL, 1, 0);
                     }
@@ -1231,7 +1267,8 @@ impl Inner {
         }
     }
 
-    /// Ctrl/Alt 단축키 흉내: 편집 명령(내부 클립보드) → Alt+F4 → 메뉴 가속기 → 대화상자 니모닉
+    /// Ctrl/Alt shortcut emulation: edit commands (internal clipboard) → Alt+F4 → menu accelerators →
+    /// dialog mnemonics.
     fn shortcut(&self, combo: &str, a: &Accel, top: Hwnd, target: Hwnd) -> Result<String> {
         if let Some(r) = self.emulate_edit(a, target)? {
             return Ok(r);
@@ -1248,7 +1285,8 @@ impl Inner {
         let alt_letter = a.alt && !a.ctrl && (0x41..=0x5A).contains(&a.vk);
         if let Some((path, owner, item, blocked)) = menu::find_by_accel(top, a) {
             if !menu::owner_usable(owner) {
-                // 모달 대화상자가 열려 있으면 실제 키보드의 Alt+글자는 대화상자의 니모닉으로 간다 (본 창 메뉴에는 닿지 않음)
+                // with a modal dialog open, a real keyboard's Alt+letter goes to the dialog's mnemonic (never
+                // reaching the main window's menu)
                 if alt_letter {
                     let ch = (a.vk as u8 as char).to_ascii_lowercase();
                     if let Some(r) = self.dialog_mnemonic(top, ch)? {
@@ -1284,7 +1322,7 @@ impl Inner {
         )
     }
 
-    /// 대화상자의 '&글자' 니모닉 단추를 누른다 (Alt+글자 흉내)
+    /// Presses a dialog's '&letter' mnemonic button (emulating Alt+letter).
     fn dialog_mnemonic(&self, top: Hwnd, ch: char) -> Result<Option<String>> {
         let _dpi = w32::DpiScope::for_window(top);
         for c in w32::child_windows(top) {
@@ -1307,7 +1345,7 @@ impl Inner {
         Ok(None)
     }
 
-    /// 선택된 글자 (UIA TextPattern → EM_GETSEL+WM_GETTEXT)
+    /// The selected text (UIA TextPattern → EM_GETSEL + WM_GETTEXT).
     fn selected_text(&self, target: Hwnd) -> Option<String> {
         if let Some(s) = uia::element_for(target).ok().and_then(|e| e.selection_text()) {
             return Some(s);
@@ -1319,7 +1357,8 @@ impl Inner {
         (s <= e && e <= u.len()).then(|| String::from_utf16_lossy(&u[s..e]))
     }
 
-    /// 편집 컨트롤에서 Ctrl+A/C/X/V/Z/Y 를 흉내 낸다 (내부 클립보드 — 시스템 클립보드는 건드리지 않음). 해당 없으면 None.
+    /// Emulates Ctrl+A/C/X/V/Z/Y in edit controls with the internal clipboard (the system clipboard
+    /// is never touched). `None` if not applicable.
     fn emulate_edit(&self, a: &Accel, target: Hwnd) -> Result<Option<String>> {
         if a.alt || !is_edit_class(&w32::class_name(target)) {
             return Ok(None);
@@ -1333,7 +1372,7 @@ impl Inner {
             (true, false, 0x59) | (true, true, 0x5A) => "redo",
             _ => return Ok(None),
         };
-        // 앞서 보낸 입력이 다 처리된 뒤에 선택 영역을 본다
+        // look at the selection after earlier input has been processed
         self.settle(500);
         self.lease();
         let class = w32::class_name(target);
@@ -1351,7 +1390,7 @@ impl Inner {
                 self.state.lock().clipboard = sel.clone();
                 if op == "cut" {
                     let before = w32::control_text(target).unwrap_or_default();
-                    // 선택 영역에 Backspace 글자 = 선택 삭제 (클립보드를 쓰지 않는다)
+                    // a Backspace char on a selection deletes it (no clipboard involved)
                     w32::post(target, w32::WM_CHAR, 0x08, 1);
                     self.settle(500);
                     if w32::control_text(target).unwrap_or_default() == before {
@@ -1387,7 +1426,8 @@ impl Inner {
         }
     }
 
-    /// (진단용) 키 메시지만 보낸다 — 사용자 화면에 메뉴를 띄우거나 클립보드를 쓰는 조합은 여전히 막는다
+    /// (Diagnostics) Sends key messages only. Combos that would open menus on the user's screen or
+    /// use the clipboard are still blocked.
     fn raw_key(&self, combo: &str) -> Result<String> {
         let plan = input::plan_combo(combo)?;
         let top = self.key_top()?;
@@ -1410,13 +1450,15 @@ impl Inner {
             }
             KeyPlan::BareModifier => return Ok("수정키만은 보내지 않았습니다".into()),
         };
-        // Ctrl/Shift 상태는 전달되지 않으므로 ctrl+F4 도 앱에는 F4 다 — 수정키와 상관없이 본다
+        // Ctrl/Shift state isn't delivered, so ctrl+F4 is just F4 to the app; check regardless of
+        // modifiers
         if let Some(r) = dropdown_key_reason(target, vk, combo) {
             bail!("{r}");
         }
         self.lease();
         if vk >= 0x41 && vk <= 0x5A {
-            // 글자 키를 WM_KEYDOWN 으로 보내면 앱의 입력기(한글 모드)가 다른 글자로 바꿀 수 있다
+            // character keys sent as WM_KEYDOWN can be turned into other characters by the app's IME (Korean
+            // mode)
             bail!("{combo}: 글자 키는 키 메시지 대신 type 으로 보내세요 (입력기 상태에 따라 다른 글자가 될 수 있음)");
         }
         input::post_key(target, vk, false);
@@ -1450,8 +1492,9 @@ impl Inner {
                 bail!("사용자가 앱을 다시 화면에 가져와 쓰는 중이라 동작하지 않았습니다. 작업을 멈추고 사용자에게 확인하세요.");
             }
         }
-        // 요소를 바꾸는 동작은 키·마우스 입력과 같은 검사: 모달 대화상자가 열려 비활성인 창의 단추·콤보 상자에 보내면
-        // 앱의 명령 처리가 대화상자의 모달 루프 안에서 다시 실행된다 (실제 마우스로는 할 수 없는 일)
+        // actions that change elements get the same checks as key and mouse input: sent to buttons or
+        // combo boxes of a window disabled by a modal dialog, the app's command handling would re-enter
+        // inside the dialog's modal loop (something a real mouse can't do)
         if matches!(action, "press" | "set_value" | "focus" | "select" | "choose") {
             self.key_top()?;
         }
@@ -1597,7 +1640,7 @@ impl Inner {
         Ok(format!("창 '{}' (스크린샷 {}x{} 픽셀 좌표):\n{}", w.title, g.shot_w, g.shot_h, lines.join("\n")))
     }
 
-    /// 요소 가운데를 (창 메시지로) 클릭한다
+    /// Clicks the center of an element (through window messages).
     fn click_node_center(&self, n: &uia::Node, count: u32) -> Result<String> {
         let top = self.current_window()?.hwnd;
         let _dpi = w32::DpiScope::for_window(top);
@@ -1649,7 +1692,8 @@ impl Inner {
         if n.aid.starts_with("Minimize") || n.aid.starts_with("Maximize") || ["최소화", "최대화", "minimize", "maximize"].contains(&lname.as_str()) {
             bail!("{} 는 창을 최소화·최대화(사용자 화면 크기로) 하므로 누르지 않았습니다", describe(n));
         }
-        // Win32 단추(체크 상자·라디오 포함)는 실제와 같은 클릭 메시지로 — 앱이 BN_CLICKED 를 받는다
+        // Win32 buttons (check boxes and radios included) get real click messages, so the app receives
+        // BN_CLICKED
         if n.hwnd != 0 && w32::class_name(n.hwnd).eq_ignore_ascii_case("button") {
             let before = w32::send_timeout(n.hwnd, w32::BM_GETCHECK, 0, 0, 500);
             let r = self.click_node_center(n, 1)?;
@@ -1690,7 +1734,7 @@ impl Inner {
         std::thread::sleep(Duration::from_millis(80));
         let mut now = n.el.value().unwrap_or_default();
         if now != text && n.hwnd != 0 && is_edit_class(&w32::class_name(n.hwnd)) {
-            // UIA 가 막히면 WM_SETTEXT (시스템이 문자열을 옮겨 준다)
+            // if UIA is blocked, WM_SETTEXT (the system marshals the string)
             w32::set_control_text(n.hwnd, text);
             std::thread::sleep(Duration::from_millis(60));
             now = w32::control_text(n.hwnd).unwrap_or_default();
@@ -1719,7 +1763,7 @@ impl Inner {
                 .ok_or_else(|| anyhow!("'{option}' 선택지가 없습니다. 선택지: [{}]", items.iter().take(40).cloned().collect::<Vec<_>>().join(", ")))?;
             self.lease();
             w32::send_timeout(n.hwnd, w32::CB_SETCURSEL, idx, 0, 1000);
-            // 앱이 선택 변경을 알도록 부모에게 CBN_SELCHANGE 를 보낸다 (CB_SETCURSEL 은 알림을 보내지 않는다)
+            // send CBN_SELCHANGE to the parent so the app learns of the change (CB_SETCURSEL doesn't notify)
             let parent = w32::parent(n.hwnd);
             w32::post(parent, w32::WM_COMMAND, w32::make_wparam(w32::ctrl_id(n.hwnd) as u32, w32::CBN_SELCHANGE), n.hwnd);
             self.settle(800);
@@ -1779,7 +1823,7 @@ impl Inner {
     }
 
     fn menus(&self) -> Result<String> {
-        // 읽기만 하므로 비활성 창(대화상자가 열린 본 창)도 볼 수 있다
+        // read only, so disabled windows (a main window with a dialog open) can be inspected too
         let top = self.current_window()?.hwnd;
         let Some((owner, bar)) = menu::menu_owner(top) else {
             let items = uia::menubar_items(top);
@@ -1791,7 +1835,8 @@ impl Inner {
                 items.iter().map(|(n, e)| if *e { n.clone() } else { format!("{n} [비활성]") }).collect::<Vec<_>>().join(" · ")
             ));
         };
-        // 모달 대화상자가 열려 비활성인 소유 창에는 메뉴 갱신 메시지(WM_INITMENU·WM_INITMENUPOPUP)도 보내지 않는다
+        // an owner disabled by a modal dialog doesn't even get menu refresh messages (WM_INITMENU,
+        // WM_INITMENUPOPUP)
         let usable = menu::owner_usable(owner);
         if usable {
             let _ = w32::send_timeout(owner, w32::WM_INITMENU, bar as usize, 0, 500);
@@ -1857,7 +1902,7 @@ impl Inner {
         if parts.is_empty() {
             bail!("메뉴 경로가 비었습니다");
         }
-        // 다른 입력과 같은 검사 (사용자가 되찾음·현재 창 비활성)
+        // same checks as other input (reclaimed by the user, current window disabled)
         let top = self.key_top()?;
         let Some((owner, bar)) = menu::menu_owner(top) else {
             bail!("이 창에는 (Win32) 메뉴 막대가 없습니다. app_control menus 로 확인하세요.");
@@ -1937,7 +1982,8 @@ impl Inner {
         match self.mode {
             NativeMode::Launched => {
                 if self.proc_.alive() || !self.proc_.pids().is_empty() {
-                    // 저장 확인 같은 대화상자가 떠도 감시기가 화면 밖으로 옮기고, 2초 뒤 Job 째로 끝낸다
+                    // if a dialog like "Save changes?" shows up, the guard moves it off-screen and the whole Job is
+                    // ended after 2 s
                     self.lease();
                     let pids = self.pids();
                     let list = move || -> Vec<Hwnd> {
@@ -1957,7 +2003,7 @@ impl Inner {
                     self.proc_.wait_exit(3000);
                 }
                 if let Some(mut g) = self.guard.lock().take() {
-                    // 닫는 동안의 기록(저장 확인 대화상자 노출 등)도 남긴다
+                    // keep logging during shutdown too (e.g. exposure of the save prompt)
                     std::thread::sleep(Duration::from_millis(50));
                     g.stop();
                     self.exposure.lock().extend(g.take_events());
@@ -1976,13 +2022,15 @@ impl Inner {
     }
 }
 
-// ───────────────────────── 보조 ─────────────────────────
+// ---- helpers ----
 
-/// 메시지로 끌기를 보내도 안전한 컨트롤인가.
+/// Whether it's safe to send drags to a control through messages.
 ///
-/// 보낸 WM_MOUSEMOVE(MK_LBUTTON)로 앱이 OLE 끌어서 놓기(DoDragDrop)를 시작하면, OLE 는 **실제** 마우스 버튼 상태(떼어져 있음)와
-/// **실제** 커서 위치로 놓을 곳을 정한다 → 사용자 화면에서 커서 아래에 있는 사용자의 앱에 내용이 놓여 버릴 수 있다.
-/// 그래서 OLE 끌기를 시작하지 않는 표준 컨트롤(스크롤 막대·슬라이더·일반 편집 칸·스핀)만 끌기를 허용한다.
+/// If a posted WM_MOUSEMOVE (MK_LBUTTON) makes the app start an OLE drag and drop (DoDragDrop),
+/// OLE uses the **real** mouse button state (released) and **real** cursor position to pick the
+/// drop target, so the content could land in whatever user app sits under the cursor. Only
+/// standard controls that never start OLE drags (scroll bars, sliders, plain edit boxes,
+/// spinners) are allowed.
 pub fn drag_safe(class: &str) -> bool {
     let l = class.to_lowercase();
     let base = l.strip_prefix("windowsforms10.").map(|r| r.split('.').next().unwrap_or("")).unwrap_or(&l);
@@ -1997,8 +2045,11 @@ fn drag_refusal(class: &str) -> String {
     )
 }
 
-/// 휠 대신 쓸 스크롤 막대: (WM_xSCROLL 을 받을 창, lParam 으로 줄 막대 컨트롤(0 = 창 자체 막대), 위치를 읽을 창, 막대 종류).
-/// 점 아래 컨트롤부터 위로 올라가며 창 자체 스크롤 막대(WS_VSCROLL/WS_HSCROLL) 또는 바로 옆의 형제 스크롤 막대 컨트롤을 찾는다.
+/// Scroll bar to use instead of the wheel: `(window receiving WM_xSCROLL, bar control passed as
+/// lParam (0 = the window's own bar), window to read the position from, bar kind)`.
+///
+/// Walks up from the control under the point, looking for the window's own scroll bar
+/// (WS_VSCROLL/WS_HSCROLL) or a sibling scroll bar control right next to it.
 fn find_scrollbar(target: Hwnd, top: Hwnd, vertical: bool) -> Option<(Hwnd, isize, Hwnd, i32)> {
     let bit = if vertical { w32::WS_VSCROLL } else { w32::WS_HSCROLL };
     let mut w = target;
@@ -2039,14 +2090,15 @@ fn find_scrollbar(target: Hwnd, top: Hwnd, vertical: bool) -> Option<(Hwnd, isiz
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Dropdown {
-    /// 콤보 상자 (드롭다운 목록)
+    /// Combo box (drop-down list).
     Combo,
-    /// 날짜 선택 컨트롤 (달력)
+    /// Date picker (calendar).
     Date,
 }
 
-/// 클릭·키로 사용자 화면에 팝업(목록·달력)을 여는 컨트롤 종류. 클래스 이름에 포함되는지로 본다 —
-/// ComboBox, ComboBoxEx32, WindowsForms10.COMBOBOX…, Delphi TComboBox, SysDateTimePick32, Delphi TDateTimePicker 등.
+/// Kinds of controls that open a popup (list, calendar) on the user's screen when clicked or
+/// keyed. Matched by substring of the class name: ComboBox, ComboBoxEx32,
+/// WindowsForms10.COMBOBOX…, Delphi TComboBox, SysDateTimePick32, Delphi TDateTimePicker, ….
 fn dropdown_kind(class: &str) -> Option<Dropdown> {
     let l = class.to_lowercase();
     if l.contains("combobox") {
@@ -2062,7 +2114,8 @@ const VK_UP: u32 = 0x26;
 const VK_DOWN: u32 = 0x28;
 const VK_F4: u32 = 0x73;
 
-/// 키 대상(또는 그 부모 — 콤보 상자 안의 입력 칸)이 드롭다운 컨트롤이면 (그 컨트롤, 종류)
+/// `(control, kind)` if the key target (or its parent, e.g. the edit inside a combo box) is a
+/// drop-down control.
 fn dropdown_of(target: Hwnd) -> Option<(Hwnd, Dropdown)> {
     if let Some(k) = dropdown_kind(&w32::class_name(target)) {
         return Some((target, k));
@@ -2078,8 +2131,8 @@ fn dropdown_of(target: Hwnd) -> Option<(Hwnd, Dropdown)> {
     None
 }
 
-/// 키를 보내면 드롭다운 목록·달력이 사용자 화면에 열리는 경우 거부 이유:
-/// F4 (콤보 상자·날짜 선택 컨트롤), 위/아래 화살표 (확장 UI 콤보 상자 — CB_SETEXTENDEDUI).
+/// Reason to refuse a key that would open a drop-down list or calendar on the user's screen: F4
+/// (combo boxes, date pickers), Up/Down (extended-UI combo boxes, CB_SETEXTENDEDUI).
 fn dropdown_key_reason(target: Hwnd, vk: u32, combo: &str) -> Option<String> {
     if !matches!(vk, VK_F4 | VK_UP | VK_DOWN) {
         return None;
@@ -2099,7 +2152,7 @@ fn dropdown_key_reason(target: Hwnd, vk: u32, combo: &str) -> Option<String> {
     }
 }
 
-/// 편집 컨트롤(Edit·RichEdit·WinForms TextBox·Delphi TEdit/TMemo 등)인가
+/// Whether this is an edit control (Edit, RichEdit, WinForms TextBox, Delphi TEdit/TMemo, …).
 pub fn is_edit_class(class: &str) -> bool {
     let l = class.to_lowercase();
     (l.contains("edit") || l.contains("memo")) && !l.contains("combobox")
@@ -2114,7 +2167,8 @@ fn describe(n: &uia::Node) -> String {
     }
 }
 
-/// 라이브 뷰: 현재 창을 ~live_fps 로 캡처해 JPEG 로 싱크에 보낸다. 노출 기록·창 목록 갱신도 겸한다.
+/// Live view: captures the current window at ~`live_fps` and sends JPEGs to the sink. Also logs
+/// exposure and refreshes the window list.
 async fn live_loop(weak: std::sync::Weak<Inner>, fps: f64) {
     let period = Duration::from_secs_f64(1.0 / fps.clamp(0.2, 10.0));
     let mut tick = 0u64;
@@ -2126,7 +2180,8 @@ async fn live_loop(weak: std::sync::Weak<Inner>, fps: f64) {
         }
         tick += 1;
         let desk = inner.desk.clone();
-        // 강한 참조는 작업 스레드 안에서만 쥔다 (마지막 참조가 여기서 풀려도 종료 처리가 tokio 워커를 막지 않게)
+        // only hold a strong reference inside the worker thread (if the last reference drops here,
+        // shutdown doesn't block a tokio worker)
         let _ = exec(&desk, move || {
             let i = inner;
             if i.process_gone() {
@@ -2194,7 +2249,7 @@ mod tests {
         for c in ["Edit", "TEdit", "ComboLBox", "Button", "SysListView32"] {
             assert_eq!(dropdown_kind(c), None, "{c}");
         }
-        // 드롭다운과 상관없는 키·창은 그대로
+        // keys and windows unrelated to drop-downs pass through
         assert_eq!(dropdown_key_reason(0, 0x0D, "Return"), None);
         assert_eq!(dropdown_key_reason(0, VK_F4, "F4"), None);
     }

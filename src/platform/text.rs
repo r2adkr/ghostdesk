@@ -1,9 +1,9 @@
-//! 사용자·에이전트에게 보여 주는 문구 중 운영체제에 따라 달라지는 낱말.
+//! OS-dependent words in text shown to users and agents.
 
-/// "이 Mac" / "이 PC"
+/// "This Mac" / "this PC".
 pub const THIS_COMPUTER: &str = if cfg!(target_os = "macos") { "이 Mac" } else { "이 PC" };
 
-/// 영문 프롬프트용 운영체제 이름
+/// OS name for English prompts.
 pub const OS_NAME: &str = if cfg!(target_os = "macos") {
     "macOS"
 } else if cfg!(windows) {
@@ -12,13 +12,14 @@ pub const OS_NAME: &str = if cfg!(target_os = "macos") {
     "Linux"
 };
 
-/// 기본 단축키 수정키 이름 (에이전트에게 알려 줄 때): macOS 는 cmd, 그 밖은 ctrl
+/// Primary shortcut modifier as told to the agent: `cmd` on macOS, `ctrl` elsewhere.
 pub const PRIMARY_MOD: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
 
-/// 로컬 앱 카드 아이콘 (Lucide app-window, 함께 넣은 아이콘 글꼴로 그려 OS 와 상관없이 같은 모양)
+/// Icon for the local-app card. Drawn from the bundled Lucide font (app-window), so it looks
+/// the same on every OS.
 pub const APP_ICON: &str = crate::icon::APP_WINDOW;
 
-/// "Mac 앱" / "Windows 앱"
+/// "Mac apps" / "Windows apps".
 pub const LOCAL_APPS: &str = if cfg!(target_os = "macos") {
     "Mac 앱"
 } else if cfg!(windows) {
@@ -27,7 +28,7 @@ pub const LOCAL_APPS: &str = if cfg!(target_os = "macos") {
     "Linux 앱"
 };
 
-/// 지원하지 않는 기능을 고른 경우의 공통 안내
+/// Common message for picking a feature this OS doesn't support.
 pub fn unsupported(feature: &str) -> String {
     format!("{feature} 은(는) {OS_NAME} 에서 아직 지원하지 않습니다 (현재 macOS 전용)")
 }
@@ -36,7 +37,7 @@ pub fn unsupported(feature: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 앱 카드 아이콘은 함께 넣은 Lucide 글꼴에 있어야 한다 (없으면 빈 네모로 그려진다)
+    /// The app-card icon must exist in the bundled Lucide font, otherwise it renders as tofu.
     #[test]
     fn app_icon_is_in_bundled_font() {
         use eframe::egui::epaint::text::{FontData, FontDefinitions, FontFamily, FontId, Fonts, TextOptions};

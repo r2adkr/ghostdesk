@@ -1,8 +1,9 @@
-//! AI API 클라이언트 (Rust 공식 SDK 가 없으므로 raw HTTP).
+//! AI API clients, over raw HTTP since there is no official Rust SDK.
 //!
-//! 대화는 에이전트 쪽에서 늘 Claude Messages 형식으로 쌓는다. 제공자가 Claude 면 그대로(anthropic),
-//! 아니면 보내기 직전에 OpenAI 호환 형식으로 바꿔 보내고 답도 Claude 형식으로 되돌린다(openai).
-//! 그래서 에이전트는 제공자를 몰라도 된다.
+//! The agent always keeps the conversation in Claude Messages format. Claude providers get it
+//! as is (`anthropic`); everyone else gets it converted to the OpenAI-compatible format right
+//! before sending, with the reply converted back (`openai`). The agent never needs to know
+//! which provider it is talking to.
 
 mod anthropic;
 mod openai;
@@ -22,7 +23,7 @@ pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 pub struct Llm {
     http: reqwest::Client,
     pub provider: Provider,
-    /// API 뿌리 주소 (`Provider::default_base_url` 또는 사용자가 넣은 OpenAI 호환 주소)
+    /// API base URL (`Provider::default_base_url` or a user-supplied OpenAI-compatible URL).
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -38,7 +39,7 @@ impl Llm {
         Llm { http: http(), provider, base_url, api_key, model, effort }
     }
 
-    /// 백엔드 종류에 맞는 도구 목록 (Claude 형식). 대화 중에는 바꾸지 않는다.
+    /// Tool definitions for a backend kind, in Claude format. Never changed mid-conversation.
     pub fn tools(kind: crate::desk::DeskKind) -> Value {
         use crate::desk::DeskKind;
         let mut tools = vec![json!({ "type": "computer_toolset_20260801" })];
@@ -97,7 +98,7 @@ impl Llm {
             })
     }
 
-    /// 한 턴을 보내고 Claude 형식의 답(`content`·`stop_reason`·`usage`)을 돌려준다.
+    /// Sends one turn and returns the reply in Claude format (`content`, `stop_reason`, `usage`).
     pub async fn send(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
         if self.provider == Provider::Anthropic {
             self.send_anthropic(system, tools, messages).await
@@ -106,7 +107,7 @@ impl Llm {
         }
     }
 
-    /// 재시도(일시 오류는 지수 대기 후 최대 5번)를 포함한 POST
+    /// POSTs `body`, retrying transient errors up to 5 times with exponential backoff.
     pub(super) async fn post(&self, url: &str, body: &Value, extra: &[(&str, &str)]) -> Result<Value> {
         let name = self.provider.short_name();
         let mut attempt = 0;
@@ -147,11 +148,12 @@ fn auth(req: reqwest::RequestBuilder, p: Provider, key: &str) -> reqwest::Reques
     }
 }
 
-/// 제공자가 실제로 쓸 수 있는 모델 이름 목록 (`GET /models`). 글·이미지 대화와 상관없는 모델은 뺀다.
+/// Model ids the provider actually offers (`GET /models`), minus models that can't do text or
+/// image chat.
 pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<String>> {
     const SKIP: &[&str] = &["embed", "tts", "whisper", "dall-e", "image", "audio", "realtime", "moderation", "transcribe", "veo", "imagen", "aqa"];
     let mut ids: Vec<String> = Vec::new();
-    // Anthropic 은 한 번에 100개까지만 주므로 has_more 가 꺼질 때까지 다음 쪽(after_id)을 이어 받는다
+    // Anthropic returns at most 100 per page, so follow `after_id` until `has_more` is false
     let mut after: Option<String> = None;
     for _ in 0..20 {
         let url = match (p, &after) {

@@ -1,11 +1,15 @@
-//! 노출 감시기: 우리가 숨김 상태로 띄운 앱이 스스로 unhide 하거나 창을 화면에 올리면 즉시 다시 숨긴다.
+//! Exposure guard: if an app we launched hidden unhides itself or puts a window on screen, hide
+//! it again right away.
 //!
-//! 문서 기반 앱(TextEdit 등)은 문서 창을 표시할 때 스스로 unhide 하는 경우가 있다 (이 Mac 에서 확인:
-//! 실행 직후 약 20ms 노출). 두 가지 경로로 감시한다.
-//! 1. AXObserver: `AXApplicationShown` / `AXWindowCreated` / `AXWindowDeminiaturized` 알림이 오면 즉시 hide.
-//! 2. 30ms 간격 CGWindowList 폴링: 화면에 보이는(onscreen, alpha>0) 창이 있으면 hide 하고 노출 시간을 기록.
+//! Document-based apps (TextEdit and the like) sometimes unhide themselves when showing a
+//! document window (seen on this Mac: about 20 ms of exposure right after launch). Two watchers:
+//! 1. AXObserver: hide as soon as `AXApplicationShown` / `AXWindowCreated` /
+//!    `AXWindowDeminiaturized` arrives.
+//! 2. CGWindowList polling every 30 ms: if any window is on screen (onscreen, alpha > 0), hide
+//!    and record how long it was exposed.
 //!
-//! **우리가 띄운 프로세스(Mode A)에만** 쓴다. 사용자의 앱(Mode B)에 쓰면 사용자가 앱을 다시 보려 할 때 방해가 된다.
+//! **Only for processes we launched (mode A).** On the user's own apps (mode B) it would fight
+//! the user trying to bring the app back.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +47,7 @@ struct Shared {
     started: Instant,
 }
 
-/// 감시기 핸들. drop 하면 멈춘다.
+/// Guard handle. Stops watching when dropped.
 pub struct ExposureGuard {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -84,7 +88,7 @@ impl ExposureGuard {
         ExposureGuard { shared, thread }
     }
 
-    /// 지금까지의 노출/대응 기록을 가져가고 비운다
+    /// Takes and clears the exposure/response log so far.
     pub fn take_events(&self) -> Vec<String> {
         std::mem::take(&mut self.shared.events.lock())
     }
@@ -108,14 +112,14 @@ fn run(sh: Arc<Shared>) {
     let mut obs: AXObserverRef = std::ptr::null_mut();
     let app = unsafe { AXUIElementCreateApplication(sh.pid) };
     let ok = unsafe { AXObserverCreate(sh.pid, on_notification, &mut obs) } == 0 && !obs.is_null();
-    // 앱이 막 실행된 직후에는 알림 등록이 실패할 수 있어 몇 초 동안 재시도한다
+    // registering can fail right after launch, so keep retrying for a few seconds
     let mut pending: Vec<&str> = vec!["AXApplicationShown", "AXWindowCreated", "AXWindowDeminiaturized"];
     let try_register = |pending: &mut Vec<&str>| {
         pending.retain(|n| {
             let s = objc2_core_foundation::CFString::from_str(n);
             let p = objc2_core_foundation::CFRetained::as_ptr(&s).as_ptr() as *const c_void;
             let r = unsafe { AXObserverAddNotification(obs, app, p, refcon) };
-            // 0 = 성공, -25209 = 이미 등록됨
+            // 0 = success, -25209 = already registered
             !(r == 0 || r == -25209)
         });
     };

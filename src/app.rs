@@ -1,4 +1,5 @@
-//! egui 화면: 에이전트 생성, 다중 에이전트 라이브 그리드, 상세 보기(로그/지시/직접 조작).
+//! The egui UI: creating agents, the live multi-agent grid, and the detail view (log,
+//! instructions, takeover).
 
 use std::sync::{atomic::Ordering, Arc};
 
@@ -34,7 +35,7 @@ use connect::ConnectState;
 use detail::{spawn_input_queue, TakeoverInput};
 use i18n::{tr, trf, Lang};
 
-/// Windows 자식 세션 켜기(UAC) 요청 상태
+/// State of the request to enable Windows child sessions (UAC).
 #[derive(Default, Clone, PartialEq)]
 enum ChildEnable {
     #[default]
@@ -43,7 +44,8 @@ enum ChildEnable {
     Done(Result<(), String>),
 }
 
-/// 한 AI 회사의 '모델' 목록을 API 에서 불러오는 상태 (회사마다 하나씩, `Provider::ALL` 순서)
+/// State of fetching an AI provider's model list from the API (one per provider, in
+/// `Provider::ALL` order).
 #[derive(Default, Clone)]
 enum ModelFetch {
     #[default]
@@ -52,7 +54,7 @@ enum ModelFetch {
     Done(Result<Vec<String>, String>),
 }
 
-/// macOS 에서는 기존 문구를, 그 밖의 OS 에서는 그 OS 에 맞는 문구를 고른다.
+/// Picks the original text on macOS and the OS-specific text elsewhere.
 fn pick(mac: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
         mac
@@ -65,21 +67,23 @@ struct AgentHandle {
     shared: Arc<AgentShared>,
     tx: mpsc::UnboundedSender<AgentCmd>,
     task: tokio::task::JoinHandle<()>,
-    /// 직접 조작 입력 큐: 한 task 가 순서대로 적용한다 (이벤트마다 spawn 하면 순서가 뒤섞임)
+    /// Takeover input queue, applied in order by a single task (spawning per event would reorder
+    /// them).
     input_tx: mpsc::UnboundedSender<TakeoverInput>,
     texture: Option<egui::TextureHandle>,
     tex_seq: u64,
-    /// 가상 마우스 표시 상태 (상세 보기 / 그리드 타일)
+    /// Virtual mouse display state (detail view / grid tile).
     cursor_view: crate::cursor::CursorView,
     tile_cursor_view: crate::cursor::CursorView,
     input: String,
     url_input: String,
     takeover: bool,
-    /// 직접 조작 중 입력기(IME)가 조합하고 있는 글자 (Windows 한글 입력 표시용, 확정되면 비움)
+    /// Text the IME is composing during takeover (shows Korean input on Windows; cleared on commit).
     preedit: String,
-    /// 이 에이전트의 화면을 늘 위에 뜨는 작은 창(PiP)으로 보고 있는가
+    /// Whether this agent's screen is shown in a small always-on-top window (PiP).
     pip: bool,
-    /// 내 확인 없이 할 수 있는 최대 단계 (0 = 무제한 · 외부 에이전트) — 진행 막대의 끝
+    /// Maximum steps allowed without my confirmation (0 = unlimited / external agent); the end of the
+    /// progress bar.
     max_steps: u64,
 }
 
@@ -111,11 +115,11 @@ enum View {
     Home,
     Grid,
     Detail,
-    /// 화면 모아보기: 모든 에이전트의 화면만 창 가득 크게 (목록·패널 없음)
+    /// Screen wall: every agent's screen filling the window (no list or panels).
     Wall,
 }
 
-/// 새 에이전트가 쓸 격리 화면 종류
+/// Kind of isolated screen a new agent uses.
 #[derive(Clone, Copy, PartialEq)]
 enum FormKind {
     Browser,
@@ -125,10 +129,10 @@ enum FormKind {
     Session,
 }
 
-/// 새 에이전트 창의 첫 선택
+/// First choice in the new-agent window.
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
-    /// 할 일을 보고 웹사이트와 이 컴퓨터의 앱 중에서 고른다 (`wizard::auto_pick`)
+    /// Picks between the web and an app on this computer based on the task (`wizard::auto_pick`).
     Auto,
     Web,
     App,
@@ -139,11 +143,12 @@ enum Choice {
 struct NewAgentForm {
     choice: Option<Choice>,
     app_search: String,
-    /// 웹사이트: 내 브라우저 로그인 상태 사용 (어느 프로필인지는 profile_idx — 고급 설정에서 고름)
+    /// Web: use my browser's login state (which profile is `profile_idx`, picked in advanced
+    /// settings).
     web_use_login: bool,
-    /// Mac 앱(Electron): 내 앱 데이터(로그인) 복제 사용
+    /// Mac app (Electron): clone my app data (logins).
     app_use_login: bool,
-    /// 별도 로그인 세션용 전용 계정 이름
+    /// Dedicated account name for the separate login session.
     session_account: String,
     kind: FormKind,
     electron_idx: Option<usize>,
@@ -154,7 +159,7 @@ struct NewAgentForm {
     native_new_instance: bool,
     native_attach: bool,
     native_current_session: bool,
-    /// 실험: 가상 디스플레이 위에서 실행 + 그 부작용에 대한 동의
+    /// Experimental: run on a virtual display, plus consent to its side effects.
     native_vdisplay: bool,
     native_vdisplay_consent: bool,
     remote_host: String,
@@ -166,7 +171,7 @@ struct NewAgentForm {
     workspace: String,
     refresh: bool,
     browser_idx: usize,
-    /// 복제할 프로필 (마법사에서는 web_use_login 이 켜졌을 때만 쓴다). None = 빈 프로필
+    /// Profile to clone (the wizard only uses it with `web_use_login` on). `None` = empty profile.
     profile_idx: Option<usize>,
     start_url: String,
     task: String,
@@ -177,88 +182,93 @@ struct NewAgentForm {
 
 pub struct GhostApp {
     rt: Handle,
-    /// 사용자가 추가한 AI 연결들 (`ai.rs`). 에이전트는 `ai_current` 연결로 일한다
+    /// AI connections added by the user (`ai.rs`). Agents work through the `ai_current` connection.
     ai: Vec<ai::AiConn>,
-    /// 지금 쓰는 연결의 id (없으면 목록이 빈 것)
+    /// Id of the current connection (none means the list is empty).
     ai_current: u64,
-    /// 다음에 만들 연결의 id
+    /// Id for the next connection created.
     ai_next_id: u64,
-    /// 연결 id → API 에서 불러온 모델 목록
+    /// Connection id → model list fetched from the API.
     model_fetch: Arc<parking_lot::Mutex<std::collections::HashMap<u64, ModelFetch>>>,
-    /// 홈 모델 단추 목록의 검색어
+    /// Search text in the home model button's list.
     model_query: String,
-    /// API 키를 이 PC 에 (암호화해) 기억할지
+    /// Whether to remember API keys on this PC (encrypted).
     remember_keys: bool,
-    /// 화면 언어
+    /// UI language.
     lang: Lang,
     effort_idx: usize,
-    /// 열려 있는 사용 설명 (처음 켤 때 · 설정에서 다시 보기)
+    /// The open guide (at first launch, or reopened from Settings).
     tour: Option<tour::Tour>,
-    /// 사용 설명을 끝까지 보거나 건너뛰었는가 (그러면 다음부터 띄우지 않는다)
+    /// Whether the guide was finished or skipped (then it's not shown again).
     tour_seen: bool,
-    /// 사용 설명 사진 찍기 모드 (`GHOSTDESK_TOUR_CAPTURE`)
+    /// Guide screenshot capture mode (`GHOSTDESK_TOUR_CAPTURE`).
     tour_capture: Option<tour::Capture>,
-    /// macOS 권한 상태 (1초마다 다시 확인: `permissions`)
+    /// macOS permission state (rechecked every second: `permissions`).
     #[cfg(target_os = "macos")]
     perm_cache: Option<(std::time::Instant, crate::macos::TccStatus)>,
-    /// 사이드바의 권한 알림을 이번 실행 동안 접었는가
+    /// Whether the sidebar permission notice was dismissed for this run.
     perm_notice_hidden: bool,
-    /// prefs.json 에서 이 버전이 모르는 칸 (저장할 때 그대로 다시 쓴다)
+    /// Fields in prefs.json this version doesn't know (written back unchanged on save).
     prefs_other: serde_json::Map<String, serde_json::Value>,
-    /// 화면이 잠겨도(디스플레이가 꺼져도) 에이전트가 일하는 동안 Mac/PC 가 잠자지 않게 한다
+    /// Keeps the Mac/PC from sleeping while agents work, even with the screen locked (display off).
     keep_awake: bool,
-    /// 지금 잠자기를 막고 있는가 (keep_awake 이고 일하는 에이전트가 있을 때)
+    /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
     awake: Option<crate::platform::awake::KeepAwake>,
-    /// 홈 화면 인사말 (켤 때마다 다르게)
+    /// Home screen greeting (different each launch).
     greeting: usize,
     browsers: Vec<InstalledBrowser>,
-    /// 백그라운드에서 감지한 Electron 앱 목록 (None = 감지 중)
+    /// Electron apps detected in the background (`None` = still detecting).
     electron_apps: Slot<Vec<crate::electron::ElectronApp>>,
-    /// 로컬 앱 (이름, 경로). macOS: /Applications 의 .app (시작할 때 바로 읽음),
-    /// Windows: 설치된 프로그램 (백그라운드에서 읽음, None = 확인 중)
+    /// Local apps `(name, path)`. macOS: .app bundles in /Applications (read at startup); Windows:
+    /// installed programs (read in the background, `None` = still checking).
     native_apps: Slot<Vec<(String, String)>>,
     form: NewAgentForm,
     agents: Vec<AgentHandle>,
     selected: Option<usize>,
     view: View,
     next_id: u64,
-    /// 에이전트 화면 위에 가상 마우스를 그릴지
+    /// Whether to draw the virtual mouse over agent screens.
     show_cursor: bool,
-    /// 외부 에이전트(MCP) 제어 서버에서 오는 이벤트
+    /// Events from the external agent (MCP) control server.
     control_rx: mpsc::UnboundedReceiver<crate::control::ControlEvent>,
-    /// 제어 서버 상태 (None = 정상 동작 중)
+    /// Control server state (`None` = running fine).
     control_error: Arc<parking_lot::Mutex<Option<String>>>,
-    /// 사용자 승인 대기 중인 외부 요청
+    /// External requests waiting for the user's approval.
     approvals: Vec<Approval>,
-    /// 승인 요청 때문에 Dock 주의 요청(바운스)을 보낸 상태인가
+    /// Whether a Dock attention request (bounce) was sent for an approval.
     attention_requested: bool,
-    /// 외부 연결 안내 창 표시
+    /// Show the Connections window.
     show_connect: bool,
-    /// 자동 연결 결과/상태 (백그라운드에서 갱신)
+    /// Auto-connect result/state (updated in the background).
     connect_state: Arc<parking_lot::Mutex<ConnectState>>,
-    /// 새 에이전트 창 / 설정 창 표시
+    /// Show the new-agent / settings window.
     wizard_open: bool,
     show_settings: bool,
     show_session_guide: bool,
-    /// Windows 자식 세션: 기능이 켜져 있는가 (None = 아직 확인 안 함) / 켜기 요청 진행·결과
+    /// Windows child sessions: whether the feature is on (`None` = not checked yet) / enable request
+    /// progress and result.
     child_enabled: Option<bool>,
     child_enable: Arc<parking_lot::Mutex<ChildEnable>>,
-    /// 개발용: GHOSTDESK_DEMO=<n> 이면 빈 프로필 브라우저 에이전트 n 개를 자동 시작
+    /// Development: with GHOSTDESK_DEMO=<n>, auto-starts n empty-profile browser agents.
     pending_demo: u32,
     toast: Option<(String, f64)>,
-    /// 화면 모아보기에서 전체 화면으로 켰는가 (모아보기를 닫으면 되돌린다)
+    /// Whether the screen wall turned on full screen (undone when the wall closes).
     wall_fullscreen: bool,
-    /// API 키 없이 시작을 눌렀음 (새 에이전트 창의 키 칸 아래에 안내를 보인다)
+    /// Start was pressed without an API key (shows a hint under the key field in the new-agent
+    /// window).
     key_warn: bool,
-    /// 새 에이전트 창에 API 키 칸을 보일지 (창을 열 때 키가 없었으면 — 입력하는 동안 칸이 사라지지 않게 고정)
+    /// Whether to show the API key field in the new-agent window (pinned if there was no key when the
+    /// window opened, so it doesn't vanish while typing).
     wizard_key_field: bool,
-    /// 다음 프레임에 API 키 칸으로 입력 포커스를 옮긴다
+    /// Move input focus to the API key field next frame.
     focus_key: bool,
-    /// 화면 모아보기를 열 때 이미 전체 화면이었는가 (닫을 때 사용자의 전체 화면은 그대로 둔다)
+    /// Whether it was already full screen when the wall opened (the user's full screen is left alone
+    /// on close).
     wall_fs_before: bool,
-    /// 지난 프레임의 사이드바·상세 오른쪽 패널 너비 (제목 표시줄을 같은 열로 나눠 칠한다)
+    /// Widths of the sidebar and detail right panel last frame (the title bar is painted in matching
+    /// columns).
     title_cols: titlebar::Columns,
-    /// 새 버전 알림 · 내려받기 상태 (백그라운드에서 갱신)
+    /// Update notice and download state (updated in the background).
     update: crate::update::Shared,
 }
 
@@ -298,7 +308,8 @@ impl GhostApp {
             electron_apps,
             native_apps,
             rt,
-            // 저장한 설정이 없을 때: 환경변수에 키가 있는 회사들 (없으면 Claude 하나). load_prefs 가 덮어쓴다
+            // without saved settings: providers with a key in the environment (or just Claude); load_prefs
+            // overrides this
             ai: Vec::new(),
             ai_current: 0,
             ai_next_id: 0,
@@ -335,9 +346,9 @@ impl GhostApp {
         };
         app.ai = ai::initial(&mut app.ai_next_id);
         app.ai_current = app.ai[0].id;
-        // 저장해 둔 언어·AI·키를 적용하고, 그 언어에 맞는 글꼴을 올린다
+        // apply the saved language, AI and keys, and load fonts for that language
         app.load_prefs();
-        // 처음 켰으면 사용 설명을 띄운다 (사진 찍기 모드에서는 띄우지 않는다)
+        // show the guide on first launch (not in capture mode)
         app.tour_seen = tour::already_seen(app.tour_seen);
         if !app.tour_seen && app.tour_capture.is_none() {
             app.open_tour();
@@ -347,7 +358,8 @@ impl GhostApp {
         app
     }
 
-    /// 화면 언어를 바꾼다: 글은 다음 프레임부터, 글꼴은 그 언어의 글자가 있는 것으로
+    /// Changes the UI language: text from the next frame, fonts to ones that have that language's
+    /// glyphs.
     fn set_lang(&mut self, ctx: &egui::Context, lang: Lang) {
         if self.lang == lang {
             return;
@@ -358,9 +370,10 @@ impl GhostApp {
         self.save_prefs();
     }
 
-    /// 외부 에이전트의 민감한 요청을 사용자에게 묻는 창 (모달: 답할 때까지 다른 조작을 막는다)
+    /// Window asking the user about a sensitive external agent request (modal: blocks everything
+    /// else until answered).
     fn approval_window(&mut self, ctx: &egui::Context) {
-        // 요청한 쪽이 시간 초과·연결 끊김으로 응답을 더 받지 않으면(수신자 drop) 창을 치운다
+        // drop the dialog if the requester stopped listening (timeout or disconnect, receiver dropped)
         prune_closed_approvals(&mut self.approvals);
         let Some((title, detail, _)) = self.approvals.first() else {
             if self.attention_requested {
@@ -369,11 +382,11 @@ impl GhostApp {
             }
             return;
         };
-        // 입력이 없어도 시간 초과된 요청이 정리되도록 주기적으로 다시 그린다
+        // repaint periodically so timed-out requests get cleaned up even without input
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
         let (title, detail) = (title.clone(), detail.clone());
         let mut answer = None;
-        // 바깥 클릭·Esc 로는 닫지 않는다: 반드시 허용/거부 중 하나를 고른다
+        // no closing by clicking outside or Esc: one of allow/deny must be chosen
         egui::Modal::new(egui::Id::unique("approval")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.horizontal(|ui| {
@@ -406,7 +419,7 @@ impl GhostApp {
 
     fn remove_agent(&mut self, idx: usize) {
         let h = self.agents.remove(idx);
-        // 아직 준비 중인 화면(내부·외부 모두)은 준비가 끝나는 즉시 닫히도록 표시한다
+        // mark screens still being prepared (internal or external) to close as soon as they're ready
         h.shared.removed.store(true, Ordering::SeqCst);
         h.task.abort();
         let ws = h.shared.workspace.lock().take();
@@ -423,8 +436,11 @@ impl GhostApp {
         }
     }
 
-    /// '화면이 잠겨도 계속 작업' 이 켜져 있고 일하는 에이전트가 있으면 잠자기를 막고, 아니면 푼다.
-    /// 외부(MCP) 에이전트는 호출 사이에 '대기' 로 보이므로, 그 화면이 열려 있는 동안을 일하는 중으로 본다.
+    /// Blocks sleep while "keep working while locked" is on and an agent is working, otherwise
+    /// releases it.
+    ///
+    /// External (MCP) agents look idle between calls, so their screen counts as working while it's
+    /// open.
     fn update_keep_awake(&mut self) {
         let working = self.keep_awake
             && self.agents.iter().any(|a| {
@@ -461,7 +477,8 @@ impl GhostApp {
 }
 
 impl eframe::App for GhostApp {
-    /// 창 바탕: 기본값(반투명 검정)이면 패널 사이 1px 틈과 구분선이 밝은 테마에서 검게 비친다
+    /// Window clear color. The default (translucent black) shows through the 1 px gaps and
+    /// separators between panels as black lines in the light theme.
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
@@ -469,19 +486,20 @@ impl eframe::App for GhostApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
-        // 외부 에이전트 이벤트 처리
+        // handle external agent events
         while let Ok(ev) = self.control_rx.try_recv() {
             match ev {
                 crate::control::ControlEvent::Register(shared) => {
-                    // 외부 에이전트가 조작하는 화면: 대화 루프가 없으므로 지시 채널·task 는 빈 것
+                    // a screen driven by an external agent has no conversation loop, so the instruction channel and
+                    // task are empty
                     let (tx, _rx) = mpsc::unbounded_channel();
                     let task = self.rt.spawn(async {});
                     self.agents.push(AgentHandle::new(&self.rt, shared, tx, task));
                 }
                 crate::control::ControlEvent::Approval { title, detail, reply } => {
                     self.approvals.push((title, detail, Some(reply)));
-                    // 백그라운드로 뜬 창이라도 알 수 있게 Dock 아이콘(Windows: 작업 표시줄 단추 깜빡임)으로 알린다
-                    // (포커스는 빼앗지 않음)
+                    // flag it on the Dock icon (Windows: flash the taskbar button) so a window in the background
+                    // notices too (without taking focus)
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                         egui::UserAttentionType::Informational,
                     ));
@@ -495,14 +513,14 @@ impl eframe::App for GhostApp {
         self.update_keep_awake();
         self.tour_capture_tick(&ctx);
 
-        // 화면 모아보기: 다른 패널 없이 화면만 (에이전트가 모두 사라지면 처음 화면으로)
+        // screen wall: only the screens, no other panels (back to home if every agent is gone)
         if self.view == View::Wall
             && (self.agents.is_empty()
                 || (self.approvals.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))))
         {
             self.leave_wall(&ctx, View::Grid);
         }
-        // 제목 표시줄은 옆 패널보다 먼저 놓아야 창 너비 전체를 차지한다
+        // the title bar must be placed before the side panels to span the full window width
         if titlebar::visible(&ctx) {
             let cols = if self.view == View::Wall { titlebar::Columns::default() } else { self.title_cols };
             egui::Panel::top("titlebar")
@@ -530,13 +548,13 @@ impl eframe::App for GhostApp {
 }
 
 impl GhostApp {
-    /// 보통 화면: 왼쪽 사이드바 · (상세면 오른쪽 패널) · 가운데 · 모달 창
+    /// Normal layout: left sidebar · (right panel in detail view) · center · modal windows.
     fn main_layout(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let ctx = ctx.clone();
-        // 보기(또는 고른 에이전트)가 바뀌면 가운데와 오른쪽 패널이 0.2초 동안 서서히 나타난다
+        // when the view (or selected agent) changes, the center and right panel fade in over 0.2 s
         let fade = theme::appear(&ctx, egui::Id::unique("view_in"), self.view_key(), 0.2);
-        // 제목 표시줄이 있으면 그 아래로 바로 이어지게 위 여백을 줄인다
-        // macOS 제목 줄은 더 낮아서(28) 조금 더 띄운다
+        // with a title bar, reduce the top margin so content follows right below it. The macOS title bar
+        // is shorter (28), so leave a bit more room.
         let top = if titlebar::visible(&ctx) { if cfg!(target_os = "macos") { 10 } else { 4 } } else { 14 };
         let side = egui::Panel::left("left")
             .resizable(true)
@@ -546,7 +564,7 @@ impl GhostApp {
             .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 10, right: 10, top, bottom: 14 }))
             .show(ui, |ui| self.sidebar(ui));
         self.title_cols = titlebar::Columns { left: side.response.rect.width(), right: 0.0 };
-        // 상세 보기: 오른쪽 패널(상태·제어·기록·지시) + 가운데 라이브 화면
+        // detail view: right panel (status, controls, log, instructions) + live screen in the center
         if self.view == View::Detail && self.selected.is_none_or(|i| i >= self.agents.len()) {
             self.view = View::Grid;
         }
@@ -579,20 +597,21 @@ impl GhostApp {
                 }
             });
 
-        // 모달 창: 승인 요청이 있으면 그것만 보인다 (다른 창은 잠시 숨김 — 적던 내용은 유지)
+        // modal windows: with an approval request pending, only that shows (others are hidden for now,
+        // typed text is kept)
         if self.approvals.is_empty() {
             self.settings_window(&ctx);
             self.connect_window(&ctx);
             self.new_agent_window(&ctx);
             self.tour_window(&ctx);
-            // 별도 세션 안내 (macOS: LaunchAgent, Windows: 자식 세션 켜기)
+            // separate session guide (macOS: LaunchAgent; Windows: enabling child sessions)
             if caps::SESSION {
                 self.session_guide_window(&ctx);
             }
         }
     }
 
-    /// 지금 보기를 나타내는 값 (바뀌면 화면 전환 효과를 다시 시작한다)
+    /// A value identifying the current view (a change restarts the transition).
     fn view_key(&self) -> u64 {
         let view = match self.view {
             View::Home => 0,
@@ -604,7 +623,7 @@ impl GhostApp {
         view << 48 | agent
     }
 
-    /// 잠깐 보이는 알림 (모든 창 위). 아래에서 살짝 떠오르며 나타나고, 끝날 때 옅어지며 사라진다.
+    /// Short-lived toast above every window. Rises slightly into view and fades out at the end.
     fn toast_area(&mut self, ctx: &egui::Context) {
         let ctx = ctx.clone();
         let now = ctx.input(|i| i.time);
@@ -626,7 +645,7 @@ impl GhostApp {
                             .shadow(ui.style().visuals.popup_shadow)
                             .show(ui, |ui| ui.label(RichText::new(msg).color(theme::text())));
                     });
-                // 나타나는 중·사라지는 중에는 매 프레임, 그 사이에는 사라지기 시작할 때 다시 그린다
+                // every frame while appearing or disappearing; in between, repaint when the fade-out starts
                 if t < 1.0 {
                     ctx.request_repaint();
                 } else {
@@ -642,8 +661,8 @@ impl GhostApp {
 impl Drop for GhostApp {
     fn drop(&mut self) {
         self.save_prefs();
-        // 종료 시 모든 격리 화면을 정리한다. 락에서 먼저 꺼내(락을 쥔 채 block_on 하지 않음)
-        // 모두 동시에 닫고, 전체에 시간 제한 하나만 둔다.
+        // clean up every isolated screen on exit: take them out of the lock first (never block_on while
+        // holding it), close them all concurrently, with one overall timeout
         let mut desks = Vec::new();
         for a in self.agents.drain(..) {
             a.shared.removed.store(true, Ordering::SeqCst);
@@ -656,8 +675,8 @@ impl Drop for GhostApp {
         if desks.is_empty() {
             return;
         }
-        // timeout(Sleep) 은 런타임 안에서 만들어야 한다: block_on 밖(메인 스레드)에서 만들면
-        // "there is no reactor running" 으로 패닉해 화면을 정리하지 못한 채 끝난다.
+        // the timeout (Sleep) must be created inside the runtime: created outside block_on (on the main
+        // thread) it panics with "there is no reactor running" and exits without cleaning up
         let _ = self.rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -670,13 +689,13 @@ impl Drop for GhostApp {
 
 type Approval = (String, String, Option<tokio::sync::oneshot::Sender<bool>>);
 
-/// 알림이 보이는 시간 (초)
+/// How long a toast stays visible (seconds).
 const TOAST_SECS: f64 = 4.0;
 
-/// 백그라운드에서 채우는 값 (None = 아직 확인 중)
+/// A value filled in the background (`None` = still checking).
 type Slot<T> = Arc<parking_lot::Mutex<Option<T>>>;
 
-/// 응답을 받을 쪽이 사라진(시간 초과·연결 끊김) 승인 요청을 버린다.
+/// Drops approval requests whose requester went away (timeout or disconnect).
 fn prune_closed_approvals(list: &mut Vec<Approval>) {
     list.retain(|(_, _, r)| r.as_ref().is_some_and(|r| !r.is_closed()));
 }
@@ -690,7 +709,7 @@ mod tests {
         let (tx1, rx1) = tokio::sync::oneshot::channel::<bool>();
         let (tx2, rx2) = tokio::sync::oneshot::channel::<bool>();
         let mut list: Vec<Approval> = vec![("a".into(), "".into(), Some(tx1)), ("b".into(), "".into(), Some(tx2)), ("c".into(), "".into(), None)];
-        drop(rx1); // 요청한 쪽이 시간 초과로 포기
+        drop(rx1); // the requester gave up after a timeout
         prune_closed_approvals(&mut list);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "b");

@@ -1,83 +1,94 @@
-//! macOS 네이티브 앱 백엔드 (AppKit / Catalyst / 샌드박스 앱: 카카오톡, 메모, 텍스트 편집기 등).
+//! macOS native app backend (AppKit / Catalyst / sandboxed apps: KakaoTalk, Notes, TextEdit, …).
 //!
-//! 에이전트는 **사용자 화면에 보이지 않는** 앱 창 하나를 조작한다.
+//! The agent drives a single app window that is **never visible on the user's screen**.
 //!
-//! ## 동작 방식
-//! - **Mode A (기본, 숨김 인스턴스 실행)**: 대상 앱을 숨김·비활성 상태로 새로 띄운다
-//!   (`NSWorkspaceOpenConfiguration` activates=false, hides=true, 필요하면 createsNewApplicationInstance).
-//!   일부 문서 기반 앱은 실행 직후 창을 아주 잠깐 보였다가 숨는다 — 노출 감시기가 즉시 다시 숨기고
-//!   측정한 노출 시간을 [`NativeAppWorkspace::exposure_report`] 와 노트로 알려준다.
-//! - **Mode B (사용자의 실행 중인 앱에 붙기)**: 호출자가 명시적인 동의 플래그(`attach_consent`)를 줄 때만.
-//!   GhostDesk 가 그 앱을 숨기므로 **에이전트가 일하는 동안 사용자의 앱 창이 화면에서 사라진다.**
-//!   원래 숨김 상태를 기록해 두었다가 종료 시 되돌린다 (원래 보이던 앱이면 unhide, 활성화는 안 함).
+//! ## How it works
+//! - **Mode A (default, hidden instance)**: launches the target app hidden and inactive
+//!   (`NSWorkspaceOpenConfiguration` activates=false, hides=true, createsNewApplicationInstance
+//!   when needed). Some document-based apps flash a window briefly right after launch; the
+//!   exposure watcher hides it again immediately and reports the measured exposure through
+//!   [`NativeAppWorkspace::exposure_report`] and a note.
+//! - **Mode B (attach to the user's running app)**: only when the caller passes the explicit
+//!   consent flag (`attach_consent`). GhostDesk hides that app, so **the user's app window
+//!   disappears from the screen while the agent works.** The original hidden state is recorded
+//!   and restored on shutdown (unhidden if it was visible, never activated).
 //!
-//! ## 화면 모델
-//! - 한 번에 창 하나. 뷰 = 앱의 창 목록 (AX + CGWindowID).
-//! - 스크린샷 = ScreenCaptureKit 단일 창 캡처 (숨김/가려진 창도 됨), 긴 변 ≤ 1280px 로 축소.
-//!   캡처 시점의 창 프레임(전역 포인트)을 기억해 에이전트 픽셀 → 창 포인트 → 전역 포인트로 바꾼다.
-//!   창에 시트(저장 대화상자 등)가 붙어 있으면 시트도 합성한다.
+//! ## Screen model
+//! - One window at a time. Views = the app's windows (AX + CGWindowID).
+//! - Screenshot = ScreenCaptureKit single-window capture (works for hidden/covered windows),
+//!   scaled down to a long edge ≤ 1280px. The window frame (global points) at capture time is
+//!   remembered to map agent pixels → window points → global points. Sheets attached to the
+//!   window (save dialogs, …) are composited in.
 //!
-//! ## 입력
-//! - 숨김 창에는 마우스 이벤트가 전달되지 않으므로 클릭은 **의미 기반 클릭**이다: 좌표 아래의 가장 깊은
-//!   AX 요소를 찾아 역할에 맞는 동작(AXPress, 포커스+커서, 행 선택, 슬라이더 값)을 수행하고 노트로 알린다.
-//!   드래그·픽셀 단위 조작·오른쪽 클릭(화면에 메뉴가 뜸)은 명확한 오류를 돌려준다.
-//! - 글자 입력은 `CGEventPostToPid` 유니코드 이벤트 (한글 포함). 반영이 확인되지 않으면
-//!   AXSelectedText 삽입으로 대체한다.
-//! - 특수키는 mac 가상 키코드. Cmd/Ctrl 단축키: 전체선택/복사/잘라내기/붙여넣기는 AX 로 흉내낸다
-//!   (복사/붙여넣기는 **내부 클립보드**를 써서 사용자의 시스템 클립보드를 건드리지 않음).
-//!   그 밖의 단축키는 같은 단축키를 가진 메뉴 항목을 AXPress 하고, 없으면 SkyLight 키 창 레코드 +
-//!   키 이벤트를 보낸다 (숨김 상태로 시작한 앱에서는 대부분 무시됨 — 노트로 알림).
-//! - LLM 용 추가 도구 [`NativeAppWorkspace::app_control`] (ui_tree / press / set_value / menu ...).
+//! ## Input
+//! - Hidden windows don't receive mouse events, so clicks are **semantic clicks**: finds the
+//!   deepest AX element under the point and performs the action fitting its role (AXPress,
+//!   focus + caret, row selection, slider value), reported in a note. Drags, pixel-level
+//!   manipulation and right clicks (a menu would appear on screen) return a clear error.
+//! - Text goes in as `CGEventPostToPid` Unicode events (Korean included). If it doesn't show up,
+//!   it falls back to inserting through AXSelectedText.
+//! - Special keys are mac virtual keycodes. Cmd/Ctrl shortcuts: select all/copy/cut/paste are
+//!   emulated through AX (copy/paste use an **internal clipboard**, leaving the user's system
+//!   clipboard alone). Other shortcuts AXPress the menu item with the same shortcut, or else send
+//!   a SkyLight key window record + key event (mostly ignored by apps started hidden; reported in
+//!   a note).
+//! - Extra LLM tool [`NativeAppWorkspace::app_control`] (ui_tree / press / set_value / menu ...).
 //!
-//! ## 사용자 세션 보호
-//! 숨김 앱의 메뉴도 AXPress 로 실행되고, 앱의 AXMenuBar 에는 Apple 메뉴(잠금 화면 ctrl+cmd+Q, 로그아웃
-//! shift+cmd+Q, 즉시 로그아웃, 재시동, 시스템 종료)가 활성 상태로 들어 있다(이 Mac 에서 확인). 그래서 메뉴 실행·
-//! 단축키·키 이벤트 모두 사용자 세션 전체나 다른 앱에 작용하는 항목(Apple 메뉴, 서비스, 기타 가리기/모두 보기,
-//! 도움말, 공유, 받아쓰기/이모지/글쓰기 도구, 열기 패널)을 차단하고, 링크·전체 화면·최소화 버튼은 누르지 않는다.
-//! 클릭 좌표는 에이전트가 마지막으로 본 스크린샷의 창에만 적용한다 (창이 바뀌었으면 오류).
+//! ## Protecting the user session
+//! Menus of hidden apps still run through AXPress, and the app's AXMenuBar contains the Apple
+//! menu, enabled (lock screen ctrl+cmd+Q, log out shift+cmd+Q, immediate log out, restart, shut
+//! down; confirmed on this Mac). So menu actions, shortcuts and key events all block items that
+//! act on the whole user session or other apps (Apple menu, Services, Hide Others/Show All, Help,
+//! Share, Dictation/Emoji/Writing Tools, open panels), and link, full-screen and minimize buttons
+//! are never pressed. Click coordinates only apply to the window in the agent's last screenshot
+//! (an error if the window changed).
 //!
-//! ## 권한
-//! 손쉬운 사용 + 화면 기록 권한이 필요하다 ([`crate::macos::preflight`]).
-//! 새 바이너리가 처음 ScreenCaptureKit 을 쓰면 macOS 가 1회성 확인 알림을 띄울 수 있다.
+//! ## Permissions
+//! Needs Accessibility + Screen Recording ([`crate::macos::preflight`]). The first time a new
+//! binary uses ScreenCaptureKit, macOS may show a one-time confirmation prompt.
 
 #![allow(dead_code)]
 
 use std::path::PathBuf;
 
-/// 네이티브 앱 작업공간 설정
+/// Native app workspace options.
 #[derive(Clone, Debug)]
 pub struct NativeOptions {
-    /// 대상 앱: `.app` 경로 또는 번들 id (예: "com.apple.TextEdit", "com.kakao.KakaoTalkMac")
+    /// Target app: `.app` path or bundle id (e.g. "com.apple.TextEdit", "com.kakao.KakaoTalkMac").
     pub app: String,
-    /// 시작할 때 열 파일들 (Mode A)
+    /// Files to open at startup (Mode A).
     pub open_files: Vec<PathBuf>,
-    /// 이미 실행 중이어도 별도 인스턴스를 띄운다 (createsNewApplicationInstance). 단일 인스턴스 앱은 거부할 수 있음.
+    /// Launches a separate instance even if one is already running (createsNewApplicationInstance).
+    /// Single-instance apps may refuse.
     pub new_instance: bool,
-    /// Mode B 동의: 사용자가 실행 중인 인스턴스를 숨기고 그 위에서 일해도 된다는 명시적 동의
+    /// Mode B consent: explicit permission to hide the user's running instance and work on top of it.
     pub attach_consent: bool,
-    /// Mode B 에서 붙을 특정 pid (없으면 번들 id 의 첫 인스턴스)
+    /// Specific pid to attach to in Mode B (defaults to the bundle id's first instance).
     pub attach_pid: Option<i32>,
-    /// 실행 인자 추가 (기본으로 상태 복원/저장을 끄는 인자가 들어간다)
+    /// Extra launch arguments (the defaults turn off state restoration/saving).
     pub extra_args: Vec<String>,
-    /// 스크린샷 긴 변 최대 픽셀
+    /// Maximum screenshot long edge in pixels.
     pub max_long_edge: u32,
-    /// 라이브 뷰 초당 프레임 (0 이면 끔)
+    /// Live view frames per second (0 = off).
     pub live_fps: f64,
-    /// (Windows) 앱을 어디서 띄울지: 숨은 데스크톱 / 화면 밖 창 / 자동
+    /// (Windows) Where to launch the app: hidden desktop / off-screen window / auto.
     pub host: NativeHost,
 }
 
-/// (Windows) Mode A 앱을 띄울 곳
+/// (Windows) Where to launch Mode A apps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum NativeHost {
-    /// 숨은 데스크톱을 먼저 쓰고, 거기서 그려지지 않는 앱(GPU blt 출력 등)은 화면 밖 창으로 다시 띄운다
+    /// Hidden desktop first; apps that don't paint there (GPU blt output, …) are relaunched as
+    /// off-screen windows.
     #[default]
     Auto,
-    /// 같은 세션의 보이지 않는 데스크톱 (CreateDesktop): 팝업·메뉴도 사용자 화면에 나타나지 않는다
+    /// An invisible desktop in the same session (CreateDesktop): popups and menus never appear on the
+    /// user's screen either.
     Hidden,
-    /// 원본 로그인 데이터를 쓰는 같은 계정의 숨은 데스크톱. 실행 중인 앱과 attach 는 거절한다.
+    /// Hidden desktop of the same account using the original login data. Running apps and attach are
+    /// refused.
     CurrentSession,
-    /// 사용자 데스크톱의 모든 모니터 바깥 (이전 방식)
+    /// Outside every monitor on the user's desktop (the older approach).
     Offscreen,
 }
 
@@ -122,14 +133,18 @@ impl Default for NativeOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NativeMode {
-    /// 우리가 숨김 상태로 띄운 인스턴스 (종료 시 프로세스를 끝낸다)
+    /// An instance we launched hidden (its process is ended on shutdown).
     Launched,
-    /// 사용자의 실행 중인 인스턴스에 동의 하에 붙음 (종료 시 숨김 상태만 되돌린다)
+    /// Attached with consent to the user's running instance (only its hidden state is restored on
+    /// shutdown).
     Attached,
 }
 
-/// 이 컴퓨터에 설치된 일반 앱 목록 (표시 이름, 실행 파일 경로) — 새 에이전트 창의 앱 고르기용.
-/// macOS 는 app.rs 가 /Applications 를 직접 훑으므로 비어 있다. Windows 는 시작 메뉴·App Paths 에서 찾는다.
+/// Regular apps installed on this computer (display name, executable path), for the app picker in
+/// the new agent window.
+///
+/// Empty on macOS, where app.rs scans /Applications itself. Windows looks in the Start menu and
+/// App Paths.
 pub fn installed_apps() -> Vec<(String, String)> {
     #[cfg(windows)]
     {
@@ -141,7 +156,8 @@ pub fn installed_apps() -> Vec<(String, String)> {
     }
 }
 
-/// 사용자가 적은 앱(경로·이름·실행 파일 이름)을 실행 파일 경로로 바꾼다. Windows 전용 (그 밖은 None).
+/// Turns the app the user typed (path, name, executable name) into an executable path. Windows
+/// only (None elsewhere).
 pub fn resolve_app_query(query: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -154,8 +170,11 @@ pub fn resolve_app_query(query: &str) -> Option<PathBuf> {
     }
 }
 
-/// 실행 전에 항상 거절할 실행 파일인지 확인한다 (Windows: Store 앱·실행 별칭·콘솔 프로그램·관리자 권한 앱·셸과 시스템 실행기 등).
-/// 외부 요청은 사람에게 승인을 묻기 **전에** 이것으로 거른다. 다른 OS 는 항상 Ok.
+/// Checks whether the executable must always be refused before launch (Windows: Store apps,
+/// execution aliases, console programs, apps needing elevation, shells and system launchers, …).
+///
+/// External requests are filtered through this **before** asking a person for approval. Always
+/// Ok on other OSes.
 pub fn preflight_app(exe: &std::path::Path) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -168,8 +187,11 @@ pub fn preflight_app(exe: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
-/// GhostDesk 가 비정상 종료되어 화면 밖에 남은 사용자 앱 창(Windows Mode B)을 원래 자리로 되돌린다. 되돌린 창 수.
-/// Windows 에서는 앱 작업공간을 열 때마다 자동으로 부르며, GUI 시작 때 불러도 된다. 다른 OS 는 할 일이 없다 (0).
+/// Puts back user app windows (Windows Mode B) left off-screen after GhostDesk crashed. Returns
+/// how many were restored.
+///
+/// On Windows it runs automatically whenever an app workspace opens, and is fine to call at GUI
+/// startup too. Nothing to do on other OSes (0).
 pub fn recover_parked_windows() -> usize {
     #[cfg(windows)]
     {
@@ -181,7 +203,8 @@ pub fn recover_parked_windows() -> usize {
     }
 }
 
-/// 이 OS 의 로컬 앱 백엔드에 맞는 에이전트 환경 설명 (None 이면 agent.rs 의 macOS 설명을 쓴다)
+/// Agent environment description for this OS's local app backend (None = use agent.rs's macOS
+/// description).
 pub fn env_prompt() -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -193,7 +216,7 @@ pub fn env_prompt() -> Option<&'static str> {
     }
 }
 
-/// LLM 에 노출할 `app_control` 도구 정의 (Anthropic custom tool 형식)
+/// The `app_control` tool definition exposed to the LLM (Anthropic custom tool format).
 pub fn app_control_tool() -> serde_json::Value {
     serde_json::json!({
         "name": "app_control",
@@ -217,7 +240,7 @@ pub fn app_control_tool() -> serde_json::Value {
     })
 }
 
-/// Windows: 화면 밖 Win32 앱용 설명 (winapp 참고)
+/// Windows: description for off-screen Win32 apps (see winapp).
 #[cfg(windows)]
 pub const APP_CONTROL_DESCRIPTION: &str = crate::winapp::APP_CONTROL_DESCRIPTION;
 
@@ -241,7 +264,7 @@ Blocked for the user's safety (menu, shortcut and click alike): the Apple menu (
 #[cfg(target_os = "macos")]
 pub use imp::*;
 
-// Windows: 화면 밖 창 + PrintWindow + 창 메시지 + UI Automation (src/winapp)
+// Windows: off-screen window + PrintWindow + window messages + UI Automation (src/winapp)
 #[cfg(windows)]
 pub use crate::winapp::{selftest, NativeAppWorkspace};
 
@@ -276,13 +299,13 @@ mod imp {
         input, skylight,
     };
 
-    // ───────────────────────── 좌표 ─────────────────────────
+    // ---- coordinates ----
 
-    /// 스크린샷 픽셀 ↔ 전역 포인트 변환 정보 (캡처 시점 기준)
+    /// Screenshot pixel ↔ global point mapping (as of capture time).
     #[derive(Clone, Copy, Debug)]
     struct Geom {
         wid: u32,
-        /// 창 프레임 (전역 포인트, 좌상단 원점)
+        /// Window frame (global points, top-left origin).
         frame: CGRect,
         shot_w: u32,
         shot_h: u32,
@@ -323,7 +346,7 @@ mod imp {
         CGPoint { x: r.origin.x + r.size.width / 2.0, y: r.origin.y + r.size.height / 2.0 }
     }
 
-    // ───────────────────────── AX 노드 정보 ─────────────────────────
+    // ---- AX node info ----
 
     const NODE_ATTRS: [&str; 10] = [
         "AXRole", "AXSubrole", "AXPosition", "AXSize", "AXTitle", "AXDescription", "AXValue", "AXEnabled",
@@ -370,7 +393,7 @@ mod imp {
             }
         }
 
-        /// 사람이 읽을 이름 (title > description > value 순)
+        /// Human-readable name (title > description > value).
         fn label(&self) -> String {
             for s in [&self.title, &self.desc, &self.placeholder] {
                 if !s.trim().is_empty() {
@@ -422,7 +445,7 @@ mod imp {
         s.encode_utf16().count() as isize
     }
 
-    /// 자식 목록. 큰 표/목록은 보이는 행만 쓴다.
+    /// Children. Large tables and lists only include the visible rows.
     fn kids(n: &Node) -> Vec<El> {
         if matches!(n.role.as_str(), "AXTable" | "AXOutline" | "AXList" | "AXBrowser" | "AXGrid") {
             let vis = n.el.elements("AXVisibleRows");
@@ -439,7 +462,8 @@ mod imp {
         n.el.children()
     }
 
-    /// 루트에서 점 p 를 포함하는 가장 깊은 요소까지의 경로 (위에 그려지는 뒤쪽 자식 우선)
+    /// Path from the root to the deepest element containing point p (later children, drawn on top,
+    /// win).
     fn hit_path(root: &El, p: CGPoint) -> Vec<Node> {
         let mut path = vec![Node::read(root)];
         let mut budget = 3000usize;
@@ -473,7 +497,7 @@ mod imp {
         path
     }
 
-    // ───────────────────────── 상태 ─────────────────────────
+    // ---- state ----
 
     #[derive(Clone)]
     struct WinEntry {
@@ -500,7 +524,7 @@ mod imp {
 
     struct Inner {
         pid: i32,
-        /// 대상 앱의 번들 id (종료 시 pid 재사용 확인용)
+        /// Target app's bundle id (to check for pid reuse on shutdown).
         bundle_id: Option<String>,
         mode: NativeMode,
         prior_hidden: bool,
@@ -516,7 +540,7 @@ mod imp {
         guard: Mutex<Option<ExposureGuard>>,
     }
 
-    /// macOS 네이티브 앱 작업공간
+    /// macOS native app workspace.
     pub struct NativeAppWorkspace {
         inner: Arc<Inner>,
     }
@@ -525,8 +549,11 @@ mod imp {
         tokio::task::spawn_blocking(f).await.map_err(|e| anyhow!("작업 스레드 오류: {e}"))
     }
 
-    /// 상태 복원/저장을 끄는 기본 실행 인자 (사용자의 창 복원 상태를 읽거나 덮어쓰지 않게)
-    /// 문서 기반 앱이 시작할 때 열기 패널(별도 시스템 프로세스 창이라 숨길 수 없음) 대신 빈 문서를 만들게 한다.
+    /// Default launch arguments turning off state restoration/saving (so the user's window
+    /// restoration state is neither read nor overwritten).
+    ///
+    /// Also makes document-based apps start with an empty document instead of an open panel (a window
+    /// of a separate system process, which can't be hidden).
     const DEFAULT_ARGS: [&str; 6] = [
         "-ApplePersistenceIgnoreState",
         "YES",
@@ -537,13 +564,13 @@ mod imp {
     ];
 
     impl NativeAppWorkspace {
-        /// 앱을 숨김 상태로 띄우거나(Mode A), 동의 하에 실행 중인 앱에 붙는다(Mode B).
+        /// Launches the app hidden (Mode A) or attaches to a running app with consent (Mode B).
         pub async fn launch(opts: NativeOptions, sink: FrameSink) -> Result<Arc<Self>> {
             anyhow::ensure!(opts.host != NativeHost::CurrentSession, "current_session 은 Windows 전용입니다");
             crate::macos::preflight()?;
-            // 실행부터 Inner 생성·첫 창 대기까지 전부 작업 스레드 안에서 한다.
-            // 이 future 가 중간에 취소되어도(에이전트 중지 등) 작업 결과인 Arc<Inner> 는 런타임이 버리면서
-            // Inner::drop → shutdown_sync 가 돌아 우리가 띄운 프로세스가 남지 않는다.
+            // everything from launch to creating Inner and waiting for the first window runs on the worker
+            // thread. If this future is cancelled midway (agent stopped, …), the runtime drops the resulting
+            // Arc<Inner>, so Inner::drop → shutdown_sync runs and no launched process is left behind.
             let inner = blocking(move || -> Result<Arc<Inner>> {
                 let st = start_app(&opts)?;
                 let inner = Arc::new(Inner {
@@ -565,7 +592,7 @@ mod imp {
                 if !st.exposure.is_empty() {
                     inner.note(format!("실행 중 창이 잠깐 화면에 노출되어 즉시 숨겼습니다: {}", st.exposure.join(", ")));
                 }
-                // 창이 생길 때까지 기다린다 (최대 10초)
+                // wait for a window to appear (up to 10 s)
                 let t = Instant::now();
                 while t.elapsed() < Duration::from_secs(10) {
                     inner.guard_exposure();
@@ -598,13 +625,13 @@ mod imp {
             self.inner.app_name.clone()
         }
 
-        /// 실행 이후 측정된 창 노출 기록 (비어 있으면 노출 없음)
+        /// Window exposure measured since launch (empty = no exposure).
         pub fn exposure_report(&self) -> Vec<String> {
             self.inner.collect_guard_events();
             self.inner.exposure.lock().clone()
         }
 
-        // ───────────── 계약 메서드 ─────────────
+        // ---- contract methods ----
 
         pub fn size(&self) -> (u32, u32) {
             *self.inner.size.lock()
@@ -626,7 +653,7 @@ mod imp {
             let mut st = self.inner.state.lock();
             st.mouse = (x, y);
             if st.down.is_some() {
-                // 드래그 중 — mouse_up 에서 오류를 낸다
+                // dragging: mouse_up returns the error
             }
             Ok(())
         }
@@ -754,14 +781,14 @@ mod imp {
             let _ = blocking(move || i.shutdown_sync()).await;
         }
 
-        /// LLM `app_control` 도구 실행. 결과 텍스트를 돌려준다.
+        /// Runs the LLM `app_control` tool and returns the result text.
         pub async fn app_control(&self, input: &Value) -> Result<String> {
             let i = self.inner.clone();
             let input = input.clone();
             blocking(move || i.app_control(&input)).await?
         }
 
-        /// (진단용) 에뮬레이션 없이 SkyLight 키 창 레코드 + 키 이벤트만 보낸다.
+        /// (Diagnostics) Sends only a SkyLight key window record + key event, without emulation.
         pub async fn raw_key(&self, combo: &str) -> Result<String> {
             let i = self.inner.clone();
             let combo = combo.to_string();
@@ -770,7 +797,7 @@ mod imp {
     }
 
     impl Drop for Inner {
-        /// shutdown 을 부르지 않고 버려져도 우리가 띄운 프로세스는 반드시 정리한다
+        /// Processes we launched are always cleaned up, even if dropped without `shutdown`.
         fn drop(&mut self) {
             self.shutdown_sync();
         }
@@ -779,7 +806,7 @@ mod imp {
     const DRAG_ERR: &str = "숨김 모드에서는 드래그와 픽셀 단위 마우스 조작을 할 수 없습니다 (숨겨진 창에는 마우스 이벤트가 전달되지 않음). \
         스크롤은 scroll, 값 변경은 app_control set_value, 선택은 app_control select 를 쓰세요.";
 
-    // ───────────────────────── 실행 / 연결 ─────────────────────────
+    // ---- launch / attach ----
 
     struct StartResult {
         pid: i32,
@@ -794,7 +821,8 @@ mod imp {
     fn start_app(o: &NativeOptions) -> Result<StartResult> {
         let target = apps::resolve_app(&o.app)?;
         if let Some(p) = o.attach_pid {
-            // attach_pid 가 지정한 앱과 다른 프로세스(사용자의 다른 앱)를 가리키면 거부한다
+            // refuse if attach_pid points at a process other than the requested app (another of the user's
+            // apps)
             let actual = apps::bundle_id_of(p);
             match (&target.bundle_id, &actual) {
                 (_, None) => bail!("pid {p} 는 실행 중인 앱이 아닙니다"),
@@ -836,25 +864,26 @@ mod imp {
             });
         }
         if !running.is_empty() && apps::multiple_instances_prohibited(&target.path) {
-            // 새 인스턴스를 요청해도 기존(사용자) 프로세스가 돌아오고, hides=true 때문에 사용자의 앱이 숨겨진다
+            // asked for a new instance but got the existing (user's) process back, and hides=true hid the
+            // user's app
             bail!(
                 "{} 은(는) 여러 인스턴스 실행을 허용하지 않는 앱이라 별도 인스턴스를 띄울 수 없습니다 (사용자의 앱이 숨겨질 수 있음). \
                  사용자의 실행 중인 앱에서 작업하려면 attach 동의가 필요합니다.",
                 target.name
             );
         }
-        // 만일 기존 프로세스가 돌아오면 숨김 상태를 되돌리기 위해 실행 전 상태를 기록한다
+        // record the pre-launch state so it can be restored if the existing process comes back
         let prior_visible: Vec<(i32, bool)> = running.iter().map(|p| (*p, apps::is_hidden(*p) == Some(false))).collect();
         let mut args: Vec<String> = DEFAULT_ARGS.iter().map(|s| s.to_string()).collect();
         args.extend(o.extra_args.iter().cloned());
-        // 번들 id 를 몰라 running 이 비어 있어도 기존(사용자) 프로세스를 우리 것으로 착각하지 않도록
-        // 실행 직전의 모든 앱 pid 를 기록해 둔다 (착각하면 종료 시 사용자의 앱을 kill 하게 된다)
+        // record every app pid right before launch, so that even with no bundle id (running is empty) an
+        // existing user process isn't mistaken for ours (which would kill the user's app on shutdown)
         let mut before: HashSet<i32> = apps::all_running_pids();
         before.extend(running.iter().copied());
         let t0 = Instant::now();
         let pid = apps::launch_hidden(&target.path, &o.open_files, &args, o.new_instance || !running.is_empty())?;
         if before.contains(&pid) {
-            // 우리 실행 요청(hides=true)이 사용자의 기존 앱을 숨겼다면 원래대로 되돌린다 (활성화는 하지 않음)
+            // if our launch request (hides=true) hid the user's existing app, put it back (without activating)
             if prior_visible.iter().any(|(p, vis)| *p == pid && *vis) && apps::is_hidden(pid) == Some(true) {
                 apps::restore_unhide(pid);
                 eprintln!("[ghostdesk] 실행 요청이 기존 앱(pid {pid})을 숨겨 원래대로 다시 표시함");
@@ -865,8 +894,8 @@ mod imp {
                 target.name
             );
         }
-        // 상시 감시기 (AXObserver + 30ms 폴링) 를 바로 켜고,
-        // 실행 직후 4초 동안은 5ms 간격으로도 감시해 노출 시간을 정밀하게 잰다
+        // start the always-on watcher (AXObserver + 30 ms polling) right away, and for the first 4 s after
+        // launch also poll every 5 ms to measure exposure precisely
         let guard = ExposureGuard::start(pid);
         let mut exposure = watch_exposure(pid, Duration::from_secs(4), t0);
         exposure.extend(guard.take_events());
@@ -889,7 +918,7 @@ mod imp {
         })
     }
 
-    /// pid 의 창이 화면에 보이면 즉시 숨기고 노출 구간을 기록한다.
+    /// Hides the pid's windows the moment they're visible on screen and records the exposure.
     fn watch_exposure(pid: i32, dur: Duration, t0: Instant) -> Vec<String> {
         let start = Instant::now();
         let mut out = Vec::new();
@@ -916,7 +945,7 @@ mod imp {
         out
     }
 
-    // ───────────────────────── 내부 구현 ─────────────────────────
+    // ---- internals ----
 
     impl Inner {
         fn note(&self, s: impl Into<String>) {
@@ -930,7 +959,7 @@ mod imp {
             El::app(self.pid)
         }
 
-        /// 상시 감시기가 남긴 기록을 노출 목록과 노트로 옮긴다
+        /// Moves records left by the always-on watcher into the exposure list and notes.
         fn collect_guard_events(&self) {
             let ev = self.guard.lock().as_ref().map(|g| g.take_events()).unwrap_or_default();
             if !ev.is_empty() {
@@ -942,7 +971,8 @@ mod imp {
             }
         }
 
-        /// 우리 창이 사용자 화면에 보이면 즉시 숨긴다 (Mode A). Mode B 에서 사용자가 직접 다시 보이게 했다면 존중한다.
+        /// Hides our window the moment it shows on the user's screen (Mode A). In Mode B, respects the
+        /// user showing it again themselves.
         fn guard_exposure(&self) {
             if self.shut.load(Ordering::SeqCst) {
                 return;
@@ -977,12 +1007,13 @@ mod imp {
             self.note(msg);
         }
 
-        /// 창 목록 갱신. 새 창이 생기면 노트를 남기고 그 창으로 전환한다.
+        /// Refreshes the window list. When a new window appears, leaves a note and switches to it.
         fn refresh_windows(&self, announce: bool) {
             let app = self.app();
             let mut list = Vec::new();
-            // AXWindows 가 정상적으로 빈 배열이면 "창 없음". 속성 자체를 못 읽을 때만 CGWindowList 로 대체한다
-            // (숨은 앱에는 화면 밖 보조 창(저장 패널 캐시 등)이 남아 있어 CG 목록은 부정확하다).
+            // an AXWindows that's legitimately an empty array means "no windows". Only fall back to
+            // CGWindowList when the attribute itself can't be read (hidden apps keep off-screen helper
+            // windows around, like the save panel cache, so the CG list is inaccurate).
             let ax_ok = app.get_raw("AXWindows").is_ok();
             for w in app.elements("AXWindows") {
                 let Some(wid) = w.window_id() else { continue };
@@ -994,7 +1025,7 @@ mod imp {
                 list.push(WinEntry { wid, title: n.title.clone(), subrole: n.subrole.clone(), frame, el: Some(w) });
             }
             if list.is_empty() && !ax_ok {
-                // AX 가 창을 주지 않는 앱: CGWindowList 로 대체 (의미 기반 조작은 제한됨)
+                // apps whose AX gives no windows: fall back to CGWindowList (semantic control is limited)
                 for c in apps::cg_windows(&[self.pid], false) {
                     if c.layer == 0 && c.bounds.size.width >= 100.0 && c.bounds.size.height >= 80.0 {
                         list.push(WinEntry { wid: c.wid, title: c.name, subrole: String::new(), frame: c.bounds, el: None });
@@ -1038,7 +1069,7 @@ mod imp {
             }
         }
 
-        /// 현재 창이 없으면 앱의 주 창(또는 첫 창)을 고른다.
+        /// With no current window, picks the app's main window (or the first one).
         fn ensure_current(&self) -> Option<WinEntry> {
             {
                 let st = self.state.lock();
@@ -1077,10 +1108,10 @@ mod imp {
             Ok((w, el))
         }
 
-        /// 현재 창을 캡처한다 (시트가 있으면 합성). (이미지, 좌표 변환)
+        /// Captures the current window (compositing any sheet). (image, coordinate mapping)
         fn capture_current(&self, max_long_edge: u32) -> Result<(RgbImage, Geom)> {
             let w = self.current_window()?;
-            // 캡처 시점의 실제 프레임 (AX), 없으면 CG
+            // the actual frame at capture time (AX), falling back to CG
             let frame = w.el.as_ref().and_then(|e| e.frame()).unwrap_or(w.frame);
             let mut cache = self.filter.lock();
             let reuse = match cache.as_ref() {
@@ -1100,14 +1131,14 @@ mod imp {
             let mut img = match f.capture(tw, th) {
                 Ok(i) => i,
                 Err(_) => {
-                    // 필터가 낡았을 수 있다 → 새로 만들어 한 번 더
+                    // the filter may be stale: rebuild it and try once more
                     *cache = Some(capture::window_filter(w.wid)?);
                     cache.as_ref().unwrap().capture(tw, th)?
                 }
             };
             drop(cache);
             let geom = Geom { wid: w.wid, frame, shot_w: img.width(), shot_h: img.height() };
-            // 시트(저장 대화상자 등)는 별도 창이므로 겹쳐 그린다
+            // sheets (save dialogs, …) are separate windows, so draw them on top
             if let Some(el) = &w.el {
                 for s in el.children().into_iter().filter(|c| c.role() == "AXSheet") {
                     let (Some(swid), Some(sf)) = (s.window_id(), s.frame()) else { continue };
@@ -1139,7 +1170,7 @@ mod imp {
             let cur = self.current_window()?;
             if let Some(g) = self.state.lock().geom {
                 if g.wid == cur.wid {
-                    // 창이 움직였을 수 있으니 원점만 최신으로
+                    // the window may have moved, so refresh just the origin
                     let mut g = g;
                     if let Some(f) = cur.el.as_ref().and_then(|e| e.frame()) {
                         if (f.size.width - g.frame.size.width).abs() < 1.0 && (f.size.height - g.frame.size.height).abs() < 1.0 {
@@ -1149,7 +1180,7 @@ mod imp {
                     return Ok(g);
                 }
             }
-            // 아직 이 창을 찍지 않았다 → 한 장 찍어 좌표계를 만든다
+            // this window hasn't been captured yet: take one to establish the coordinate space
             self.screenshot_png()?;
             self.state.lock().geom.ok_or_else(|| anyhow!("좌표계를 만들지 못했습니다"))
         }
@@ -1189,11 +1220,14 @@ mod imp {
             Ok(format!("창 [{index}] '{}' 로 전환했습니다", w.title))
         }
 
-        // ───────────── 의미 기반 클릭 ─────────────
+        // ---- semantic clicks ----
 
-        /// 입력(클릭·스크롤)용 좌표계. 에이전트가 마지막으로 본 스크린샷의 창이 지금 창과 같아야 한다.
-        /// 창이 바뀐 뒤(새 창 자동 전환, switch_window) 아직 스크린샷이 없으면 예전 스크린샷 기준 좌표를
-        /// 새 창에 잘못 적용하지 않도록(엉뚱한 버튼을 누르게 됨) 오류를 낸다.
+        /// Coordinate space for input (clicks, scrolls). The window in the agent's last screenshot must be
+        /// the current window.
+        ///
+        /// After the window changes (auto-switch to a new window, switch_window) with no new screenshot
+        /// yet, this errors out rather than applying coordinates from the old screenshot to the new
+        /// window (which would press the wrong button).
         fn input_geom(&self) -> Result<(Geom, El)> {
             let cur = self.current_window()?;
             let g = self.state.lock().geom;
@@ -1208,7 +1242,7 @@ mod imp {
                 .el
                 .clone()
                 .ok_or_else(|| anyhow!("이 창은 접근성(AX) 정보를 제공하지 않아 의미 기반 조작을 할 수 없습니다"))?;
-            // 창이 움직였을 수 있으니 크기가 같으면 원점만 최신으로
+            // the window may have moved, so if the size matches, refresh just the origin
             if let Some(f) = el.frame() {
                 if (f.size.width - g.frame.size.width).abs() < 1.0 && (f.size.height - g.frame.size.height).abs() < 1.0 {
                     g.frame.origin = f.origin;
@@ -1226,7 +1260,7 @@ mod imp {
             let path = hit_path(&win, p);
             let deepest = path.last().unwrap();
             let mut tried = Vec::new();
-            // 가장 깊은 요소부터 최대 6단계 위까지 동작 가능한 요소를 찾는다
+            // look for an actionable element from the deepest one up to 6 levels up
             for n in path.iter().rev().take(6) {
                 let role = n.role.as_str();
                 if role == "AXWindow" || role == "AXSheet" && n.el == win {
@@ -1268,11 +1302,11 @@ mod imp {
                 }
                 tried.push(n.describe());
             }
-            // 표 안의 셀/글자 → 행 선택
+            // a cell or text inside a table → select the row
             if let Some(row) = path.iter().rev().find(|n| n.role == "AXRow" || n.role == "AXOutlineRow") {
                 return self.select_row(row, count);
             }
-            // 일반 요소라도 AXPress 를 지원하면 누른다
+            // press plain elements too if they support AXPress
             for n in path.iter().rev().take(4) {
                 if n.el.actions().iter().any(|a| a == "AXPress") && n.role != "AXWindow" {
                     return self.press_node(n, count);
@@ -1363,7 +1397,7 @@ mod imp {
             std::thread::sleep(Duration::from_millis(50));
             let mut ok = n.el.bool("AXSelected").unwrap_or(false);
             if !ok {
-                // 표에 AXSelectedRows 로 지정
+                // select it through the table's AXSelectedRows
                 if let Some(table) = n.el.parent() {
                     let arr = objc2_core_foundation::CFArray::from_objects(&[&*n.el.0]);
                     let _ = table.set("AXSelectedRows", &arr);
@@ -1408,7 +1442,7 @@ mod imp {
             ))
         }
 
-        // ───────────── 스크롤 ─────────────
+        // ---- scrolling ----
 
         fn semantic_scroll(&self, x: f64, y: f64, dx: f64, dy: f64) -> Result<String> {
             let (g, win) = self.input_geom()?;
@@ -1449,7 +1483,7 @@ mod imp {
                 std::thread::sleep(Duration::from_millis(50));
                 let now = bar.number("AXValue").unwrap_or(old);
                 if (now - old).abs() < 1e-4 && (new - old).abs() > 1e-4 {
-                    // 값 설정이 안 먹으면 페이지 단위 동작
+                    // if setting the value doesn't take, fall back to page-wise actions
                     let act = if delta_px > 0.0 { "AXIncrement" } else { "AXDecrement" };
                     let e2 = bar.perform(act);
                     std::thread::sleep(Duration::from_millis(50));
@@ -1465,7 +1499,7 @@ mod imp {
             Ok(format!("스크롤 → {}", out.join(", ")))
         }
 
-        // ───────────── 키보드 ─────────────
+        // ---- keyboard ----
 
         fn focused_text(&self) -> Option<El> {
             let f = self.app().element("AXFocusedUIElement")?;
@@ -1483,7 +1517,7 @@ mod imp {
             let Some(f) = focused else {
                 return Ok(Some("글자를 보냈지만 포커스된 텍스트 요소가 없어 입력 반영을 확인하지 못했습니다".into()));
             };
-            // 반영 확인 (최대 600ms)
+            // confirm it took effect (up to 600 ms)
             let want = text.replace('\r', "\n");
             let t = Instant::now();
             loop {
@@ -1502,7 +1536,7 @@ mod imp {
             if now != before {
                 return Ok(Some("입력은 반영되었지만 내용이 예상과 다를 수 있습니다 — 스크린샷으로 확인하세요".into()));
             }
-            // 이벤트가 안 먹었다 → AXSelectedText 로 삽입
+            // the events didn't take: insert through AXSelectedText
             if f.settable("AXSelectedText") {
                 let e = f.set_string("AXSelectedText", &want);
                 std::thread::sleep(Duration::from_millis(60));
@@ -1520,7 +1554,8 @@ mod imp {
         fn key_combo(&self, combo: &str, repeat: u32, hold: Duration) -> Result<Option<String>> {
             let c = input::parse_combo(combo)?;
             if !c.is_shortcut() {
-                // 글자 키(수정키 없음/shift 만)는 유니코드로 보낸다 → 입력기 상태와 무관
+                // character keys (no modifiers or shift only) go out as Unicode, independent of the input method
+                // state
                 if let (Some(ch), true) = (c.ch, hold <= Duration::from_millis(15)) {
                     if c.keycode != 49 || c.mods == 0 {
                         let ch = if c.mods & MOD_SHIFT != 0 { shifted_char(ch) } else { ch };
@@ -1534,7 +1569,7 @@ mod imp {
                 }
                 return Ok(None);
             }
-            // ── 단축키 ──
+            // ---- shortcuts ----
             if let Some(r) = system_combo_block(&c) {
                 bail!("{combo}: {r}");
             }
@@ -1546,8 +1581,8 @@ mod imp {
                     }
                 }
             }
-            // 같은 단축키를 가진 메뉴 항목 (차단 항목과 겹치면 키 이벤트로도 보내지 않는다 — 앱이 키 창이면
-            // 키 이벤트가 그 메뉴 항목을 실행하기 때문)
+            // the menu item with the same shortcut (if it matches a blocked item, don't send it as a key event
+            // either: when the app is the key window, the key event would run that menu item)
             if let Some(ch) = c.ch {
                 if let Some((path, item, blocked)) = find_menu_by_shortcut(&self.app(), ch, c.mods) {
                     if let Some(r) = blocked {
@@ -1568,7 +1603,7 @@ mod imp {
             )))
         }
 
-        /// SkyLight 키 창 레코드(대상 PSN 전용) + 키 이벤트
+        /// SkyLight key window record (for the target PSN only) + key event.
         fn raw_key(&self, combo: &str) -> Result<String> {
             let c = input::parse_combo(combo)?;
             if c.is_shortcut() {
@@ -1583,7 +1618,8 @@ mod imp {
             }
             let wid = self.state.lock().current;
             let rec = if self.mode == NativeMode::Attached {
-                // 안전 규칙: SkyLight 레코드는 우리가 띄운 프로세스에만 보낸다 (Mode B 의 사용자 앱에는 보내지 않음)
+                // safety rule: SkyLight records only go to processes we launched (never to the user's app in
+                // Mode B)
                 "생략 — Mode B".to_string()
             } else {
                 match wid {
@@ -1596,7 +1632,8 @@ mod imp {
             Ok(format!("{combo} 키 이벤트를 보냈습니다 (키 창 레코드 {rec})"))
         }
 
-        /// Cmd/Ctrl + A/C/X/V/Z 를 포커스된 텍스트 요소에 접근성으로 흉내낸다. 해당 없으면 None.
+        /// Emulates Cmd/Ctrl + A/C/X/V/Z on the focused text element through accessibility. None if not
+        /// applicable.
         fn emulate_edit(&self, ch: char, shift: bool) -> Result<Option<String>> {
             let ch = ch.to_ascii_lowercase();
             if !matches!(ch, 'a' | 'c' | 'x' | 'v') {
@@ -1641,7 +1678,7 @@ mod imp {
                     std::thread::sleep(Duration::from_millis(40));
                     let after = f.string("AXValue").unwrap_or_default();
                     if after == value {
-                        // 접근성 삽입이 안 되면 키 이벤트로
+                        // if accessibility insertion doesn't work, use key events
                         input::pid_type_text(self.pid, &clip)?;
                         return Ok(Some(format!("붙여넣기: 접근성 삽입 실패({}) → 글자 입력으로 대체", ax::err_name(e))));
                     }
@@ -1840,7 +1877,7 @@ mod imp {
             let n = Node::read(el);
             let items = popup_items(el);
             if items.is_empty() {
-                // 닫힌 팝업은 메뉴 항목을 노출하지 않는 경우가 많다 → 값 직접 설정 시도
+                // closed popups often don't expose their menu items, so try setting the value directly
                 if el.settable("AXValue") {
                     let e = el.set_string("AXValue", option);
                     std::thread::sleep(Duration::from_millis(120));
@@ -1897,7 +1934,7 @@ mod imp {
                 bail!("메뉴 '{}': {r}", top.title);
             }
             if parts.len() == 1 {
-                // 최상위 메뉴 막대 항목을 누르면 메뉴가 화면에 열린다 → 하위 항목까지 지정하게 한다
+                // pressing a top-level menu bar item opens the menu on screen, so require a submenu item
                 bail!("메뉴 '{}' 의 항목까지 지정하세요 (예: \"{} > …\"). app_control menus 로 항목을 확인할 수 있습니다.", top.title, top.title);
             }
             let mut walked = vec![top.title.clone()];
@@ -1948,7 +1985,8 @@ mod imp {
             unreachable!()
         }
 
-        /// 메뉴 막대 구조 (2단계, 단축키 포함) — 지역화된 메뉴 이름을 알려주기 위함. Apple 메뉴는 보여주지 않는다.
+        /// Menu bar structure (two levels, with shortcuts), to tell the agent the localized menu names.
+        /// The Apple menu isn't shown.
         fn menus(&self) -> Result<String> {
             let bar = self.app().element("AXMenuBar").ok_or_else(|| anyhow!("앱의 메뉴 막대를 읽지 못했습니다"))?;
             let mut out = String::new();
@@ -1996,7 +2034,8 @@ mod imp {
             }
             match self.mode {
                 NativeMode::Launched => {
-                    // 앱이 이미 스스로 종료된 뒤 pid 가 다른 프로세스에 재사용되었을 수 있다 → 같은 앱일 때만 kill
+                    // the app may have exited on its own and the pid been reused by another process, so only kill if
+                    // it's still the same app
                     let now = apps::bundle_id_of(self.pid);
                     let same = match (&self.bundle_id, &now) {
                         (_, None) => !apps::is_running(self.pid) || self.bundle_id.is_none(),
@@ -2021,7 +2060,7 @@ mod imp {
         }
     }
 
-    // ───────────────────────── 보조 ─────────────────────────
+    // ---- helpers ----
 
     fn norm(s: &str) -> String {
         s.trim().trim_end_matches('…').trim_end_matches("...").trim().to_lowercase()
@@ -2129,11 +2168,12 @@ mod imp {
         CFRange { location: s as isize, length: (e - s) as isize }
     }
 
-    // ───────────── 메뉴 안전 ─────────────
+    // ---- menu safety ----
     //
-    // 숨김 앱의 메뉴 항목도 AXPress 로 실행되므로(이 Mac 에서 확인), 앱 밖 — 사용자 세션 전체 — 에 작용하는
-    // 항목은 메뉴 실행·단축키 모두 차단한다. Apple 메뉴(잠금 화면 ctrl+cmd+Q, 로그아웃 shift+cmd+Q,
-    // 즉시 로그아웃 alt+shift+cmd+Q, 재시동/시스템 종료)는 앱의 AXMenuBar 첫 항목으로 노출되고 활성 상태다.
+    // menu items of hidden apps still run through AXPress (confirmed on this Mac), so items acting
+    // outside the app, on the whole user session, are blocked for both menu actions and shortcuts. The
+    // Apple menu (lock screen ctrl+cmd+Q, log out shift+cmd+Q, immediate log out alt+shift+cmd+Q,
+    // restart/shut down) is exposed, enabled, as the first item of the app's AXMenuBar.
 
     const R_APPLE: &str = "Apple 메뉴(잠금 화면·로그아웃·재시동·시스템 종료·강제 종료 등)는 사용자의 Mac 전체에 영향을 주므로 차단했습니다";
     const R_APP_MENU: &str = "앱 메뉴의 서비스·기타 가리기·모두 보기는 사용자의 다른 앱에 영향을 주므로 차단했습니다";
@@ -2148,7 +2188,8 @@ mod imp {
         "yardım", "hjelp",
     ];
     const SHARE_TITLES: [&str; 6] = ["share", "공유", "共享", "共有", "teilen", "partager"];
-    /// 시스템 UI 를 띄우거나 창 배치·공간을 바꾸는 표준 항목의 AXIdentifier
+    /// AXIdentifiers of standard items that bring up system UI or change window arrangement and
+    /// Spaces.
     const BLOCKED_MENU_IDS: [&str; 11] = [
         "startDictation:",
         "orderFrontCharacterPalette:",
@@ -2163,7 +2204,7 @@ mod imp {
         "alternateArrangeInFront:",
     ];
 
-    /// 메뉴 막대의 최상위 항목
+    /// A top-level menu bar item.
     struct MenuTop {
         el: El,
         title: String,
@@ -2201,7 +2242,7 @@ mod imp {
         }
     }
 
-    /// 메뉴 항목 siblings[i] 의 차단 이유. depth 0 = 최상위 메뉴의 직접 항목.
+    /// Why menu item siblings[i] is blocked. depth 0 = direct items of a top-level menu.
     fn item_block_reason(top: &MenuTop, siblings: &[El], i: usize, depth: usize) -> Option<&'static str> {
         if let Some(r) = top_block_reason(top) {
             return Some(r);
@@ -2220,7 +2261,7 @@ mod imp {
         let (ch, m) = cmd(it);
         let has_sub = it.children().iter().any(|c| c.role() == "AXMenu");
         if top.idx == 1 && depth == 0 {
-            // 앱 메뉴: 서비스(하위 메뉴), 기타 가리기(alt+cmd+H), 그 바로 다음의 모두 보기(단축키 없음)
+            // app menu: Services (submenu), Hide Others (alt+cmd+H) and Show All right after it (no shortcut)
             if has_sub || (ch == "H" && m == 2) {
                 return Some(R_APP_MENU);
             }
@@ -2237,23 +2278,25 @@ mod imp {
         None
     }
 
-    /// 메뉴와 무관하게 사용자 세션 전체에 작용하는 시스템 단축키 — 메뉴 실행도, 대상 앱에 키 이벤트로 보내지도 않는다.
+    /// System shortcuts acting on the whole user session regardless of menus: neither run as menu items
+    /// nor sent to the target app as key events.
     fn system_combo_block(c: &input::MacCombo) -> Option<&'static str> {
         let has = |b: i64| c.mods & b != 0;
         match c.keycode {
-            12 if has(MOD_META) && (has(MOD_CTRL) || has(MOD_SHIFT)) => Some(R_APPLE), // 잠금 화면 / 로그아웃
-            53 if has(MOD_META) && has(MOD_ALT) => Some(R_APPLE),                     // 강제 종료
-            4 if has(MOD_META) && has(MOD_ALT) => Some(R_APP_MENU),                   // 기타 가리기
-            49 if has(MOD_META) && has(MOD_CTRL) => Some(R_SYSTEM_UI),                // 이모지 및 기호
+            12 if has(MOD_META) && (has(MOD_CTRL) || has(MOD_SHIFT)) => Some(R_APPLE), // lock screen / log out
+            53 if has(MOD_META) && has(MOD_ALT) => Some(R_APPLE), // force quit
+            4 if has(MOD_META) && has(MOD_ALT) => Some(R_APP_MENU), // hide others
+            49 if has(MOD_META) && has(MOD_CTRL) => Some(R_SYSTEM_UI), // emoji & symbols
             _ => None,
         }
     }
 
-    /// 메뉴 막대에서 단축키(ch + 수정키)를 가진 항목을 찾는다. (경로, 항목, 차단 이유)
-    /// 차단 항목은 비활성이어도 찾아서 돌려준다 (호출자가 키 이벤트까지 막도록).
+    /// Finds the menu bar item with a shortcut (ch + modifiers). (path, item, block reason)
+    ///
+    /// Blocked items are returned even if disabled (so the caller blocks the key event too).
     fn find_menu_by_shortcut(app: &El, ch: char, mods: i64) -> Option<(String, El, Option<&'static str>)> {
         let bar = app.element("AXMenuBar")?;
-        // AXMenuItemCmdModifiers: 0=Cmd 만, 1=Shift, 2=Option, 4=Control, 8=Cmd 없음
+        // AXMenuItemCmdModifiers: 0=Cmd only, 1=Shift, 2=Option, 4=Control, 8=no Cmd
         let want_mods = (if mods & MOD_SHIFT != 0 { 1 } else { 0 })
             | (if mods & MOD_ALT != 0 { 2 } else { 0 })
             | (if mods & MOD_CTRL != 0 { 4 } else { 0 })
@@ -2302,7 +2345,8 @@ mod imp {
         None
     }
 
-    /// 라이브 뷰: 현재 창을 ~live_fps 로 캡처해 JPEG 로 싱크에 보낸다. 노출 감시와 창 목록 갱신도 겸한다.
+    /// Live view: captures the current window at ~live_fps and sends JPEGs to the sink. Also handles
+    /// exposure watching and window list refreshes.
     async fn live_loop(weak: std::sync::Weak<Inner>, fps: f64) {
         let period = Duration::from_secs_f64(1.0 / fps.clamp(0.2, 10.0));
         let mut tick = 0u64;
@@ -2313,8 +2357,9 @@ mod imp {
                 break;
             }
             tick += 1;
-            // 강한 참조는 작업 스레드 안에서만 쥔다: 작업공간이 shutdown 없이 버려져 여기서 마지막 참조가
-            // 풀리더라도 Inner::drop(프로세스 kill, 최대 3초 대기)이 tokio 워커가 아닌 작업 스레드에서 돈다.
+            // only hold a strong reference inside the worker thread: if the workspace is dropped without
+            // shutdown and the last reference goes here, Inner::drop (kill the process, wait up to 3 s) runs
+            // on the worker thread rather than a tokio worker
             let _ = tokio::task::spawn_blocking(move || {
                 let i = inner;
                 if !apps::is_running(i.pid) {
@@ -2371,7 +2416,7 @@ mod imp {
         }
     }
 
-    /// ui_tree 출력에서 조건에 맞는 첫 줄의 (id, 중심 좌표)
+    /// (id, center point) of the first ui_tree line matching the predicate.
     fn find_in_tree(tree: &str, pred: impl Fn(&str) -> bool) -> Option<(usize, (f64, f64))> {
         for line in tree.lines() {
             let t = line.trim_start();
@@ -2391,15 +2436,17 @@ mod imp {
 
     /// `--selftest-native [--pidfile P] [--out DIR] [--skip-calc]`
     ///
-    /// 자체 TextEdit 인스턴스(숨김, 임시 .txt)로 스크린샷·ui_tree·입력·의미 기반 클릭·set_value·뷰 목록·
-    /// Mode B 연결을 검사하고, 사용자가 Calculator 를 쓰고 있지 않으면 숨김 Calculator 로 1+2= 을 눌러 본다.
+    /// Checks screenshots, ui_tree, input, semantic clicks, set_value, the view list and Mode B attach
+    /// on our own TextEdit instance (hidden, temp .txt), and if the user isn't using Calculator,
+    /// presses 1+2= on a hidden Calculator.
     pub async fn selftest(args: &[String]) -> Result<()> {
         let pidfile = arg_value(args, "--pidfile");
         let out_dir = PathBuf::from(arg_value(args, "--out").unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string()));
         let skip_calc = args.iter().any(|a| a == "--skip-calc");
-        // 실행 노출 측정 전용: --launch-only [--no-file]
+        // launch exposure measurement only: --launch-only [--no-file]
         let launch_only = args.iter().any(|a| a == "--launch-only");
-        // 기본은 빈 문서로 시작 (문서를 열면 TextEdit 이 스스로 unhide 해서 수 ms 노출됨 — 이 Mac 에서 측정)
+        // start with an empty document by default (opening a document makes TextEdit unhide itself for a
+        // few ms; measured on this Mac)
         let no_file = !args.iter().any(|a| a == "--with-file");
         let tcc = crate::macos::preflight()?;
         println!("TCC: {tcc:?}");
@@ -2445,7 +2492,7 @@ mod imp {
         }
 
         let result = async {
-            // 스크린샷
+            // screenshot
             let t = Instant::now();
             let png = ws.screenshot().await?;
             let shot = out_dir.join("native-textedit.png");
@@ -2466,7 +2513,7 @@ mod imp {
                 log.check("set_value(initial)", r.as_ref().map(|s| s.contains("확인됨")).unwrap_or(false), format!("{r:?}"));
             }
 
-            // 의미 기반 클릭: 체크박스(볼드) → AXPress, 값 변화 확인
+            // semantic click: checkbox (bold) → AXPress, check the value changed
             if let Some((_, c)) = find_in_tree(&tree, |l| l.contains("AXCheckBox") && (l.contains("볼드") || l.to_lowercase().contains("bold"))) {
                 ws.click(Some(c), MouseButton::Left, 1, 0).await?;
                 let n = ws.take_notes();
@@ -2474,7 +2521,8 @@ mod imp {
                 ws.click(Some(c), MouseButton::Left, 1, 0).await?;
                 let _ = ws.take_notes();
             }
-            // 팝업 버튼: 클릭은 거부(메뉴가 화면에 뜨므로), choose 로 메뉴를 열지 않고 선택
+            // popup button: clicks are refused (the menu would show on screen); choose selects without
+            // opening the menu
             if let Some((pid_, c)) = find_in_tree(&tree, |l| l.split_whitespace().nth(1) == Some("AXPopUpButton") && l.contains("줄 간격")) {
                 let r = ws.click(Some(c), MouseButton::Left, 1, 0).await;
                 log.check("popup-click-refused", r.is_err(), format!("{:?}", r.err().map(|e| short(&e.to_string(), 160))));
@@ -2494,21 +2542,22 @@ mod imp {
                     let r = ws.app_control(&serde_json::json!({"action": "choose", "id": pid_, "option": o})).await;
                     log.check("popup-choose(no menu shown)", r.as_ref().map(|s| s.contains(&format!("→ '{o}'"))).unwrap_or(false), format!("{r:?}"));
                 } else {
-                    // 닫힌 NSPopUpButton 은 메뉴 항목을 노출하지 않는다 — 알려진 한계 (정보성)
+                    // a closed NSPopUpButton doesn't expose its menu items: known limitation (informational)
                     log.check("popup-choose(info)", true, format!("선택지를 읽지 못함(알려진 한계): {list:?}"));
                 }
             }
 
-            // 의미 기반 클릭 (텍스트 영역 → 포커스 + 커서)
+            // semantic click (text area → focus + caret)
             ws.click(Some(ta_c), MouseButton::Left, 1, 0).await?;
             let notes = ws.take_notes();
             log.check("semantic-click-text", notes.iter().any(|n| n.contains("AXTextArea") && n.contains("포커스")), format!("{notes:?}"));
 
-            // 커서를 끝으로 (End 대신 cmd+a 흉내 후 오른쪽 화살표는 앱에 따라 다르므로 set_value 로 상태를 분명히)
+            // caret to the end (End, or emulated cmd+a then Right, varies by app, so make the state explicit
+            // with set_value)
             let r = ws.app_control(&serde_json::json!({"action": "read", "id": ta_id})).await?;
             println!("read before typing: {}", short(&r, 120));
             ws.key("End", 1).await.ok();
-            // 글자 입력 (한글 포함)
+            // typing (Korean included)
             ws.type_text("hello 안녕").await?;
             tokio::time::sleep(Duration::from_millis(200)).await;
             let v = ws.app_control(&serde_json::json!({"action": "read", "id": ta_id})).await?;
@@ -2522,12 +2571,13 @@ mod imp {
             let v = ws.app_control(&serde_json::json!({"action": "read", "id": ta_id})).await?;
             log.check("key-Return", v.contains("안녕\n둘째 줄"), format!("{:?}", short(v.split("value:\n").nth(1).unwrap_or(""), 80)));
 
-            // BackSpace x2 → "둘째 줄" 에서 " 줄" 이 지워진다
+            // BackSpace x2 → " 줄" is erased from "둘째 줄"
             ws.key("BackSpace", 2).await?;
             tokio::time::sleep(Duration::from_millis(150)).await;
             let v = ws.app_control(&serde_json::json!({"action": "read", "id": ta_id})).await?;
             log.check("key-BackSpace", v.contains("안녕\n둘째GhostDesk"), format!("{:?}", short(v.split("value:\n").nth(1).unwrap_or(""), 80)));
-            // Delete = 앞으로 지우기 (xdotool/keys.rs 와 같은 의미): 커서를 맨 앞에 두고 Delete → 첫 글자가 지워진다
+            // Delete = forward delete (same meaning as xdotool/keys.rs): caret at the start, Delete → first
+            // character is erased
             {
                 let i = ws.inner.clone();
                 blocking(move || {
@@ -2544,7 +2594,8 @@ mod imp {
             }
             let menus = ws.app_control(&serde_json::json!({"action": "menus"})).await.unwrap_or_else(|e| e.to_string());
             println!("{menus}");
-            // 메뉴 안전: Apple/도움말/서비스 등은 차단 (실제로 누르지 않는 조회·존재하지 않는 항목으로만 검사)
+            // menu safety: Apple/Help/Services etc. are blocked (checked only with read-only queries and
+            // nonexistent items, never actually pressed)
             log.check("menus-hide-apple+mark-blocked", !menus.contains("잠금") && !menus.contains("로그아웃") && menus.contains("[차단]"), short(&menus, 200));
             {
                 let i = ws.inner.clone();
@@ -2574,14 +2625,14 @@ mod imp {
                 format!("{:?} / {:?} / {:?} / {:?}", r1.err().map(|e| short(&e.to_string(), 50)), r2.err().map(|e| short(&e.to_string(), 30)), r3.err().map(|e| short(&e.to_string(), 30)), r4.err().map(|e| short(&e.to_string(), 30))),
             );
 
-            // 단축키: 전체 선택(에뮬레이션)
+            // shortcut: select all (emulated)
             ws.key("cmd+a", 1).await?;
             let notes = ws.take_notes();
             log.check("cmd+a(emulated)", notes.iter().any(|n| n.contains("전체 선택") && !n.contains("확인 안 됨")), format!("{notes:?}"));
             ws.key("cmd+c", 1).await?;
             println!("cmd+c: {:?}", ws.take_notes());
 
-            // 메뉴로 전체 선택: 먼저 커서를 0 으로 (클릭 좌표를 텍스트 시작 부근으로)
+            // select all through the menu: first put the caret at 0 (click near the start of the text)
             ws.click(Some(((ta_c.0 * 0.05).max(5.0), ta_c.1)), MouseButton::Left, 1, 0).await.ok();
             let _ = ws.take_notes();
             if let Some((path, _)) = {
@@ -2596,7 +2647,7 @@ mod imp {
                 println!("menu '{path}': {r} → selection={sel:?} (전체 {total})");
                 log.check("menu-select-all(info)", true, format!("selection after AX menu press = {sel:?}, full={total} (효과 {})", if sel.map(|s| s.1 == total).unwrap_or(false) { "있음" } else { "없음 — 숨김 모드 한계" }));
             }
-            // SkyLight 레코드 + 실제 cmd 키 이벤트 (에뮬레이션 없이)
+            // SkyLight record + real cmd key event (no emulation)
             ws.click(Some(((ta_c.0 * 0.05).max(5.0), ta_c.1)), MouseButton::Left, 1, 0).await.ok();
             let _ = ws.take_notes();
             let r = ws.raw_key("cmd+a").await?;
@@ -2609,7 +2660,7 @@ mod imp {
             let r = ws.app_control(&serde_json::json!({"action": "set_value", "id": ta_id, "text": "set_value 로 바꾼 내용\n두 번째"})).await;
             log.check("set_value", r.as_ref().map(|s| s.contains("확인됨")).unwrap_or(false), format!("{r:?}"));
 
-            // 의미 기반 클릭 후 cmd+v (내부 클립보드)
+            // semantic click, then cmd+v (internal clipboard)
             ws.click(Some(ta_c), MouseButton::Left, 1, 0).await?;
             let _ = ws.take_notes();
             ws.key("cmd+v", 1).await?;
@@ -2617,7 +2668,7 @@ mod imp {
             let v = ws.app_control(&serde_json::json!({"action": "read", "id": ta_id})).await?;
             log.check("cmd+v(internal clipboard)", notes.iter().any(|n| n.contains("붙여넣")), format!("{notes:?} value={:?}", short(v.split("value:\n").nth(1).unwrap_or(""), 80)));
 
-            // 앱 수준 메뉴 단축키: cmd+n → 같은 단축키의 메뉴 항목(파일 > 신규)을 AXPress
+            // app-level menu shortcut: cmd+n → AXPress the menu item with the same shortcut (File > New)
             let (v0, orig) = ws.views();
             let before_n = v0.len();
             ws.key("cmd+n", 1).await?;
@@ -2628,10 +2679,11 @@ mod imp {
             let n2 = ws.take_notes();
             log.check("cmd+n(menu press, info)", true, format!("창 {before_n} → {after_n}; {n1:?} {n2:?}"));
             if after_n > before_n {
-                // 새 창으로 자동 전환된 뒤 스크린샷 없이 예전 좌표로 클릭하면 거부해야 한다
+                // after auto-switching to the new window, clicking with old coordinates and no screenshot must be
+                // refused
                 let r = ws.click(Some(ta_c), MouseButton::Left, 1, 0).await;
                 log.check("stale-coords-refused", r.as_ref().err().map(|e| e.to_string().contains("스크린샷")).unwrap_or(false), format!("{:?}", r.err().map(|e| short(&e.to_string(), 60))));
-                // 새 창으로 자동 전환되었을 것 → 원래 창으로 돌아간다
+                // should have auto-switched to the new window, so go back to the original one
                 let (views, _) = ws.views();
                 if let Some(i) = views.iter().position(|v| Some(&v.id) == orig.as_ref()) {
                     ws.switch_view(i).await.ok();
@@ -2639,34 +2691,35 @@ mod imp {
                 let _ = ws.app_control(&serde_json::json!({"action": "ui_tree"})).await?;
             }
 
-            // 스크롤 (짧은 문서라 막대가 없을 수 있음)
+            // scroll (a short document may have no scroll bar)
             let r = ws.scroll(Some(ta_c), 0.0, 300.0, 0).await;
             log.check("scroll(info)", true, format!("{r:?} {:?}", ws.take_notes()));
 
-            // 드래그/오른쪽 클릭은 명확한 오류
+            // drag/right click give a clear error
             let d = ws.drag((10.0, 10.0), (50.0, 50.0), 0).await;
             let rc = ws.click(Some(ta_c), MouseButton::Right, 1, 0).await;
             log.check("drag/right-click refused", d.is_err() && rc.is_err(), format!("{:?} / {:?}", d.err().map(|e| short(&e.to_string(), 40)), rc.err().map(|e| short(&e.to_string(), 40))));
 
-            // 줌
+            // zoom
             let z = ws.zoom([0.0, 0.0, 200.0, 120.0]).await?;
             let zp = out_dir.join("native-textedit-zoom.png");
             std::fs::write(&zp, &z)?;
             log.check("zoom", z.len() > 1000, format!("{}B → {}", z.len(), zp.display()));
 
-            // 최종 스크린샷 저장 (닫기 전에)
+            // save the final screenshot (before closing)
             let png = ws.screenshot().await?;
             let shot2 = out_dir.join("native-textedit-after.png");
             std::fs::write(&shot2, &png)?;
             println!("after screenshot → {}", shot2.display());
 
-            // 라이브 뷰
+            // live view
             let f0 = frames.load(Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(2600)).await;
             let f1 = frames.load(Ordering::SeqCst);
             log.check("live-view", f1 - f0 >= 3, format!("2.6초 동안 {}프레임", f1 - f0));
 
-            // Mode B: 우리가 띄운 인스턴스에 동의 하에 붙기 (원래 숨김 → 종료 후에도 숨김 유지)
+            // Mode B: attach with consent to the instance we launched (hidden before → stays hidden after
+            // shutdown)
             let b = NativeAppWorkspace::launch(
                 NativeOptions {
                     app: "com.apple.TextEdit".into(),
@@ -2701,7 +2754,8 @@ mod imp {
         if let Err(e) = &result {
             log.check("textedit-flow", false, format!("{e:#}"));
         }
-        // 정리: 문서 창을 닫고 "삭제"를 눌러 자동 저장본을 남기지 않는다 (TextEdit 컨테이너는 사용자와 공유됨)
+        // cleanup: close the document window and press "Delete" so no autosave is left (the TextEdit
+        // container is shared with the user)
         let mut sheet_shot = false;
         for _round in 0..6 {
             let (views, _) = ws.views();
@@ -2761,7 +2815,7 @@ mod imp {
         log.check("shutdown-TextEdit", !apps::is_running(pid), format!("pid {pid} 종료"));
         drop(ws);
 
-        // ── 취소된 launch 가 프로세스를 남기지 않는지 (에이전트 중지 등으로 launch future 가 버려진 경우) ──
+        // ---- a cancelled launch leaves no process behind (launch future dropped by an agent stop, …) ----
         if !args.iter().any(|a| a == "--skip-cancel") {
             let before: HashSet<i32> = apps::running_pids("com.apple.TextEdit").into_iter().collect();
             let r = tokio::time::timeout(
@@ -2776,7 +2830,8 @@ mod imp {
             if let Ok(Ok(w)) = r {
                 w.shutdown().await;
             }
-            // 실행(최대 30초) + 노출 측정(4초) + 창 대기 뒤 버려진 Inner 가 정리될 때까지 기다린다
+            // wait for launch (up to 30 s) + exposure measurement (4 s) + window wait, then for the dropped
+            // Inner to be cleaned up
             let t = Instant::now();
             let mut seen_new = HashSet::new();
             let mut left: Vec<i32> = vec![];
@@ -2815,7 +2870,8 @@ mod imp {
                 log.check("calculator", false, format!("{e:#}"));
             }
         }
-        // 세션 헬퍼용 디스플레이 캡처: 크기만 확인하고 내용은 저장하지 않는다 (사용자 화면이므로)
+        // display capture for the session helper: only the size is checked, the contents aren't saved
+        // (it's the user's screen)
         if args.iter().any(|a| a == "--display-check") {
             let r = tokio::task::spawn_blocking(|| crate::macos::capture::capture_display_png(0, 640)).await?;
             match r {
@@ -2863,7 +2919,7 @@ mod imp {
                     names.iter().any(|n| low.contains(&format!("desc=\"{n}\"")) || low.contains(&format!(" \"{n}\"")))
                 })
             };
-            // 먼저 초기화 (AC/C)
+            // reset first (AC/C)
             if let Some((_, c)) = btn(&["all clear", "clear", "지우기", "모두 지우기", "ac", "c"]) {
                 ws.click(Some(c), MouseButton::Left, 1, 0).await.ok();
             }
@@ -2906,7 +2962,7 @@ mod imp {
     }
 }
 
-// ═════════════════════════════════════════ 다른 OS ═════════════════════════════════════════
+// ---- other OSes ----
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod stub {

@@ -1,10 +1,12 @@
-//! 처음 켤 때 보여 주는 사용 설명 (사진 + 짧은 설명, 몇 쪽).
+//! First-launch guide (a few pages of screenshots and short descriptions).
 //!
-//! 사진은 앱이 자기 창을 찍어 만든다: `GHOSTDESK_TOUR_CAPTURE=<폴더>` 로 켜면 `PAGES` 의 장면을 차례로 띄우고
-//! 창을 찍어 `<폴더>/<파일>` 로 저장한 뒤 끝난다 (`Capture`). 그 파일을 assets/tour 에 두면 빌드에 들어간다.
-//! UI 가 바뀌면 같은 방법으로 다시 찍으면 된다 (방법은 assets/tour/README.md).
+//! The screenshots are taken by the app of its own window: with `GHOSTDESK_TOUR_CAPTURE=<dir>`
+//! it shows each scene in `PAGES`, saves the window as `<dir>/<file>` and exits (`Capture`).
+//! Files placed in assets/tour are built in. Retake them the same way when the UI changes (see
+//! assets/tour/README.md).
 //!
-//! 사진은 사용 설명 창이 열려 있을 때만 풀어서 올리고, 닫으면 버린다 (평소 메모리를 쓰지 않게).
+//! Images are decoded and uploaded only while the guide is open, and dropped when it closes, so
+//! they cost no memory the rest of the time.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +14,7 @@ use std::sync::Arc;
 
 use super::*;
 
-/// 사용 설명의 한 쪽: 찍을 장면 · 사진 파일 · 제목 · 설명
+/// One page of the guide: scene to capture, image file, title, description.
 pub(super) struct Page {
     scene: Scene,
     file: &'static str,
@@ -68,13 +70,16 @@ pub(super) const PAGES: &[Page] = &[
     },
 ];
 
-/// 사용 설명을 끝까지 봤다는 표시 파일 (<데이터 루트>/tour-seen).
-/// prefs.json 에도 적지만, 그 칸을 모르는 예전 버전이 설정을 다시 쓰면 지워지므로 따로 둔다.
+/// Marker file recording that the guide was finished (`<data root>/tour-seen`).
+///
+/// It's also in prefs.json, but an older version that doesn't know the field would drop it when
+/// rewriting the file, hence the separate marker.
 fn seen_marker() -> std::path::PathBuf {
     crate::platform::paths::data_root().join("tour-seen")
 }
 
-/// 사용 설명을 이미 봤는가 (표시 파일이 있거나 설정에 적혀 있으면). 설정에만 있으면 표시 파일도 남겨 둔다.
+/// Whether the guide was already seen (marker file or prefs). Writes the marker if only prefs
+/// has it.
 pub(super) fn already_seen(in_prefs: bool) -> bool {
     let marker = seen_marker().exists();
     if in_prefs && !marker {
@@ -83,7 +88,7 @@ pub(super) fn already_seen(in_prefs: bool) -> bool {
     in_prefs || marker
 }
 
-/// 사용 설명을 봤다고 남긴다 (실패해도 설정 파일에는 남는다)
+/// Records that the guide was seen (prefs still has it if this fails).
 fn mark_seen() {
     let p = seen_marker();
     if let Some(d) = p.parent() {
@@ -92,12 +97,12 @@ fn mark_seen() {
     let _ = std::fs::write(p, env!("CARGO_PKG_VERSION"));
 }
 
-/// 사용 설명의 쪽 수: 사진 쪽들 + (macOS) 마지막 권한 쪽
+/// Number of pages: the screenshot pages plus (on macOS) a final permissions page.
 fn page_count() -> usize {
     PAGES.len() + usize::from(cfg!(target_os = "macos"))
 }
 
-/// 열려 있는 사용 설명: 지금 쪽과, 풀어 둔 사진
+/// An open guide: current page and decoded images.
 #[derive(Default)]
 pub(super) struct Tour {
     page: usize,
@@ -105,7 +110,7 @@ pub(super) struct Tour {
 }
 
 impl Tour {
-    /// `i` 쪽 사진 (처음 볼 때 풀어서 올린다)
+    /// Image for page `i` (decoded and uploaded on first view).
     fn texture(&mut self, ctx: &egui::Context, i: usize) -> Option<egui::TextureHandle> {
         if self.textures.len() < PAGES.len() {
             self.textures.resize(PAGES.len(), None);
@@ -120,24 +125,24 @@ impl Tour {
 }
 
 impl GhostApp {
-    /// 사용 설명을 연다 (처음 켤 때, 설정의 '사용 설명 다시 보기')
+    /// Opens the guide (at first launch, or from "Show guide again" in Settings).
     pub(super) fn open_tour(&mut self) {
         self.tour = Some(Tour::default());
     }
 
-    /// 사용 설명 창. 끝까지 보거나 건너뛰면 다시 띄우지 않는다.
+    /// The guide window. Not shown again once finished or skipped.
     pub(super) fn tour_window(&mut self, ctx: &egui::Context) {
         let Some(tour) = self.tour.as_mut() else { return };
         const W: f32 = 640.0;
         let count = page_count();
         let i = tour.page.min(count - 1);
         let last = i + 1 == count;
-        // 사진 쪽이면 그 사진, 마지막 권한 쪽이면 없음
+        // screenshot pages get their image; the final permissions page has none
         let page = PAGES.get(i);
         let tex = page.and_then(|_| tour.texture(ctx, i));
         let mut done = false;
         let mut go: isize = 0;
-        // 건너뛰기는 없다: 끝까지 넘겨 '시작하기' 로만 닫는다 (Esc·바깥 누르기로도 닫히지 않음)
+        // no skipping: it only closes via "Get started" on the last page (not Esc or clicking outside)
         egui::Modal::new(egui::Id::unique("tour")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(W);
             match page {
@@ -146,7 +151,7 @@ impl GhostApp {
                         let size = t.size_vec2();
                         let h = W * size.y / size.x.max(1.0);
                         let r = ui.add(egui::Image::new(t).fit_to_exact_size(Vec2::new(W, h)).corner_radius(theme::CARD_RADIUS)).rect;
-                        // 어두운 사진이 창 바탕과 섞이지 않게 테두리를 두른다
+                        // border so dark screenshots don't blend into the window background
                         let line = ui.visuals().widgets.noninteractive.bg_stroke;
                         ui.painter().rect_stroke(r, theme::CARD_RADIUS, line, egui::StrokeKind::Inside);
                     }
@@ -159,7 +164,7 @@ impl GhostApp {
             }
             ui.add_space(18.0);
             ui.horizontal(|ui| {
-                // 몇 번째 쪽인지: 점
+                // page indicator dots
                 for j in 0..count {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     let c = if j == i { theme::text() } else { theme::overlay_pressed() };
@@ -179,7 +184,7 @@ impl GhostApp {
                 });
             });
         });
-        // 키보드: → / ← 로 넘기기
+        // keyboard: → / ← to turn pages
         let (right, left) = ctx.input(|inp| (inp.key_pressed(egui::Key::ArrowRight), inp.key_pressed(egui::Key::ArrowLeft)));
         if right && !last {
             go = 1;
@@ -197,7 +202,8 @@ impl GhostApp {
         }
     }
 
-    /// 마지막 쪽 (macOS): Mac 앱을 조작하는 데 필요한 권한을 하나씩 켠다. 설정의 '권한' 과 같은 줄을 쓴다.
+    /// Final page (macOS): turn on the permissions needed to drive Mac apps, one by one. Uses the
+    /// same rows as Settings > Permissions.
     fn permission_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.label(RichText::new(icon::SHIELD_ALERT).size(36.0).color(theme::text()));
@@ -212,7 +218,7 @@ impl GhostApp {
         #[cfg(target_os = "macos")]
         self.permission_rows(ui);
     }
-    /// 사진 찍기 모드면 한 프레임 진행한다 (`Capture`)
+    /// Advances one frame in capture mode (`Capture`).
     pub(super) fn tour_capture_tick(&mut self, ctx: &egui::Context) {
         let Some(mut cap) = self.tour_capture.take() else { return };
         if cap.tick(self, ctx) {
@@ -222,7 +228,7 @@ impl GhostApp {
         }
     }
 
-    /// 장면을 띄운다: 다른 창을 모두 닫고 그 장면만
+    /// Shows a scene: closes every other window and shows only that scene.
     fn show_scene(&mut self, ctx: &egui::Context, scene: Scene) {
         self.wizard_open = false;
         self.show_settings = false;
@@ -232,7 +238,7 @@ impl GhostApp {
             Scene::Home => {}
             Scene::NewAgent => self.open_wizard(),
             Scene::Work => {
-                // 데모 에이전트는 이 장면에서 처음 띄운다 (앞 장면의 사이드바가 비어 보이게)
+                // the demo agent first appears in this scene (so earlier scenes show an empty sidebar)
                 if self.agents.is_empty() && self.pending_demo == 0 {
                     self.pending_demo = 1;
                 }
@@ -244,29 +250,32 @@ impl GhostApp {
             Scene::Settings => self.show_settings = true,
             Scene::Connect => {
                 self.open_connect(ctx);
-                // 찍을 때는 자동 설치·연결을 끄고 켜므로(GHOSTDESK_NO_AUTOCONNECT) 스위치만 평소 기본값(켜짐)으로 보인다
+                // auto-install/connect is off while capturing (GHOSTDESK_NO_AUTOCONNECT), so only show the
+                // switch at its usual default (on)
                 self.connect_state.lock().auto = true;
             }
         }
     }
 }
 
-/// `GHOSTDESK_TOUR_CAPTURE=<폴더>`: 장면을 하나씩 띄워 창을 찍고 끝낸다.
-/// 일하는 장면(Work)은 그 장면에서 데모 에이전트를 띄우고(가짜 AI 서버: `ANTHROPIC_BASE_URL`) 몇 단계 일한 뒤에 찍는다.
+/// `GHOSTDESK_TOUR_CAPTURE=<dir>`: shows each scene, captures the window, then exits.
+///
+/// The Work scene starts a demo agent (against a fake AI server via `ANTHROPIC_BASE_URL`) and is
+/// captured after it has done a few steps.
 pub(super) struct Capture {
     dir: PathBuf,
     step: usize,
     frames: u32,
-    /// 지금 장면의 사진을 저장했는가 (사진은 다음 프레임 뒤에 따로 도착한다)
+    /// Whether the current scene's image was saved (images arrive separately, a frame later).
     saved: Arc<AtomicBool>,
     requested: bool,
 }
 
-/// 장면이 자리 잡을 때까지 기다리는 프레임 수 (창 전환 효과 0.2초 포함)
+/// Frames to wait for a scene to settle (including the 0.2 s window transition).
 const SETTLE_FRAMES: u32 = 45;
-/// 일하는 장면에서 에이전트를 기다리는 최대 프레임 수
+/// Maximum frames to wait for the agent in the Work scene.
 const WORK_TIMEOUT_FRAMES: u32 = 3000;
-/// 저장할 사진의 너비 (사용 설명 창 640pt 의 레티나 두 배쯤)
+/// Width of saved images (about 2x the guide's 640 pt for Retina).
 const SHOT_WIDTH: u32 = 1280;
 
 impl Capture {
@@ -276,12 +285,12 @@ impl Capture {
         Some(Capture { dir, step: 0, frames: 0, saved: Arc::default(), requested: false })
     }
 
-    /// 한 프레임. 다 찍었으면 false
+    /// One frame. Returns false when everything is captured.
     fn tick(&mut self, app: &mut GhostApp, ctx: &egui::Context) -> bool {
         ctx.request_repaint();
         let Some(page) = PAGES.get(self.step) else { return false };
         if self.step == 0 && self.frames == 0 {
-            // 모든 사진을 같은 크기로
+            // every image at the same size
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(1280.0, 800.0)));
         }
         if self.frames == 0 {
@@ -296,10 +305,10 @@ impl Capture {
             return true;
         }
         let ready = match page.scene {
-            // 데모 에이전트의 라이브 화면과 기록이 몇 줄 쌓일 때까지
+            // until the demo agent's live screen is up and a few log rows have accumulated
             Scene::Work => {
                 app.show_scene(ctx, page.scene);
-                // 마지막 동작(입력)까지 끝나고 다음 답을 생각하는 중일 때
+                // once the last action (typing) is done and it's thinking about the next reply
                 let agent_ready = app.agents.first().is_some_and(|a| {
                     a.texture.is_some() && a.shared.log.lock().len() >= 6 && matches!(a.shared.status(), crate::agent::AgentStatus::Thinking)
                 });
@@ -321,7 +330,7 @@ impl Capture {
     }
 }
 
-/// 창 사진을 `SHOT_WIDTH` 너비로 줄여 JPEG 로 저장한다
+/// Scales the window image to `SHOT_WIDTH` and saves it as JPEG.
 fn save_jpeg(img: &egui::ColorImage, path: &std::path::Path) -> anyhow::Result<()> {
     use image::ImageEncoder;
     let [w, h] = img.size;
@@ -343,7 +352,7 @@ fn save_jpeg(img: &egui::ColorImage, path: &std::path::Path) -> anyhow::Result<(
 mod tests {
     use super::*;
 
-    /// 넣어 둔 사진이 모두 풀리고, 파일 이름이 겹치지 않는다
+    /// Every bundled image decodes and no file names collide.
     #[test]
     fn tour_images_decode() {
         let mut names = std::collections::HashSet::new();

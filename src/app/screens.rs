@@ -1,10 +1,10 @@
-//! 홈 화면과 화면 모아보기(그리드·전체 화면 벽).
+//! Home screen and the screen wall (grid and full-screen wall).
 
 use super::*;
 use super::detail::preparing;
 use super::labels::{attention, humanize_error, is_error, status_text};
 
-/// 홈 화면 가운데 인사말 (앱을 켤 때마다 하나를 고른다)
+/// Greetings for the middle of the home screen (one is picked at each launch).
 pub(super) const GREETINGS: &[&str] = &[
     "오늘은 어떤 일을 대신 맡아 드릴까요?",
     "무엇을 도와 드릴까요?",
@@ -38,22 +38,23 @@ pub(super) const GREETINGS: &[&str] = &[
     "준비됐어요. 무엇부터 할까요?",
 ];
 
-/// 켤 때마다 다른 인사말 (시계의 나노초로 고른다: 매번 달라 보이기만 하면 된다)
+/// A different greeting each launch, picked from the clock's nanoseconds; it only has to look
+/// varied.
 pub(super) fn random_greeting() -> usize {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
     nanos % GREETINGS.len()
 }
 
 impl GhostApp {
-    /// 화면 모아보기를 연다
+    /// Opens the screen wall.
     pub(super) fn enter_wall(&mut self, ctx: &egui::Context) {
         self.wall_fs_before = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
         self.view = View::Wall;
     }
 
-    /// 모아보기를 닫고 다른 보기로 (전체 화면이었으면 창 모드로 되돌린다)
+    /// Closes the wall and switches to another view, leaving full screen if the wall entered it.
     pub(super) fn leave_wall(&mut self, ctx: &egui::Context, to: View) {
-        // 모아보기에서 켠 전체 화면만 끈다 (열기 전부터 전체 화면이었으면 그대로)
+        // only leave full screen if the wall turned it on (keep it if it was already full screen)
         if self.wall_fullscreen && !self.wall_fs_before {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
@@ -67,7 +68,7 @@ impl GhostApp {
             ui.add_space((ui.available_height() * 0.28).max(24.0));
             ui.label(RichText::new(tr(GREETINGS[self.greeting])).size(28.0).color(theme::text()));
             ui.add_space(28.0);
-            // 맡길 일 입력 상자: Enter(또는 ↵ 버튼)로 새 에이전트 창을 열고, 적은 일을 그대로 넘긴다
+            // task box: Enter (or the ↵ button) opens the new-agent window with the typed task
             let id = egui::Id::unique("welcome_composer");
             let focused = ui.memory(|m| m.has_focus(id));
             let focus = ui.ctx().animate_bool_with_time(id.with("focus_t"), focused, 0.15);
@@ -82,7 +83,7 @@ impl GhostApp {
                                 .id(id)
                                 .hint_text(tr("에이전트에게 맡길 일을 적어 보세요"))
                                 .frame(egui::Frame::NONE)
-                                // 첫 줄을 조금 내려 오른쪽 아래 ↵ 버튼과 무게 중심을 맞춘다
+                                // nudge the first line down to balance against the ↵ button at the bottom right
                                 .margin(Margin { left: 4, right: 4, top: 8, bottom: 2 })
                                 .desired_rows(2)
                                 .desired_width(ui.available_width())
@@ -95,7 +96,7 @@ impl GhostApp {
                     });
                 });
             });
-            // 입력 상자 바로 아래, 상자 왼쪽 끝에 맞춰: 어떤 AI 로 일할지
+            // right below the box, aligned to its left edge: which AI to work with
             ui.add_space(6.0);
             ui.allocate_ui_with_layout(Vec2::new(w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
@@ -129,20 +130,21 @@ impl GhostApp {
         self.screens(ui, false);
     }
 
-    /// 모든 에이전트의 화면만 창 가득 배치한다. 화면을 누르면 그 에이전트의 상세 보기로.
+    /// Lays out every agent's screen to fill the window. Clicking a screen opens that agent's detail
+    /// view.
     pub(super) fn screens(&mut self, ui: &mut egui::Ui, immersive: bool) {
         let ctx = ui.ctx().clone();
-        // 창 관리자가 전체 화면을 바꿨을 수도 있으니 실제 상태를 따른다
+        // the window manager may have toggled full screen, so follow the actual state
         if let Some(fs) = ctx.input(|i| i.viewport().fullscreen).filter(|_| immersive) {
             self.wall_fullscreen = fs;
         }
         let mut exit = false;
-        // 전체 화면: F11 (macOS 는 ⌃⌘F)
+        // full screen: F11 (⌃⌘F on macOS)
         let mut toggle_fs = immersive && ctx.input(|i| {
             i.key_pressed(egui::Key::F11) || (cfg!(target_os = "macos") && i.modifiers.mac_cmd && i.modifiers.ctrl && i.key_pressed(egui::Key::F))
         });
 
-        // 화면만: 창 전체를 화면 배치에 쓰고, 단추는 오른쪽 위에 겹쳐 둔다
+        // screens only: the whole window is for the layout, with buttons overlaid at the top right
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
         let n = self.agents.len();
@@ -152,7 +154,7 @@ impl GhostApp {
                 sh as f32 / sw.max(1) as f32
             })
         };
-        // 칸 비율은 가장 세로로 긴 화면에 맞춘다 (모든 화면이 칸 안에 비율 그대로 들어가게)
+        // size cells for the tallest screen so every screen fits with its aspect ratio intact
         let aspect = self.agents.iter().filter_map(aspect_of).fold(0.0f32, f32::max);
         let aspect = if aspect > 0.0 { aspect } else { 0.625 };
         let gap = 10.0;
@@ -165,7 +167,7 @@ impl GhostApp {
         let mut repaint = false;
         for (i, a) in self.agents.iter_mut().enumerate() {
             let (r, c) = (i / cols, i % cols);
-            // 마지막 줄은 가운데 정렬
+            // center the last row
             let in_row = if r + 1 == rows { n - r * cols } else { cols };
             let row_w = in_row as f32 * cell.x + gap * (in_row as f32 - 1.0);
             let left = area.center().x - row_w / 2.0;
@@ -204,7 +206,8 @@ impl GhostApp {
                     w.mouse_pos(), crate::cursor::agent_color(a.shared.id), None, true,
                 );
             }
-            // 왼쪽 위 이름표: ● 이름 · 상태 (사람이 볼 일이 있으면 그 색으로 테두리와 상태 글)
+            // top-left name tag: ● name · status (border and status text in the attention color if a
+            // person is needed)
             let attn = attention(&st, a.takeover);
             let mut job = egui::text::LayoutJob::default();
             let fmt = |color: Color32| egui::TextFormat { font_id: egui::FontId::proportional(12.0), color, ..Default::default() };
@@ -233,10 +236,10 @@ impl GhostApp {
                 }
             });
         }
-        // 오른쪽 위 단추 (전체 화면에서는 마우스를 위쪽 가장자리로 가져갈 때만)
+        // top-right buttons (in full screen, only while the pointer is near the top edge)
         let near_top = ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < area.top() + 90.0));
         if immersive && (!self.wall_fullscreen || near_top) {
-            // 제목 표시줄이 있으면 그 아래에 띄운다 (창 단추를 가리지 않게)
+            // sit below the title bar if there is one, so the window buttons stay uncovered
             let top = if titlebar::visible(&ctx) { titlebar::HEIGHT } else { 0.0 } + 18.0;
             egui::Area::new(egui::Id::unique("wall_bar"))
                 .order(egui::Order::Foreground)
@@ -279,7 +282,8 @@ impl GhostApp {
     }
 }
 
-/// 화면 모아보기 배치: n 개 화면을 area 안에 가장 크게 놓는 (열 수, 칸 크기). aspect = 높이/너비.
+/// Wall layout: `(columns, cell size)` that fits `n` screens into `area` as large as possible.
+/// `aspect` is height / width.
 pub(super) fn wall_layout(n: usize, area: Vec2, aspect: f32, gap: f32) -> (usize, Vec2) {
     let n = n.max(1);
     let mut best = (1, Vec2::ZERO);
@@ -302,17 +306,17 @@ mod tests {
     #[test]
     fn wall_layout_fills_area() {
         let wide = Vec2::new(1600.0, 900.0);
-        // 하나면 화면 높이에 맞춰 크게
+        // a single screen fills the height
         let (c, cell) = wall_layout(1, wide, 0.625, 10.0);
         assert_eq!(c, 1);
         assert!((cell.y - 900.0).abs() < 0.5 && cell.x <= 1600.0, "{cell:?}");
-        // 넷이면 2x2
+        // four make a 2x2
         assert_eq!(wall_layout(4, wide, 0.625, 10.0).0, 2);
-        // 둘이면 넓은 화면에서는 나란히
+        // two sit side by side in a wide area
         assert_eq!(wall_layout(2, wide, 0.625, 10.0).0, 2);
-        // 세로로 긴 영역에서는 위아래로
+        // and stack in a tall one
         assert_eq!(wall_layout(2, Vec2::new(700.0, 1200.0), 0.625, 10.0).0, 1);
-        // 어떤 경우에도 영역 밖으로 넘치지 않는다
+        // never overflows the area
         for n in 1..=12 {
             for area in [wide, Vec2::new(800.0, 600.0), Vec2::new(500.0, 1400.0)] {
                 let (c, cell) = wall_layout(n, area, 0.625, 10.0);

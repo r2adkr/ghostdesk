@@ -1,9 +1,10 @@
-//! 사용자가 추가한 AI 연결 목록.
+//! The user's list of AI connections.
 //!
-//! 연결 하나 = 회사(`Provider`) + 키 + 고른 모델 (+ OpenAI 호환이면 이름과 주소).
-//! 정해진 회사는 하나씩만 둘 수 있고, OpenAI 호환 API 는 주소마다 여러 개 둘 수 있다.
-//! 연결의 `id` 는 만들 때 정해져 바뀌지 않는다: 모델 목록 불러오기 상태와 입력 칸이 이것으로 연결을 찾는다
-//! (목록에서 지우거나 순서가 바뀌어도 다른 연결의 상태가 섞이지 않게).
+//! A connection is a provider (`Provider`) plus a key and the chosen model, and for
+//! OpenAI-compatible APIs also a name and URL. Built-in providers can appear once each;
+//! OpenAI-compatible APIs can be added once per URL. A connection's `id` is fixed at creation:
+//! model-list fetches and input fields key off it, so deleting or reordering connections never
+//! mixes up their state.
 
 use crate::llm::{Llm, Provider};
 
@@ -13,16 +14,18 @@ use super::i18n::{tr, trf};
 pub(super) struct AiConn {
     pub id: u64,
     pub provider: Provider,
-    /// OpenAI 호환 연결의 이름 (예: "DeepSeek"). 다른 회사는 비워 두고 회사 이름을 쓴다
+    /// Display name of an OpenAI-compatible connection (e.g. "DeepSeek"). Empty for built-in
+    /// providers, which use the provider name.
     pub name: String,
-    /// OpenAI 호환 연결의 주소 (사용자가 넣은 그대로, 쓸 때 다듬는다)
+    /// URL of an OpenAI-compatible connection, as typed by the user (normalized on use).
     pub url: String,
     pub key: String,
     pub model: String,
 }
 
 impl AiConn {
-    /// 새 연결: 키는 환경변수에 있으면 채우고, 모델은 그 회사의 첫 기본 모델
+    /// A new connection. The key is filled from the environment if set; the model is the
+    /// provider's first default.
     pub fn new(id: u64, provider: Provider) -> Self {
         AiConn {
             id,
@@ -34,7 +37,7 @@ impl AiConn {
         }
     }
 
-    /// 목록·단추에 보일 이름
+    /// Name shown in lists and buttons.
     pub fn title(&self) -> String {
         match self.name.trim() {
             "" if self.provider.needs_url() => tr("OpenAI 호환").to_string(),
@@ -43,7 +46,7 @@ impl AiConn {
         }
     }
 
-    /// API 뿌리 주소
+    /// API base URL.
     pub fn base_url(&self) -> String {
         if self.provider.needs_url() {
             Provider::normalize_base_url(&self.url)
@@ -52,7 +55,8 @@ impl AiConn {
         }
     }
 
-    /// 일을 맡기기에 빠진 설정 (주소 또는 필수 키). 다 있으면 None
+    /// What is still missing before this connection can take a task (URL or required key).
+    /// `None` when it's ready.
     pub fn missing(&self) -> Option<String> {
         if self.provider.needs_url() && self.base_url().is_empty() {
             Some(trf("설정에서 {} 의 API 주소를 넣어 주세요.", &[&self.title()]))
@@ -63,23 +67,25 @@ impl AiConn {
         }
     }
 
-    /// 모델 목록을 부를 수 있는가 (주소·필수 키가 있음)
+    /// Whether the model list can be fetched (URL and any required key are set).
     pub fn configured(&self) -> bool {
         self.missing().is_none()
     }
 
-    /// 이 연결로 일하는 AI 클라이언트
+    /// An AI client for this connection.
     pub fn llm(&self, effort: &str) -> Llm {
         Llm::new(self.provider, self.base_url(), self.key.trim().to_string(), self.model.trim().to_string(), effort.to_string())
     }
 }
 
-/// '+ AI 추가' 메뉴에 보일 회사: 아직 없는 회사들, 그리고 늘 OpenAI 호환 (여러 개 둘 수 있으므로)
+/// Providers offered in the "+ Add AI" menu: those not added yet, plus OpenAI-compatible,
+/// which can be added any number of times.
 pub(super) fn addable(conns: &[AiConn]) -> Vec<Provider> {
     Provider::ALL.into_iter().filter(|p| p.needs_url() || !conns.iter().any(|c| c.provider == *p)).collect()
 }
 
-/// 처음 켤 때(저장한 설정이 없을 때)의 목록: 환경변수에 키가 있는 회사들, 없으면 Claude 하나
+/// The initial list when there are no saved settings: providers with a key in the environment,
+/// or just Claude.
 pub(super) fn initial(next_id: &mut u64) -> Vec<AiConn> {
     let mut list: Vec<AiConn> = Provider::ALL
         .into_iter()

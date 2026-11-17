@@ -1,6 +1,7 @@
-//! 대화 기록 관리: 스크린샷을 보낼 블록으로 만들고, 오래된 것을 덜어 내고,
-//! 바뀌지 않은 화면·창 목록은 다시 보내지 않으며, 너무 길어지면 새 구간을 시작할 요약을 만든다.
-//! 모두 요청 크기(토큰·업로드)와 메모리를 줄이기 위한 것이다.
+//! Conversation history management: turns screenshots into blocks to send, prunes old ones,
+//! skips resending unchanged screens and window lists, and builds a summary to start a fresh
+//! segment when things get too long. All of it is about keeping request size (tokens, upload)
+//! and memory down.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -10,32 +11,38 @@ use serde_json::{json, Value};
 use super::{LogEntry, LogKind};
 use crate::{desk::Desk, llm::short};
 
-/// 요청 본문이 이 크기를 넘으면 새 대화 구간을 시작한다 (스크린샷은 몇 장만 남으므로 보통은 토큰 한도가 먼저 온다)
+/// Start a new conversation segment when the request body exceeds this. Only a few screenshots
+/// are kept, so the token limit usually hits first.
 pub(super) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-/// 직전 요청의 입력 토큰이 이보다 많으면 다음 턴에 새 대화 구간을 시작한다
-/// (매 턴 전체 기록을 다시 보내므로 기록이 길수록 턴마다 비용이 커진다)
+/// Start a new segment on the next turn when the previous request's input tokens exceed this.
+///
+/// The whole history is resent every turn, so the longer it gets the more each turn costs.
 pub(super) const MAX_CONTEXT_TOKENS: u64 = 80_000;
-/// 이미지로 남겨 둘 최근 스크린샷 수
+/// Number of recent screenshots kept as images.
 const KEEP_IMAGES: usize = 3;
-/// 한 번에 덜어 낼 최소 장 수. 매 턴 한 장씩 지우면 대화 앞부분이 매번 바뀌어 프롬프트 캐시가 깨지므로
-/// KEEP_IMAGES + PRUNE_CHUNK 장이 쌓였을 때 한꺼번에 덜어 낸다.
+/// Minimum number of images pruned at once.
+///
+/// Pruning one per turn would change the start of the conversation every time and break the
+/// prompt cache, so they are pruned in bulk once KEEP_IMAGES + PRUNE_CHUNK have accumulated.
 const PRUNE_CHUNK: usize = 3;
 const PRUNED_IMAGE: &str = "(older screenshot removed)";
-/// 직접 지운 오래된 도구 결과 자리에 남기는 글
+/// Placeholder left where an old tool result was cleared.
 const CLEARED_RESULT: &str = "(older tool result cleared to save context)";
-/// 서버가 오래된 도구 결과를 지워 주지 않는 회사에서, 직전 입력 토큰이 이보다 많으면 직접 지운다 (Claude 서버와 같은 기준)
+/// For providers whose servers don't clear old tool results, clear them ourselves once the
+/// previous input tokens exceed this (same threshold as Claude's server).
 pub(super) const CLEAR_TOOL_RESULTS_AT: u64 = crate::llm::CLEAR_TOOL_USES_AT;
 const SAME_SCREEN: &str = "(screen unchanged since the previous screenshot)";
-/// 스크린샷의 JPEG 품질 (PNG 보다 몇 배 작아 업로드·메모리가 준다. 토큰은 픽셀 수로 정해지므로 같다)
+/// JPEG quality for screenshots. Several times smaller than PNG, which saves upload and memory;
+/// tokens depend on pixel count, so they're the same.
 const JPEG_QUALITY: u8 = 80;
-/// 새 구간 요약에 넣을 최근 기록 수
+/// Number of recent log entries in a new segment's summary.
 const SUMMARY_LOG_ENTRIES: usize = 40;
 
 pub(super) fn json_len(v: &Value) -> usize {
     serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0)
 }
 
-/// 원래 작업(첫 항목)은 항상 남기고, 이후 지시는 최근 것만 남긴다.
+/// Always keeps the original task (first item); later instructions keep only the most recent.
 pub(super) fn remember(list: &mut Vec<String>, t: &str) {
     if t.trim().is_empty() {
         return;
@@ -46,7 +53,8 @@ pub(super) fn remember(list: &mut Vec<String>, t: &str) {
     }
 }
 
-/// 새 대화 구간의 첫 메시지 텍스트: 원래 작업, 이후 지시, 최근 동작 기록, 직전 동작 결과(텍스트만).
+/// Text of a new segment's first message: original task, later instructions, recent action log,
+/// and the previous action results (text only).
 pub(super) fn segment_summary(instructions: &[String], log: &[LogEntry], last: &[Value]) -> String {
     let mut out = String::from(
         "[대화 기록이 너무 커져 새 대화 구간으로 이어갑니다. 이전 대화와 스크린샷은 더 이상 볼 수 없으니, 아래 요약과 현재 화면을 바탕으로 작업을 이어서 하세요.]\n",
@@ -77,7 +85,8 @@ pub(super) fn segment_summary(instructions: &[String], log: &[LogEntry], last: &
             out.push_str(&format!("- [{k}] {}\n", short(&l.text.replace('\n', " "), 200)));
         }
     }
-    // 직전 배치의 결과(텍스트) — 짝이 되는 tool_use 는 새 구간에 없으므로 내용만 옮긴다
+    // previous batch results (text): their matching tool_use isn't in the new segment, so only the
+    // content moves over
     let mut results = Vec::new();
     for b in last {
         let texts: Vec<String> = match b["type"].as_str() {
@@ -103,8 +112,9 @@ pub(super) fn segment_summary(instructions: &[String], log: &[LogEntry], last: &
     out
 }
 
-/// 스크린샷을 보낼 이미지 블록으로 만든다. 요청 크기를 줄이려고 JPEG 로 다시 인코딩한다
-/// (이미 JPEG 이면 그대로, 디코딩할 수 없으면 원본 PNG 그대로).
+/// Turns a screenshot into an image block to send, re-encoded as JPEG to shrink the request.
+///
+/// JPEG input is passed through; anything that can't be decoded goes out as the original PNG.
 pub(crate) fn image_block(img: &[u8]) -> Value {
     let (media_type, bytes) = match to_jpeg(img) {
         Some(j) => ("image/jpeg", j),
@@ -129,7 +139,8 @@ fn to_jpeg(img: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 현재 화면 (작업·지시를 시작하는 메시지용). 직전에 보낸 화면과 같으면 짧은 글.
+/// The current screen, for messages that start a task or instruction. A short note if it's the
+/// same as the last one sent.
 pub(super) async fn screenshot_context(ws: &Desk, seen: &mut Seen) -> Value {
     match ws.screenshot().await {
         Ok(png) => seen.screen(&png, 0),
@@ -137,7 +148,7 @@ pub(super) async fn screenshot_context(ws: &Desk, seen: &mut Seen) -> Value {
     }
 }
 
-/// 블록 하나(와 그 안의 도구 결과 내용)에 든 이미지 수
+/// Number of images in a block (including inside tool result content).
 fn count(b: &Value) -> usize {
     let nested = b["content"].as_array().map_or(0, |c| c.iter().filter(|c| c["type"] == "image").count());
     usize::from(b["type"] == "image") + nested
@@ -147,7 +158,8 @@ fn images(messages: &[Value]) -> usize {
     messages.iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).map(count).sum()
 }
 
-/// 오래된 스크린샷을 글로 바꾼다 (최근 KEEP_IMAGES 장만 이미지로). 줄어든 바이트 수(대략)를 돌려준다.
+/// Replaces old screenshots with text, keeping only the last KEEP_IMAGES as images. Returns
+/// roughly how many bytes were saved.
 pub(super) fn prune_images(messages: &mut [Value]) -> usize {
     let total = images(messages);
     if total < KEEP_IMAGES + PRUNE_CHUNK {
@@ -161,7 +173,7 @@ pub(super) fn prune_images(messages: &mut [Value]) -> usize {
             left -= 1;
         }
     };
-    // 오래된 것부터: 메시지 순, 블록 순, 도구 결과 안의 순서
+    // oldest first: by message, then block, then position inside tool results
     for m in messages.iter_mut() {
         for b in m["content"].as_array_mut().into_iter().flatten() {
             strip(b);
@@ -173,9 +185,12 @@ pub(super) fn prune_images(messages: &mut [Value]) -> usize {
     freed
 }
 
-/// 최근 `keep` 개를 뺀 도구 결과의 글을 짧은 표시로 바꾼다 (이미지는 `prune_images` 가 따로 맡는다).
-/// 서버가 이 일을 해 주지 않는 회사(Claude 밖)용이다. 대화 앞부분이 바뀌면 프롬프트 캐시가 깨지므로
-/// 매 턴이 아니라 기록이 `CLEAR_TOOL_RESULTS_AT` 을 넘었을 때만 한꺼번에 부른다. 줄어든 바이트 수(대략)를 돌려준다.
+/// Replaces the text of all but the last `keep` tool results with a short marker (images are
+/// handled separately by `prune_images`).
+///
+/// For providers whose servers don't do this (anything but Claude). Changing the start of the
+/// conversation breaks the prompt cache, so this runs in bulk only once the history passes
+/// `CLEAR_TOOL_RESULTS_AT`, not every turn. Returns roughly how many bytes were saved.
 pub(super) fn clear_old_tool_results(messages: &mut [Value], keep: usize) -> usize {
     let is_result = |b: &Value| b["type"] == "tool_result";
     let total = messages.iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| is_result(b)).count();
@@ -206,9 +221,11 @@ pub(super) fn clear_old_tool_results(messages: &mut [Value], keep: usize) -> usi
     freed
 }
 
-/// 이전에 보낸 것과 같은 내용(화면·창 목록)을 다시 보내지 않게 기억한다.
-/// 모델이 그 내용을 아직 볼 수 있을 때만 생략한다: 최근 도구 호출 `KEEP_TOOL_USES` 개 밖으로 밀려나면
-/// 서버 측 정리(Claude)로 지워질 수 있으므로 다시 보낸다. 새 대화 구간에서는 새로 만든다.
+/// Remembers what was already sent (screen, window list) so it isn't sent again.
+///
+/// Only skipped while the model can still see it: once it falls outside the last
+/// `KEEP_TOOL_USES` tool calls, server-side clearing (Claude) may have removed it, so it's sent
+/// again. Rebuilt for each new segment.
 #[derive(Default)]
 pub(super) struct Seen {
     screen: Sent,
@@ -218,12 +235,12 @@ pub(super) struct Seen {
 #[derive(Default)]
 struct Sent {
     hash: Option<u64>,
-    /// 보낸 뒤로 지나간 도구 호출 수
+    /// Tool calls since it was sent.
     since: usize,
 }
 
 impl Sent {
-    /// 이번(도구 호출 `uses` 개) 결과에 다시 붙여야 하는가
+    /// Whether it needs re-attaching to this result (after `uses` tool calls).
     fn needs(&mut self, data: &[u8], uses: usize) -> bool {
         let mut h = DefaultHasher::new();
         data.hash(&mut h);
@@ -238,7 +255,8 @@ impl Sent {
 }
 
 impl Seen {
-    /// 배치(도구 호출 `uses` 개) 뒤 화면 → 보낼 블록. 직전에 보낸 화면과 같으면 짧은 글.
+    /// Screen after a batch (`uses` tool calls) → block to send. A short note if it's the same as the
+    /// last one sent.
     pub(super) fn screen(&mut self, png: &[u8], uses: usize) -> Value {
         if self.screen.needs(png, uses) {
             image_block(png)
@@ -247,12 +265,13 @@ impl Seen {
         }
     }
 
-    /// 창·탭 목록을 다시 보내야 하는가
+    /// Whether the window/tab list needs resending.
     pub(super) fn views(&mut self, text: &str, uses: usize) -> bool {
         self.views.needs(text.as_bytes(), uses)
     }
 
-    /// 모델이 직접 받은 이미지(screenshot·zoom)가 끼면 '직전 화면' 이 무엇인지 흐려지므로 다음 화면은 그대로 보낸다
+    /// Images the model received directly (screenshot, zoom) blur what "the previous screen" was, so
+    /// the next screen is sent in full.
     pub(super) fn forget_screen(&mut self) {
         self.screen = Sent::default();
     }
@@ -283,7 +302,7 @@ mod tests {
         for (i, m) in messages.iter().enumerate().skip(3) {
             assert_eq!(m["content"][0]["content"][0]["text"], format!("long output {i}"), "최근 결과는 그대로");
         }
-        // tool_use_id 는 남아 짝이 맞는다. 다시 불러도 더 줄 것이 없다
+        // tool_use_id stays so pairs still match; calling again has nothing more to shrink
         assert_eq!(messages[1]["content"][0]["tool_use_id"], "t1");
         assert_eq!(clear_old_tool_results(&mut messages, 2), 0);
     }
@@ -297,7 +316,7 @@ mod tests {
         assert!(data.starts_with(&[0xFF, 0xD8, 0xFF]));
         let back = image::load_from_memory(&data).unwrap();
         assert_eq!((back.width(), back.height()), (320, 200));
-        // 디코딩할 수 없는 데이터는 원본 그대로 (PNG 로 표시)
+        // undecodable data passes through unchanged (labeled PNG)
         let b = image_block(b"not an image");
         assert_eq!(b["source"]["media_type"], "image/png");
     }
@@ -341,7 +360,7 @@ mod tests {
 
     #[test]
     fn jpeg_shrinks_requests() {
-        // 잡음이 많은 화면에서도 JPEG 는 PNG 보다 작아야 한다 (요청 크기 한도까지 훨씬 오래 간다)
+        // even on a noisy screen JPEG must beat PNG (lasting much longer before the request size cap)
         let img = image::RgbaImage::from_fn(1280, 800, |x, y| {
             let v = ((x * 7919 + y * 104729) % 251) as u8;
             image::Rgba([v, v.wrapping_mul(3), v.wrapping_add(x as u8), 255])
@@ -358,7 +377,8 @@ mod tests {
         json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "AAAA" } })
     }
 
-    /// 최근 KEEP_IMAGES 장만 남기되, PRUNE_CHUNK 장이 더 쌓일 때까지는 건드리지 않는다 (프롬프트 캐시 보존)
+    /// Keeps only the last KEEP_IMAGES but leaves things alone until PRUNE_CHUNK more pile up
+    /// (preserving the prompt cache).
     #[test]
     fn prunes_old_images_in_chunks() {
         let turn = |n: usize| {
@@ -375,7 +395,8 @@ mod tests {
         assert_eq!(prune_images(&mut m), 0);
     }
 
-    /// 같은 화면은 짧은 글로, 단 보낸 화면이 최근 도구 호출 범위를 벗어나면 다시 이미지로
+    /// The same screen becomes a short note, but turns back into an image once the screen sent
+    /// falls outside the recent tool-call window.
     #[test]
     fn unchanged_screens_are_not_resent() {
         let (a, b) = (png(8, 8), png(9, 9));

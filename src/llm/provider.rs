@@ -1,4 +1,4 @@
-//! AI 제공자 목록과 제공자별 고정 정보 (주소·키 이름·기본 모델).
+//! Supported AI providers and their fixed details (base URL, key variables, default models).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
@@ -9,7 +9,8 @@ pub enum Provider {
     OpenRouter,
     Mistral,
     Ollama,
-    /// 사용자가 주소를 넣는 OpenAI 호환 API (DeepSeek·Groq·Together·LM Studio·vLLM 등)
+    /// Any OpenAI-compatible API at a user-supplied URL (DeepSeek, Groq, Together, LM Studio,
+    /// vLLM, …).
     Custom,
 }
 
@@ -38,7 +39,7 @@ impl Provider {
         }
     }
 
-    /// 짧은 이름 (오류·안내 문구용)
+    /// Short name, for errors and hints.
     pub fn short_name(self) -> &'static str {
         match self {
             Provider::Anthropic => "Claude",
@@ -48,13 +49,15 @@ impl Provider {
             Provider::OpenRouter => "OpenRouter",
             Provider::Mistral => "Mistral",
             Provider::Ollama => "Ollama",
-            // 설정 파일의 키 이름이기도 하므로 바꾸지 않는다
+            // also the key in the settings file, don't rename
             Provider::Custom => "Custom",
         }
     }
 
-    /// 기본 API 주소. Claude 는 Messages API 의 뿌리 주소, 나머지는 OpenAI 호환 API 주소.
-    /// `Custom` 은 기본 주소가 없다 (사용자가 넣은 주소를 `normalize_base_url` 로 다듬어 쓴다).
+    /// Default API base URL: the Messages API root for Claude, an OpenAI-compatible root for the
+    /// rest.
+    ///
+    /// `Custom` has none; the user's URL is cleaned up with `normalize_base_url` instead.
     pub fn default_base_url(self) -> String {
         match self {
             Provider::Anthropic => std::env::var("ANTHROPIC_BASE_URL")
@@ -72,7 +75,7 @@ impl Provider {
         }
     }
 
-    /// 키를 자동으로 채울 환경변수 (앞의 것부터)
+    /// Environment variables to fill the key from, in order of preference.
     pub fn env_keys(self) -> &'static [&'static str] {
         match self {
             Provider::Anthropic => &["ANTHROPIC_API_KEY"],
@@ -102,7 +105,7 @@ impl Provider {
         }
     }
 
-    /// API 키를 만드는 곳 (`Custom` 은 없음: 빈 글)
+    /// Where to create an API key (empty for `Custom`).
     pub fn key_page(self) -> &'static str {
         match self {
             Provider::Anthropic => "https://console.anthropic.com/settings/keys",
@@ -116,22 +119,22 @@ impl Provider {
         }
     }
 
-    /// 키가 꼭 있어야 하는가
+    /// Whether a key is required.
     pub fn needs_key(self) -> bool {
         !matches!(self, Provider::Ollama | Provider::Custom)
     }
 
-    /// 키 칸을 보여 주는가 (`Custom` 은 키가 없어도 되지만 넣을 수는 있다)
+    /// Whether to show a key field (`Custom` doesn't need one but accepts one).
     pub fn takes_key(self) -> bool {
         self != Provider::Ollama
     }
 
-    /// 사용자가 API 주소를 넣어야 하는가
+    /// Whether the user must enter an API URL.
     pub fn needs_url(self) -> bool {
         self == Provider::Custom
     }
 
-    /// 처음 보여 줄 모델 (목록은 '모델' 칸을 열면 API 에서 실제로 불러온다)
+    /// Models to show before the real list is fetched from the API (when the model field opens).
     pub fn default_models(self) -> &'static [&'static str] {
         match self {
             Provider::Anthropic => &["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5"],
@@ -141,18 +144,20 @@ impl Provider {
             Provider::OpenRouter => &["openai/gpt-5.5", "google/gemini-3.1-pro-preview", "anthropic/claude-sonnet-5-5"],
             Provider::Mistral => &["mistral-medium-latest"],
             Provider::Ollama => &["qwen2.5vl"],
-            // 서버마다 모델이 달라 기본값이 없다 (목록은 그 서버의 /models 에서 불러온다)
+            // models differ per server, so no defaults; the list comes from that server's /models
             Provider::Custom => &[],
         }
     }
 
-    /// `reasoning_effort` 를 받는 제공자 (받지 않는 모델이면 오류를 보고 빼고 다시 보낸다)
+    /// Providers that accept `reasoning_effort`. Models that reject it get the request resent
+    /// without it.
     pub(super) fn takes_effort(self) -> bool {
         matches!(self, Provider::OpenAi | Provider::Gemini)
     }
 
-    /// 사용자가 넣은 주소를 API 의 뿌리 주소로 다듬는다: 앞뒤 공백·끝의 '/' 와,
-    /// 실수로 붙여 넣은 `/chat/completions`·`/models` 를 뗀다 (예: "https://api.deepseek.com/v1/").
+    /// Cleans a user-supplied URL down to the API root: trims whitespace and a trailing '/', and
+    /// strips an accidentally pasted `/chat/completions` or `/models`
+    /// (e.g. "https://api.deepseek.com/v1/").
     pub fn normalize_base_url(url: &str) -> String {
         let mut u = url.trim().trim_end_matches('/');
         for tail in ["/chat/completions", "/models"] {
@@ -161,12 +166,14 @@ impl Provider {
         u.trim_end_matches('/').to_string()
     }
 
-    /// 오래된 도구 결과를 서버가 지워 주는가 (Claude 의 context_management). 아니면 에이전트가 직접 지운다.
+    /// Whether the server clears old tool results itself (Claude's context management). Otherwise
+    /// the agent does it.
     pub fn clears_old_tool_results(self) -> bool {
         self == Provider::Anthropic
     }
 
-    /// '생각 깊이'(effort) 설정이 요청에 실리는 제공자 (Claude 는 output_config.effort, 그 밖은 reasoning_effort)
+    /// Providers whose requests carry the thinking-depth (effort) setting: `output_config.effort`
+    /// for Claude, `reasoning_effort` for the others.
     pub fn supports_effort(self) -> bool {
         self == Provider::Anthropic || self.takes_effort()
     }
@@ -194,7 +201,7 @@ mod tests {
         let c = Provider::Custom;
         assert!(c.needs_url() && c.takes_key() && !c.needs_key());
         assert!(c.default_base_url().is_empty() && c.default_models().is_empty());
-        // 받는지 모르는 옵션은 보내지 않는다. 오래된 도구 결과는 에이전트가 직접 지운다
+        // don't send options it might not accept; the agent clears old tool results itself
         assert!(!c.supports_effort() && !c.clears_old_tool_results());
         for p in Provider::ALL.into_iter().filter(|p| *p != Provider::Custom) {
             assert!(!p.needs_url() && !p.default_base_url().is_empty() && !p.default_models().is_empty(), "{p:?}");
