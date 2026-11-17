@@ -114,6 +114,28 @@ pub(super) struct AppListItem {
 enum AutoPick {
     Web,
     App { label: String, path: String, electron: Option<usize> },
+    /// A Windows Store app (Notepad, …) that can't be hidden, so it runs in a child session, where
+    /// it has a whole separate Windows screen to itself.
+    ChildSession { label: String },
+}
+
+/// Windows 11 built-ins that are Store apps (`launch::PACKAGED_STUBS` and Notepad's execution
+/// alias): refused on the hidden desktop and missing from the app list. `(Korean, English)`.
+const STORE_APPS: &[(&str, &str)] =
+    &[("메모장", "notepad"), ("계산기", "calculator"), ("그림판", "paint"), ("캡처 도구", "snipping tool"), ("워드패드", "wordpad")];
+
+/// Whether `needle` occurs in `hay` with no ASCII letter or digit right before or after it.
+fn word_at(hay: &str, needle: &str) -> bool {
+    hay.match_indices(needle).any(|(i, m)| {
+        let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+        edge(hay[..i].chars().next_back()) && edge(hay[i + m.len()..].chars().next())
+    })
+}
+
+/// The Store app named in the task, by its Korean name.
+fn store_app(task: &str) -> Option<&'static str> {
+    let t = task.to_lowercase();
+    STORE_APPS.iter().find(|(ko, en)| t.contains(ko) || word_at(&t, en)).map(|(ko, _)| *ko)
 }
 
 /// The app on this computer named in the task (unpickable apps excluded); the longest name wins
@@ -128,14 +150,6 @@ fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem>
     if t.contains("http://") || t.contains("https://") || t.contains("www.") {
         return None;
     }
-    let word_at = |hay: &str, needle: &str| -> bool {
-        hay.match_indices(needle).any(|(i, m)| {
-            let before = hay[..i].chars().next_back();
-            let after = hay[i + m.len()..].chars().next();
-            let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
-            edge(before) && edge(after)
-        })
-    };
     items
         .iter()
         .filter(|it| it.disabled.is_none())
@@ -527,6 +541,7 @@ impl GhostApp {
     fn simple_auto(&mut self, ui: &mut egui::Ui) {
         let line = match self.auto_pick() {
             AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
+            AutoPick::ChildSession { label } => trf("→ '{}' 은(는) Store 앱이라 자식 세션(보이지 않는 별도 Windows 화면)에서 일해요", &[&label]),
             AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 어디서 일할지 정해요 (적지 않으면 웹사이트)").to_string(),
             AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
         };
@@ -544,7 +559,10 @@ impl GhostApp {
         let items = app_list_items(&electrons, &natives, false);
         match auto_app(&self.form.task, &items) {
             Some(it) => AutoPick::App { label: it.label.clone(), path: it.path.clone(), electron: it.electron },
-            None => AutoPick::Web,
+            None => match store_app(&self.form.task) {
+                Some(label) if cfg!(windows) && caps::SESSION => AutoPick::ChildSession { label: tr(label).to_string() },
+                _ => AutoPick::Web,
+            },
         }
     }
 
@@ -719,6 +737,7 @@ impl GhostApp {
                     self.form.native_app = path;
                     self.form.electron_idx = electron;
                 }
+                AutoPick::ChildSession { .. } => self.form.choice = Some(Choice::Session),
                 AutoPick::Web => self.form.choice = Some(Choice::Web),
             }
         }
@@ -1213,5 +1232,13 @@ mod tests {
         // found by the English file name even when the display name is Korean
         assert_eq!(pick("open the Calculator app"), Some("계산기"));
         assert!(is_system_app(r"C:\Windows\System32\notepad.exe") && !is_system_app(r"C:\Program Files\Slack\slack.exe"));
+
+        // Store apps aren't in the app list; auto mode sends them to a child session instead of the web
+        assert!(auto_app("메모장을 이용해서 소설을 써줘", &items).is_none());
+        assert_eq!(store_app("메모장을 이용해서 소설을 써줘"), Some("메모장"));
+        assert_eq!(store_app("Open Notepad and write a poem"), Some("메모장"));
+        assert_eq!(store_app("paint 앱으로 그려줘"), Some("그림판"));
+        assert_eq!(store_app("Fix the paintball schedule"), None, "낱말 안의 일부는 아님");
+        assert_eq!(store_app("오늘 날씨 찾아줘"), None);
     }
 }
