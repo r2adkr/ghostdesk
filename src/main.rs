@@ -30,6 +30,7 @@ mod winapp;
 mod session;
 mod vdisplay;
 mod keys;
+mod licenses;
 mod llm;
 mod profiles;
 mod rfb;

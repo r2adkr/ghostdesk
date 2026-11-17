@@ -406,6 +406,7 @@ impl GhostApp {
                     };
                     if theme::tab(ui, self.settings_tab == t, &label).clicked() {
                         self.settings_tab = t;
+                        self.license_view = None;
                     }
                 }
             });
@@ -430,6 +431,7 @@ impl GhostApp {
         }
         if close || m.should_close() {
             self.show_settings = false;
+            self.license_view = None;
             self.save_prefs();
         }
     }
@@ -516,11 +518,24 @@ impl GhostApp {
         });
     }
 
-    /// About tab: version, release notes, token usage so far.
+    /// About tab: version, release notes, license, token usage so far.
     fn settings_about(&mut self, ui: &mut egui::Ui) {
+        if let Some(view) = &mut self.license_view {
+            if license_page(ui, view) {
+                self.license_view = None;
+            }
+            return;
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
             ui.hyperlink_to(RichText::new(tr("릴리스 노트")).size(12.0), crate::update::RELEASES_PAGE);
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(theme::hint(trf("{} 라이선스 · 오픈소스 패키지 포함", &[&"Blue Oak Model License 1.0.0"])));
+            if theme::secondary(ui, tr("라이선스")).clicked() {
+                self.license_view = Some(LicenseView::new());
+            }
         });
         if let crate::update::State::Available(r) | crate::update::State::Failed(r, _) = &*self.update.lock() {
             ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
@@ -708,6 +723,108 @@ impl GhostApp {
             }
         });
     }
+}
+
+/// State of Settings > About > License (the parsed package list lives only while it's open).
+pub(super) struct LicenseView {
+    data: crate::licenses::ThirdParty,
+    query: String,
+    /// package whose license texts are shown
+    open: Option<usize>,
+    own_open: bool,
+}
+
+impl LicenseView {
+    fn new() -> Self {
+        Self { data: crate::licenses::third_party(), query: String::new(), open: None, own_open: false }
+    }
+}
+
+/// License page: GhostDesk's own license, then every open-source package built in, searchable,
+/// with its license texts on click. Returns true when "back" was clicked.
+fn license_page(ui: &mut egui::Ui, v: &mut LicenseView) -> bool {
+    let mono = |t: &str| RichText::new(t.to_owned()).monospace().size(11.0).color(theme::body());
+    let back = ui.link(RichText::new(format!("‹ {}", tr("정보"))).size(13.0)).clicked();
+    ui.add_space(8.0);
+
+    theme::section(ui, "GhostDesk");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Blue Oak Model License 1.0.0").color(theme::text()));
+        ui.hyperlink_to(RichText::new(crate::licenses::OWN_URL).size(12.0), crate::licenses::OWN_URL);
+    });
+    ui.label(theme::hint(tr("누구나 자유롭게 쓰고 고치고 나눠 줄 수 있어요. 나눠 줄 때는 이 라이선스 전문이나 링크를 함께 줘야 하고, 소프트웨어는 보증 없이 있는 그대로 제공돼요")));
+    let label = if v.own_open { tr("전문 접기") } else { tr("전문 보기") };
+    if ui.link(RichText::new(label).size(12.0)).clicked() {
+        v.own_open = !v.own_open;
+    }
+    if v.own_open {
+        theme::card_frame().inner_margin(Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(mono(crate::licenses::OWN)).wrap());
+        });
+    }
+
+    ui.add_space(14.0);
+    theme::section(ui, tr("오픈소스 라이선스"));
+    ui.label(theme::hint(trf("GhostDesk 에 들어간 오픈소스 패키지 {}개와 각 라이선스예요", &[&v.data.packages.len()])));
+    ui.add_space(4.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut v.query)
+            .desired_width(ui.available_width())
+            .margin(Margin::symmetric(10, 6))
+            .hint_text(tr("패키지 이름이나 라이선스로 찾기")),
+    );
+    ui.add_space(6.0);
+    let q = v.query.trim().to_lowercase();
+    let mut shown = 0;
+    for (i, p) in v.data.packages.iter().enumerate() {
+        if !q.is_empty() && !p.name.to_lowercase().contains(&q) && !p.license.to_lowercase().contains(&q) {
+            continue;
+        }
+        shown += 1;
+        let open = v.open == Some(i);
+        let row = ui
+            .horizontal(|ui| {
+                ui.label(RichText::new(if open { "▾" } else { "▸" }).color(theme::muted()));
+                ui.label(RichText::new(format!("{} {}", p.name, p.version)).color(theme::text()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // a few packages have very long expressions; keep the row to the window width
+                    const MAX: usize = 32;
+                    let full = if p.license.is_empty() { "-".to_string() } else { p.license.clone() };
+                    let short = if full.chars().count() > MAX {
+                        format!("{}…", full.chars().take(MAX).collect::<String>().trim_end())
+                    } else {
+                        full.clone()
+                    };
+                    let r = ui.label(theme::hint(short));
+                    if full.chars().count() > MAX {
+                        r.on_hover_text(full);
+                    }
+                });
+            })
+            .response
+            .interact(egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if row.clicked() {
+            v.open = if open { None } else { Some(i) };
+        }
+        if open {
+            if let Some(r) = &p.repository {
+                ui.hyperlink_to(RichText::new(r).size(12.0), r);
+            }
+            for &t in &p.texts {
+                theme::card_frame().inner_margin(Margin::same(10)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(mono(&crate::licenses::reflow(&v.data.texts[t]))).wrap());
+                });
+                ui.add_space(4.0);
+            }
+        }
+    }
+    if shown == 0 {
+        ui.label(theme::hint(tr("찾는 패키지가 없어요")));
+    }
+    back
 }
 
 /// Settings window tabs.

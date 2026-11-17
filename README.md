@@ -467,3 +467,14 @@ cargo test
 | `src/kit.rs` | Connection kit for unlisted apps (MCP config, skill, plugin; the skill is generated from the instructions and tool list in `mcp.rs`) |
 | `src/llm.rs` | Claude, OpenAI-compatible, Gemini and other AI APIs |
 | `assets/tour/` | App screenshots used by the guide and this README (the app captures its own window) |
+| `src/licenses.rs`, `assets/third-party-licenses.json` | License page in Settings → About: GhostDesk's license and every open-source package built in |
+
+## License
+
+GhostDesk is released under the [Blue Oak Model License 1.0.0](LICENSE.md).
+
+The open-source packages built into the app, with their licenses, are listed in
+**Settings → About → License**. The list is generated from Cargo.lock; after
+changing dependencies, regenerate it with
+`GHOSTDESK_UPDATE_LICENSES=1 cargo test third_party_list_is_current`
+(the test fails while it is out of date).

@@ -249,6 +249,8 @@ pub struct GhostApp {
     show_settings: bool,
     /// Tab shown when Settings opens (kept between openings).
     settings_tab: settings::SettingsTab,
+    /// Settings > About > License, while open (the parsed package list is dropped when it closes)
+    license_view: Option<settings::LicenseView>,
     show_session_guide: bool,
     /// Windows child sessions: whether the feature is on (`None` = not checked yet) / enable request
     /// progress and result.
@@ -308,6 +310,7 @@ impl GhostApp {
             wizard_open: false,
             show_settings: false,
             settings_tab: Default::default(),
+            license_view: None,
             show_session_guide: false,
             child_enabled: None,
             child_enable: Default::default(),
