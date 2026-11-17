@@ -874,7 +874,11 @@ fn is_helper_exe(name: &str) -> bool {
         "inno_updater.exe",
         "winpty-agent.exe",
     ];
-    EXACT.contains(&name) || name.starts_with("unins") || name.starts_with("uninstall") || name.ends_with("_helper.exe")
+    EXACT.contains(&name)
+        || name.starts_with("unins")
+        || name.starts_with("uninstall")
+        || name.starts_with("old_")
+        || name.ends_with("_helper.exe")
 }
 
 /// Whether it's usable as a Windows folder name (for guessing userData).
@@ -1063,13 +1067,19 @@ mod win_apps {
         best.map(|(_, p)| p)
     }
 
+    /// The app's executable: in the app folder, or in the install root when only the runtime and
+    /// resources sit in a version folder (VS Code since 2026: `Code.exe` + `<commit>\resources`).
+    pub(super) fn app_exe(root: &Path, appdir: &Path) -> Option<PathBuf> {
+        main_exe(appdir).or_else(|| if root != appdir { main_exe(root) } else { None })
+    }
+
     /// Install folder or .exe path → the executable to read fuses from.
     pub(super) fn exe_for(p: &Path) -> Option<PathBuf> {
         if p.is_file() {
             return Some(p.to_path_buf());
         }
-        let (_, appdir) = resolve_layout(p)?;
-        main_exe(&appdir)
+        let (root, appdir) = resolve_layout(p)?;
+        app_exe(&root, &appdir)
     }
 
     /// Fuse inspection cache (not reread if path, size and mtime match, since executables are hundreds
@@ -1095,7 +1105,7 @@ mod win_apps {
     pub(super) fn inspect_dirs(root: &Path, appdir: &Path, exe: Option<PathBuf>) -> Option<ElectronApp> {
         let exe = match exe {
             Some(e) => e,
-            None => main_exe(appdir)?,
+            None => app_exe(root, appdir)?,
         };
         let res = appdir.join("resources");
         let pkg = read_res_json(&res, "package.json");
@@ -5135,6 +5145,21 @@ document.body.textContent = 'RES:' + JSON.stringify(out);
         let b = inspect(&code.join("Code.exe")).unwrap();
         assert_eq!((b.bundle_id.as_str(), b.exe.clone()), ("com.microsoft.VSCode", code.join("Code.exe")));
         assert_eq!(read_fuses(&code).unwrap().wire, "101100011");
+
+        // 1b) VS Code's newer layout: Code.exe (+ a larger old_Code.exe from the last update) in the
+        // install root, runtime and resources in a commit-named folder
+        let split = tmp.join("Split Code");
+        let commit = split.join("69047191fc");
+        fake_app_dir(&commit, "Code.exe", b"101100011", json!({ "name": "code", "main": "./out/main.js" }),
+            Some(json!({ "nameLong": "Split Code", "dataFolderName": ".vscode", "darwinBundleIdentifier": "com.microsoft.VSCode" })), false);
+        fs::rename(commit.join("Code.exe"), split.join("Code.exe")).unwrap();
+        let mut old = fs::read(split.join("Code.exe")).unwrap();
+        old.extend_from_slice(&[0u8; 4096]);
+        fs::write(split.join("old_Code.exe"), old).unwrap();
+        let a = inspect(&split).expect("버전 폴더로 나뉜 VS Code 감지");
+        assert_eq!((a.exe.clone(), a.name.as_str()), (split.join("Code.exe"), "Split Code"));
+        assert!(a.hideable, "{:?}", a.reason);
+        assert_eq!(inspect(&split.join("Code.exe")).unwrap().exe, split.join("Code.exe"));
 
         // 2) Squirrel (root\Update.exe + app-<version>\, asar): highest version, root is the bundle
         let sq = tmp.join("SqApp");
