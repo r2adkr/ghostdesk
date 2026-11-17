@@ -246,13 +246,8 @@ impl GhostApp {
             target,
             max_steps: self.form.max_steps,
             reply_lang: self.lang.english_name(),
-            llm: Llm::new(
-                self.provider,
-                self.base_url(self.pi()),
-                self.key().trim().to_string(),
-                self.models[self.pi()].trim().to_string(),
-                EFFORTS[self.effort_idx].to_string(),
-            ),
+            // missing_setup 을 위에서 확인했으므로 연결이 있다
+            llm: self.cur().map(|c| c.llm(EFFORTS[self.effort_idx])).expect("missing_setup checked the connection"),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -410,24 +405,15 @@ impl GhostApp {
                     ui.add_space(18.0);
                     theme::section(ui, tr("AI 와 API 키"));
                     ui.add_space(4.0);
-                    self.provider_combo(ui, W);
-                    ui.add_space(4.0);
-                    if self.provider.needs_url() && self.custom_url_field(ui, W).changed() {
+                    // 지금 쓰는 연결에 빠진 주소·키를 바로 넣는다 (다른 AI 는 설정·홈의 모델 단추에서 고른다)
+                    if self.key_warn && self.missing_setup().is_some() {
+                        ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, theme::warn());
+                    }
+                    let focus = std::mem::take(&mut self.focus_key);
+                    if self.setup_fields(ui, W, focus) {
                         self.key_warn = false;
                     }
                     ui.horizontal(|ui| {
-                        let link_w = 96.0;
-                        if self.key_warn && self.missing_key() {
-                            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, theme::warn());
-                        }
-                        let w = (ui.available_width() - link_w).max(120.0);
-                        let r = self.key_field(ui, w, egui::Id::unique("wizard_api_key"));
-                        if std::mem::take(&mut self.focus_key) {
-                            r.request_focus();
-                        }
-                        if r.changed() {
-                            self.key_warn = false;
-                        }
                         if ui
                             .link(tr("키 없이 쓰기"))
                             .on_hover_text(tr("Claude 앱·Claude Code 같은 AI 앱에 연결하면 키가 필요 없어요"))

@@ -1,117 +1,69 @@
-//! 설정 창(언어 · 지금 쓰는 AI · 회사별 API 키 · 화면)과 홈 화면의 모델 고르기.
-//! 새 에이전트 창도 키·모델 칸을 같이 쓴다.
+//! 설정 창(언어 · AI 연결 목록 · 지금 쓰는 AI · 화면 · 작업)과 홈 화면의 모델 고르기.
+//! 새 에이전트 창도 지금 연결의 키·주소 칸을 같이 쓴다.
+//!
+//! AI 연결 하나의 규칙(이름·주소·빠진 설정)은 `ai.rs` 에 있고, 여기는 그것을 그리고 고치는 화면만 맡는다.
 
-use super::*;
+use super::ai::{self, AiConn};
 use super::labels::{effort_label, effort_short};
+use super::*;
 
 impl GhostApp {
-    /// 지금 고른 AI 회사의 순서 (`api_keys`·`models` 의 칸)
-    pub(super) fn pi(&self) -> usize {
-        Provider::ALL.iter().position(|p| *p == self.provider).unwrap_or(0)
+    /// 지금 쓰는 연결
+    pub(super) fn cur(&self) -> Option<&AiConn> {
+        self.ai.iter().find(|c| c.id == self.ai_current)
     }
 
-    pub(super) fn key(&self) -> &str {
-        &self.api_keys[self.pi()]
+    fn conn_index(&self, id: u64) -> Option<usize> {
+        self.ai.iter().position(|c| c.id == id)
     }
 
-    /// `i` 번째 회사의 API 주소 (OpenAI 호환은 사용자가 넣은 주소를 다듬어서)
-    pub(super) fn base_url(&self, i: usize) -> String {
-        match Provider::ALL[i] {
-            p if p.needs_url() => Provider::normalize_base_url(&self.custom_url),
-            p => p.default_base_url(),
-        }
-    }
-
-    /// 지금 회사로 일을 시작하기에 빠진 설정 (키 또는 주소). 다 있으면 None
+    /// 지금 연결로 일을 시작하기에 빠진 설정. 다 있으면 None
     pub(super) fn missing_setup(&self) -> Option<String> {
-        let p = self.provider;
-        if p.needs_url() && self.base_url(self.pi()).is_empty() {
-            Some(tr("설정에서 OpenAI 호환 API 주소를 넣어 주세요.").to_string())
-        } else if p.needs_key() && self.key().trim().is_empty() {
-            Some(trf("설정에서 {} API 키를 넣어 주세요.", &[&p.short_name()]))
-        } else {
-            None
+        match self.cur() {
+            None => Some(tr("설정에서 쓸 AI 를 추가해 주세요.").to_string()),
+            Some(c) => c.missing(),
         }
     }
 
-    /// 키가 필요한 회사인데 키가 비어 있는가
-    pub(super) fn missing_key(&self) -> bool {
-        self.provider.needs_key() && self.key().trim().is_empty()
-    }
-
-    /// `i` 번째 회사가 모델 목록을 부를 수 있게 준비됐는가 (주소·필수 키)
-    fn configured(&self, i: usize) -> bool {
-        let p = Provider::ALL[i];
-        !(p.needs_url() && self.base_url(i).is_empty()) && !(p.needs_key() && self.api_keys[i].trim().is_empty())
-    }
-
-    /// 바로 쓸 수 있게 준비된 회사인가: 키가 필요하면 키가, 주소가 필요하면 주소가 있는 회사.
-    /// 아무것도 필요 없는 Ollama 는 지금 쓰고 있을 때만 (켜 두지 않은 PC 가 많다)
-    fn ready(&self, i: usize) -> bool {
-        let p = Provider::ALL[i];
-        if p.needs_key() || p.needs_url() {
-            self.configured(i)
+    /// 홈 메뉴에 보일 만큼 준비된 연결인가. 아무것도 필요 없는 Ollama 는 지금 쓰고 있을 때만 (켜 두지 않은 PC 가 많다)
+    fn ready(&self, c: &AiConn) -> bool {
+        if c.provider.needs_key() || c.provider.needs_url() {
+            c.configured()
         } else {
-            p == self.provider
+            c.id == self.ai_current
         }
     }
 
-    pub(super) fn provider_combo(&mut self, ui: &mut egui::Ui, width: f32) {
-        egui::ComboBox::from_id_salt(ui.scope_id().with("provider")).width(width).selected_text(tr(self.provider.label())).show_ui(ui, |ui| {
-            for p in Provider::ALL {
-                ui.selectable_value(&mut self.provider, p, tr(p.label()));
-            }
+    /// 연결의 모델 목록을 아직 안 불러왔으면 API 에서 불러오기 시작한다 (주소·필수 키가 없으면 하지 않음).
+    fn fetch_models(&mut self, ctx: &egui::Context, id: u64) -> ModelFetch {
+        let Some(c) = self.ai.iter().find(|c| c.id == id) else { return ModelFetch::Idle };
+        let state = self.model_fetch.lock().get(&id).cloned().unwrap_or_default();
+        if !matches!(state, ModelFetch::Idle) || !c.configured() {
+            return state;
+        }
+        self.model_fetch.lock().insert(id, ModelFetch::Loading);
+        let (slot, p, url, key, ctx) = (self.model_fetch.clone(), c.provider, c.base_url(), c.key.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let r = crate::llm::list_models(p, &url, &key).await.map_err(|e| format!("{e:#}"));
+            slot.lock().insert(id, ModelFetch::Done(r));
+            ctx.request_repaint();
         });
+        ModelFetch::Loading
     }
 
-    /// 지금 회사의 API 키 칸 (새 에이전트 창)
-    pub(super) fn key_field(&mut self, ui: &mut egui::Ui, width: f32, id: egui::Id) -> egui::Response {
-        self.key_field_for(ui, self.pi(), width, id)
+    /// 키·주소가 바뀌었으니 그 연결의 모델 목록을 다음에 새로 불러온다
+    fn refetch(&self, id: u64) {
+        self.model_fetch.lock().remove(&id);
     }
 
-    /// `i` 번째 회사의 API 키 칸. 키가 바뀌면 그 회사의 모델 목록을 새 키로 다시 불러온다.
-    fn key_field_for(&mut self, ui: &mut egui::Ui, i: usize, width: f32, id: egui::Id) -> egui::Response {
-        let p = Provider::ALL[i];
-        let r = ui.add_enabled(
-            p.takes_key(),
-            egui::TextEdit::singleline(&mut self.api_keys[i])
-                .id(id)
-                .password(true)
-                .desired_width(width)
-                .margin(Margin::symmetric(10, 6))
-                .hint_text(tr(p.key_hint())),
-        );
-        if r.changed() {
-            self.model_fetch.lock()[i] = ModelFetch::Idle;
-        }
-        r
-    }
-
-    /// `i` 번째 회사의 모델 목록을 아직 안 불러왔으면 API 에서 불러오기 시작한다 (키가 필요한데 없으면 하지 않음).
-    fn fetch_models(&mut self, ctx: &egui::Context, i: usize) -> ModelFetch {
-        let p = Provider::ALL[i];
-        let state = self.model_fetch.lock()[i].clone();
-        if matches!(state, ModelFetch::Idle) && self.configured(i) {
-            self.model_fetch.lock()[i] = ModelFetch::Loading;
-            let (slot, key, url, ctx) = (self.model_fetch.clone(), self.api_keys[i].clone(), self.base_url(i), ctx.clone());
-            self.rt.spawn(async move {
-                let r = crate::llm::list_models(p, &url, &key).await.map_err(|e| format!("{e:#}"));
-                slot.lock()[i] = ModelFetch::Done(r);
-                ctx.request_repaint();
-            });
-            return ModelFetch::Loading;
-        }
-        state
-    }
-
-    /// `i` 번째 회사에서 고를 수 있는 모델: API 에서 불러온 전체 목록 (불러오기 전·실패 때는 기본 목록).
+    /// 연결에서 고를 수 있는 모델: API 에서 불러온 전체 목록 (불러오기 전·실패 때는 기본 목록).
     /// 지금 고른 모델은 목록에 없어도(이름을 직접 적었어도) 맨 앞에 넣는다.
-    fn models_for(&self, i: usize, state: &ModelFetch) -> Vec<String> {
+    fn models_for(c: &AiConn, state: &ModelFetch) -> Vec<String> {
         let mut list: Vec<String> = match state {
             ModelFetch::Done(Ok(list)) if !list.is_empty() => list.clone(),
-            _ => Provider::ALL[i].default_models().iter().map(|s| s.to_string()).collect(),
+            _ => c.provider.default_models().iter().map(|s| s.to_string()).collect(),
         };
-        let cur = self.models[i].trim();
+        let cur = c.model.trim();
         if !cur.is_empty() && !list.iter().any(|m| m == cur) {
             list.insert(0, cur.to_string());
         }
@@ -119,7 +71,7 @@ impl GhostApp {
     }
 
     /// 불러오는 중이면 작은 표시. 실패했으면 무슨 일인지와 '다시 시도' (API 원문 오류는 글에 마우스를 올리면).
-    fn fetch_status(&mut self, ui: &mut egui::Ui, i: usize, state: &ModelFetch) {
+    fn fetch_status(&self, ui: &mut egui::Ui, id: u64, state: &ModelFetch) {
         match state {
             ModelFetch::Loading => {
                 ui.horizontal(|ui| {
@@ -132,7 +84,7 @@ impl GhostApp {
                     ui.label(RichText::new(tr("모델 목록을 못 불러와서 기본 모델만 보여요")).size(12.0).color(theme::warn()))
                         .on_hover_text(crate::llm::short(e, 300));
                     if ui.link(RichText::new(tr("다시 시도")).size(12.0)).clicked() {
-                        self.model_fetch.lock()[i] = ModelFetch::Idle;
+                        self.refetch(id);
                     }
                 });
             }
@@ -140,46 +92,108 @@ impl GhostApp {
         }
     }
 
-    /// `i` 번째 회사에서 쓸 수 있는 모델 목록을 그린다 (설정 창). 고른 모델을 돌려준다.
-    fn model_list(&mut self, ui: &mut egui::Ui, i: usize) -> Option<String> {
-        let p = Provider::ALL[i];
-        let state = self.fetch_models(ui.ctx(), i);
-        self.fetch_status(ui, i, &state);
-        let list = self.models_for(i, &state);
-        let mut picked = None;
-        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-            for m in list {
-                let sel = self.provider == p && self.models[i] == m;
-                if ui.selectable_label(sel, &m).clicked() {
-                    picked = Some(m);
-                }
-            }
-        });
-        picked
+    // ── 입력 칸 (설정 창·새 에이전트 창이 같이 쓴다) ──
+
+    /// `i` 번째 연결의 API 키 칸. 키가 바뀌면 그 연결의 모델 목록을 새 키로 다시 불러온다.
+    pub(super) fn key_field(&mut self, ui: &mut egui::Ui, i: usize, width: f32, id: egui::Id) -> egui::Response {
+        let c = &mut self.ai[i];
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut c.key)
+                .id(id)
+                .password(true)
+                .desired_width(width)
+                .margin(Margin::symmetric(10, 6))
+                .hint_text(tr(c.provider.key_hint())),
+        );
+        if r.changed() {
+            self.refetch(self.ai[i].id);
+        }
+        r
     }
 
-    /// 모델 이름 칸 + ▾ 목록 (설정 창)
-    pub(super) fn model_field(&mut self, ui: &mut egui::Ui, width: f32) {
-        let i = self.pi();
+    /// `i` 번째(OpenAI 호환) 연결의 주소 칸. 바뀌면 모델 목록을 다시 불러온다.
+    pub(super) fn url_field(&mut self, ui: &mut egui::Ui, i: usize, width: f32) -> egui::Response {
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut self.ai[i].url)
+                .desired_width(width)
+                .margin(Margin::symmetric(10, 6))
+                .hint_text(tr("API 주소 (예: https://api.deepseek.com/v1)")),
+        );
+        if r.changed() {
+            self.refetch(self.ai[i].id);
+        }
+        r
+    }
+
+    /// 새 에이전트 창: 지금 연결에 빠진 키·주소를 바로 넣는 칸 (연결이 없으면 설정을 여는 단추).
+    /// 칸이 바뀌면 true.
+    pub(super) fn setup_fields(&mut self, ui: &mut egui::Ui, width: f32, focus_key: bool) -> bool {
+        let Some(i) = self.conn_index(self.ai_current) else {
+            if theme::secondary(ui, trf("{}  AI 추가", &[&icon::PLUS])).clicked() {
+                self.show_settings = true;
+            }
+            return false;
+        };
+        let mut changed = false;
+        ui.label(RichText::new(self.ai[i].title()).strong().color(theme::text()));
+        if self.ai[i].provider.needs_url() {
+            changed |= self.url_field(ui, i, width).changed();
+        }
+        if self.ai[i].provider.takes_key() {
+            let r = self.key_field(ui, i, width, egui::Id::unique("wizard_api_key"));
+            if focus_key {
+                r.request_focus();
+            }
+            changed |= r.changed();
+        }
+        changed
+    }
+
+    /// 지금 연결의 모델 이름 칸 + ▾ 목록 (설정 창)
+    fn model_field(&mut self, ui: &mut egui::Ui, width: f32) {
+        let Some(i) = self.conn_index(self.ai_current) else { return };
+        let id = self.ai[i].id;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add(egui::TextEdit::singleline(&mut self.models[i]).desired_width(width - 40.0).margin(Margin::symmetric(10, 6)));
+            ui.add(egui::TextEdit::singleline(&mut self.ai[i].model).desired_width(width - 40.0).margin(Margin::symmetric(10, 6)));
             ui.menu_button(icon::CHEVRON_DOWN, |ui| {
                 ui.set_min_width(260.0);
-                if let Some(m) = self.model_list(ui, i) {
-                    self.models[i] = m;
-                    ui.close();
-                }
+                let state = self.fetch_models(ui.ctx(), id);
+                self.fetch_status(ui, id, &state);
+                let list = Self::models_for(&self.ai[i], &state);
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for m in list {
+                        if ui.selectable_label(self.ai[i].model == m, &m).clicked() {
+                            self.ai[i].model = m;
+                            ui.close();
+                        }
+                    }
+                });
             })
             .response
             .on_hover_text(tr("쓸 수 있는 모델 보기"));
         });
     }
 
-    /// 홈 입력 상자 아래의 모델 단추: 키를 넣어 둔 회사의 모델을 한 목록에서 골라 바로 바꾼다.
+    /// 생각 깊이 슬라이더 (낮음 … 최대). 바뀌면 true
+    fn effort_slider(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        let label_w = 96.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = (width - label_w).max(80.0);
+            let r = ui
+                .add(egui::Slider::new(&mut self.effort_idx, 0..=EFFORTS.len() - 1).show_value(false))
+                .on_hover_text(tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"));
+            ui.label(RichText::new(effort_short(EFFORTS[self.effort_idx])).color(theme::body())).on_hover_text(effort_label(EFFORTS[self.effort_idx]));
+            r.changed()
+        })
+        .inner
+    }
+
+    // ── 홈 화면의 모델 단추 ──
+
+    /// 홈 입력 상자 아래의 모델 단추: 준비된 모든 연결의 모델을 한 목록에서 골라 바로 바꾼다.
     pub(super) fn model_picker(&mut self, ui: &mut egui::Ui) {
-        let i = self.pi();
-        // 회사 이름(흐리게) · 모델 이름 · ▾ 를 한 줄 가운데에 맞춰 놓는다 (아이콘 글꼴은 기준선이 달라 가운데 정렬이 필요)
+        // 연결 이름(흐리게) · 모델 이름 · 생각 깊이 · ▾ 를 한 줄 가운데에 맞춰 놓는다 (아이콘 글꼴은 기준선이 달라 가운데 정렬이 필요)
         let mut label = egui::text::LayoutJob::default();
         let part = |size: f32, color: Color32| egui::TextFormat {
             font_id: egui::FontId::proportional(size),
@@ -187,13 +201,19 @@ impl GhostApp {
             valign: egui::Align::Center,
             ..Default::default()
         };
-        label.append(self.provider.short_name(), 0.0, part(13.0, theme::muted()));
-        label.append(&self.models[i], 6.0, part(13.0, theme::body()));
-        if self.provider.supports_effort() {
-            label.append(&format!("· {}", effort_short(EFFORTS[self.effort_idx])), 6.0, part(13.0, theme::muted()));
+        match self.cur() {
+            Some(c) => {
+                label.append(&c.title(), 0.0, part(13.0, theme::muted()));
+                label.append(&c.model, 6.0, part(13.0, theme::body()));
+                if c.provider.supports_effort() {
+                    label.append(&format!("· {}", effort_short(EFFORTS[self.effort_idx])), 6.0, part(13.0, theme::muted()));
+                }
+            }
+            None => label.append(tr("AI 를 추가해 주세요"), 0.0, part(13.0, theme::muted())),
         }
         label.append(icon::CHEVRON_DOWN, 6.0, part(12.0, theme::muted()));
         let button = egui::Button::new(label).frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
+        let hover = self.cur().map(|c| tr(c.provider.label()).to_string()).unwrap_or_default();
         let (r, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             // 폭을 고정한다 (검색 칸이 남는 폭을 다 차지하려 해서 메뉴가 화면만큼 넓어지지 않게)
             ui.set_width(340.0);
@@ -201,8 +221,13 @@ impl GhostApp {
             // (메뉴는 기본 안쪽 여백이 2px 라 선택 배경 끝에 글이 붙으므로 넓힌다)
             ui.spacing_mut().button_padding.x = 10.0;
             let pad = ui.spacing().button_padding.x;
-            let mut chosen = None;
-            // 키를 넣어 둔(연결된) 모든 회사의 모델을 API 에서 불러와 한 목록에 다 보여 준다. 많으면 검색으로 좁힌다.
+            let indent = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    add(ui);
+                });
+            };
+            let mut chosen: Option<(u64, String)> = None;
             // 검색 칸에서 Enter: 맨 위에 보이는 모델을 고른다 (칸이 Enter 를 가져가기 전에 본다)
             let qid = ui.make_persistent_id("model_query");
             let enter = ui.ctx().memory(|m| m.has_focus(qid)) && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -218,128 +243,101 @@ impl GhostApp {
                 q.request_focus();
             }
             let query = self.model_query.trim().to_lowercase();
-            let mut first: Option<(usize, String)> = None;
+            let mut first: Option<(u64, String)> = None;
             let mut shown = 0;
+            let ids: Vec<u64> = self.ai.iter().filter(|c| self.ready(c)).map(|c| c.id).collect();
             egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
-                for (j, p) in Provider::ALL.into_iter().enumerate() {
-                    if !self.ready(j) && p != self.provider {
-                        continue;
-                    }
-                    let state = self.fetch_models(ui.ctx(), j);
+                for id in ids {
+                    let state = self.fetch_models(ui.ctx(), id);
+                    let Some(c) = self.ai.iter().find(|c| c.id == id) else { continue };
                     let models: Vec<String> =
-                        self.models_for(j, &state).into_iter().filter(|m| query.is_empty() || m.to_lowercase().contains(&query)).collect();
-                    if models.is_empty() && !matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_))) {
+                        Self::models_for(c, &state).into_iter().filter(|m| query.is_empty() || m.to_lowercase().contains(&query)).collect();
+                    let busy = matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_)));
+                    if models.is_empty() && !busy {
                         continue;
                     }
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(pad);
-                        ui.label(theme::hint(tr(p.label())));
-                        if let ModelFetch::Done(Ok(all)) = &state {
-                            ui.label(theme::hint(format!("· {}", all.len())));
-                        }
+                    let title = c.title();
+                    let count = match &state {
+                        ModelFetch::Done(Ok(all)) => format!("· {}", all.len()),
+                        _ => String::new(),
+                    };
+                    indent(ui, &mut |ui| {
+                        ui.label(theme::hint(&title));
+                        ui.label(theme::hint(&count));
                     });
-                    if matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_))) {
-                        ui.horizontal(|ui| {
-                            ui.add_space(pad);
-                            ui.vertical(|ui| self.fetch_status(ui, j, &state));
+                    if busy {
+                        indent(ui, &mut |ui| {
+                            ui.vertical(|ui| self.fetch_status(ui, id, &state));
                         });
                     }
                     ui.add_space(2.0);
+                    let selected_model = (id == self.ai_current).then(|| c.model.clone());
                     for m in models {
                         shown += 1;
                         if first.is_none() {
-                            first = Some((j, m.clone()));
+                            first = Some((id, m.clone()));
                         }
-                        let sel = self.provider == p && self.models[j] == m;
-                        if ui.selectable_label(sel, &m).clicked() {
-                            chosen = Some((j, m));
+                        if ui.selectable_label(selected_model.as_deref() == Some(m.as_str()), &m).clicked() {
+                            chosen = Some((id, m));
                         }
                     }
                 }
-                if shown == 0 && !query.is_empty() {
+                if shown == 0 {
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(pad);
-                        ui.label(theme::hint(tr("맞는 모델이 없어요")));
+                    let msg = if query.is_empty() { tr("설정에서 AI 를 추가하고 키를 넣어 주세요") } else { tr("맞는 모델이 없어요") };
+                    indent(ui, &mut |ui| {
+                        ui.label(theme::hint(msg));
                     });
                 }
             });
             if enter && chosen.is_none() && !query.is_empty() {
                 chosen = first;
             }
-            if self.provider.supports_effort() {
+            if self.cur().is_some_and(|c| c.provider.supports_effort()) {
                 ui.separator();
-                self.effort_row(ui, pad);
+                indent(ui, &mut |ui| {
+                    ui.label(theme::hint(tr("생각 깊이")));
+                });
+                let w = ui.available_width() - 2.0 * pad;
+                let changed = ui
+                    .horizontal(|ui| {
+                        ui.add_space(pad);
+                        self.effort_slider(ui, w)
+                    })
+                    .inner;
+                if changed {
+                    self.save_prefs();
+                }
             }
             ui.separator();
             if ui.button(format!("{}  {}", icon::SETTINGS, tr("AI 회사 · API 키 관리"))).clicked() {
                 self.show_settings = true;
                 ui.close();
             }
-            if let Some((j, m)) = chosen {
-                self.provider = Provider::ALL[j];
-                self.models[j] = m;
+            if let Some((id, m)) = chosen {
+                if let Some(i) = self.conn_index(id) {
+                    self.ai[i].model = m;
+                    self.ai_current = id;
+                }
                 self.model_query.clear();
                 self.save_prefs();
                 ui.close();
             }
         });
-        r.on_hover_text(tr(self.provider.label()));
-    }
-
-    /// 모델 메뉴 안의 '생각 깊이' 줄: 낮음 … 최대 중 하나를 바로 고른다 (메뉴는 닫지 않는다)
-    fn effort_row(&mut self, ui: &mut egui::Ui, pad: f32) {
-        ui.horizontal(|ui| {
-            ui.add_space(pad);
-            ui.label(theme::hint(tr("생각 깊이")));
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().button_padding.x = 8.0;
-            ui.add_space(pad - 8.0);
-            for (i, e) in EFFORTS.iter().enumerate() {
-                if ui.selectable_label(self.effort_idx == i, effort_short(e)).on_hover_text(effort_label(e)).clicked() && self.effort_idx != i {
-                    self.effort_idx = i;
-                    self.save_prefs();
-                }
-            }
-        })
-        .response
-        .on_hover_text(tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"));
-    }
-
-    /// 'OpenAI 호환 API' 의 주소 칸 (설정 창·새 에이전트 창). 바뀌면 모델 목록을 다시 불러온다.
-    pub(super) fn custom_url_field(&mut self, ui: &mut egui::Ui, width: f32) -> egui::Response {
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut self.custom_url)
-                .desired_width(width)
-                .margin(Margin::symmetric(10, 6))
-                .hint_text(tr("API 주소 (예: https://api.deepseek.com/v1)")),
-        );
-        if r.changed() {
-            let i = Provider::ALL.iter().position(|p| p.needs_url()).unwrap_or(0);
-            self.model_fetch.lock()[i] = ModelFetch::Idle;
+        if !hover.is_empty() {
+            r.on_hover_text(hover);
         }
-        r
-    }
-
-    /// 'OpenAI 호환 API' 줄: 주소 칸, 그 아래 (선택) 키 칸. 주소·키가 바뀌면 모델 목록을 다시 불러온다.
-    fn custom_rows(&mut self, ui: &mut egui::Ui, i: usize, field: f32) {
-        self.custom_url_field(ui, field);
-        ui.end_row();
-        ui.label("");
-        self.key_field_for(ui, i, field, egui::Id::unique(("settings_key", i)));
-        ui.end_row();
     }
 
     /// 키를 어디서 받는지 · 어디에 두는지 한 줄로 (새 에이전트 창)
     pub(super) fn key_help(&self, ui: &mut egui::Ui) {
-        let p = self.provider;
+        let Some(c) = self.cur() else { return };
+        let p = c.provider;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if p.needs_url() {
-                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요. 주소는 설정에서 넣어요.")));
+                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요.")));
             } else if p.needs_key() {
                 ui.label(theme::hint(tr("키가 없나요?")));
                 ui.hyperlink_to(RichText::new(trf("{} 에서 만들기", &[&p.short_name()])).size(12.0), p.key_page());
@@ -359,7 +357,9 @@ impl GhostApp {
         }
     }
 
-    /// ⚙ 설정: 언어 · 지금 쓰는 AI · 회사별 API 키 · 화면
+    // ── 설정 창 ──
+
+    /// ⚙ 설정: 언어 · AI 연결 · 지금 쓰는 AI · 화면 · 작업
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -391,31 +391,11 @@ impl GhostApp {
                 });
 
                 ui.add_space(18.0);
-                theme::section(ui, tr("지금 쓰는 AI"));
+                theme::section(ui, tr("AI 연결"));
+                ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
                 ui.add_space(4.0);
-                egui::Grid::new("settings_ai").num_columns(2).min_col_width(LABEL).spacing([14.0, 10.0]).show(ui, |ui| {
-                    ui.label(tr("AI 회사"));
-                    self.provider_combo(ui, field);
-                    ui.end_row();
-                    ui.label(tr("모델"));
-                    self.model_field(ui, field);
-                    ui.end_row();
-                    ui.label(tr("생각 깊이"));
-                    egui::ComboBox::from_id_salt("effort").width(field).selected_text(effort_label(EFFORTS[self.effort_idx])).show_ui(ui, |ui| {
-                        for (i, e) in EFFORTS.iter().enumerate() {
-                            ui.selectable_value(&mut self.effort_idx, i, effort_label(e));
-                        }
-                    })
-                    .response
-                    .on_hover_text(tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"));
-                    ui.end_row();
-                });
-
-                ui.add_space(18.0);
-                theme::section(ui, tr("API 키"));
-                ui.label(theme::hint(tr("여러 회사의 키를 넣어 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
-                ui.add_space(4.0);
-                self.key_rows(ui, LABEL, field);
+                self.conn_cards(ui, W);
+                self.add_conn_button(ui);
                 ui.add_space(4.0);
                 if prefs::CAN_REMEMBER_KEYS {
                     ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
@@ -424,13 +404,44 @@ impl GhostApp {
                     ui.label(theme::hint(self.key_storage_note()));
                 }
 
+                if !self.ai.is_empty() {
+                    ui.add_space(18.0);
+                    theme::section(ui, tr("지금 쓰는 AI"));
+                    ui.add_space(4.0);
+                    egui::Grid::new("settings_ai").num_columns(2).min_col_width(LABEL).spacing([14.0, 10.0]).show(ui, |ui| {
+                        ui.label(tr("AI"));
+                        let title = self.cur().map(AiConn::title).unwrap_or_default();
+                        egui::ComboBox::from_id_salt("current_ai").width(field).selected_text(title).show_ui(ui, |ui| {
+                            for c in &self.ai {
+                                ui.selectable_value(&mut self.ai_current, c.id, c.title());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label(tr("모델"));
+                        self.model_field(ui, field);
+                        ui.end_row();
+                        if self.cur().is_some_and(|c| c.provider.supports_effort()) {
+                            ui.label(tr("생각 깊이"));
+                            self.effort_slider(ui, field);
+                            ui.end_row();
+                        }
+                    });
+                }
+
                 ui.add_space(18.0);
                 theme::section(ui, tr("화면"));
                 ui.add_space(4.0);
                 ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
                     .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
+
+                ui.add_space(18.0);
+                theme::section(ui, tr("작업"));
+                ui.add_space(4.0);
+                ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
+                    .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
+                ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요.")));
                 if ti + to > 0 {
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     ui.label(theme::hint(trf("지금까지 쓴 양: 보낸 글 {} · 받은 글 {} 토큰", &[&ti, &to])));
                 }
             });
@@ -444,31 +455,81 @@ impl GhostApp {
         }
     }
 
-    /// 회사마다 한 줄: 이름 · 키 칸 · (들어 있으면 ✓, 없으면 '키 받기')
-    fn key_rows(&mut self, ui: &mut egui::Ui, label_w: f32, field: f32) {
-        let link_w = 64.0;
-        egui::Grid::new("settings_keys").num_columns(2).min_col_width(label_w).spacing([14.0, 8.0]).show(ui, |ui| {
-            for (i, p) in Provider::ALL.into_iter().enumerate() {
-                ui.label(p.short_name()).on_hover_text(tr(p.label()));
-                if p.needs_url() {
-                    self.custom_rows(ui, i, field);
-                    continue;
-                }
+    /// 연결마다 카드 하나: 이름(OpenAI 호환은 고칠 수 있음) · 회사 · ✕, 그 아래 주소 · 키 칸
+    fn conn_cards(&mut self, ui: &mut egui::Ui, width: f32) {
+        let mut remove = None;
+        for i in 0..self.ai.len() {
+            let p = self.ai[i].provider;
+            theme::card_frame().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+                ui.set_width(width - 28.0);
+                let inner = ui.available_width();
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if p.needs_key() {
-                        self.key_field_for(ui, i, field - link_w - 8.0, egui::Id::unique(("settings_key", i)));
-                        if self.api_keys[i].trim().is_empty() {
-                            ui.hyperlink_to(RichText::new(tr("키 받기")).size(12.0), p.key_page());
-                        } else {
-                            ui.label(RichText::new(icon::CIRCLE_CHECK).color(theme::success())).on_hover_text(tr("키가 들어 있어요"));
-                        }
+                    if p.needs_url() {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ai[i].name)
+                                .desired_width(180.0)
+                                .margin(Margin::symmetric(8, 4))
+                                .hint_text(tr("이름 (예: DeepSeek)")),
+                        );
                     } else {
+                        ui.label(RichText::new(self.ai[i].title()).strong().color(theme::text()));
+                    }
+                    ui.label(theme::hint(tr(p.label())));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(icon::X).on_hover_text(tr("이 AI 연결 지우기")).clicked() {
+                            remove = Some(i);
+                        }
+                        if self.ai[i].configured() && p.takes_key() {
+                            ui.label(RichText::new(icon::CIRCLE_CHECK).color(theme::success())).on_hover_text(tr("쓸 준비가 됐어요"));
+                        }
+                    });
+                });
+                if p.needs_url() {
+                    self.url_field(ui, i, inner);
+                }
+                if p.takes_key() {
+                    ui.horizontal(|ui| {
+                        let link = p.needs_key() && self.ai[i].key.trim().is_empty() && !p.key_page().is_empty();
+                        let w = if link { inner - 72.0 } else { inner };
+                        self.key_field(ui, i, w, egui::Id::unique(("settings_key", self.ai[i].id)));
+                        if link {
+                            ui.hyperlink_to(RichText::new(tr("키 받기")).size(12.0), p.key_page());
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
                         ui.label(theme::hint(tr("키가 필요 없어요 (내 PC 에서 실행)")));
                         ui.hyperlink_to(RichText::new(tr("내려받기")).size(12.0), p.key_page());
+                    });
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if let Some(i) = remove {
+            let gone = self.ai.remove(i);
+            self.refetch(gone.id);
+            if gone.id == self.ai_current {
+                self.ai_current = self.ai.first().map_or(0, |c| c.id);
+            }
+        }
+    }
+
+    /// '+ AI 추가' — 아직 없는 회사와 OpenAI 호환(여러 개 가능) 중에서 골라 새 연결을 만든다
+    fn add_conn_button(&mut self, ui: &mut egui::Ui) {
+        let choices = ai::addable(&self.ai);
+        ui.menu_button(format!("{}  {}", icon::PLUS, tr("AI 추가")), |ui| {
+            ui.set_min_width(260.0);
+            for p in choices {
+                if ui.button(tr(p.label())).clicked() {
+                    self.ai_next_id += 1;
+                    let c = AiConn::new(self.ai_next_id, p);
+                    // 처음 추가한 연결이면 바로 그것을 쓴다
+                    if self.ai.is_empty() {
+                        self.ai_current = c.id;
                     }
-                });
-                ui.end_row();
+                    self.ai.push(c);
+                    ui.close();
+                }
             }
         });
     }

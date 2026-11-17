@@ -4,6 +4,7 @@
 //! `cfg(target_os = "macos")`, Win32 는 `cfg(windows)` 로 가른다. 공개 함수·타입은 가능한 한
 //! 모든 플랫폼에서 같은 이름으로 제공해, 호출하는 쪽(UI·에이전트·제어 서버)에 cfg 가 번지지 않게 한다.
 
+pub mod awake;
 pub mod caps;
 pub mod fsx;
 pub mod input;

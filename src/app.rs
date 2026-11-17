@@ -9,7 +9,7 @@ use crate::{
     icon,
     agent::{self, AgentCmd, AgentConfig, AgentShared, AgentStatus, DeskTarget, LogKind, ProfileSource, RemoteTarget},
     browser::MouseButton,
-    llm::{Llm, Provider, EFFORTS},
+    llm::{Provider, EFFORTS},
     platform::{caps, text},
     profiles::{self, InstalledBrowser},
 };
@@ -17,6 +17,7 @@ use crate::{
 mod connect;
 mod detail;
 mod fonts;
+mod ai;
 mod i18n;
 mod labels;
 mod pip;
@@ -173,14 +174,14 @@ struct NewAgentForm {
 
 pub struct GhostApp {
     rt: Handle,
-    /// 에이전트를 움직일 AI 회사. 키와 모델은 회사마다 따로 기억한다 (`Provider::ALL` 순서)
-    provider: Provider,
-    api_keys: Vec<String>,
-    /// 'OpenAI 호환 API' 의 주소 (사용자가 넣은 그대로, 쓸 때 다듬는다)
-    custom_url: String,
-    models: Vec<String>,
-    /// '모델' 목록을 열 때 API 에서 불러온 실제 모델 목록 (회사마다)
-    model_fetch: Arc<parking_lot::Mutex<Vec<ModelFetch>>>,
+    /// 사용자가 추가한 AI 연결들 (`ai.rs`). 에이전트는 `ai_current` 연결로 일한다
+    ai: Vec<ai::AiConn>,
+    /// 지금 쓰는 연결의 id (없으면 목록이 빈 것)
+    ai_current: u64,
+    /// 다음에 만들 연결의 id
+    ai_next_id: u64,
+    /// 연결 id → API 에서 불러온 모델 목록
+    model_fetch: Arc<parking_lot::Mutex<std::collections::HashMap<u64, ModelFetch>>>,
     /// 홈 모델 단추 목록의 검색어
     model_query: String,
     /// API 키를 이 PC 에 (암호화해) 기억할지
@@ -188,6 +189,10 @@ pub struct GhostApp {
     /// 화면 언어
     lang: Lang,
     effort_idx: usize,
+    /// 화면이 잠겨도(디스플레이가 꺼져도) 에이전트가 일하는 동안 Mac/PC 가 잠자지 않게 한다
+    keep_awake: bool,
+    /// 지금 잠자기를 막고 있는가 (keep_awake 이고 일하는 에이전트가 있을 때)
+    awake: Option<crate::platform::awake::KeepAwake>,
     /// 홈 화면 인사말 (켤 때마다 다르게)
     greeting: usize,
     browsers: Vec<InstalledBrowser>,
@@ -277,16 +282,17 @@ impl GhostApp {
             electron_apps,
             native_apps,
             rt,
-            // 환경변수에 키가 있는 첫 회사를 고른다 (없으면 Claude)
-            provider: Provider::ALL.into_iter().find(|p| p.needs_key() && !p.env_key().is_empty()).unwrap_or(Provider::Anthropic),
-            api_keys: Provider::ALL.iter().map(|p| p.env_key()).collect(),
-            custom_url: String::new(),
-            models: Provider::ALL.iter().map(|p| p.default_models().first().copied().unwrap_or_default().to_string()).collect(),
-            model_fetch: Arc::new(parking_lot::Mutex::new(vec![ModelFetch::Idle; Provider::ALL.len()])),
+            // 저장한 설정이 없을 때: 환경변수에 키가 있는 회사들 (없으면 Claude 하나). load_prefs 가 덮어쓴다
+            ai: Vec::new(),
+            ai_current: 0,
+            ai_next_id: 0,
+            model_fetch: Default::default(),
             model_query: String::new(),
             remember_keys: prefs::CAN_REMEMBER_KEYS,
             lang: Lang::Ko,
             effort_idx: 1,
+            keep_awake: true,
+            awake: None,
             greeting: screens::random_greeting(),
             browsers,
             form: NewAgentForm::new(profile_idx),
@@ -304,6 +310,8 @@ impl GhostApp {
             wall_fs_before: false,
             title_cols: titlebar::Columns { left: 248.0, right: 0.0 },
         };
+        app.ai = ai::initial(&mut app.ai_next_id);
+        app.ai_current = app.ai[0].id;
         // 저장해 둔 언어·AI·키를 적용하고, 그 언어에 맞는 글꼴을 올린다
         app.load_prefs();
         i18n::set(app.lang);
@@ -387,6 +395,21 @@ impl GhostApp {
         }
     }
 
+    /// '화면이 잠겨도 계속 작업' 이 켜져 있고 일하는 에이전트가 있으면 잠자기를 막고, 아니면 푼다.
+    /// 외부(MCP) 에이전트는 호출 사이에 '대기' 로 보이므로, 그 화면이 열려 있는 동안을 일하는 중으로 본다.
+    fn update_keep_awake(&mut self) {
+        let working = self.keep_awake
+            && self.agents.iter().any(|a| {
+                detail::is_working(&a.shared.status())
+                    || (a.shared.external.lock().is_some() && a.shared.workspace().is_some_and(|w| !w.is_closed()))
+            });
+        match (working, self.awake.is_some()) {
+            (true, false) => self.awake = Some(crate::platform::awake::KeepAwake::start("GhostDesk agents are working")),
+            (false, true) => self.awake = None,
+            _ => {}
+        }
+    }
+
     fn update_textures(&mut self, ctx: &egui::Context) {
         for a in &mut self.agents {
             let seq = a.shared.frame_seq.load(Ordering::Relaxed);
@@ -441,6 +464,7 @@ impl eframe::App for GhostApp {
         self.approval_window(&ctx);
         self.spawn_demos(&ctx);
         self.update_textures(&ctx);
+        self.update_keep_awake();
 
         // 화면 모아보기: 다른 패널 없이 화면만 (에이전트가 모두 사라지면 처음 화면으로)
         if self.view == View::Wall

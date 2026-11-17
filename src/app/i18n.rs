@@ -128,6 +128,7 @@ mod tests {
     fn every_ui_string_is_translated() {
         const SOURCES: &[(&str, &str)] = &[
             ("app.rs", include_str!("../app.rs")),
+            ("ai.rs", include_str!("ai.rs")),
             ("connect.rs", include_str!("connect.rs")),
             ("detail.rs", include_str!("detail.rs")),
             ("labels.rs", include_str!("labels.rs")),
