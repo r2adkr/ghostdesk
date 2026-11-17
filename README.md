@@ -11,10 +11,10 @@ Windows 쪽에서 다른 점(쓸 수 있는 화면 종류, 설치 위치, 빌드
 
 ## 내려받기
 
-- Windows x64: [GhostDesk-0.4.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.4.0/GhostDesk-0.4.0-windows-x64.exe)
+- Windows x64: [GhostDesk-0.5.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.5.0/GhostDesk-0.5.0-windows-x64.exe)
   받아서 실행하면 끝입니다. 설치 과정은 없습니다. 서명이 없는 파일이라 처음엔 SmartScreen 경고가 뜰 수 있습니다.
   이미 깔려 있는 상태에서 새로 받은 exe 를 실행하면, 떠 있던 옛 GhostDesk 를 닫고 설치본(`%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe`)을 새 버전으로 바꾼 뒤 그걸 띄웁니다. 설치본이 더 새 버전이면 건드리지 않습니다.
-- macOS (Apple Silicon, Intel): [GhostDesk-0.4.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.4.0/GhostDesk-0.4.0-macos-universal.zip)
+- macOS (Apple Silicon, Intel): [GhostDesk-0.5.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.5.0/GhostDesk-0.5.0-macos-universal.zip)
   압축을 풀어 GhostDesk.app 을 응용 프로그램 폴더에 넣으세요. 공증을 안 받은 앱이라 처음엔 열리지 않는데,
   시스템 설정 → 개인정보 보호 및 보안 맨 아래의 '그래도 열기'를 한 번 누르면 그다음부터는 그냥 열립니다.
   이미 GhostDesk 가 깔려 있는 상태에서 새로 받은 앱을 압축 푼 자리에서 바로 열면, 떠 있던 옛 GhostDesk 를 닫고 설치된 앱(`~/Applications/GhostDesk.app`)을 새 버전으로 바꾼 뒤 그걸로 다시 엽니다. 설치된 쪽이 더 새 버전이면 건드리지 않습니다.
