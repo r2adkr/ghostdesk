@@ -33,6 +33,8 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["이 컴퓨터의 Mac 앱을 맡기려면 두 권한이 필요해요. '허용'을 누르면 macOS 의 요청 창이 하나 뜨고, 그 창의 '시스템 설정 열기'에서 GhostDesk 를 켜면 돼요. 웹사이트만 쓸 거라면 나중에 설정 > 권한 에서 해도 돼요.", "Handing over Mac apps on this computer needs two permissions. Allow shows one macOS request; use its Open System Settings button and turn on GhostDesk. If you only use websites, you can do this later in Settings > Permissions.", "このコンピュータの Mac アプリを任せるには 2 つの権限が必要です。「許可」を押すと macOS の確認画面が 1 つ出るので、その「システム設定を開く」から GhostDesk をオンにしてください。ウェブサイトだけ使うなら、あとで 設定 > 権限 からでも構いません。", "要把本机的 Mac 应用交给它，需要两项权限。点击“允许”会弹出一个 macOS 请求窗口，用其中的“打开系统设置”打开 GhostDesk。如果只用网站，也可以以后在 设置 > 权限 中设置。"],
     ["권한 설정", "Permission settings", "権限の設定", "权限设置"],
     ["설정의 '권한'에서 하나씩 허용할 수 있어요", "Allow them one at a time under Permissions in Settings", "設定の「権限」で 1 つずつ許可できます", "可在设置的“权限”中逐项允许"],
+    ["화면 기록 목록에 GhostDesk 가 없으면 목록 아래 + 를 눌러 Finder 에 보이는 GhostDesk 를 추가하세요.", "If GhostDesk isn't in the Screen Recording list, click + below the list and add the GhostDesk shown in Finder.", "画面収録のリストに GhostDesk がない場合は、リストの下の + を押して Finder に表示された GhostDesk を追加してください。", "如果录屏列表中没有 GhostDesk，请点击列表下方的 +，添加 Finder 中显示的 GhostDesk。"],
+    ["화면 기록 설정과 앱 위치 열기", "Open Screen Recording settings and the app's location", "画面収録の設定とアプリの場所を開く", "打开录屏设置和应用位置"],
     ["화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요", "If you turned on Screen Recording, restart GhostDesk for it to take effect", "画面収録をオンにした場合は、GhostDesk を再起動すると反映されます", "如果已开启录屏，需要重新启动 GhostDesk 才会生效"],
     ["손쉬운 사용", "Accessibility", "アクセシビリティ", "辅助功能"],
     ["화면 기록", "Screen Recording", "画面収録", "录屏"],

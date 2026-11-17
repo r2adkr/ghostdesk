@@ -617,6 +617,13 @@ impl GhostApp {
                     crate::update::request_relaunch(ui.ctx());
                 }
             });
+            // after asking, macOS should list GhostDesk; if it doesn't, it can be added by hand
+            ui.horizontal_wrapped(|ui| {
+                ui.label(theme::hint(tr("화면 기록 목록에 GhostDesk 가 없으면 목록 아래 + 를 눌러 Finder 에 보이는 GhostDesk 를 추가하세요.")));
+                if ui.link(RichText::new(tr("화면 기록 설정과 앱 위치 열기")).size(12.0)).clicked() {
+                    crate::macos::add_to_screen_capture_by_hand();
+                }
+            });
         }
         ui.label(theme::hint(tr("스위치가 이미 켜져 있는데 여기서 꺼짐으로 보이면 업데이트로 앱 서명이 바뀐 거예요. '허용'을 누르면 옛 항목을 지우고 새로 요청해요.")));
     }

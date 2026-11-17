@@ -85,6 +85,22 @@ pub fn screen_capture_needs_restart() -> bool {
 /// on but doesn't apply to the current build. The stale entry has to go before the current build
 /// can ask again.
 fn reset_permission(service: &str) {
+    // Builds signed with the local certificate keep their permissions across updates, so their
+    // entries aren't reset. The stale entry left by old ad-hoc builds is reset once per service
+    // after the switch.
+    if signed_with_stable_cert() {
+        let marker = dirs::config_dir().map(|d| d.join("GhostDesk").join(format!(".tcc-migrated-{service}")));
+        match marker {
+            Some(m) if m.exists() => return,
+            Some(m) => {
+                if let Some(d) = m.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let _ = std::fs::write(&m, "");
+            }
+            None => {}
+        }
+    }
     let _ = std::process::Command::new("/usr/bin/tccutil").args(["reset", service, crate::install::BUNDLE_ID]).output();
 }
 
@@ -122,4 +138,23 @@ pub fn request_screen_capture() {
         reset_permission("ScreenCapture");
     }
     objc2_core_graphics::CGRequestScreenCaptureAccess();
+}
+
+/// Whether this executable is signed with the local certificate (not ad-hoc).
+fn signed_with_stable_cert() -> bool {
+    std::env::current_exe().map(|exe| crate::install::signed_with_local_cert(&exe)).unwrap_or(false)
+}
+
+/// Opens System Settings at Privacy & Security > Screen Recording, and shows the installed
+/// GhostDesk.app in Finder so it can be added with "+" (or dragged in) when it isn't listed.
+pub fn add_to_screen_capture_by_hand() {
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .status();
+    let app = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.ancestors().find(|p| p.extension().is_some_and(|x| x == "app")).map(|p| p.to_path_buf()));
+    if let Some(app) = app {
+        let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(app).status();
+    }
 }

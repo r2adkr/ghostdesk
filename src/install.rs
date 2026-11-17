@@ -290,11 +290,31 @@ fn info_plist() -> String {
 ///
 /// Without a fingerprint, any old one is removed so it doesn't linger.
 #[cfg(not(windows))]
-fn seal_bundle(bundle: &Path, src_hash: Option<&str>) -> Result<()> {
+fn seal_bundle(bundle: &Path, src_hash: Option<&str>, local: bool) -> Result<()> {
     match src_hash {
         Some(h) => write_source_stamp(bundle, h)?,
         None => {
             let _ = std::fs::remove_file(source_stamp_path(bundle));
+        }
+    }
+    // The installed copy is always signed with the same local self-signed certificate. macOS ties
+    // Screen Recording and Accessibility to the signature's designated requirement; with ad-hoc
+    // signing that is the build's hash, so every update or second copy lost the grants. With the
+    // certificate it is "this identifier + this certificate", which survives updates.
+    // Release packaging (`local == false`) stays ad-hoc; installing re-signs locally.
+    // Falls back to ad-hoc if the certificate can't be made.
+    if let Some(kc) = local.then(signing_keychain).flatten() {
+        let ok = run(
+            Command::new("/usr/bin/codesign")
+                .args(["--force", "-s", SIGN_CERT, "--keychain"])
+                .arg(&kc)
+                .args(["--identifier", BUNDLE_ID])
+                .arg(bundle),
+            Duration::from_secs(120),
+        )
+        .is_ok();
+        if ok {
+            return Ok(());
         }
     }
     let _ = run(
@@ -304,18 +324,109 @@ fn seal_bundle(bundle: &Path, src_hash: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Name of the local signing certificate and the password of its own keychain.
+///
+/// The keychain holds only this certificate. The password is fixed because GhostDesk has to unlock
+/// it without asking; it protects nothing else.
+#[cfg(not(windows))]
+const SIGN_CERT: &str = "GhostDesk Local Signing";
+#[cfg(not(windows))]
+const SIGN_KC_PASS: &str = "ghostdesk";
+
+/// Returns the signing keychain (~/Library/Keychains/ghostdesk-signing.keychain-db), creating it
+/// with a new self-signed code-signing certificate if needed.
+///
+/// The login keychain is not touched, so no password prompt appears. None on failure.
+#[cfg(not(windows))]
+fn signing_keychain() -> Option<PathBuf> {
+    // unit tests never create keychains (they sign ad-hoc)
+    if cfg!(test) {
+        return None;
+    }
+    let kc = home().join("Library/Keychains/ghostdesk-signing.keychain-db");
+    let t = Duration::from_secs(60);
+    if kc.exists() {
+        let unlocked = run(Command::new("/usr/bin/security").args(["unlock-keychain", "-p", SIGN_KC_PASS]).arg(&kc), t).is_ok();
+        let has_cert = run(Command::new("/usr/bin/security").args(["find-certificate", "-c", SIGN_CERT]).arg(&kc), t).is_ok();
+        if unlocked && has_cert {
+            return Some(kc);
+        }
+        let _ = std::fs::remove_file(&kc);
+    }
+    let work = std::env::temp_dir().join(format!("ghostdesk-sign-{}", std::process::id()));
+    let res = (|| -> Result<()> {
+        std::fs::create_dir_all(&work)?;
+        let cnf = work.join("o.cnf");
+        std::fs::write(
+            &cnf,
+            format!(
+                "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN={SIGN_CERT}\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n"
+            ),
+        )?;
+        let (key, crt, p12) = (work.join("k.pem"), work.join("c.pem"), work.join("c.p12"));
+        run(
+            Command::new("/usr/bin/openssl")
+                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "36500", "-config"])
+                .arg(&cnf)
+                .arg("-keyout")
+                .arg(&key)
+                .arg("-out")
+                .arg(&crt),
+            t,
+        )?;
+        run(
+            Command::new("/usr/bin/openssl")
+                .args(["pkcs12", "-export", "-passout", "pass:gd", "-inkey"])
+                .arg(&key)
+                .arg("-in")
+                .arg(&crt)
+                .arg("-out")
+                .arg(&p12),
+            t,
+        )?;
+        let sec = |args: &[&str], extra: Option<&Path>| {
+            let mut c = Command::new("/usr/bin/security");
+            c.args(args);
+            if let Some(e) = extra {
+                c.arg(e);
+            }
+            run(&mut c, t)
+        };
+        sec(&["create-keychain", "-p", SIGN_KC_PASS], Some(&kc))?;
+        sec(&["set-keychain-settings"], Some(&kc))?; // no auto-lock
+        sec(&["unlock-keychain", "-p", SIGN_KC_PASS], Some(&kc))?;
+        run(
+            Command::new("/usr/bin/security")
+                .args(["import"])
+                .arg(&p12)
+                .args(["-k"])
+                .arg(&kc)
+                .args(["-P", "gd", "-T", "/usr/bin/codesign"]),
+            t,
+        )?;
+        sec(&["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", SIGN_KC_PASS], Some(&kc))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    if res.is_err() {
+        let _ = std::fs::remove_file(&kc);
+        return None;
+    }
+    Some(kc)
+}
+
 /// Builds a fresh GhostDesk.app bundle at `dest` from the single executable `exe` (Info.plist,
 /// executable, source fingerprint, signature).
 ///
 /// Shared by installation (when run outside a bundle) and release packaging (`package_macos`).
 #[cfg(not(windows))]
-pub fn build_bundle(exe: &Path, dest: &Path) -> Result<()> {
+pub fn build_bundle(exe: &Path, dest: &Path, local: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(dest);
     let macos = dest.join("Contents/MacOS");
     std::fs::create_dir_all(&macos)?;
     std::fs::write(dest.join("Contents/Info.plist"), info_plist())?;
     std::fs::copy(exe, macos.join("ghostdesk")).with_context(|| format!("{} 를 복사하지 못했습니다", exe.display()))?;
-    seal_bundle(dest, sha256_file(exe).ok().as_deref())
+    seal_bundle(dest, sha256_file(exe).ok().as_deref(), local)
 }
 
 /// `ghostdesk --package-macos <executable> <output.zip>`: builds a release GhostDesk.app and zips
@@ -329,7 +440,7 @@ pub fn package_macos(args: &[String]) -> Result<()> {
     let work = std::env::temp_dir().join(format!("ghostdesk-package-{}", std::process::id()));
     let app = work.join("GhostDesk.app");
     let res = (|| {
-        build_bundle(Path::new(exe), &app)?;
+        build_bundle(Path::new(exe), &app, false)?;
         let _ = std::fs::remove_file(out);
         run(Command::new("/usr/bin/ditto").args(["-c", "-k", "--keepParent"]).arg(&app).arg(out), Duration::from_secs(300))?;
         Ok(())
@@ -398,25 +509,66 @@ pub fn take_over_install() -> bool {
         return false;
     }
     let Some(me) = current_bundle() else { return false };
+    let target = stable_app();
+    // The installed copy itself, still signed ad-hoc by an older version: re-sign it once with the
+    // local certificate and reopen, so the permissions granted from now on survive updates.
+    // (Granting them from this ad-hoc process would tie them to the old signature again.)
+    if me.canonicalize().ok() == target.canonicalize().ok() {
+        if signed_with_local_cert(&me) || signing_keychain().is_none() {
+            return false;
+        }
+        if let Err(e) = install_app_inner(true) {
+            eprintln!("[ghostdesk] 설치본을 다시 서명하지 못했습니다: {e:#}");
+            return false;
+        }
+        if !signed_with_local_cert(&target) {
+            return false;
+        }
+        return Command::new("/usr/bin/open").arg("-n").arg(&target).status().map(|s| s.success()).unwrap_or(false);
+    }
     // opened from where it was unpacked (translocated) or straight from the mounted .dmg
     if !me.to_string_lossy().contains("/AppTranslocation/") && !me.starts_with("/Volumes/") {
         return false;
     }
-    let target = stable_app();
-    if let Some(v) = bundle_version(&target) {
-        if crate::update::newer(&v, env!("CARGO_PKG_VERSION")) {
+    // The installed copy is the one that holds the macOS permissions, so this downloaded copy never
+    // runs itself: if the installed copy is newer it is simply opened instead.
+    let installed_newer = bundle_version(&target).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION")));
+    if !installed_newer {
+        if !crate::macos::apps::quit_instances_at(BUNDLE_ID, &target, Duration::from_secs(8)) {
+            eprintln!("[ghostdesk] 설치된 GhostDesk 가 종료되지 않아 이 앱을 그대로 엽니다");
+            return false;
+        }
+        if let Err(e) = install_app() {
+            eprintln!("[ghostdesk] 설치본을 바꾸지 못했습니다: {e:#}");
             return false;
         }
     }
-    if !crate::macos::apps::quit_instances_at(BUNDLE_ID, &target, Duration::from_secs(8)) {
-        eprintln!("[ghostdesk] 설치된 GhostDesk 가 종료되지 않아 이 앱을 그대로 엽니다");
-        return false;
-    }
-    if let Err(e) = install_app() {
-        eprintln!("[ghostdesk] 설치본을 바꾸지 못했습니다: {e:#}");
-        return false;
-    }
+    // an older install may still carry the quarantine flag; opening it would translocate it again
+    // and bring us straight back here
+    clear_quarantine(&target);
     Command::new("/usr/bin/open").arg("-n").arg(&target).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Whether the app or executable at `p` is signed with a certificate (the local one) rather than
+/// ad-hoc.
+#[cfg(target_os = "macos")]
+pub(crate) fn signed_with_local_cert(p: &Path) -> bool {
+    Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-"])
+        .arg(p)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("certificate leaf"))
+        .unwrap_or(false)
+}
+
+/// Removes the download quarantine flag from an app bundle.
+///
+/// A quarantined copy that wasn't moved by Finder is run by macOS from a random read-only location
+/// (App Translocation), which keeps it out of the Screen Recording list and would make every
+/// launch look like a fresh download.
+#[cfg(target_os = "macos")]
+fn clear_quarantine(app: &Path) {
+    let _ = run(Command::new("/usr/bin/xattr").args(["-dr", "com.apple.quarantine"]).arg(app), Duration::from_secs(30));
 }
 
 /// Installs (or updates) the running GhostDesk at the fixed location (`stable_app`) and returns
@@ -426,22 +578,34 @@ pub fn take_over_install() -> bool {
 /// updated safely too (macOS: swapped for a new bundle folder; Windows: the running exe is moved
 /// aside and the new one put in its place).
 pub fn install_app() -> Result<PathBuf> {
+    install_app_inner(false)
+}
+
+/// `resign`: re-sign the installed copy with the local certificate even if it is this app itself
+/// or was installed from the same source (macOS; it keeps the recorded source fingerprint).
+fn install_app_inner(resign: bool) -> Result<PathBuf> {
     let me = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
     #[cfg(windows)]
     {
+        let _ = resign;
         install_exe_into(&me, &stable_app())
     }
     #[cfg(not(windows))]
     {
         let target_app = stable_app();
         let target_exe = stable_exe();
-        if me.canonicalize().ok() == target_exe.canonicalize().ok() {
+        let is_installed_copy = me.canonicalize().ok() == target_exe.canonicalize().ok();
+        if is_installed_copy && !resign {
             return Ok(target_exe);
         }
         // compare the fingerprint of the unsigned source (codesign changed the installed copy's bytes)
-        let src_hash = sha256_file(&me).ok();
+        let src_hash = if is_installed_copy {
+            std::fs::read_to_string(source_stamp_path(&target_app)).ok().map(|s| s.trim().to_string())
+        } else {
+            sha256_file(&me).ok()
+        };
         if let Some(h) = &src_hash {
-            if installed_from(&target_app, h) {
+            if installed_from(&target_app, h) && !resign {
                 return Ok(target_exe);
             }
         }
@@ -462,9 +626,10 @@ pub fn install_app() -> Result<PathBuf> {
                 run(Command::new("/usr/bin/ditto").arg("--noqtn").arg(&bundle).arg(&staging), Duration::from_secs(120))?;
                 // the fingerprint is written before signing (changing Resources after signing breaks the bundle
                 // seal)
-                seal_bundle(&staging, src_hash.as_deref())?;
+                clear_quarantine(&staging);
+                seal_bundle(&staging, src_hash.as_deref(), true)?;
             }
-            None => build_bundle(&me, &staging)?,
+            None => build_bundle(&me, &staging, true)?,
         }
         // swap: move the existing installed copy aside, then put the new one in place (running processes
         // keep using the old files)
