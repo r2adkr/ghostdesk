@@ -468,6 +468,17 @@ impl GhostApp {
                     ui.add_space(10.0);
                     ui.label(theme::hint(trf("지금까지 쓴 양: 보낸 글 {} · 받은 글 {} 토큰", &[&ti, &to])));
                 }
+
+                ui.add_space(18.0);
+                theme::section(ui, tr("정보"));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
+                    ui.hyperlink_to(RichText::new(tr("릴리스 노트")).size(12.0), crate::update::RELEASES_PAGE);
+                });
+                if let crate::update::State::Available(r) | crate::update::State::Failed(r, _) = &*self.update.lock() {
+                    ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
+                }
             });
         });
         if lang != self.lang {

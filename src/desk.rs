@@ -182,7 +182,7 @@ impl Desk {
             return self.mouse_move(x, y, mods).await;
         }
         let dur = crate::cursor::glide_duration(dist);
-        let steps = ((dist / 22.0) as u32).clamp(4, 24);
+        let steps = crate::cursor::frames(dur);
         let dt = dur / steps;
         for i in 1..=steps {
             let t = crate::cursor::ease(i as f32 / steps as f32) as f64;

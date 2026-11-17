@@ -139,7 +139,8 @@ impl GhostApp {
                     _ => {
                         let failed = matches!(st, State::Failed(..));
                         if let State::Failed(_, e) = &st {
-                            ui.label(RichText::new(trf("업데이트 실패: {}", &[&crate::llm::short(e, 120)])).size(12.0).color(theme::warn()));
+                            ui.label(RichText::new(trf("업데이트 실패: {}", &[&crate::llm::short(e, 120)])).size(12.0).color(theme::warn()))
+                                .on_hover_text(e.as_str());
                         }
                         ui.horizontal(|ui| {
                             if r.installable() {

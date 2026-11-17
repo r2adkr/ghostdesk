@@ -208,12 +208,21 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "desk_action",
-            "description": format!("화면에서 마우스/키보드 동작을 한다 (Claude computer-use 와 같은 동작 이름). action: screenshot, left_click, right_click, middle_click, double_click, triple_click, left_click_drag(start_coordinate→coordinate), mouse_move, left_mouse_down, left_mouse_up, scroll(scroll_direction up/down/left/right, scroll_amount), type(text, 한글 가능), key(text: 'Return', '{}+a', 'ctrl+shift+t'; repeat), hold_key(text, duration), wait(duration), zoom(region [x0,y0,x1,y1]), cursor_position. 동작 뒤 스크린샷을 돌려준다.", pl.primary_mod),
+            "description": format!("화면에서 마우스/키보드 동작을 한다 (Claude computer-use 와 같은 동작 이름). action: screenshot, left_click, right_click, middle_click, double_click, triple_click, left_click_drag(start_coordinate→coordinate), mouse_move, left_mouse_down, left_mouse_up, scroll(scroll_direction up/down/left/right, scroll_amount), type(text, 한글 가능), key(text: 'Return', '{}+a', 'ctrl+shift+t'; repeat), hold_key(text, duration), wait(duration), zoom(region [x0,y0,x1,y1]), cursor_position. 동작 뒤 스크린샷을 돌려준다. \
+                 여러 동작을 한 번에: action 대신 actions 에 동작 객체 배열을 넣으면 순서대로 실행하고 끝에 스크린샷 한 장만 돌려준다 \
+                 (예: [{{\"action\":\"left_click\",\"coordinate\":[400,300]}},{{\"action\":\"type\",\"text\":\"서울 날씨\"}},{{\"action\":\"key\",\"text\":\"Return\"}}]). \
+                 결과를 보고 판단해야 하는 지점에서는 묶음을 끊으세요. 하나가 실패하면 거기서 멈추고 몇 번째까지 했는지 알려 준다 (최대 50개).", pl.primary_mod),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "desk_id": { "type": "string" },
                     "action": { "type": "string" },
+                    "actions": {
+                        "type": "array",
+                        "description": "action 대신: 순서대로 실행할 동작들. 각 항목은 action 과 그 동작의 인자(coordinate, text, …)를 가진 객체",
+                        "items": { "type": "object", "properties": { "action": { "type": "string" } }, "required": ["action"] },
+                        "minItems": 1, "maxItems": 50
+                    },
                     "coordinate": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                     "start_coordinate": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                     "text": { "type": "string" },
@@ -224,7 +233,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
                     "screenshot": { "type": "boolean", "description": "동작 뒤 스크린샷을 받을지 (기본 true)" }
                 },
-                "required": ["desk_id", "action"]
+                "required": ["desk_id"]
             }
         },
         {
@@ -249,6 +258,12 @@ fn tools_for(pl: &Plat) -> Value {
                 "properties": {
                     "desk_id": { "type": "string" },
                     "action": { "type": "string" },
+                    "actions": {
+                        "type": "array",
+                        "description": "action 대신: 순서대로 실행할 동작들. 각 항목은 action 과 그 동작의 인자(coordinate, text, …)를 가진 객체",
+                        "items": { "type": "object", "properties": { "action": { "type": "string" } }, "required": ["action"] },
+                        "minItems": 1, "maxItems": 50
+                    },
                     "id": { "type": "integer" }, "index": { "type": "integer" },
                     "text": { "type": "string" }, "option": { "type": "string" },
                     "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context"] },

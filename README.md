@@ -108,7 +108,7 @@ Kimi Code 와 pi 는 위 JSON 과 같은 `mcpServers` 형식이고, OpenCode 는
 "mcp": { "ghostdesk": { "type": "local", "command": ["/Applications/GhostDesk.app/Contents/MacOS/ghostdesk", "--mcp"], "enabled": true, "timeout": 30000 } }
 ```
 
-도구는 `desk_open`, `desk_action`(클릭·입력·스크롤, 결과로 스크린샷), `desk_browser`(주소 이동·탭), `desk_app`(앱 메뉴·접근성 요소), `desk_list`, `desk_close` 입니다.
+도구는 `desk_open`, `desk_action`(클릭·입력·스크롤, 결과로 스크린샷. `actions` 에 여러 동작을 넣으면 순서대로 하고 끝에 한 번만 찍음), `desk_browser`(주소 이동·탭), `desk_app`(앱 메뉴·접근성 요소), `desk_list`, `desk_close` 입니다.
 `desk_open` 의 `mode` 는 `web`, `web_login`, `app`, `app_login`, `app_running`, `app_vdisplay`, `session`, `remote` 이고(Windows 는 `app_vdisplay` 대신 `app_current_session`), 에이전트가 할 일에 맞춰 직접 고릅니다.
 외부 에이전트가 연 화면은 목록에 플러그 표시로 나오고 가상 마우스가 보입니다. 제어 소켓은 `~/Library/Application Support/GhostDesk/control.sock` 이고 권한은 0600 입니다.
 

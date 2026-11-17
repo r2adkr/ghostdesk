@@ -20,6 +20,8 @@ use tokio::runtime::Handle;
 
 /// 릴리스를 올리는 저장소
 const REPO: &str = "r2adkr/ghostdesk";
+/// 설정의 '릴리스 노트' 링크
+pub const RELEASES_PAGE: &str = "https://github.com/r2adkr/ghostdesk/releases";
 /// 이 OS·CPU 에서 받을 릴리스 파일의 이름 끝. 앞의 것부터 찾는다 (macOS 는 이 CPU 전용이 없으면 유니버설).
 /// 릴리스 파일 이름은 .github/workflows/release.yml 과 같아야 한다.
 fn asset_suffixes() -> &'static [&'static str] {
@@ -191,12 +193,24 @@ async fn latest(current: &str) -> Result<Option<Release>> {
 fn update_target() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
     if cfg!(target_os = "macos") {
-        exe.ancestors()
+        let bundle = exe
+            .ancestors()
             .find(|p| p.extension().is_some_and(|e| e == "app"))
             .map(Path::to_path_buf)
-            .context("GhostDesk.app 번들 안에서 실행 중이 아니라 앱 안에서 업데이트할 수 없습니다")
+            .context("GhostDesk.app 번들 안에서 실행 중이 아니라 앱 안에서 업데이트할 수 없습니다")?;
+        Ok(mac_target(&bundle))
     } else {
         Ok(exe)
+    }
+}
+
+/// 내려받은 zip 에서 바로 연 앱은 macOS 가 읽기 전용 임시 위치(AppTranslocation)에서 실행한다.
+/// 그 자리는 바꿔 넣을 수 없으므로 설치 위치(~/Applications/GhostDesk.app)에 새 버전을 넣고 거기서 다시 연다.
+fn mac_target(bundle: &Path) -> PathBuf {
+    if bundle.to_string_lossy().contains("/AppTranslocation/") {
+        crate::install::stable_app()
+    } else {
+        bundle.to_path_buf()
     }
 }
 
@@ -254,6 +268,9 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
     };
     // 같은 폴더에 받아야 이름 바꾸기만으로 바꿔 넣을 수 있다
     let staging = sibling(&me, &format!(".update-{}", std::process::id()));
+    if let Some(dir) = me.parent() {
+        tokio::fs::create_dir_all(dir).await.with_context(|| format!("{} 폴더를 만들 수 없습니다", dir.display()))?;
+    }
     let res: Result<()> = async {
         let mut resp = http.get(&asset.url).send().await?.error_for_status()?;
         let mut f = tokio::fs::File::create(&staging)
@@ -303,10 +320,16 @@ fn swap(zip: &Path, bundle: &Path) -> Result<()> {
         let new_app = unpacked.join("GhostDesk.app");
         anyhow::ensure!(new_app.join("Contents/MacOS/ghostdesk").is_file(), "받은 파일 안에 GhostDesk.app 이 없습니다");
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        // 설치 위치에 아직 앱이 없으면(옮겨 둔 적 없이 내려받은 곳에서 연 경우) 새 앱만 넣는다
         let old = sibling(bundle, &format!(".old-{secs}"));
-        std::fs::rename(bundle, &old).context("지금 앱을 옮기지 못했습니다")?;
+        let had = bundle.exists();
+        if had {
+            std::fs::rename(bundle, &old).context("지금 앱을 옮기지 못했습니다")?;
+        }
         if let Err(e) = std::fs::rename(&new_app, bundle) {
-            let _ = std::fs::rename(&old, bundle);
+            if had {
+                let _ = std::fs::rename(&old, bundle);
+            }
             return Err(anyhow::Error::from(e).context("새 앱을 제자리에 넣지 못했습니다"));
         }
         Ok(())
@@ -467,7 +490,23 @@ mod tests {
         std::process::Command::new("/usr/bin/ditto").args(["-c", "-k"]).arg(dir.join("x.txt")).arg(&bad).status().unwrap();
         assert!(swap(&bad, &target).is_err());
         assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/ghostdesk")).unwrap(), "new");
+
+        // 설치 위치에 아직 앱이 없어도 (내려받은 곳에서 바로 연 앱의 업데이트) 새 앱을 넣는다
+        let fresh = dir.join("fresh").join("GhostDesk.app");
+        std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+        let zip2 = dir.join("again.zip");
+        std::process::Command::new("/usr/bin/ditto").args(["-c", "-k", "--keepParent"]).arg(&new_app).arg(&zip2).status().unwrap();
+        swap(&zip2, &fresh).unwrap();
+        assert_eq!(std::fs::read_to_string(fresh.join("Contents/MacOS/ghostdesk")).unwrap(), "new");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translocated_app_updates_the_installed_copy() {
+        let t = Path::new("/private/var/folders/x/T/AppTranslocation/158384EE/d/GhostDesk.app");
+        assert_eq!(mac_target(t), crate::install::stable_app());
+        let normal = Path::new("/Applications/GhostDesk.app");
+        assert_eq!(mac_target(normal), normal);
     }
 
     #[test]

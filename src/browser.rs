@@ -910,9 +910,14 @@ impl BrowserWorkspace {
         if let Some((x, y)) = pos {
             self.mouse_move(x, y, mods).await?;
         }
+        // 사람처럼 누르고 잠깐 뒤 뗀다 (눌림 상태를 보고 반응하는 페이지가 있고, 화면의 클릭 표시와도 맞는다)
         for i in 1..=count.max(1) as i64 {
             self.mouse_down(button, i, mods).await?;
+            tokio::time::sleep(Duration::from_millis(crate::cursor::PRESS_MS)).await;
             self.mouse_up(button, i, mods).await?;
+            if i < count as i64 {
+                tokio::time::sleep(Duration::from_millis(crate::cursor::MULTI_CLICK_GAP_MS)).await;
+            }
         }
         Ok(())
     }
@@ -920,13 +925,14 @@ impl BrowserWorkspace {
     pub async fn drag(&self, from: (f64, f64), to: (f64, f64), mods: i64) -> Result<()> {
         self.mouse_move(from.0, from.1, mods).await?;
         self.mouse_down(MouseButton::Left, 1, mods).await?;
-        let steps = 12;
+        tokio::time::sleep(Duration::from_millis(crate::cursor::PRESS_MS)).await;
+        // 거리에 맞는 시간 동안 천천히 출발해 천천히 멈추는 경로로 끈다 (화면 표시의 미끄러짐과 같은 곡선)
+        let dist = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+        let steps = crate::cursor::frames(crate::cursor::glide_duration(dist));
         for i in 1..=steps {
-            let t = i as f64 / steps as f64;
-            let x = from.0 + (to.0 - from.0) * t;
-            let y = from.1 + (to.1 - from.1) * t;
-            self.mouse_move(x, y, mods).await?;
-            tokio::time::sleep(Duration::from_millis(16)).await;
+            let t = crate::cursor::ease(i as f32 / steps as f32) as f64;
+            self.mouse_move(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t, mods).await?;
+            tokio::time::sleep(Duration::from_millis(crate::cursor::FRAME_MS)).await;
         }
         self.mouse_up(MouseButton::Left, 1, mods).await
     }
@@ -939,8 +945,16 @@ impl BrowserWorkspace {
             }
             None => self.mouse_pos(),
         };
-        self.mouse_event("mouseWheel", x, y, "none", 0, mods, json!({ "deltaX": dx, "deltaY": dy }))
-            .await
+        // 한 번에 크게 건너뛰지 않고 여러 번의 작은 휠 이벤트로 나눠, 빠르게 시작해 천천히 멈추게 굴린다
+        let parts = crate::cursor::scroll_parts(dx.abs().max(dy.abs()));
+        let n = parts.len();
+        for (i, f) in parts.into_iter().enumerate() {
+            self.mouse_event("mouseWheel", x, y, "none", 0, mods, json!({ "deltaX": dx * f, "deltaY": dy * f })).await?;
+            if i + 1 < n {
+                tokio::time::sleep(Duration::from_millis(crate::cursor::FRAME_MS)).await;
+            }
+        }
+        Ok(())
     }
 
     fn clamp(&self, x: f64, y: f64) -> (f64, f64) {

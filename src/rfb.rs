@@ -829,7 +829,7 @@ impl RfbDesk {
                 self.send_pointer().await?;
                 self.input.lock().buttons &= !bit;
                 self.send_pointer().await?;
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
         self.set_mods(0).await

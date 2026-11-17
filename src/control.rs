@@ -861,6 +861,9 @@ impl ControlServer {
         }
         let tool = p["tool"].as_str().unwrap_or("computer");
         let input = &p["input"];
+        if tool == "computer" && input.get("actions").is_some() {
+            return self.act_sequence(&shared, &desk, input, p["screenshot"].as_bool().unwrap_or(true)).await;
+        }
         let name = match tool {
             "computer" => input["action"].as_str().ok_or_else(|| anyhow!("input.action 이 필요합니다"))?.to_string(),
             "browser" => "browser_control".to_string(),
@@ -895,21 +898,69 @@ impl ControlServer {
                 return Err(e);
             }
         };
-        let mut image = out.image;
-        let want_shot = p["screenshot"].as_bool().unwrap_or(true);
-        if image.is_none() && want_shot {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            image = desk.screenshot().await.ok();
+        let text = if out.text.is_empty() { "OK".to_string() } else { out.text };
+        act_reply(&desk, text, out.image, p["screenshot"].as_bool().unwrap_or(true)).await
+    }
+
+    /// `input.actions`: 여러 computer 동작을 순서대로 실행한다 (한 번의 호출로 클릭 → 입력 → Enter 같은 묶음).
+    /// 하나가 실패하거나 사용자가 중지·일시정지하면 거기서 멈추고, 몇 번째까지 했는지 알린다. 화면은 끝에 한 번만 찍는다.
+    async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, input: &Value, want_shot: bool) -> Result<Value> {
+        let steps = input["actions"].as_array().ok_or_else(|| anyhow!("actions 는 동작 객체의 배열이어야 합니다"))?;
+        anyhow::ensure!(!steps.is_empty(), "actions 가 비어 있습니다");
+        anyhow::ensure!(steps.len() <= MAX_SEQUENCE, "actions 는 한 번에 {MAX_SEQUENCE}개까지입니다 (받은 수: {})", steps.len());
+        let mut lines = Vec::new();
+        let mut image = None;
+        for (i, step) in steps.iter().enumerate() {
+            let n = i + 1;
+            let name = match step["action"].as_str() {
+                Some(a) => a.to_string(),
+                None => bail!("{}{n}번째 항목에 action 이 없습니다", done_prefix(&lines)),
+            };
+            if shared.stop.swap(false, Ordering::SeqCst) {
+                shared.log(LogKind::Info, "사용자가 '중지'를 눌러 외부 에이전트의 동작을 멈췄습니다");
+                bail!("{}사용자가 GhostDesk 창에서 '중지'를 눌러 {n}번째 동작부터 실행하지 않았습니다. 사용자에게 다음 지시를 확인하세요.", done_prefix(&lines));
+            }
+            if shared.paused.load(Ordering::SeqCst) {
+                bail!("{}사용자가 직접 조작을 시작해 {n}번째 동작부터 실행하지 않았습니다. 잠시 후 화면을 확인하고 이어서 하세요.", done_prefix(&lines));
+            }
+            let desc = agent::describe(&name, step);
+            shared.log(LogKind::Action, desc.clone());
+            shared.set_status(AgentStatus::Acting(short(&format!("{n}/{} {desc}", steps.len()), 60)));
+            let aim = |pt: (f64, f64)| {
+                shared.cursor.lock().aim(pt, desk.mouse_pos());
+                shared.ctx.request_repaint();
+            };
+            let r = agent::exec_computer(desk, &name, step, &aim).await;
+            shared.cursor.lock().record(&name, step, desk.mouse_pos(), false);
+            shared.ctx.request_repaint();
+            match r {
+                Ok(o) => {
+                    lines.push(format!("{n}. {name}: {}", if o.text.is_empty() { "OK" } else { &o.text }));
+                    if o.image.is_some() {
+                        image = o.image;
+                    }
+                }
+                Err(e) => {
+                    shared.log(LogKind::Error, format!("{name} 실패: {e:#}"));
+                    let client = shared.external.lock().clone().unwrap_or_default();
+                    shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+                    bail!("{}{n}번째 동작({name})이 실패해 거기서 멈췄습니다: {e:#}", done_prefix(&lines));
+                }
+            }
+            // 화면이 앞 동작에 반응할 틈 (사람이 잇달아 누르는 정도)
+            if n < steps.len() {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
         }
-        let notes = desk.take_notes();
-        let (w, h) = desk.size();
-        Ok(json!({
-            "text": if out.text.is_empty() { "OK".to_string() } else { out.text },
-            "notes": notes,
-            "views": desk.views_text(),
-            "size": [w, h],
-            "screenshot_png": image.map(|b| B64.encode(b)),
-        }))
+        let client = shared.external.lock().clone().unwrap_or_default();
+        shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+        shared.ctx.request_repaint();
+        // 묶음 끝의 화면이 중요하므로, 중간 스크린샷이 있어도 마지막 동작이 스크린샷이 아니면 새로 찍는다
+        let last_is_shot = steps.last().and_then(|s| s["action"].as_str()).is_some_and(|a| a == "screenshot" || a == "zoom");
+        if !last_is_shot {
+            image = None;
+        }
+        act_reply(desk, lines.join("\n"), image, want_shot).await
     }
 
     async fn close(&self, p: &Value, conn: &Conn) -> Result<Value> {
@@ -925,6 +976,36 @@ impl ControlServer {
         self.shutdown_entry(e, "외부 에이전트가 화면을 닫았습니다").await;
         Ok(json!({ "closed": id }))
     }
+}
+
+/// 한 번의 desk_action 으로 실행할 수 있는 동작 수
+const MAX_SEQUENCE: usize = 50;
+
+/// 묶음이 중간에 멈췄을 때 앞에서 실행된 것을 알리는 머리말
+fn done_prefix(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("앞의 {}개는 실행했습니다 ({}). ", lines.len(), lines.join(" / "))
+    }
+}
+
+/// 동작 결과: 글, 이벤트, 창·탭 목록, 화면 (`want_shot` 이고 동작이 화면을 돌려주지 않았으면 새로 찍는다)
+async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot: bool) -> Result<Value> {
+    let mut image = image;
+    if image.is_none() && want_shot {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        image = desk.screenshot().await.ok();
+    }
+    let notes = desk.take_notes();
+    let (w, h) = desk.size();
+    Ok(json!({
+        "text": text,
+        "notes": notes,
+        "views": desk.views_text(),
+        "size": [w, h],
+        "screenshot_png": image.map(|b| B64.encode(b)),
+    }))
 }
 
 /// GUI 실행마다 달라지는 짧은 태그 (pid + 시작 시각)

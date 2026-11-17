@@ -51,6 +51,29 @@ pub fn glide_duration(dist: f64) -> Duration {
     Duration::from_millis((140.0 + dist * 0.3).clamp(140.0, 480.0) as u64)
 }
 
+/// 실제 입력을 나눠 보낼 때 한 걸음 사이 시간 (약 60fps)
+pub const FRAME_MS: u64 = 16;
+/// 버튼을 누르고 있는 시간
+pub const PRESS_MS: u64 = 45;
+/// 더블·트리플 클릭의 클릭 사이 간격 (운영체제의 더블 클릭 인식 시간보다 충분히 짧게)
+pub const MULTI_CLICK_GAP_MS: u64 = 70;
+
+/// `dur` 동안 한 프레임씩 나눈 걸음 수
+pub fn frames(dur: Duration) -> u32 {
+    ((dur.as_millis() as u64 / FRAME_MS) as u32).clamp(6, 30)
+}
+
+/// 스크롤 `amount`(픽셀)를 나눠 보낼 비율들 (합은 1). 처음에 많이, 끝으로 갈수록 적게 (ease-out).
+/// 작은 스크롤은 한 번에 보낸다.
+pub fn scroll_parts(amount: f64) -> Vec<f64> {
+    if amount <= 60.0 {
+        return vec![1.0];
+    }
+    let n = ((amount / 40.0) as usize).clamp(4, 16);
+    let out = |t: f64| 1.0 - (1.0 - t).powi(3);
+    (1..=n).map(|i| out(i as f64 / n as f64) - out((i - 1) as f64 / n as f64)).collect()
+}
+
 /// ease-in-out (cubic)
 pub fn ease(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -375,6 +398,17 @@ pub fn paint(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn scroll_is_split_and_slows_down() {
+        assert_eq!(scroll_parts(30.0), vec![1.0]);
+        let p = scroll_parts(300.0);
+        assert!(p.len() >= 4);
+        assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!(p.windows(2).all(|w| w[0] >= w[1]), "{p:?}");
+        assert_eq!(frames(glide_duration(0.0)), 8);
+        assert_eq!(frames(Duration::from_secs(5)), 30);
+    }
 
     #[test]
     fn records_actions() {
