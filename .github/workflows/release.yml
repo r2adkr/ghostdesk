@@ -78,12 +78,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 설명은 태그 메시지를 파일로 꺼내 넘긴다. 실패하면 그 줄을 오류 주석으로 남긴다
+      # (공개 저장소의 실행 로그는 로그인해야 보이지만 주석은 누구나 볼 수 있다)
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist
-          sha256sum GhostDesk-* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          gh release create "$GITHUB_REF_NAME" GhostDesk-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --notes-from-tag --title "GhostDesk $GITHUB_REF_NAME"
+          set -euo pipefail
+          ls -l dist
+          (cd dist && sha256sum GhostDesk-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+          [ -s notes.md ] || { echo "::error::태그 $GITHUB_REF_NAME 에 메시지가 없습니다 (git tag -a 로 만드세요)"; exit 1; }
+          if ! out=$(gh release create "$GITHUB_REF_NAME" dist/GhostDesk-* dist/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --title "GhostDesk $GITHUB_REF_NAME" --notes-file notes.md 2>&1); then
+            echo "$out"
+            echo "::error::gh release create 실패: $(echo "$out" | tail -n 3 | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "$out"
