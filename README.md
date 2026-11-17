@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-0.5.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.5.0/GhostDesk-0.5.0-windows-x64.exe)
+- **Windows x64:** [GhostDesk-0.6.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.0/GhostDesk-0.6.0-windows-x64.exe)
 
   Download it and run it; there is no installer. The executable is unsigned, so
   SmartScreen may warn you the first time. If GhostDesk is already installed,
@@ -33,7 +33,7 @@ screen types, install location, building) are collected in the
   (`%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe`) and starts it. A newer
   installed copy is never replaced by an older one.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.5.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.5.0/GhostDesk-0.5.0-macos-universal.zip)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.0/GhostDesk-0.6.0-macos-universal.zip)
 
   Unzip it and move GhostDesk.app to Applications. The app is not notarized,
   so macOS blocks it the first time: open System Settings → Privacy & Security
