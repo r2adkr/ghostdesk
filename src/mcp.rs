@@ -200,8 +200,11 @@ fn tools_for(pl: &Plat) -> Value {
     let names: Vec<&str> = modes.iter().map(|(n, _)| *n).collect();
     let mode_desc = modes.iter().map(|(n, d)| format!("{n}={d}")).collect::<Vec<_>>().join("; ");
     let app_desc = format!(
-        "앱 화면의 보조 조작. Electron 앱: action=list|click (source=app|context, path='File > New Text File') 로 네이티브 메뉴 사용. {apps}: action=list_windows | switch_window{{index}} | ui_tree{{max_depth}} | press{{id}} | set_value{{id,text}} | focus{{id}} | select{{id}} | choose{{id,option}} | menus | menu{{path:'파일 > 신규'}} | read{{id}}. ui_tree 의 id 는 다음 ui_tree 전까지 유효하다."
+        "앱 화면의 보조 조작. Electron 앱: action=list|click (source=app|context, path='File > New Text File') 로 네이티브 메뉴 사용. dialog 로 대기 중인 대화상자를 조회하고 respond_dialog 에 반환된 source·id 를 지정한다. source=native 는 response (0부터 시작하는 버튼 번호), source=javascript 는 accept (true/false)와 prompt_text 로 응답한다. 삭제·결제 등 되돌릴 수 없는 응답은 작업에서 허용한 범위인지 먼저 확인한다. {apps}: action=list_windows | switch_window{{index}} | ui_tree{{max_depth}} | press{{id}} | set_value{{id,text}} | focus{{id}} | select{{id}} | choose{{id,option}} | menus | menu{{path:'파일 > 신규'}} | read{{id}}. ui_tree 의 id 는 다음 ui_tree 전까지 유효하다."
     );
+    let app_desc = if pl.child_session {
+        format!("{app_desc} Windows 자식 세션에서도 list_windows, switch_window, ui_tree, press, set_value, focus, select, choose, read 를 사용할 수 있다. 창·포커스를 바꾼 뒤 ui_tree 를 다시 조회한다. 긴 글은 set_value 후 read 로 확인한다. 이 세션의 앱 메뉴는 화면이나 키보드로 조작한다.")
+    } else { app_desc };
     let mut t = json!([
         {
             "name": "desk_open",
@@ -214,6 +217,9 @@ fn tools_for(pl: &Plat) -> Value {
                     "url": { "type": "string", "description": "web: 처음 열 URL" },
                     "account": { "type": "string", "description": "session: 전용 에이전트 macOS 계정 이름 (기본 ghostdesk-agent)" },
                     "browser": { "type": "string", "description": "web: Chrome / Edge / Whale 등 (기본: 처음 찾은 것)" },
+                    "browser_profile": { "type": "string", "description": "web_login: 탐지된 브라우저 프로필 ID (Default, Profile 1 등) 또는 표시 이름. 생략하면 첫 프로필" },
+                    "workspace": { "type": "string", "description": "재사용할 작업공간 이름. 이전 복제 로그인·앱 데이터를 유지한다. 로그인 사용 여부별로 분리되며 동시에 사용 중이면 별도 이름으로 열린다" },
+                    "refresh_login": { "type": "boolean", "description": "web_login/app_login 전용: 기존 작업공간의 복제 데이터를 원본에서 새로 복사한 데이터로 교체한다. 이전 복제본에서 변경한 데이터는 사라질 수 있다" },
                     "name": { "type": "string", "description": "화면 이름" },
                     "host": { "type": "string" }, "port": { "type": "integer" },
                     "username": { "type": "string" }, "password": { "type": "string" },
@@ -255,14 +261,17 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "desk_browser",
-            "description": "브라우저 화면의 주소 이동과 탭 관리 (화면에 주소창이 없으므로 이것을 쓴다). action: navigate(url), back, forward, reload, new_tab(url), switch_tab(index), close_tab(index), list_tabs.",
+            "description": "브라우저 화면의 주소 이동·탭 관리·대화상자 응답. action: navigate(url), back, forward, reload, new_tab(url), switch_tab(index), close_tab(index), list_tabs, dialog, respond_dialog(id,accept,prompt_text). confirm/prompt 는 자동 수락하지 않는다. dialog 에서 받은 현재 id 와 명시적인 accept=true/false 로 응답한다. 입력 중 대화상자가 열렸다면 같은 입력을 반복하지 말고 먼저 조회한다. 삭제·결제 같은 응답은 작업에서 허용한 범위인지 확인한다.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "desk_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs"] },
+                    "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
                     "url": { "type": "string" },
-                    "index": { "type": "integer" }
+                    "index": { "type": "integer" },
+                    "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: dialog 에서 받은 현재 id" },
+                    "accept": { "type": "boolean", "description": "respond_dialog: 수락 true / 취소 false 를 반드시 명시" },
+                    "prompt_text": { "type": "string", "description": "respond_dialog: prompt 에 넣을 답변" }
                 },
                 "required": ["desk_id", "action"]
             }
@@ -283,8 +292,11 @@ fn tools_for(pl: &Plat) -> Value {
                     },
                     "id": { "type": "integer" }, "index": { "type": "integer" },
                     "text": { "type": "string" }, "option": { "type": "string" },
-                    "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context"] },
-                    "max_depth": { "type": "integer" }
+                    "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context", "javascript", "native"], "description": "메뉴 list/click: app|context. respond_dialog: dialog 가 반환한 javascript|native" },
+                    "max_depth": { "type": "integer" },
+                    "response": { "type": "integer", "minimum": 0, "description": "native respond_dialog: 0부터 시작하는 버튼 번호" },
+                    "accept": { "type": "boolean", "description": "javascript respond_dialog: 명시적 수락 또는 취소" },
+                    "prompt_text": { "type": "string", "description": "javascript respond_dialog: prompt 답변" }
                 },
                 "required": ["desk_id", "action"]
             }
@@ -1097,6 +1109,23 @@ mod tests {
             // the user says so
             let d = props["dedicated_machine"]["description"].as_str().unwrap();
             assert!(d.contains("직접 말했을 때만") && d.contains("이 컴퓨터 자신의 VNC 서버") && !d.contains("Mac"), "{d}");
+        }
+    }
+
+    #[test]
+    fn schema_exposes_clone_refresh_profile_and_explicit_dialog_responses() {
+        let tools = tools();
+        let open = &tools[0]["inputSchema"]["properties"];
+        for key in ["workspace", "browser_profile"] { assert_eq!(open[key]["type"], "string", "{key}"); }
+        assert_eq!(open["refresh_login"]["type"], "boolean");
+        assert!(open["refresh_login"]["description"].as_str().unwrap().contains("교체"));
+        for name in ["desk_browser", "desk_app"] {
+            let Some(tool) = tools.as_array().unwrap().iter().find(|tool| tool["name"] == name) else { continue };
+            let props = &tool["inputSchema"]["properties"];
+            assert_eq!(props["id"]["type"], "integer");
+            assert_eq!(props["accept"]["type"], "boolean");
+            assert_eq!(props["prompt_text"]["type"], "string");
+            assert!(props["accept"].get("default").is_none());
         }
     }
 

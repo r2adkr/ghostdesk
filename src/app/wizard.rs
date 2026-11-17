@@ -114,8 +114,7 @@ pub(super) struct AppListItem {
 enum AutoPick {
     Web,
     App { label: String, path: String, electron: Option<usize> },
-    /// A Windows Store app (Notepad, …) that can't be hidden, so it runs in a child session, where
-    /// it has a whole separate Windows screen to itself.
+    /// An app that needs a full Windows screen instead of hidden-window control.
     ChildSession { label: String },
 }
 
@@ -138,7 +137,7 @@ fn store_app(task: &str) -> Option<&'static str> {
     STORE_APPS.iter().find(|(ko, en)| t.contains(ko) || word_at(&t, en)).map(|(ko, _)| *ko)
 }
 
-/// The app on this computer named in the task (unpickable apps excluded); the longest name wins
+/// The app on this computer named in the task; the longest name wins
 /// when several match ('Visual Studio Code' over 'Code'). A URL (http, www) means web.
 ///
 /// English names only match on word boundaries ('Notes' doesn't match 'footnotes'), and names
@@ -152,7 +151,6 @@ fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem>
     }
     items
         .iter()
-        .filter(|it| it.disabled.is_none())
         .filter_map(|it| {
             // match on both the display name (메모) and the file name (Notes)
             let file = std::path::Path::new(&it.path).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -541,7 +539,7 @@ impl GhostApp {
     fn simple_auto(&mut self, ui: &mut egui::Ui) {
         let line = match self.auto_pick() {
             AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
-            AutoPick::ChildSession { label } => trf("→ '{}' 은(는) Store 앱이라 자식 세션(보이지 않는 별도 Windows 화면)에서 일해요", &[&label]),
+            AutoPick::ChildSession { label } => trf("→ '{}' 앱은 별도 Windows 화면에서 실행해요. 실제 계정·데이터를 사용해요.", &[&label]),
             AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 어디서 일할지 정해요 (적지 않으면 웹사이트)").to_string(),
             AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
         };
@@ -558,6 +556,8 @@ impl GhostApp {
         let natives = self.native_apps.lock().clone().unwrap_or_default();
         let items = app_list_items(&electrons, &natives, false);
         match auto_app(&self.form.task, &items) {
+            Some(it) if it.disabled.is_some() && cfg!(windows) && caps::SESSION => AutoPick::ChildSession { label: it.label.clone() },
+            Some(it) if it.disabled.is_some() => AutoPick::Web,
             Some(it) => AutoPick::App { label: it.label.clone(), path: it.path.clone(), electron: it.electron },
             None => match store_app(&self.form.task) {
                 Some(label) if cfg!(windows) && caps::SESSION => AutoPick::ChildSession { label: tr(label).to_string() },
@@ -590,11 +590,14 @@ impl GhostApp {
             if r.changed() && self.form.web_use_login && self.form.profile_idx.is_none_or(|i| i >= profiles.len()) {
                 self.form.profile_idx = Some(0);
             }
-            // with several profiles, show just the name of the one being cloned (never the account address)
+            // Keep the login choice beside its switch so the source account is visible before starting.
             if self.form.web_use_login && profiles.len() > 1 {
-                if let Some(p) = self.form.profile_idx.and_then(|i| profiles.get(i)) {
-                    ui.label(theme::hint(profile_short(&p.name)));
-                }
+                let selected = self.form.profile_idx.and_then(|i| profiles.get(i)).map(|p| profile_short(&p.name)).unwrap_or_default();
+                egui::ComboBox::from_id_salt("simple_profile").selected_text(selected).width(160.0).show_ui(ui, |ui| {
+                    for (i, p) in profiles.iter().enumerate() {
+                        ui.selectable_value(&mut self.form.profile_idx, Some(i), &p.name);
+                    }
+                });
             }
         });
     }
@@ -625,7 +628,9 @@ impl GhostApp {
                 // one-line list: left-aligned, each row clickable across its full width
                 ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    let mut found = false;
                     for it in items.iter().filter(|it| q.is_empty() || it.label.to_lowercase().contains(&q) || it.path.to_lowercase().contains(&q)) {
+                        found = true;
                         match &it.disabled {
                             // Electron apps that can't be launched hidden: listed but unpickable, with the reason
                             Some(reason) => {
@@ -638,6 +643,12 @@ impl GhostApp {
                                     self.form.electron_idx = it.electron;
                                 }
                             }
+                        }
+                    }
+                    if !found && !detecting {
+                        ui.label(theme::hint(tr("검색 결과가 없어요. 앱 이름을 줄여서 찾아보세요.")));
+                        if !q.is_empty() && theme::secondary(ui, tr("검색 지우기")).clicked() {
+                            self.form.app_search.clear();
                         }
                     }
                 });
@@ -658,6 +669,9 @@ impl GhostApp {
         if cfg!(windows) {
             ui.add(theme::switch(&mut self.form.native_current_session, tr("숨은 화면에서 내 계정 그대로 실행")))
                 .on_hover_text(tr("보이지 않는 별도 Windows 화면에 앱을 새로 띄워요. 앱의 실제 로그인과 데이터를 써요."));
+            if !current && items.iter().any(|it| it.disabled.is_some()) {
+                ui.label(theme::hint(tr("선택할 수 없는 앱은 위 옵션이나 '별도 세션'에서 실행을 시도할 수 있어요. 실제 계정·데이터를 사용해요.")));
+            }
         }
         if current {
             self.form.electron_idx = None;
@@ -1217,7 +1231,7 @@ mod tests {
         assert_eq!(pick("Open Visual Studio Code and run the tests"), Some("Visual Studio Code"), "긴 이름 우선");
         assert_eq!(pick("notes 앱에 장보기 목록 적어줘"), Some("Notes"));
         assert_eq!(pick("Write footnotes for the paper"), None, "낱말 안의 일부는 아님");
-        assert_eq!(pick("슬랙 대신 Slack 에 올려줘"), None, "고를 수 없는 앱은 빼고");
+        assert_eq!(pick("슬랙 대신 Slack 에 올려줘"), Some("Slack"), "지원하지 않는 앱도 먼저 식별해서 다른 실행 경로를 안내");
         assert_eq!(pick("https://code.org 에서 강의 찾아줘"), None, "주소가 있으면 웹");
         assert_eq!(pick("네이버에서 오늘 날씨 찾아줘"), None);
 

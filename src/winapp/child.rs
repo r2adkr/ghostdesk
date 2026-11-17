@@ -118,6 +118,13 @@ fn helper_allowed(marker: Option<u32>, me: u32, console: u32) -> Result<(), Stri
     }
 }
 
+fn require_isolated_clipboard(redirected: Option<bool>) -> Result<()> {
+    if redirected != Some(false) {
+        bail!("자식 세션의 클립보드 격리를 확인하지 못했습니다. 사용자 클립보드를 보호하기 위해 연결하지 않았습니다.");
+    }
+    Ok(())
+}
+
 // ---- enabling the feature (admin) ----
 
 /// `ghostdesk --enable-child-sessions` (runs elevated).
@@ -167,8 +174,136 @@ struct ChildPlatform {
     session: u32,
 }
 
+/// UI element ids belong to one helper connection and one observed foreground window.
+#[derive(Default)]
+pub(crate) struct AppControl {
+    windows: Vec<super::w32::Hwnd>,
+    nodes: Vec<super::uia::Node>,
+    tree_for: Option<super::w32::Hwnd>,
+}
+
+fn process_in_session(pid: u32, session: u32) -> bool {
+    let mut found = u32::MAX;
+    unsafe { ProcessIdToSessionId(pid, &mut found) != 0 && found == session }
+}
+
+fn app_rect_to_frame(r: (i32, i32, i32, i32), screen: (i32, i32), frame: (u32, u32)) -> [i64; 4] {
+    [r.0 as i64 * frame.0 as i64 / screen.0 as i64, r.1 as i64 * frame.1 as i64 / screen.1 as i64,
+        (r.2 - r.0) as i64 * frame.0 as i64 / screen.0 as i64, (r.3 - r.1) as i64 * frame.1 as i64 / screen.1 as i64]
+}
+
+impl AppControl {
+    fn run(&mut self, input: &serde_json::Value, session: u32, frame: (u32, u32), check: &dyn Fn() -> Result<()>) -> Result<String> {
+        use super::{uia, w32};
+        check()?;
+        helper_allowed(read_marker(), my_session_id(), unsafe { WTSGetActiveConsoleSessionId() }).map_err(|e| anyhow!(e))?;
+        if session != my_session_id() { bail!("앱 요소 조작 대상 세션이 헬퍼와 다릅니다"); }
+        uia::com_init();
+        let action = input["action"].as_str().unwrap_or("");
+        if !matches!(action, "list_windows" | "switch_window" | "ui_tree" | "press" | "set_value" | "read" | "focus" | "select" | "choose") {
+            bail!("지원하지 않는 app_control 동작입니다: {action}");
+        }
+        if action == "list_windows" {
+            self.windows = crate::platform::win::top_level_hwnds().into_iter().filter_map(|h| {
+                let w = crate::platform::win::window_info(h);
+                (w.visible && !w.cloaked && process_in_session(w.pid, session)
+                    && !super::guard::is_helper_class(&w.class) && !super::guard::is_shell_window(&w)).then_some(w.hwnd)
+            }).collect();
+            if self.windows.is_empty() { return Ok("열린 앱 창이 없습니다. 자식 세션에서 앱을 먼저 여세요.".into()); }
+            let foreground = w32::root(w32::foreground());
+            return Ok(self.windows.iter().enumerate().map(|(i, h)| format!("{} [{i}] '{}' ({}){}", if *h == foreground { "▶" } else { " " },
+                w32::window_text(*h), w32::class_name(*h), if w32::is_enabled(*h) { "" } else { " (대화상자가 열려 비활성)" })).collect::<Vec<_>>().join("\n"));
+        }
+        if action == "switch_window" {
+            let index = input["index"].as_u64().ok_or_else(|| anyhow!("index 가 필요합니다"))? as usize;
+            let h = *self.windows.get(index).ok_or_else(|| anyhow!("먼저 list_windows 로 창 목록을 확인하세요"))?;
+            if !w32::is_window(h) || !process_in_session(w32::thread_pid(h).1, session) || !w32::is_enabled(h) {
+                bail!("이 창은 닫혔거나 대화상자가 열려 조작할 수 없습니다. list_windows 를 다시 확인하세요");
+            }
+            check()?;
+            mark_pending_input();
+            unsafe {
+                if windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(h as _) != 0 {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync(h as _, windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE);
+                }
+                windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h as _);
+            }
+            self.nodes.clear();
+            self.tree_for = None;
+            if w32::root(w32::foreground()) != h { bail!("창 전환이 반영되지 않았습니다. 자식 세션 화면에서 창을 클릭하세요"); }
+            return Ok(format!("창 '{}' 로 전환했습니다", w32::window_text(h)));
+        }
+        let top = w32::root(w32::foreground());
+        if top == 0 || !process_in_session(w32::thread_pid(top).1, session) {
+            bail!("자식 세션의 활성 창을 찾지 못했습니다. 먼저 앱 창을 여세요");
+        }
+        if action == "ui_tree" {
+            let depth = input["max_depth"].as_u64().unwrap_or(30).clamp(1, 80) as usize;
+            let nodes = uia::snapshot(top, depth, 500, |_| true)?;
+            self.nodes = nodes.iter().map(|(_, n)| n.clone()).collect();
+            self.tree_for = Some(top);
+            let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN).max(1), GetSystemMetrics(SM_CYSCREEN).max(1)) };
+            let (fw, fh) = if frame.0 == 0 || frame.1 == 0 { (sw as u32, sh as u32) } else { frame };
+            let lines = nodes.iter().enumerate().map(|(i, (depth, n))| {
+                let r = app_rect_to_frame(n.rect, (sw, sh), (fw, fh));
+                format!("{}{} {} \"{}\" value=\"{}\" [{},{},{},{}]{}{}", "  ".repeat(depth.saturating_sub(1).min(12)), i + 1,
+                    uia::type_name(n.ctype), w32::short(&n.name, 70), w32::short(n.value.as_deref().unwrap_or(""), 80),
+                    r[0], r[1], r[2], r[3],
+                    if n.enabled { "" } else { " disabled" }, if n.focused { " focused" } else { "" })
+            }).collect::<Vec<_>>();
+            return Ok(format!("창 '{}' (스크린샷 {fw}x{fh} 좌표):\n{}", w32::window_text(top), lines.join("\n")));
+        }
+        if self.tree_for != Some(top) { bail!("창이 바뀌었거나 UI 목록이 없습니다. ui_tree 를 다시 호출하세요"); }
+        let id = input["id"].as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| anyhow!("id 가 필요합니다"))?;
+        let node = id.checked_sub(1).and_then(|i| self.nodes.get(i)).ok_or_else(|| anyhow!("id {id} 가 없습니다. ui_tree 를 다시 호출하세요"))?;
+        if !process_in_session(node.el.process_id()?, session) { bail!("UI 요소가 확인된 자식 세션에 속하지 않습니다"); }
+        if action == "read" {
+            let value = node.el.value().or_else(|| node.el.document_text()).unwrap_or_default();
+            return Ok(format!("{} '{}'\nvalue:\n{value}", uia::type_name(node.ctype), node.el.name()));
+        }
+        if !w32::is_enabled(top) || !node.el.current_enabled() { bail!("창 또는 요소가 비활성화되어 있습니다. 대화상자를 먼저 확인하세요"); }
+        check()?;
+        // UIA providers may return before their queued focus/selection changes are visible.
+        mark_pending_input();
+        match action {
+            "press" => {
+                if node.toggle.is_some() { node.el.toggle()?; }
+                else if node.invoke { node.el.invoke()?; }
+                else if node.select { node.el.select()?; }
+                else if node.expand { node.el.expand_toggle()?; }
+                else { bail!("이 요소는 버튼 동작을 제공하지 않습니다. 자식 세션 화면에서 좌표로 클릭하세요"); }
+                Ok(format!("'{}' 요소를 눌렀습니다", node.name))
+            }
+            "focus" => { node.el.focus_in_child_session(session)?; Ok(format!("'{}' 요소에 포커스를 주었습니다", node.name)) }
+            "select" => { node.el.select()?; Ok(format!("'{}' 요소를 선택했습니다", node.name)) }
+            "set_value" => {
+                let text = input["text"].as_str().ok_or_else(|| anyhow!("text 가 필요합니다"))?;
+                let result = node.el.set_value(text);
+                let mut actual = node.el.value().or_else(|| node.el.document_text());
+                if actual.as_deref() != Some(text) && node.hwnd != 0 && process_in_session(w32::thread_pid(node.hwnd).1, session)
+                    && super::workspace::is_edit_class(&w32::class_name(node.hwnd))
+                    && w32::style(node.hwnd) & windows_sys::Win32::UI::WindowsAndMessaging::ES_READONLY as u32 == 0 {
+                    check()?;
+                    if w32::set_control_text(node.hwnd, text) { actual = w32::control_text(node.hwnd); }
+                }
+                if actual.as_ref().map(|s| s.replace("\r\n", "\n")) == Some(text.replace("\r\n", "\n")) {
+                    Ok(format!("'{}' 값 설정을 확인했습니다 ({}자)", node.name, text.chars().count()))
+                } else { bail!("값 설정을 확인하지 못했습니다{}", result.err().map(|e| format!(": {e}")).unwrap_or_default()); }
+            }
+            "choose" => {
+                let option = input["option"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| anyhow!("option 이 필요합니다"))?;
+                let selected = node.el.choose_in_child_session(option, session)?;
+                Ok(format!("'{selected}' 선택을 요청했습니다"))
+            }
+            _ => bail!("지원하지 않는 app_control 동작입니다: {action}"),
+        }
+    }
+}
+
 static QUEUED_INPUT: AtomicU64 = AtomicU64::new(0);
 static OBSERVED_INPUT: AtomicU64 = AtomicU64::new(0);
+
+fn mark_pending_input() { QUEUED_INPUT.fetch_add(1, Ordering::SeqCst); }
 
 fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe {
@@ -187,7 +322,7 @@ fn send(inputs: &[INPUT]) -> Result<()> {
             input.Anonymous.mi.dwFlags & !(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK) != 0
         })
     });
-    if changes_focus_or_selection { QUEUED_INPUT.fetch_add(1, Ordering::SeqCst); }
+    if changes_focus_or_selection { mark_pending_input(); }
     let n = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
     if n as usize != inputs.len() {
         bail!("SendInput 실패 ({}/{}): {}", n, inputs.len(), std::io::Error::last_os_error());
@@ -262,6 +397,10 @@ impl ChildPlatform {
 }
 
 impl SessionPlatform for ChildPlatform {
+    fn supports_app_control(&self) -> bool { true }
+    fn app_control(&self, input: &serde_json::Value, state: &mut crate::session::AppControlState, frame: (u32, u32), check: &dyn Fn() -> Result<()>) -> Result<String> {
+        state.windows.run(input, self.session, frame, check)
+    }
     fn input_epoch(&self) -> u64 { QUEUED_INPUT.load(Ordering::SeqCst) }
     fn observe_input(&self, epoch: u64) { OBSERVED_INPUT.store(epoch, Ordering::SeqCst); }
     fn name(&self) -> String {
@@ -712,6 +851,14 @@ mod rdp {
             let adv = invoke(&disp, "AdvancedSettings", DISPATCH_PROPERTYGET, None)?;
             let adv = unsafe { (*adv.Anonymous.Anonymous.Anonymous.pdispVal).clone() }.context("RDP 컨트롤 AdvancedSettings 가 없습니다")?;
             invoke(&adv, "EnableCredSspSupport", DISPATCH_PROPERTYPUT, Some(v_bool(true)))?;
+            invoke(&adv, "RedirectClipboard", DISPATCH_PROPERTYPUT, Some(v_bool(false))).context("클립보드 격리 설정 실패")?;
+            let mut clipboard = invoke(&adv, "RedirectClipboard", DISPATCH_PROPERTYGET, None).context("클립보드 격리 확인 실패")?;
+            let redirected = unsafe {
+                let value = &clipboard.Anonymous.Anonymous;
+                (value.vt == VT_BOOL).then(|| value.Anonymous.boolVal.0 != 0)
+            };
+            unsafe { let _ = VariantClear(&mut clipboard); }
+            require_isolated_clipboard(redirected)?;
             invoke(&disp, "Connect", DISPATCH_METHOD, None)?;
 
             let start = Instant::now();
@@ -753,6 +900,99 @@ mod rdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_element_rectangles_are_xywh_in_screenshot_pixels() {
+        assert_eq!(app_rect_to_frame((100, 50, 300, 150), (1000, 500), (500, 250)), [50, 25, 100, 50]);
+        assert_eq!(app_rect_to_frame((-10, -20, 90, 80), (1000, 500), (500, 250)), [-5, -10, 50, 50]);
+    }
+
+    #[test]
+    fn clipboard_redirection_must_be_confirmed_disabled() {
+        assert!(require_isolated_clipboard(Some(false)).is_ok());
+        assert!(require_isolated_clipboard(Some(true)).is_err());
+        assert!(require_isolated_clipboard(None).is_err());
+    }
+
+    #[test]
+    fn semantic_app_control_refuses_unverified_sessions_before_enumerating_windows() {
+        let mut state = AppControl::default();
+        let result = state.run(&serde_json::json!({"action":"list_windows"}), u32::MAX, (1280, 800), &|| Ok(()));
+        assert!(result.is_err());
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the marked child session; creates only a generated test window there"]
+    fn semantic_controls_work_inside_child_session() {
+        use super::super::{uia, w32};
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let session = my_session_id();
+        helper_allowed(read_marker(), session, unsafe { WTSGetActiveConsoleSessionId() }).unwrap();
+        let ui = std::thread::spawn(|| super::super::testapp::run(false, false).unwrap());
+        let end = Instant::now() + Duration::from_secs(5);
+        let h = loop {
+            let h = w32::find_window_class("GhostDeskWinAppTestTarget");
+            if h != 0 && w32::thread_pid(h).1 == std::process::id() { break h; }
+            assert!(Instant::now() < end, "test window did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        struct TestWindow(u32, Option<std::thread::JoinHandle<()>>);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe { PostThreadMessageW(self.0, WM_QUIT, 0, 0); }
+                self.1.take().unwrap().join().unwrap();
+            }
+        }
+        let _window = TestWindow(w32::thread_pid(h).0, Some(ui));
+        unsafe { ShowWindow(h as _, SW_SHOW); SetForegroundWindow(h as _); }
+        let end = Instant::now() + Duration::from_secs(3);
+        while w32::root(w32::foreground()) != h && Instant::now() < end {
+            unsafe { SetForegroundWindow(h as _); }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(w32::root(w32::foreground()), h);
+        let mut state = AppControl::default();
+        let request = |action: &str, id: usize| serde_json::json!({"action":action, "id":id});
+        let tree = state.run(&serde_json::json!({"action":"ui_tree"}), session, (1280, 800), &|| Ok(())).unwrap();
+        println!("generated semantic fixture:\n{tree}");
+        let edit = state.nodes.iter().position(|n| matches!(n.ctype, uia::CT_EDIT | uia::CT_DOCUMENT))
+            .unwrap_or_else(|| panic!("edit/document element missing: {tree}")) + 1;
+        let checkbox = state.nodes.iter().position(|n| n.ctype == uia::CT_CHECKBOX)
+            .unwrap_or_else(|| panic!("checkbox element missing: {tree}")) + 1;
+        let combo = state.nodes.iter().position(|n| n.ctype == uia::CT_COMBOBOX)
+            .unwrap_or_else(|| panic!("combo element missing: {tree}")) + 1;
+        let value = "자식 세션 UIA\n둘째 줄 👋";
+        state.run(&serde_json::json!({"action":"set_value", "id":edit, "text":value}), session, (1280, 800), &|| Ok(())).unwrap();
+        let read = state.run(&request("read", edit), session, (1280, 800), &|| Ok(())).unwrap();
+        assert!(read.replace("\r\n", "\n").contains(value), "{read}");
+        let platform = ChildPlatform { session };
+        let observed = platform.input_epoch();
+        platform.observe_input(observed);
+        state.run(&request("read", edit), session, (1280, 800), &|| Ok(())).unwrap();
+        assert_eq!(platform.input_epoch(), observed, "reading must keep the observed field usable");
+        state.run(&request("focus", edit), session, (1280, 800), &|| Ok(())).unwrap();
+        assert!(platform.input_epoch() > observed, "semantic focus must invalidate the synchronous edit observation");
+        assert_eq!(w32::thread_focus(w32::thread_pid(h).0).unwrap().1, state.nodes[edit - 1].hwnd);
+        state.run(&request("press", checkbox), session, (1280, 800), &|| Ok(())).unwrap();
+        let checked = || w32::send_timeout(state.nodes[checkbox - 1].hwnd, w32::BM_GETCHECK, 0, 0, 500);
+        let end = Instant::now() + Duration::from_secs(2);
+        while checked() != Some(1) && Instant::now() < end { std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!(checked(), Some(1), "application must apply the requested checkbox toggle");
+        state.run(&serde_json::json!({"action":"choose", "id":combo, "option":"포도"}), session, (1280, 800), &|| Ok(())).unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while w32::window_text(h) != "선택: 포도" && Instant::now() < end { std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!(w32::window_text(h), "선택: 포도", "application must receive its selection notification");
+        unsafe { ShowWindow(h as _, SW_MAXIMIZE); }
+        assert!(unsafe { IsZoomed(h as _) } != 0);
+        let before_list = platform.input_epoch();
+        state.run(&serde_json::json!({"action":"list_windows"}), session, (1280, 800), &|| Ok(())).unwrap();
+        assert_eq!(platform.input_epoch(), before_list, "listing must not invalidate observed input");
+        let index = state.windows.iter().position(|w| *w == h).unwrap();
+        state.run(&serde_json::json!({"action":"switch_window", "index":index}), session, (1280, 800), &|| Ok(())).unwrap();
+        assert!(unsafe { IsZoomed(h as _) } != 0, "switching windows must preserve maximized placement");
+        assert!(state.run(&request("read", edit), session, (1280, 800), &|| Ok(())).unwrap_err().to_string().contains("ui_tree"));
+    }
 
     /// Run only inside the marked child session: a deliberately slow real EDIT control catches
     /// replies that acknowledge queued input before the application has actually inserted it.

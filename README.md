@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-0.6.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.0/GhostDesk-0.6.0-windows-x64.exe)
+- **Windows x64:** [GhostDesk-0.6.1-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.1/GhostDesk-0.6.1-windows-x64.exe)
 
   Download it and run it; there is no installer. The executable is unsigned, so
   SmartScreen may warn you the first time. If GhostDesk is already installed,
@@ -33,7 +33,7 @@ screen types, install location, building) are collected in the
   (`%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe`) and starts it. A newer
   installed copy is never replaced by an older one.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.0/GhostDesk-0.6.0-macos-universal.zip)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.1-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.1/GhostDesk-0.6.1-macos-universal.zip)
 
   Unzip it and move GhostDesk.app to Applications. The app is not notarized,
   so macOS blocks it the first time: open System Settings → Privacy & Security
@@ -170,6 +170,22 @@ Screens opened by external agents are marked with a plug icon and show the
 virtual cursor. The control socket is
 `~/Library/Application Support/GhostDesk/control.sock` with mode 0600.
 
+For login continuity, give `desk_open` the same `workspace` on later visits.
+`web_login` accepts a detected `browser_profile` ID (for example `Profile 1`)
+or an unambiguous profile name. Unknown or ambiguous browser/profile choices
+are refused instead of using another account. `refresh_login: true` in
+`web_login` or `app_login` replaces the workspace's cloned data from the
+original; omit it to keep the existing clone. A browser clone whose original
+source cannot be verified needs a new workspace or an explicit refresh.
+
+Browser and Electron confirmation/prompt dialogs wait for an explicit answer.
+Use `desk_browser` or `desk_app` with `action: "dialog"` to read the current
+dialog, then `action: "respond_dialog"` with its `id`. Browser/JavaScript
+responses require `accept: true|false` and optionally `prompt_text`.
+Electron also requires the returned `source` (`javascript` or `native`);
+native message boxes take a zero-based `response` button index. File dialogs
+continue to provide their existing notes. A stale ID cannot answer a new dialog.
+
 ## Safety restrictions
 
 - Cloning your logins, launching a Mac app (not isolated), using a running app,
@@ -293,6 +309,12 @@ macOS.
   Notepad, Calculator and Paint, which cannot run in hidden app mode. External
   agents use `desk_open(mode="session")`; GhostDesk asks for approval before
   opening it.
+- Windows child sessions support `desk_app` actions `list_windows`,
+  `switch_window`, `ui_tree`, `press`, `set_value`, `read`, `focus`, `select`
+  and `choose`. IDs remain valid until the next `ui_tree`. Use screenshots and
+  keyboard shortcuts for menus; `menus` and `menu` are only available in regular app mode.
+  The child helper must also be updated for these actions. Clipboard sharing
+  with the user's desktop is disabled on new child-session connections.
 - The child-session helper starts from HKCU `RunOnce`, so it needs an
   administrator account (including one normally used with standard rights).
   On a standard account the helper will not start even if another administrator

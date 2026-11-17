@@ -1,7 +1,7 @@
 //! UI Automation (COM, MTA): element listing, pattern invocation, value reads and writes.
 //!
-//! Rules: never call anything that moves focus or the foreground (`IUIAutomationElement::SetFocus`
-//! and friends). Don't use `IsOffscreen` either; it is always true for windows parked off-screen.
+//! Hidden app callers never move focus or the foreground. The explicitly guarded child-session
+//! methods may do so inside that separate session. Don't use `IsOffscreen` for parked windows.
 //! Every calling thread is initialized as MTA.
 
 use std::sync::OnceLock;
@@ -319,6 +319,70 @@ fn snapshot_menubar(top: Hwnd) -> Result<Vec<(String, bool)>> {
 }
 
 impl UiEl {
+    pub fn process_id(&self) -> Result<u32> {
+        let pid = unsafe { self.0.CurrentProcessId()? };
+        u32::try_from(pid).ok().filter(|p| *p != 0).ok_or_else(|| anyhow!("UI 요소의 프로세스를 확인할 수 없습니다"))
+    }
+
+    fn check_child_session(&self, session: u32) -> Result<()> {
+        use windows_sys::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+        let mut me = u32::MAX;
+        let mut target = u32::MAX;
+        if unsafe { ProcessIdToSessionId(std::process::id(), &mut me) } == 0
+            || unsafe { ProcessIdToSessionId(self.process_id()?, &mut target) } == 0
+            || me != session || target != session || session == unsafe { WTSGetActiveConsoleSessionId() } {
+            bail!("포커스·목록 펼치기는 확인된 자식 세션 안에서만 허용됩니다");
+        }
+        Ok(())
+    }
+
+    pub fn focus_in_child_session(&self, session: u32) -> Result<()> {
+        self.check_child_session(session)?;
+        unsafe { self.0.SetFocus()? };
+        Ok(())
+    }
+
+    pub fn expand_in_child_session(&self, session: u32) -> Result<()> {
+        self.check_child_session(session)?;
+        let p: IUIAutomationExpandCollapsePattern = self.pattern(UIA_ExpandCollapsePatternId).ok_or_else(|| anyhow!("펼치기를 지원하지 않습니다"))?;
+        unsafe { p.Expand()? };
+        Ok(())
+    }
+
+    pub fn choose_in_child_session(&self, option: &str, session: u32) -> Result<String> {
+        use super::{menu, w32};
+        self.check_child_session(session)?;
+        let h = unsafe { self.0.CurrentNativeWindowHandle().map(|h| h.0 as Hwnd).unwrap_or(0) };
+        if h != 0 && w32::class_name(h).to_lowercase().contains("combobox") {
+            let parent = w32::parent(h);
+            let pid = self.process_id()?;
+            if w32::thread_pid(h).1 != pid || w32::thread_pid(parent).1 != pid || !w32::is_enabled(h) || !w32::is_enabled(parent) {
+                bail!("목록 또는 소유 창이 바뀌었거나 비활성화되었습니다. ui_tree 를 다시 확인하세요");
+            }
+            let items = w32::combo_items(h);
+            let want = menu::norm(option);
+            let index = items.iter().position(|item| menu::norm(item) == want)
+                .or_else(|| items.iter().position(|item| menu::norm(item).contains(&want)))
+                .ok_or_else(|| anyhow!("'{option}' 선택지가 없습니다. 선택지: [{}]", items.iter().take(40).cloned().collect::<Vec<_>>().join(", ")))?;
+            self.check_child_session(session)?;
+            if w32::send_timeout(h, w32::CB_SETCURSEL, index, 0, 1000) != Some(index) {
+                bail!("목록 선택이 반영되지 않았습니다");
+            }
+            // CB_SETCURSEL and the UIA selection provider do not notify the owning application.
+            if !w32::post(parent, w32::WM_COMMAND, w32::make_wparam(w32::ctrl_id(h) as u32, w32::CBN_SELCHANGE), h) {
+                bail!("선택은 바뀌었지만 앱에 선택 알림을 전달하지 못했습니다");
+            }
+            return Ok(items[index].clone());
+        }
+        let item = self.find_descendant_named(option).or_else(|| {
+            self.expand_in_child_session(session).ok()?;
+            self.find_descendant_named(option)
+        }).ok_or_else(|| anyhow!("'{option}' 선택지를 찾지 못했습니다. ui_tree 로 펼쳐진 목록을 확인하세요"))?;
+        item.check_child_session(session)?;
+        item.select()?;
+        Ok(item.name())
+    }
+
     fn pattern<T: Interface>(&self, id: UIA_PATTERN_ID) -> Option<T> {
         unsafe { self.0.GetCurrentPatternAs::<T>(id).ok() }
     }

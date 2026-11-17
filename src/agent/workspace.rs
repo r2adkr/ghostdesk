@@ -1,9 +1,9 @@
 //! Sets up isolated screens: launches or connects whatever a `DeskTarget` describes and builds
 //! the `Desk`.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::{AgentShared, AgentStatus, DeskTarget, LogKind, ProfileSource, RemoteTarget};
 use crate::{
@@ -223,6 +223,29 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
     Ok(Desk::Remote(desk))
 }
 
+const BROWSER_SOURCE_MARKER: &str = ".ghostdesk-browser-source.json";
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct BrowserCloneSource {
+    data_dir: PathBuf,
+    profile_dir: String,
+}
+
+fn browser_clone_reusable(dir: &Path, source: &BrowserCloneSource, refresh: bool) -> Result<bool> {
+    if refresh || dir.join(".ghostdesk-cloning").exists() || !dir.exists() {
+        return Ok(false);
+    }
+    if std::fs::read_dir(dir)?.next().transpose()?.is_none() {
+        return Ok(false);
+    }
+    let previous = std::fs::read_to_string(dir.join(BROWSER_SOURCE_MARKER)).ok()
+        .and_then(|text| serde_json::from_str::<BrowserCloneSource>(&text).ok());
+    if previous.as_ref() != Some(source) || !dir.join(&source.profile_dir).is_dir() {
+        bail!("기존 작업공간 '{}' 의 브라우저·프로필 출처가 선택한 로그인 원본과 다르거나 확인되지 않습니다. 기존 내용은 유지했습니다. 다른 작업공간 이름을 쓰거나, 기존 복제본을 교체하려면 refresh_login=true 로 새로 복제하세요.", dir.display());
+    }
+    Ok(true)
+}
+
 async fn prepare_browser(
     shared: &Arc<AgentShared>,
     workspace: &str,
@@ -238,25 +261,28 @@ async fn prepare_browser(
             // a marker file is left behind if we exit mid-clone (runtime shutdown_timeout on quit, etc.);
             // that clone gets rebuilt
             let cloning_mark = dir.join(".ghostdesk-cloning");
-            let has = dir.join(profile_dir).is_dir() && !cloning_mark.exists();
-            if *refresh || !has {
+            let clone_source = BrowserCloneSource {
+                data_dir: crate::platform::paths::canonicalize(&browser.data_dir).unwrap_or_else(|_| browser.data_dir.clone()),
+                profile_dir: profile_dir.clone(),
+            };
+            if !browser_clone_reusable(&dir, &clone_source, *refresh)? {
                 if dir.exists() {
+                    crate::platform::fsx::remove_file_retry(&dir.join(BROWSER_SOURCE_MARKER))
+                        .context("기존 복제본의 완료 표시를 지우지 못했습니다")?;
                     // Windows file locks are mandatory, so deletion can briefly fail on files held by a browser or
                     // antivirus that just exited. Retry a few times, and if it still fails, report it rather than
                     // cloning over a half-deleted folder.
                     let r = crate::platform::fsx::remove_dir_all_retry(&dir);
-                    if cfg!(windows) {
-                        if let Err(e) = r {
-                            return Err(anyhow!(
+                    if let Err(e) = r {
+                        return Err(anyhow!(
                                 "작업공간 폴더를 비우지 못했습니다 (다른 프로그램이 사용 중일 수 있습니다 — 그 작업공간을 쓰던 브라우저가 \
                                  아직 닫히는 중이면 잠시 후 다시 시도하세요): {} — {e}",
                                 dir.display()
-                            ));
-                        }
+                        ));
                     }
                 }
-                std::fs::create_dir_all(&dir).ok();
-                std::fs::write(&cloning_mark, b"").ok();
+                std::fs::create_dir_all(&dir).with_context(|| format!("작업공간 생성 실패: {}", dir.display()))?;
+                std::fs::write(&cloning_mark, b"").context("프로필 복제 진행 표시를 기록하지 못했습니다")?;
                 shared.set_status(AgentStatus::Preparing("프로필 복제 중".into()));
                 shared.log(
                     LogKind::Info,
@@ -272,7 +298,9 @@ async fn prepare_browser(
                     })
                 })
                 .await??;
-                std::fs::remove_file(&cloning_mark).ok();
+                std::fs::write(dir.join(BROWSER_SOURCE_MARKER), serde_json::to_vec(&clone_source)?)
+                    .context("프로필 복제 원본을 기록하지 못했습니다")?;
+                crate::platform::fsx::remove_file_retry(&cloning_mark).context("프로필 복제 완료 표시를 갱신하지 못했습니다")?;
                 shared.log(
                     LogKind::Info,
                     format!(
@@ -321,6 +349,57 @@ async fn prepare_browser(
 mod tests {
     use super::*;
     use eframe::egui;
+
+    fn browser_clone_fixture(tag: &str) -> (PathBuf, PathBuf, BrowserCloneSource) {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("ghostdesk-browser-affinity-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let clone = root.join("clone");
+        std::fs::create_dir_all(clone.join("Default")).unwrap();
+        std::fs::write(clone.join("Default/keep.txt"), "existing login workspace").unwrap();
+        let source = BrowserCloneSource { data_dir: root.join("Chrome"), profile_dir: "Default".into() };
+        (root, clone, source)
+    }
+
+    fn remove_clone_fixture(root: &Path) {
+        let root = std::fs::canonicalize(root).unwrap();
+        assert!(root.starts_with(std::fs::canonicalize(std::env::temp_dir()).unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn browser_clone_source_mismatch_preserves_existing_workspace() {
+        let (root, clone, source) = browser_clone_fixture("mismatch");
+        let other = BrowserCloneSource { data_dir: root.join("Edge"), profile_dir: "Default".into() };
+        std::fs::write(clone.join(BROWSER_SOURCE_MARKER), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(browser_clone_reusable(&clone, &source, false).is_err());
+        assert_eq!(std::fs::read_to_string(clone.join("Default/keep.txt")).unwrap(), "existing login workspace");
+        remove_clone_fixture(&root);
+    }
+
+    #[test]
+    fn browser_clone_legacy_and_missing_profile_require_explicit_refresh() {
+        let (root, clone, source) = browser_clone_fixture("legacy");
+        let error = browser_clone_reusable(&clone, &source, false).unwrap_err().to_string();
+        assert!(error.contains("refresh_login") && error.contains("다른 작업공간"), "{error}");
+        std::fs::write(clone.join(BROWSER_SOURCE_MARKER), serde_json::to_vec(&source).unwrap()).unwrap();
+        let other_profile = BrowserCloneSource { data_dir: source.data_dir, profile_dir: "Profile 1".into() };
+        assert!(browser_clone_reusable(&clone, &other_profile, false).is_err(), "a missing requested profile must not delete the previous profile");
+        assert!(clone.join("Default/keep.txt").is_file());
+        assert!(!browser_clone_reusable(&clone, &other_profile, true).unwrap());
+        remove_clone_fixture(&root);
+    }
+
+    #[test]
+    fn browser_clone_matching_source_reuses_and_interrupted_clone_rebuilds() {
+        let (root, clone, source) = browser_clone_fixture("matching");
+        std::fs::write(clone.join(BROWSER_SOURCE_MARKER), serde_json::to_vec(&source).unwrap()).unwrap();
+        assert!(browser_clone_reusable(&clone, &source, false).unwrap());
+        assert!(!browser_clone_reusable(&clone, &source, true).unwrap());
+        std::fs::write(clone.join(".ghostdesk-cloning"), "").unwrap();
+        assert!(!browser_clone_reusable(&clone, &source, false).unwrap());
+        remove_clone_fixture(&root);
+    }
 
     /// This machine's VNC server needs the dedicated-machine confirmation outside macOS; the Apple
     /// server itself is always refused, but only on macOS.

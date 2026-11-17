@@ -95,6 +95,8 @@ struct State {
     moved_pressed: bool,
     /// (Drag interception) Sessions where Input.setInterceptDrags couldn't be enabled (old Electron, …).
     no_intercept: HashSet<String>,
+    dialogs: HashMap<String, Value>,
+    next_dialog_id: u64,
 }
 
 /// An intercepted HTML5 drag (Input.dragIntercepted).
@@ -122,6 +124,7 @@ pub struct BrowserWorkspace {
     ready: AtomicBool,
     closed: AtomicBool,
     sink: FrameSink,
+    dialog_changed: tokio::sync::Notify,
 }
 
 /// Options for attaching to the CDP endpoint of an already running Chromium/Electron.
@@ -308,6 +311,7 @@ impl BrowserWorkspace {
             ready: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             sink,
+            dialog_changed: tokio::sync::Notify::new(),
         });
 
         // if we bail out (cancelled or errored) before ready, event_loop still holds the Arc and Drop
@@ -459,7 +463,7 @@ impl BrowserWorkspace {
                 let next = {
                     let mut st = self.state.lock();
                     st.tabs.retain(|t| t.target_id != id);
-                    st.sessions.remove(&id);
+                    if let Some(session) = st.sessions.remove(&id) { st.dialogs.remove(&session); }
                     if st.active.as_deref() == Some(id.as_str()) {
                         st.active = None;
                         Some(st.tabs.last().map(|t| t.target_id.clone()))
@@ -493,23 +497,28 @@ impl BrowserWorkspace {
                 if let Some(sid) = ev.params["sessionId"].as_str() {
                     let mut st = self.state.lock();
                     st.sessions.retain(|_, s| s != sid);
+                    st.dialogs.remove(sid);
                     if st.drag.as_ref().is_some_and(|d| d.session == sid) {
                         st.drag = None;
                     }
                 }
             }
             "Page.javascriptDialogOpening" => {
-                // alert/confirm blocks the page, so accept it automatically and record it
+                let Some(session) = ev.session_id else { return Ok(()) };
                 let msg = ev.params["message"].as_str().unwrap_or_default().to_string();
                 let kind = ev.params["type"].as_str().unwrap_or("dialog").to_string();
-                self.state
-                    .lock()
-                    .notes
-                    .push(format!("페이지 대화상자({kind})를 자동 수락했습니다: {msg}"));
-                let _ = self
-                    .cdp
-                    .call("Page.handleJavaScriptDialog", json!({ "accept": true }), ev.session_id.as_deref())
-                    .await;
+                let mut state = self.state.lock();
+                state.next_dialog_id += 1;
+                let mut dialog = ev.params;
+                dialog["id"] = json!(state.next_dialog_id);
+                dialog["source"] = json!("javascript");
+                state.dialogs.insert(session, dialog);
+                state.notes.push(format!("페이지 대화상자({kind})가 응답을 기다립니다. dialog 조회 후 respond_dialog 로 응답하세요: {msg}"));
+                drop(state);
+                self.dialog_changed.notify_waiters();
+            }
+            "Page.javascriptDialogClosed" => {
+                if let Some(session) = ev.session_id { self.state.lock().dialogs.remove(&session); }
             }
             "Input.dragIntercepted" if self.intercept_drags => {
                 // the page started an HTML5 drag (it doesn't reach the OS). If it's the active session and the
@@ -545,6 +554,51 @@ impl BrowserWorkspace {
 
     fn session(&self) -> Result<String> {
         self.active_session().ok_or_else(|| anyhow!("활성 탭이 없습니다"))
+    }
+
+    pub fn dialog(&self) -> Option<Value> {
+        let session = self.active_session()?;
+        self.state.lock().dialogs.get(&session).cloned()
+    }
+
+    pub async fn respond_dialog(&self, id: u64, accept: bool, prompt_text: Option<&str>) -> Result<()> {
+        let session = self.session()?;
+        {
+            let mut state = self.state.lock();
+            let dialog = state.dialogs.get_mut(&session).ok_or_else(|| anyhow!("응답할 페이지 대화상자가 없습니다"))?;
+            if dialog["id"] != id || dialog["responding"] == true { bail!("대화상자가 바뀌었거나 이미 응답 중입니다. dialog 를 다시 조회하세요."); }
+            dialog["responding"] = json!(true);
+        }
+        let mut params = json!({"accept":accept});
+        if let Some(text) = prompt_text { params["promptText"] = json!(text); }
+        let result = self.cdp.call("Page.handleJavaScriptDialog", params, Some(&session)).await;
+        let mut state = self.state.lock();
+        if state.dialogs.get(&session).is_some_and(|dialog| dialog["id"] == id) {
+            if result.is_ok() { state.dialogs.remove(&session); }
+            else if let Some(dialog) = state.dialogs.get_mut(&session) { dialog.as_object_mut().unwrap().remove("responding"); }
+        }
+        result.map(|_| ())
+    }
+
+    async fn input_call(&self, method: &str, params: Value, session: &str) -> Result<Value> {
+        let changed = self.dialog_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if self.state.lock().dialogs.contains_key(session) { bail!("페이지 대화상자가 응답을 기다립니다. dialog 조회 후 respond_dialog 로 응답하세요."); }
+        let call = self.cdp.call(method, params, Some(session));
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                result = &mut call => return result,
+                _ = &mut changed => {
+                    if self.state.lock().dialogs.contains_key(session) {
+                        bail!("입력은 전달됐으며 페이지 대화상자가 응답을 기다립니다. 입력을 반복하지 말고 dialog 조회 후 respond_dialog 로 응답하세요.");
+                    }
+                    changed.set(self.dialog_changed.notified());
+                    changed.as_mut().enable();
+                }
+            }
+        }
     }
 
     async fn activate(&self, target_id: &str) -> Result<()> {
@@ -704,6 +758,7 @@ impl BrowserWorkspace {
 
     /// PNG screenshot of the current viewport (exactly width x height).
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
+        if self.dialog().is_some() { bail!("페이지 대화상자가 응답을 기다립니다. 화면 대신 dialog 로 내용을 확인하세요."); }
         let s = self.session()?;
         let r = self
             .cdp
@@ -770,7 +825,7 @@ impl BrowserWorkspace {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        self.cdp.call("Input.dispatchMouseEvent", p, Some(&s)).await?;
+        self.input_call("Input.dispatchMouseEvent", p, &s).await?;
         Ok(())
     }
 
@@ -1004,7 +1059,7 @@ impl BrowserWorkspace {
         if !commands.is_empty() {
             p["commands"] = json!(commands);
         }
-        self.cdp.call("Input.dispatchKeyEvent", p, Some(&s)).await?;
+        self.input_call("Input.dispatchKeyEvent", p, &s).await?;
         Ok(())
     }
 
@@ -1050,6 +1105,7 @@ impl BrowserWorkspace {
     pub async fn type_text(&self, text: &str) -> Result<()> {
         let s = self.session()?;
         let mut buf = String::new();
+        let text = text.replace("\r\n", "\n");
         for ch in text.chars() {
             let special = match ch {
                 '\n' | '\r' => Some("Return"),
@@ -1058,8 +1114,8 @@ impl BrowserWorkspace {
             };
             if special.is_some() || (ch.is_ascii() && !ch.is_ascii_control()) {
                 if !buf.is_empty() {
-                    self.cdp
-                        .call("Input.insertText", json!({ "text": std::mem::take(&mut buf) }), Some(&s))
+                    self
+                        .input_call("Input.insertText", json!({ "text": std::mem::take(&mut buf) }), &s)
                         .await?;
                 }
                 match special {
@@ -1076,7 +1132,7 @@ impl BrowserWorkspace {
             }
         }
         if !buf.is_empty() {
-            self.cdp.call("Input.insertText", json!({ "text": buf }), Some(&s)).await?;
+            self.input_call("Input.insertText", json!({ "text": buf }), &s).await?;
         }
         Ok(())
     }
@@ -1207,8 +1263,7 @@ impl BrowserWorkspace {
     pub async fn eval(&self, expr: &str) -> Result<Value> {
         let s = self.session()?;
         let r = self
-            .cdp
-            .call("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }), Some(&s))
+            .input_call("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }), &s)
             .await?;
         Ok(r["result"]["value"].clone())
     }
@@ -1578,6 +1633,55 @@ mod win_tests {
         }
     }
 
+    #[tokio::test]
+    async fn real_browser_dialog_can_be_cancelled_and_prompt_answered_without_stalling() {
+        let Some(exe) = ["chrome.exe", "msedge.exe"].iter().find_map(|e| crate::platform::win::app_path(e)) else { return };
+        let dir = std::env::temp_dir().join(format!("ghostdesk-dialog-test-{}", std::process::id()));
+        let _ = remove_dir_all_retry(&dir);
+        let ws = BrowserWorkspace::launch(LaunchOptions {
+            exe, user_data_dir: dir.clone(), profile_dir: None, width: 640, height: 400, headless: true,
+            start_url: r#"data:text/html,<button style='position:absolute;left:20px;top:20px;width:200px;height:40px' onclick='window.deleted=confirm("Delete?")'>Delete</button><button style='position:absolute;left:20px;top:80px;width:200px;height:40px' onclick='window.answer=prompt("Name?","seed")'>Name</button>"#.into(),
+        }, Arc::new(|_| {})).await.unwrap();
+        async fn pending(ws: &BrowserWorkspace) -> Value {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(dialog) = ws.dialog() { return dialog; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("JavaScript dialog event did not arrive")
+        }
+        let desk = crate::desk::Desk::Browser(ws.clone());
+        for (y, kind) in [(40.0, "confirm"), (100.0, "prompt")] {
+            let click = tokio::time::timeout(Duration::from_secs(3), ws.click(Some((100.0, y)), MouseButton::Left, 1, 0))
+                .await.expect("click stalled behind a pending JavaScript dialog");
+            if let Err(error) = click { assert!(error.to_string().contains("대화상자"), "{error:#}"); }
+            let dialog = pending(&ws).await;
+            assert_eq!(dialog["type"], kind);
+            let id = dialog["id"].as_u64().unwrap();
+            let queried = crate::agent::exec_desk_tool(&desk, "browser_control", &json!({"action":"dialog"})).await.unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&queried.text).unwrap()["id"], id);
+            for invalid in [json!({"action":"respond_dialog", "id":id}), json!({"action":"respond_dialog", "id":id, "accept":"false"})] {
+                assert!(crate::agent::exec_desk_tool(&desk, "browser_control", &invalid).await.is_err());
+                assert_eq!(ws.dialog().unwrap()["id"], id, "missing/invalid accept must not answer the dialog");
+            }
+            assert!(ws.respond_dialog(id + 1, true, None).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_secs(1), ws.screenshot()).await.unwrap().is_err());
+            let mut reply = json!({"action":"respond_dialog", "id":id, "accept":kind == "prompt"});
+            if kind == "prompt" { reply["prompt_text"] = json!("재용👋"); }
+            crate::agent::exec_desk_tool(&desk, "browser_control", &reply).await.unwrap();
+        }
+        assert_eq!(ws.eval("window.deleted").await.unwrap(), false);
+        assert_eq!(ws.eval("window.answer").await.unwrap(), "재용👋");
+        let evaluation = tokio::time::timeout(Duration::from_secs(3), ws.eval("window.third = confirm('From eval')"))
+            .await.expect("evaluation stalled behind its JavaScript dialog");
+        assert!(evaluation.is_err());
+        let dialog = pending(&ws).await;
+        ws.respond_dialog(dialog["id"].as_u64().unwrap(), false, None).await.unwrap();
+        assert_eq!(ws.eval("window.third").await.unwrap(), false);
+        ws.shutdown().await;
+        remove_dir_all_retry(&dir).unwrap();
+    }
+
     /// If the executable exits right away leaving nothing behind (e.g. it only handed the command
     /// line to a browser using the same workspace), report it immediately instead of waiting 40 s.
     #[tokio::test]
@@ -1828,6 +1932,87 @@ mod url_tests {
         }
         assert_eq!(percent_decode("a%41%zz%4"), "aA%zz%4");
         assert_eq!(percent_decode("%ED%95%9C"), "한");
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+
+    async fn mock_workspace() -> (BrowserWorkspace, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = events.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = socket.next().await {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                received.lock().push(event.clone());
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":event["id"],"result":{}}).to_string().into())).await.unwrap();
+            }
+        });
+        let mut state = State::default();
+        state.active = Some("page".into());
+        state.sessions.insert("page".into(), "session".into());
+        let ws = BrowserWorkspace {
+            cdp: Cdp::connect(&url).await.unwrap(), child: Mutex::new(None), width: 640, height: 400,
+            user_agent: None, app_mode: false, intercept_drags: false, state: Mutex::new(state),
+            ready: AtomicBool::new(true), closed: AtomicBool::new(false), sink: Arc::new(|_| {}), dialog_changed: tokio::sync::Notify::new(),
+        };
+        (ws, events, server)
+    }
+
+    #[tokio::test]
+    async fn javascript_dialog_waits_for_explicit_response() {
+        let (ws, events, server) = mock_workspace().await;
+        ws.handle_event(CdpEvent {
+            method: "Page.javascriptDialogOpening".into(),
+            params: json!({"type":"confirm", "message":"Delete this?", "url":"https://example.test"}),
+            session_id: Some("session".into()),
+        }).await.unwrap();
+        assert!(events.lock().is_empty(), "a confirmation must not be accepted automatically");
+        let first = ws.dialog().unwrap();
+        let id = first["id"].as_u64().unwrap();
+        assert_eq!(first["message"], "Delete this?");
+        assert!(ws.respond_dialog(id + 1, true, None).await.is_err());
+        assert!(events.lock().is_empty(), "a stale response must not reach CDP");
+        ws.respond_dialog(id, false, None).await.unwrap();
+        assert!(ws.dialog().is_none());
+        assert_eq!(events.lock()[0]["params"], json!({"accept":false}));
+        ws.handle_event(CdpEvent {
+            method: "Page.javascriptDialogOpening".into(),
+            params: json!({"type":"prompt", "message":"Name?", "defaultPrompt":"seed"}),
+            session_id: Some("session".into()),
+        }).await.unwrap();
+        let second = ws.dialog().unwrap();
+        assert_eq!(second["defaultPrompt"], "seed");
+        assert_ne!(first["id"], second["id"]);
+        assert!(ws.respond_dialog(id, true, None).await.is_err());
+        ws.respond_dialog(second["id"].as_u64().unwrap(), true, Some("재용👋")).await.unwrap();
+        assert_eq!(events.lock()[1]["params"], json!({"accept":true,"promptText":"재용👋"}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn crlf_types_one_return_and_preserves_other_text() {
+        let (ws, events, server) = mock_workspace().await;
+        ws.type_text("a\r\nb\rc\n가\t👋").await.unwrap();
+        let trace: Vec<String> = events.lock().iter().map(|event| {
+            let p = &event["params"];
+            match event["method"].as_str().unwrap() {
+                "Input.insertText" => format!("text:{}", p["text"].as_str().unwrap()),
+                "Input.dispatchKeyEvent" => format!("{}:{}", if p["type"] == "keyUp" { "up" } else { "down" }, p["key"].as_str().unwrap()),
+                other => panic!("unexpected command: {other}"),
+            }
+        }).collect();
+        server.abort();
+        assert_eq!(trace, [
+            "down:a", "up:a", "down:Enter", "up:Enter", "down:b", "up:b", "down:Enter", "up:Enter",
+            "down:c", "up:c", "down:Enter", "up:Enter", "text:가", "down:Tab", "up:Tab", "text:👋",
+        ]);
     }
 }
 

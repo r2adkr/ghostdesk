@@ -214,8 +214,6 @@ pub struct GhostApp {
     keep_awake: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
     awake: Option<crate::platform::awake::KeepAwake>,
-    /// Home screen greeting (different each launch).
-    greeting: usize,
     browsers: Vec<InstalledBrowser>,
     /// Electron apps detected in the background (`None` = still detecting).
     electron_apps: Slot<Vec<crate::electron::ElectronApp>>,
@@ -330,7 +328,6 @@ impl GhostApp {
             perm_notice_hidden: false,
             prefs_other: Default::default(),
             awake: None,
-            greeting: screens::random_greeting(),
             browsers,
             form: NewAgentForm::new(profile_idx),
             agents: Vec::new(),
@@ -501,10 +498,11 @@ impl eframe::App for GhostApp {
                 }
                 crate::control::ControlEvent::Approval { title, detail, reply } => {
                     self.approvals.push((title, detail, Some(reply)));
-                    // flag it on the Dock icon (Windows: flash the taskbar button) so a window in the background
-                    // notices too (without taking focus)
+                    #[cfg(windows)]
+                    show_approval_window();
+                    // Keep the notice visible until the human opens GhostDesk; never take keyboard focus.
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Informational,
+                        egui::UserAttentionType::Critical,
                     ));
                     self.attention_requested = true;
                 }
@@ -554,6 +552,7 @@ impl GhostApp {
     /// Normal layout: left sidebar · (right panel in detail view) · center · modal windows.
     fn main_layout(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let ctx = ctx.clone();
+        let (sidebar_w, detail_w, page_padding) = panel_sizes(ctx.content_rect().width());
         // when the view (or selected agent) changes, the center and right panel fade in over 0.2 s
         let fade = theme::appear(&ctx, egui::Id::unique("view_in"), self.view_key(), 0.2);
         // with a title bar, reduce the top margin so content follows right below it. The macOS title bar
@@ -561,9 +560,9 @@ impl GhostApp {
         let top = if titlebar::visible(&ctx) { if cfg!(target_os = "macos") { 10 } else { 4 } } else { 14 };
         let side = egui::Panel::left("left")
             .resizable(true)
-            .default_size(248.0)
+            .default_size(sidebar_w)
             .min_size(200.0)
-            .max_size(380.0)
+            .max_size(if sidebar_w == 200.0 { 200.0 } else { 380.0 })
             .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 10, right: 10, top, bottom: 14 }))
             .show(ui, |ui| self.sidebar(ui));
         self.title_cols = titlebar::Columns { left: side.response.rect.width(), right: 0.0 };
@@ -576,8 +575,9 @@ impl GhostApp {
                 let mut remove = false;
                 let detail = egui::Panel::right("detail_side")
                     .resizable(true)
-                    .default_size(400.0)
+                    .default_size(detail_w)
                     .min_size(320.0)
+                    .max_size(detail_panel_limit(ctx.content_rect().width() - side.response.rect.width()))
                     .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin::same(16)))
                     .show(ui, |ui| {
                         ui.multiply_opacity(fade);
@@ -590,7 +590,7 @@ impl GhostApp {
             }
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(Margin::same(24)))
+            .frame(egui::Frame::new().fill(theme::bg()).inner_margin(Margin::same(page_padding as i8)))
             .show(ui, |ui| {
                 ui.multiply_opacity(fade);
                 match self.view {
@@ -692,6 +692,32 @@ impl Drop for GhostApp {
 
 type Approval = (String, String, Option<tokio::sync::oneshot::Sender<bool>>);
 
+#[cfg(windows)]
+fn approval_show_mode(minimized: bool) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SW_SHOWNA};
+    if minimized { SW_SHOWNOACTIVATE } else { SW_SHOWNA }
+}
+
+#[cfg(windows)]
+fn show_approval_window() {
+    use crate::platform::win;
+    // egui's Minimized(false) uses SW_RESTORE, which activates the window on Windows.
+    if let Some(w) = win::top_level_hwnds().into_iter().map(win::window_info)
+        .find(|w| w.pid == std::process::id() && w.title == "GhostDesk" && (w.minimized || !w.visible)) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync(w.hwnd as _, approval_show_mode(w.minimized));
+        }
+    }
+}
+
+fn panel_sizes(width: f32) -> (f32, f32, f32) {
+    if width < 1120.0 { (200.0, 320.0, 16.0) } else { (248.0, 360.0, 24.0) }
+}
+
+fn detail_panel_limit(available: f32) -> f32 {
+    (available - 368.0).clamp(320.0, 520.0)
+}
+
 /// How long a toast stays visible (seconds).
 const TOAST_SECS: f64 = 4.0;
 
@@ -706,6 +732,28 @@ fn prune_closed_approvals(list: &mut Vec<Approval>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn approval_restore_does_not_request_activation() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SW_SHOWNA};
+        assert_eq!(approval_show_mode(true), SW_SHOWNOACTIVATE);
+        assert_eq!(approval_show_mode(false), SW_SHOWNA);
+    }
+
+    #[test]
+    fn detail_columns_leave_room_for_the_live_screen() {
+        for width in [900.0, 1120.0, 1280.0, 1920.0] {
+            let (side, detail, padding) = panel_sizes(width);
+            assert!(side >= 200.0 && detail >= 320.0);
+            assert!(width - side - detail - padding * 2.0 >= 320.0, "width={width}");
+            let max_detail = detail_panel_limit(width - side);
+            assert!(max_detail >= detail);
+            assert!(width - side - max_detail - padding * 2.0 >= 320.0, "width={width}");
+            let resized_side = if width < 1120.0 { side } else { 380.0 };
+            assert!(width - resized_side - detail_panel_limit(width - resized_side) - padding * 2.0 >= 320.0, "resized width={width}");
+        }
+    }
 
     #[test]
     fn stale_approvals_are_dropped() {

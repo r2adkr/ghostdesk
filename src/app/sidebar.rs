@@ -2,7 +2,7 @@
 
 use super::*;
 use super::detail::is_working;
-use super::labels::{attention, status_text};
+use super::labels::{attention, display_status};
 
 impl GhostApp {
     /// The left sidebar: name, new agent, views and the agent list, with Connections and Settings
@@ -173,6 +173,8 @@ impl GhostApp {
         let mut clicked = None;
         for (i, a) in self.agents.iter().enumerate() {
             let st = a.shared.status();
+            let paused = a.shared.paused.load(Ordering::Relaxed);
+            let (status, _) = display_status(&st, paused, a.takeover);
             let sel = self.view == View::Detail && self.selected == Some(i);
             let fill = if sel { theme::card_hover() } else { Color32::TRANSPARENT };
             let row_id = egui::Id::unique(("agent_row", a.shared.id));
@@ -189,16 +191,22 @@ impl GhostApp {
                         theme::dot(ui, crate::cursor::agent_color(a.shared.id), 4.5);
                         // place the right-hand bits (status dot, external marker) first, then truncate the name to fit
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            match (&st, attention(&st, a.takeover)) {
-                                (AgentStatus::WaitingUser(_), _) => {
-                                    theme::chip(ui, theme::warn(), tr("질문")).on_hover_text(status_text(&st));
+                            match (&st, a.takeover, paused, attention(&st, a.takeover)) {
+                                (_, true, _, _) => {
+                                    theme::chip(ui, theme::takeover(), tr("직접 조작")).on_hover_text(&status);
                                 }
-                                (_, Some(c)) => {
-                                    theme::dot(ui, c, 3.5).on_hover_text(if a.takeover { tr("직접 조작 중").to_string() } else { status_text(&st) });
+                                (_, false, true, _) => {
+                                    theme::chip(ui, theme::muted(), tr("일시정지")).on_hover_text(&status);
+                                }
+                                (AgentStatus::WaitingUser(_), _, _, _) => {
+                                    theme::chip(ui, theme::warn(), tr("질문")).on_hover_text(&status);
+                                }
+                                (_, _, _, Some(c)) => {
+                                    theme::dot(ui, c, 3.5).on_hover_text(&status);
                                 }
                                 // small spinner while working (nothing while paused)
-                                _ if is_working(&st) && !a.shared.paused.load(Ordering::Relaxed) => {
-                                    theme::spinner(ui, 13.0, theme::muted()).on_hover_text(status_text(&st));
+                                _ if is_working(&st) => {
+                                    theme::spinner(ui, 13.0, theme::muted()).on_hover_text(&status);
                                 }
                                 _ => {}
                             }
@@ -206,7 +214,7 @@ impl GhostApp {
                                 ui.label(theme::hint(tr("외부")));
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(egui::Label::new(RichText::new(&a.shared.name).color(theme::text())).truncate().selectable(false));
+                                ui.add(egui::Label::new(RichText::new(&a.shared.name).color(theme::text())).truncate().selectable(false)).on_hover_text(&a.shared.name);
                             });
                         });
                     });
@@ -220,6 +228,8 @@ impl GhostApp {
                 .response
                 .interact(egui::Sense::click());
             r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, sel, trf("{} 열기", &[&a.shared.name])));
+            theme::focus_outline(ui, &r, theme::CARD_RADIUS);
+            let r = r.on_hover_text(format!("{}\n{status}", a.shared.name));
             // fade the border in on hover
             let h = ui.ctx().animate_bool_with_time(row_id, r.hovered() && !sel, 0.12);
             if h > 0.0 {

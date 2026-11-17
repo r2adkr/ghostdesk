@@ -48,22 +48,38 @@ impl Llm {
             DeskKind::Native => tools.push(crate::native::app_control_tool()),
             DeskKind::VDisplay => tools.push(crate::vdisplay::app_control_tool()),
             DeskKind::Electron => tools.push(Self::app_menu_tool()),
-            DeskKind::Remote | DeskKind::Session => {}
+            DeskKind::Session => {
+                #[cfg(windows)]
+                tools.push(Self::session_control_tool());
+            }
+            DeskKind::Remote => {}
         }
         tools.push(Self::ask_user_tool());
         Value::Array(tools)
     }
 
+    #[cfg(windows)]
+    fn session_control_tool() -> Value {
+        let mut tool = crate::native::app_control_tool();
+        tool["description"] = json!("Inspect and operate windows and UI Automation elements inside the Windows child session. Actions: list_windows, switch_window(index), ui_tree(max_depth optional), press(id), set_value(id,text), focus(id), select(id), choose(id,option), read(id). Use set_value for exact long-text replacement and read to verify it. Element IDs belong to the last ui_tree and observed foreground window; refresh the tree after switching windows or changing focus. Operate application menus using screenshots and keyboard shortcuts.");
+        tool["input_schema"]["properties"]["action"]["enum"] = json!(["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]);
+        tool["input_schema"]["properties"].as_object_mut().unwrap().remove("path");
+        tool
+    }
+
     fn browser_control_tool() -> Value {
         json!({
                 "name": "browser_control",
-                "description": "Control the isolated browser outside the page viewport. The screen you see is only the page viewport (there is no address bar or tab strip), so use this tool to open URLs, go back/forward, reload and manage tabs. Actions: navigate(url), back, forward, reload, new_tab(url optional), switch_tab(index), close_tab(index), list_tabs.",
+                "description": "Control the isolated browser outside the page viewport. There is no address bar or tab strip. Actions: navigate(url), back, forward, reload, new_tab(url optional), switch_tab(index), close_tab(index), list_tabs. Read pending JavaScript confirmations/prompts with dialog; respond_dialog requires the returned id and explicit accept=true/false, plus prompt_text for a prompt. Dialogs are never accepted automatically. A dialog can interrupt an input that already ran; query it instead of repeating the input. Follow the task's authorization before confirming an irreversible action.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs"] },
+                        "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
                         "url": { "type": "string", "description": "URL or search words for navigate/new_tab" },
-                        "index": { "type": "integer", "description": "Tab index for switch_tab/close_tab" }
+                        "index": { "type": "integer", "description": "Tab index for switch_tab/close_tab" },
+                        "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: current dialog ID from dialog" },
+                        "accept": { "type": "boolean", "description": "respond_dialog: required explicit accept or cancel" },
+                        "prompt_text": { "type": "string", "description": "respond_dialog: answer for a JavaScript prompt" }
                     },
                     "required": ["action"]
                 }
@@ -73,13 +89,17 @@ impl Llm {
     fn app_menu_tool() -> Value {
         json!({
             "name": "app_menu",
-            "description": "List or click items of the desktop app's native menus, which are not visible in screenshots. source=app is the app's menu bar; source=context is the context menu the app last tried to open (after a right click). Use action=list first, then action=click with a path like \"File > New Text File\". Native menu shortcuts cannot be triggered with keys, so use this tool or the app's own command palette.",
+            "description": "List or click hidden native menus: list, then click(path), with source=app or context. Read pending message/JavaScript dialogs with dialog; respond_dialog requires its exact source and id. For source=native provide response, the zero-based button index. For source=javascript provide explicit accept=true/false and optional prompt_text. Do not repeat input interrupted by a dialog or accept irreversible actions without task authorization. Native file open/save dialogs remain cancelled; use in-window alternatives.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "click"] },
-                    "source": { "type": "string", "enum": ["app", "context"] },
-                    "path": { "type": "string", "description": "Menu path for click, items separated by ' > '" }
+                    "action": { "type": "string", "enum": ["list", "click", "dialog", "respond_dialog"] },
+                    "source": { "type": "string", "enum": ["app", "context", "javascript", "native"], "description": "list/click: app or context; respond_dialog: source returned by dialog" },
+                    "path": { "type": "string", "description": "Menu path for click, items separated by ' > '" },
+                    "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: current dialog ID" },
+                    "response": { "type": "integer", "minimum": 0, "description": "native respond_dialog: zero-based button index" },
+                    "accept": { "type": "boolean", "description": "javascript respond_dialog: required explicit accept or cancel" },
+                    "prompt_text": { "type": "string", "description": "javascript respond_dialog: prompt answer" }
                 },
                 "required": ["action"]
             }
@@ -197,5 +217,44 @@ pub fn short(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tool_contract_tests {
+    use super::*;
+    use crate::desk::DeskKind;
+
+    #[test]
+    fn dialog_tools_require_explicit_response_fields() {
+        for (kind, name) in [(DeskKind::Browser, "browser_control"), (DeskKind::Electron, "app_menu")] {
+            let tools = Llm::tools(kind);
+            let tool = tools.as_array().unwrap().iter().find(|tool| tool["name"] == name).unwrap();
+            let props = &tool["input_schema"]["properties"];
+            for action in ["dialog", "respond_dialog"] {
+                assert!(props["action"]["enum"].as_array().unwrap().contains(&json!(action)), "{name}: {action}");
+            }
+            assert_eq!(props["id"]["type"], "integer");
+            assert_eq!(props["accept"]["type"], "boolean");
+            assert!(props["accept"].get("default").is_none(), "accepting a confirmation must never be implicit");
+            assert_eq!(props["prompt_text"]["type"], "string");
+            if kind == DeskKind::Electron {
+                assert!(props["source"]["enum"].as_array().unwrap().contains(&json!("native")));
+                assert!(props["source"]["enum"].as_array().unwrap().contains(&json!("javascript")));
+                assert_eq!(props["response"]["minimum"], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn session_app_control_matches_supported_platform_and_actions() {
+        let tools = Llm::tools(DeskKind::Session);
+        let control = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "app_control");
+        assert_eq!(control.is_some(), cfg!(windows));
+        if let Some(control) = control {
+            assert_eq!(control["input_schema"]["properties"]["action"]["enum"],
+                json!(["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]));
+            assert!(control["input_schema"]["properties"].get("path").is_none());
+        }
     }
 }

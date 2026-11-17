@@ -371,7 +371,8 @@ mod gui_instance {
     /// if the previous process exits and the mutex goes away, this one becomes the first.
     pub fn acquire(activate: bool) -> Start {
         let sid = crate::platform::win::current_user_sid().ok();
-        let name = mutex_name(sid.as_deref());
+        let scope = crate::platform::ipc::instance_suffix(std::env::var_os("GHOSTDESK_DATA_DIR").as_deref());
+        let name = format!("{}{scope}", mutex_name(sid.as_deref()));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match create(&name) {

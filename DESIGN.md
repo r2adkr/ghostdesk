@@ -1,5 +1,17 @@
 # GhostDesk 디자인
 
+## 사용성 개선 기준
+
+Unslop by Damir Sokolovsky ([@heydamir](https://github.com/heydamir/unslop), CC BY 4.0)과 [Emil Kowalski의 design-engineering skills](https://github.com/emilkowalski/skills)를 참고했습니다. 웹 전용 CSS 구현 대신 해당 원칙을 기존 Rust/egui 위젯에 적용합니다.
+
+- 제품: 사용자가 마우스를 계속 쓰면서 AI에게 웹·앱 작업을 맡기는 창.
+- 성격: 차분한, 정확한, 상황이 잘 보이는.
+- 배경: 작업 책상 뒤편의 조용한 관제창. 기존 흑백 표면을 유지합니다.
+- 집중점: 실제 작업 화면과 사용자의 판단이 필요한 질문·승인.
+- 고유 표식: 작업 화면 속 커서와 목록에 같은 에이전트 색을 씁니다.
+
+작은 창에서도 실제 화면이 조작 패널보다 작아지지 않게 합니다. 긴 이름은 말줄임과 툴팁으로 처리하고, 직접 조작·일시정지를 작업 중 상태보다 먼저 표시합니다. 키보드 포커스는 선택 상태와 구분하며 반복하는 키보드 조작에는 장식 애니메이션을 붙이지 않습니다.
+
 근거: [meta/astryx](https://github.com/meta/astryx)의 Neutral 테마. 값의 원본은 `src/app/theme.rs` 이고, 이 문서는 그 요약이다.
 
 ## 원칙

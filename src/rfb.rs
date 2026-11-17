@@ -935,6 +935,7 @@ impl RfbDesk {
     ///
     /// Note: whether macOS Screen Sharing servers accept Unicode keysyms is unverified.
     pub async fn type_text(&self, text: &str) -> Result<()> {
+        let text = text.replace("\r\n", "\n");
         for ch in text.chars() {
             let (ks, shift) = match ch {
                 '\n' | '\r' => (0xff0d, false),
@@ -2027,6 +2028,39 @@ mod bigint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn crlf_types_one_return_and_preserves_other_text() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let received = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let (_, writer) = stream.into_split();
+        let mut opts = RfbOptions::new("127.0.0.1", 0);
+        opts.key_delay = Duration::ZERO;
+        let desk = RfbDesk {
+            opts, name: Mutex::new("test".into()), server_version: "RFB 003.008\n".into(), security_type: SEC_NONE,
+            fb: Mutex::new(Framebuffer::new(16, 16)), writer: tokio::sync::Mutex::new(writer),
+            input: Mutex::new(InputState::default()), closed: AtomicBool::new(false),
+            seq_tx: watch::channel(0).0, coverage: AtomicU64::new(0), notes: Mutex::new(Vec::new()),
+            on_frame: Arc::new(|| {}), reader: Mutex::new(None), cursor: Mutex::new(None),
+            server_clipboard: Mutex::new(None), last_request: Mutex::new(Instant::now()),
+        };
+        desk.type_text("a\r\nb\rc\n가\t👋").await.unwrap();
+        desk.shutdown().await;
+        let bytes = tokio::time::timeout(Duration::from_secs(3), received).await.unwrap().unwrap();
+        let expected: Vec<u8> = ['a' as u32, 0xff0d, 'b' as u32, 0xff0d, 'c' as u32, 0xff0d, 0x0100_0000 + '가' as u32, 0xff09, 0x0100_0000 + '👋' as u32]
+            .into_iter().flat_map(|keysym| [true, false].into_iter().flat_map(move |down| {
+                let mut packet = vec![4, down as u8, 0, 0];
+                packet.extend_from_slice(&keysym.to_be_bytes());
+                packet
+            })).collect();
+        assert_eq!(bytes, expected, "CRLF must send one Return; lone CR/LF, tab and Unicode stay unchanged");
+    }
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()

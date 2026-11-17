@@ -146,6 +146,13 @@ impl Desk {
         }
     }
 
+    pub fn as_session(&self) -> Option<&Arc<SessionDesk>> {
+        match self {
+            Desk::Session(session) => Some(session),
+            _ => None,
+        }
+    }
+
     /// Screenshot size in pixels (the agent's coordinate space).
     pub fn size(&self) -> (u32, u32) {
         each!(self, w => w.size())

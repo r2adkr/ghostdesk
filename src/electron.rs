@@ -1575,17 +1575,24 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
         ElectronProfile::Empty => {}
         ElectronProfile::Clone { source, refresh } => {
             let real_ud = real_root.join("user-data");
-            // Windows: clone-in-progress marker (outside user-data so it doesn't end up in the clone). Keeps
-            // the next run from mistaking user-data left by an unfinished clone (failed on locked cookies and
-            // then failed to delete, copy error, forced exit, …) for a complete one and launching a
-            // logged-out half copy (same approach as the browser clone in agent.rs).
+            // Markers stay outside user-data so a source cannot supply them. Interrupted clones are rebuilt.
             let mark = real_root.join(".ghostdesk-cloning");
-            let unfinished = cfg!(windows) && mark.exists();
+            let source_mark = real_root.join(".ghostdesk-electron-source.json");
+            let identity = json!({
+                "source": crate::platform::paths::canonicalize(source).unwrap_or_else(|_| source.clone()),
+                "bundle_id": opts.app.bundle_id,
+                "exe": crate::platform::paths::canonicalize(&opts.app.exe).unwrap_or_else(|_| opts.app.exe.clone()),
+            });
+            let unfinished = mark.exists();
             let has = !unfinished && real_ud.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false);
+            if has && !*refresh {
+                let previous = fs::read(&source_mark).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                ensure!(previous.as_ref() == Some(&identity),
+                    "작업공간 '{}' 의 앱·로그인 원본이 선택한 원본과 다르거나 확인되지 않습니다. 기존 내용은 유지했습니다. 다른 작업공간 이름을 쓰거나, 기존 복제 데이터를 교체하려면 refresh_login=true 로 새로 복제하세요.", opts.workspace);
+            }
             if *refresh || !has {
-                if cfg!(windows) {
-                    fs::write(&mark, b"").with_context(|| format!("{} 생성 실패", mark.display()))?;
-                }
+                crate::platform::fsx::remove_file_retry(&source_mark).context("기존 앱 복제본의 완료 표시를 지우지 못했습니다")?;
+                fs::write(&mark, b"").with_context(|| format!("{} 생성 실패", mark.display()))?;
                 if real_ud.exists() {
                     // Windows: files held by an app that just exited are released shortly, so retry (once on macOS)
                     let r = crate::platform::fsx::remove_dir_all_retry(&real_ud);
@@ -1606,10 +1613,8 @@ pub fn prepare_workspace(opts: &ElectronLaunch) -> Result<WorkspacePaths> {
                     None => &noop,
                 };
                 clone_user_data(source, &real_ud, prog)?;
-                if cfg!(windows) {
-                    // only removed once the clone completes (if removal fails, the next run just clones again)
-                    let _ = fs::remove_file(&mark);
-                }
+                fs::write(&source_mark, serde_json::to_vec(&identity)?).context("앱 복제본의 로그인 원본을 기록하지 못했습니다")?;
+                crate::platform::fsx::remove_file_retry(&mark).context("앱 복제 완료 표시를 갱신하지 못했습니다")?;
             }
         }
     }
@@ -2090,12 +2095,40 @@ const PATCH_JS: &str = r#"(() => {
     const cancelIdx = (o) => {
       if (typeof o.cancelId === 'number') return o.cancelId;
       const b = o.buttons || [];
-      const i = b.findIndex(t => /cancel|취소|^no$|아니|close|닫기/i.test(String(t)));
-      return i >= 0 ? i : (b.length > 1 ? b.length - 1 : 0);
+      const i = b.findIndex(t => /^(cancel|취소|no|아니오|아니요|close|닫기)$/i.test(String(t).replace(/&/g, '').replace(/\([a-z]\)$/i, '').trim()));
+      return i;
     };
     const never = () => new Promise(() => {});
-    D.showMessageBox = function (...a) { const o = opt(a); note('앱이 메시지 대화상자를 띄우려 해서 막았습니다 (응답하지 않은 상태로 둠): ' + short([o.title, o.message, o.detail, o.buttons].filter(Boolean))); return never(); };
-    D.showMessageBoxSync = function (...a) { const o = opt(a); const i = cancelIdx(o); note('앱의 메시지 대화상자(동기)를 막고 "' + ((o.buttons || [])[i] || i) + '" 로 응답했습니다: ' + short([o.title, o.message, o.detail].filter(Boolean))); return i; };
+    const dialogs = [], pending = new Map();
+    let nextId = 0;
+    G.nextDialog = () => dialogs.length ? dialogs[0] : null;
+    G.respondDialog = (id, response) => {
+      const entry = pending.get(id);
+      if (!entry) throw new Error('대화상자가 바뀌었거나 이미 응답했습니다. dialog 를 다시 조회하세요.');
+      if (!Number.isInteger(response) || response < 0 || response >= entry.data.buttons.length) throw new Error('대화상자 버튼 번호가 범위를 벗어났습니다.');
+      pending.delete(id);
+      dialogs.splice(dialogs.indexOf(entry.data), 1);
+      entry.resolve({ response, checkboxChecked: entry.data.checkboxChecked });
+      return true;
+    };
+    D.showMessageBox = function (...a) {
+      const o = opt(a), buttons = Array.isArray(o.buttons) && o.buttons.length ? o.buttons.map(String) : ['OK'];
+      const data = { source: 'native', id: ++nextId, type: 'messageBox', title: String(o.title || ''), message: String(o.message || ''), detail: String(o.detail || ''),
+        buttons, defaultId: Number.isInteger(o.defaultId) ? o.defaultId : 0, cancelId: cancelIdx(o), checkboxLabel: String(o.checkboxLabel || ''), checkboxChecked: !!o.checkboxChecked };
+      const promise = new Promise(resolve => pending.set(data.id, { data, resolve }));
+      dialogs.push(data);
+      note('앱의 메시지 대화상자가 응답을 기다립니다. dialog 조회 후 respond_dialog 로 버튼을 선택하세요: ' + short([data.title, data.message, buttons]));
+      return promise;
+    };
+    D.showMessageBoxSync = function (...a) {
+      const o = opt(a), i = cancelIdx(o), buttons = o.buttons || [];
+      if (!Number.isInteger(i) || i < 0 || i >= buttons.length) {
+        note('앱의 메시지 대화상자(동기)는 안전한 취소 버튼이 없어 자동 응답하지 않았습니다: ' + short([o.title, o.message, buttons]));
+        throw new Error('GhostDesk: 동기 메시지 대화상자에 안전한 취소 버튼이 없습니다. 자식/별도 세션에서 이 앱을 사용하세요.');
+      }
+      note('앱의 메시지 대화상자(동기)를 막고 "' + buttons[i] + '" 로 취소했습니다: ' + short([o.title, o.message, o.detail]));
+      return i;
+    };
     D.showErrorBox = function (t, c) { note('앱의 오류 대화상자를 막았습니다: ' + short([t, c])); };
     D.showOpenDialog = function (...a) { const o = opt(a); note('파일 열기 대화상자를 막고 취소로 처리했습니다' + (o.title ? ' (' + o.title + ')' : '') + '. 경로는 앱 안의 입력창으로 입력하세요.'); return Promise.resolve({ canceled: true, filePaths: [], bookmarks: [] }); };
     D.showOpenDialogSync = function () { note('파일 열기 대화상자(동기)를 막았습니다.'); return undefined; };
@@ -3330,6 +3363,29 @@ impl ElectronWorkspace {
         self.inner.type_text(text).await
     }
 
+    pub async fn dialog(&self) -> Result<Value> {
+        if let Some(dialog) = self.inner.dialog() { return Ok(dialog); }
+        self.main_eval("globalThis.__ghostdesk && globalThis.__ghostdesk.nextDialog ? globalThis.__ghostdesk.nextDialog() : null").await
+    }
+
+    pub async fn respond_dialog(
+        &self, source: &str, id: u64, response: Option<usize>, accept: Option<bool>, prompt_text: Option<&str>,
+    ) -> Result<()> {
+        match source {
+            "javascript" => {
+                ensure!(response.is_none(), "JavaScript 대화상자는 response 대신 accept 를 지정하세요");
+                self.inner.respond_dialog(id, accept.ok_or_else(|| anyhow!("accept 가 필요합니다"))?, prompt_text).await
+            }
+            "native" => {
+                ensure!(accept.is_none() && prompt_text.is_none(), "앱 메시지 대화상자는 accept/prompt_text 대신 response 버튼 번호를 지정하세요");
+                let response = response.ok_or_else(|| anyhow!("response 버튼 번호가 필요합니다"))?;
+                self.main_eval(&format!("globalThis.__ghostdesk.respondDialog({id}, {response})")).await?;
+                Ok(())
+            }
+            _ => bail!("대화상자 source 는 javascript / native 중 하나입니다"),
+        }
+    }
+
     pub fn mouse_pos(&self) -> (f64, f64) {
         self.inner.mouse_pos()
     }
@@ -4408,6 +4464,124 @@ async fn selftest_drive(ws: &ElectronWorkspace, outdir: Option<&Path>, frames: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clone_affinity_fixture(tag: &str) -> (PathBuf, ElectronLaunch) {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("gd-electron-affinity-{tag}-{}-{nonce}", std::process::id()));
+        let source = root.join("source-a");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Preferences"), "login-a").unwrap();
+        fs::create_dir_all(root.join("source-b")).unwrap();
+        fs::write(root.join("source-b/Preferences"), "login-b").unwrap();
+        let fake = ElectronApp {
+            name: "Fake".into(), bundle_id: "test.ghostdesk.affinity".into(), bundle: root.join("app"), exe: root.join("app/Fake.exe"),
+            app_version: None, electron_version: None, fuses: None, hideable: false, reason: None,
+            family: AppFamily::Generic, user_data_guess: None, main_script: None, running: false, launch_profile: String::new(),
+        };
+        let mut options = ElectronLaunch::new(fake, "clone", 640, 400);
+        options.workspaces_root = Some(root.join("workspaces"));
+        options.profile = ElectronProfile::Clone { source, refresh: false };
+        (root, options)
+    }
+
+    #[test]
+    fn electron_clone_source_mismatch_preserves_existing_data() {
+        let (root, mut options) = clone_affinity_fixture("source");
+        let paths = prepare_workspace(&options).unwrap();
+        fs::write(paths.user_data.join("kept"), "user-edits").unwrap();
+        options.profile = ElectronProfile::Clone { source: root.join("source-b"), refresh: false };
+        let error = prepare_workspace(&options).err().expect("a different login source must not reuse the old clone");
+        assert!(error.to_string().contains("refresh_login"), "{error:#}");
+        assert_eq!(fs::read_to_string(paths.user_data.join("Preferences")).unwrap(), "login-a");
+        assert!(paths.user_data.join("kept").is_file());
+        if paths.root != paths.real_root { fs::remove_file(paths.root).unwrap(); }
+        crate::platform::fsx::remove_dir_all_retry(&root).unwrap();
+    }
+
+    #[test]
+    fn electron_clone_legacy_and_executable_mismatch_require_explicit_refresh() {
+        let (root, mut options) = clone_affinity_fixture("legacy");
+        let paths = prepare_workspace(&options).unwrap();
+        let original_exe = options.app.exe.clone();
+        options.app.exe = root.join("another-app/Fake.exe");
+        assert!(prepare_workspace(&options).is_err(), "same bundle ID with another executable must not reuse a login");
+        options.app.exe = original_exe;
+        let _ = fs::remove_file(paths.real_root.join(".ghostdesk-electron-source.json"));
+        assert!(prepare_workspace(&options).is_err(), "a nonempty legacy clone has no proven login source");
+        assert_eq!(fs::read_to_string(paths.user_data.join("Preferences")).unwrap(), "login-a");
+        if paths.root != paths.real_root { fs::remove_file(paths.root).unwrap(); }
+        crate::platform::fsx::remove_dir_all_retry(&root).unwrap();
+    }
+
+    #[test]
+    fn electron_clone_matching_source_reuses_and_explicit_refresh_replaces() {
+        let (root, mut options) = clone_affinity_fixture("refresh");
+        let paths = prepare_workspace(&options).unwrap();
+        fs::write(paths.user_data.join("kept"), "user-edits").unwrap();
+        prepare_workspace(&options).unwrap();
+        assert!(paths.user_data.join("kept").is_file());
+        options.profile = ElectronProfile::Clone { source: root.join("source-b"), refresh: true };
+        prepare_workspace(&options).unwrap();
+        assert!(!paths.user_data.join("kept").exists());
+        assert_eq!(fs::read_to_string(paths.user_data.join("Preferences")).unwrap(), "login-b");
+        options.profile = ElectronProfile::Clone { source: root.join("source-b"), refresh: false };
+        prepare_workspace(&options).unwrap();
+        options.profile = ElectronProfile::Clone { source: root.join("missing-source"), refresh: true };
+        assert!(prepare_workspace(&options).is_err());
+        assert!(!paths.real_root.join(".ghostdesk-electron-source.json").exists(), "a failed refresh must invalidate the old completion record");
+        assert!(paths.real_root.join(".ghostdesk-cloning").exists());
+        options.profile = ElectronProfile::Clone { source: root.join("source-b"), refresh: false };
+        prepare_workspace(&options).unwrap();
+        assert_eq!(fs::read_to_string(paths.user_data.join("Preferences")).unwrap(), "login-b");
+        assert!(!paths.real_root.join(".ghostdesk-cloning").exists(), "only a successful rebuild completes the clone");
+        if paths.root != paths.real_root { fs::remove_file(paths.root).unwrap(); }
+        crate::platform::fsx::remove_dir_all_retry(&root).unwrap();
+    }
+
+    #[test]
+    fn native_message_dialog_is_available_for_explicit_response() {
+        let start = PATCH_JS.find("  // ---- native dialogs:").unwrap();
+        let end = PATCH_JS[start..].find("  // ---- block opening external").unwrap() + start;
+        let patch = &PATCH_JS[start..end];
+        let script = format!(r#"
+const G = {{}}, electron = {{dialog:{{}}}};
+const note = () => {{}}, short = v => JSON.stringify(v), safe = (name, f) => f();
+{patch}
+let done = false;
+const promise = electron.dialog.showMessageBox({{message:'Save changes?', detail:'unsaved', buttons:['Save','Discard','Cancel'],defaultId:0,cancelId:2,checkboxChecked:true}}).then(result => {{done = true; return result;}});
+(async () => {{
+ const out = {{done,pending:typeof G.nextDialog === 'function' ? G.nextDialog() : null}};
+ if (out.pending) {{
+  try {{ G.respondDialog(out.pending.id, 99); }} catch (e) {{ out.invalid = true; }}
+  G.respondDialog(out.pending.id, 1);
+  out.result = await promise;
+  try {{ G.respondDialog(out.pending.id, 0); }} catch (e) {{ out.stale = true; }}
+  out.empty = G.nextDialog() === null;
+  try {{ electron.dialog.showMessageBoxSync({{message:'Delete?',buttons:['Delete']}}); }} catch (e) {{ out.syncDeleteRefused = true; }}
+  try {{ electron.dialog.showMessageBoxSync({{message:'Delete?',buttons:['Close and Delete']}}); }} catch (e) {{ out.syncAmbiguousRefused = true; }}
+  out.syncCancel = electron.dialog.showMessageBoxSync({{message:'Save?',buttons:['Save','Discard','Cancel'],cancelId:2}});
+ }}
+ console.log(JSON.stringify(out));
+}})().catch(e => {{ console.error(e); process.exitCode = 1; }});
+"#);
+        let mut command = Command::new("node");
+        command.args(["-e", &script]);
+        let output = match crate::platform::proc::hide_console(&mut command).output() {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { eprintln!("Node.js unavailable; skipping dialog hook execution"); return; },
+            Err(e) => panic!("Node.js failed: {e}"),
+        };
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["done"], false);
+        assert_eq!(result["pending"]["message"], "Save changes?", "message promises need a recoverable pending dialog: {result}");
+        assert_eq!(result["pending"]["buttons"], json!(["Save","Discard","Cancel"]));
+        assert_eq!(result["pending"]["defaultId"], 0);
+        assert_eq!(result["pending"]["cancelId"], 2);
+        assert_eq!(result["result"], json!({"response":1,"checkboxChecked":true}));
+        for field in ["invalid", "stale", "empty", "syncDeleteRefused", "syncAmbiguousRefused"] { assert_eq!(result[field], true, "{field}: {result}"); }
+        assert_eq!(result["syncCancel"], 2);
+    }
 
     #[test]
     fn fuse_block_parsing() {

@@ -1,7 +1,7 @@
 //! Detail view for one agent: live screen, takeover, log and instructions.
 
 use super::*;
-use super::labels::{status_color, status_text};
+use super::labels::display_status;
 
 /// One takeover input from the user, in agent coordinates.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,24 +58,25 @@ impl GhostApp {
                 .response
                 .on_hover_text(tr("더 보기"));
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(RichText::new(&a.shared.name).size(18.0).strong().color(theme::text())).truncate());
+                    ui.add(egui::Label::new(RichText::new(&a.shared.name).size(18.0).strong().color(theme::text())).truncate()).on_hover_text(&a.shared.name);
                 });
             });
         });
         let tokens = *a.shared.tokens.lock();
         let paused = a.shared.paused.load(Ordering::Relaxed);
+        let (status, color) = display_status(&st, paused, a.takeover);
         let info = trf("단계 {} · 토큰 {} / {} · 작업공간 {}", &[&a.shared.steps.load(Ordering::Relaxed), &tokens.0, &tokens.1, &a.shared.workspace_name]);
         // spinner plus shimmering status text while working, a colored chip when stopped
-        if is_working(&st) && !paused {
+        if is_working(&st) && !paused && !a.takeover {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 theme::spinner(ui, 15.0, theme::text());
-                theme::shimmer(ui, &crate::llm::short(&status_text(&st), 48), 13.0)
+                theme::shimmer(ui, &crate::llm::short(&status, 48), 13.0)
             })
             .response
             .on_hover_text(info);
         } else {
-            theme::chip(ui, status_color(&st), &status_text(&st)).on_hover_text(info);
+            theme::chip(ui, color, &status).on_hover_text(format!("{status}\n{info}"));
         }
         // steps: how many moves since the last instruction (a bar when there's a step limit)
         let run = a.shared.run_steps.load(Ordering::Relaxed);
@@ -92,7 +93,7 @@ impl GhostApp {
             });
         }
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::secondary(ui, if paused { tr("재개") } else { tr("일시정지") }).clicked() {
                 a.shared.paused.store(!paused, Ordering::Relaxed);
             }
@@ -245,6 +246,7 @@ impl GhostApp {
         let rt = self.rt.clone();
         let ws_opt = self.agents[idx].shared.workspace();
         let browser = ws_opt.as_ref().and_then(|w| w.as_browser().cloned());
+        let compact_browser = browser.is_some() && ui.available_width() < 520.0;
         let (views, active) = ws_opt.as_ref().map(|w| w.views()).unwrap_or_default();
         // row 1: ‹ all agents · (browser: ◀ ▶ ⟳ + address / app: current window title) · virtual
         // mouse at the far right
@@ -277,18 +279,8 @@ impl GhostApp {
                         if theme::icon_button(ui, "＋", tr("새 탭")).clicked() {
                             rt.spawn(async move { let _ = w.new_tab("").await; });
                         }
-                        let a = &mut self.agents[idx];
-                        let cur = b.active_tab().map(|t| t.url).unwrap_or_default();
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut a.url_input)
-                                .desired_width(f32::INFINITY)
-                                .margin(Margin::symmetric(10, 6))
-                                .hint_text(cur),
-                        );
-                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !a.url_input.trim().is_empty() {
-                            let w = b.clone();
-                            let u = std::mem::take(&mut a.url_input);
-                            rt.spawn(async move { let _ = w.navigate(&u).await; });
+                        if !compact_browser {
+                            browser_address(ui, b, &rt, &mut self.agents[idx].url_input);
                         }
                     } else if let Some(t) = views.iter().find(|t| Some(&t.id) == active.as_ref()) {
                         let title = if t.title.is_empty() { t.detail.clone() } else { t.title.clone() };
@@ -297,6 +289,11 @@ impl GhostApp {
                 });
             });
         });
+        if compact_browser {
+            if let Some(b) = &browser {
+                browser_address(ui, b, &rt, &mut self.agents[idx].url_input);
+            }
+        }
         // row 2: only with two or more tabs/windows (wraps when it overflows)
         if views.len() > 1 {
             ui.horizontal_wrapped(|ui| {
@@ -314,7 +311,8 @@ impl GhostApp {
         }
         let a = &mut self.agents[idx];
         let Some(ws) = ws_opt else {
-            ui.centered_and_justified(|ui| ui.label(RichText::new(status_text(&a.shared.status())).color(theme::muted())));
+            let (status, color) = display_status(&a.shared.status(), a.shared.paused.load(Ordering::Relaxed), a.takeover);
+            ui.centered_and_justified(|ui| ui.label(RichText::new(status).color(color)));
             return;
         };
         ui.add_space(6.0);
@@ -526,6 +524,17 @@ pub(super) fn preparing(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 /// Whether the agent is working (preparing, thinking, acting).
 pub(super) fn is_working(st: &AgentStatus) -> bool {
     matches!(st, AgentStatus::Preparing(_) | AgentStatus::Thinking | AgentStatus::Acting(_))
+}
+
+fn browser_address(ui: &mut egui::Ui, browser: &Arc<crate::browser::BrowserWorkspace>, rt: &Handle, input: &mut String) {
+    let current = browser.active_tab().map(|t| t.url).unwrap_or_default();
+    let r = ui.add(egui::TextEdit::singleline(input).desired_width(f32::INFINITY)
+        .margin(Margin::symmetric(10, 6)).hint_text(&current)).on_hover_text(&current);
+    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !input.trim().is_empty() {
+        let browser = browser.clone();
+        let url = std::mem::take(input);
+        rt.spawn(async move { let _ = browser.navigate(&url).await; });
+    }
 }
 
 /// One log row: kind marker plus text (wrapped lines indent past the marker). The time shows on

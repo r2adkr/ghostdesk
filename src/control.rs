@@ -497,15 +497,9 @@ impl ControlServer {
         let target = match kind {
             "browser" => {
                 let browsers = profiles::detect();
-                let want = p["browser"].as_str().unwrap_or("").to_lowercase();
-                let browser = browsers
-                    .iter()
-                    .find(|b| !want.is_empty() && b.name.to_lowercase().contains(&want))
-                    .or(browsers.first())
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Chromium 계열 브라우저(Chrome/Edge/Brave/Whale 등)를 찾지 못했습니다"))?;
+                let browser = browser_choice(&browsers, p["browser"].as_str().unwrap_or_default())?.clone();
                 let source = if use_login {
-                    let prof = browser.profiles.first().cloned().ok_or_else(|| anyhow!("{} 프로필이 없습니다", browser.name))?;
+                    let prof = profile_choice(&browser, p["browser_profile"].as_str())?;
                     self.ask(
                         conn,
                         "내 브라우저 로그인 사용 요청",
@@ -762,8 +756,13 @@ impl ControlServer {
         if let Some(e) = r.electron.filter(|_| !native) {
             if !e.hideable {
                 // opening it natively would run it on the user's real login data, so don't hand it off that way
+                let alternative = if cfg!(windows) {
+                    "대안: mode=session 으로 별도 Windows 화면에서 실행하거나, 앱을 완전히 종료한 뒤 mode=app_current_session 을 선택하세요. 두 방식 모두 실제 계정·데이터를 사용하며 별도 승인이 필요합니다."
+                } else {
+                    "대안: mode=app_running 으로 실행 중인 앱을 연결하거나 mode=app_vdisplay 를 선택하세요. 실제 계정·데이터를 사용하며 별도 승인이 필요합니다."
+                };
                 bail!(
-                    "'{}' 은(는) Electron 앱이지만 숨김 실행을 지원하지 않습니다: {}. 사용자의 실제 계정 데이터로 열리는 것을 막기 위해 {NATIVE_APP_WORD} 방식으로도 열지 않습니다.",
+                    "'{}' 은(는) Electron 앱이지만 숨김 실행을 지원하지 않습니다: {}. 사용자의 실제 계정 데이터로 열리는 것을 막기 위해 {NATIVE_APP_WORD} 방식으로도 열지 않습니다. {alternative}",
                     e.name,
                     e.reason.clone().unwrap_or_else(|| "이유 미상".into())
                 );
@@ -784,7 +783,7 @@ impl ControlServer {
                     ),
                 )
                 .await?;
-                crate::electron::ElectronProfile::Clone { source: src, refresh: false }
+                crate::electron::ElectronProfile::Clone { source: src, refresh: p["refresh_login"].as_bool().unwrap_or(false) }
             } else {
                 crate::electron::ElectronProfile::Empty
             };
@@ -1338,11 +1337,46 @@ fn remote_is_this_computer(host: &str, port: u16) -> bool {
 pub(crate) const MODES: [&str; 9] =
     ["web", "web_login", "app", "app_login", "app_current_session", "app_running", "app_vdisplay", "session", "remote"];
 
-/// desk_open mode → internal arguments (kind + options). Old options the agent sent along are
-/// dropped so only the mode applies.
-///
-/// Without a mode, the old arguments (kind, …) are used as is.
+fn browser_choice<'a>(browsers: &'a [profiles::InstalledBrowser], query: &str) -> Result<&'a profiles::InstalledBrowser> {
+    let want = query.trim().to_lowercase();
+    if want.is_empty() {
+        return browsers.first().ok_or_else(|| anyhow!("Chromium 계열 브라우저(Chrome/Edge/Brave/Whale 등)를 찾지 못했습니다"));
+    }
+    if let Some(browser) = browsers.iter().find(|b| b.name.to_lowercase() == want) {
+        return Ok(browser);
+    }
+    let matches: Vec<_> = browsers.iter().filter(|b| b.name.to_lowercase().contains(&want)).collect();
+    if let [browser] = matches.as_slice() {
+        return Ok(*browser);
+    }
+    bail!("브라우저 '{query}' 를 하나로 선택할 수 없습니다. 감지된 이름을 지정하세요: {}", browsers.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", "))
+}
+
+fn profile_choice(browser: &profiles::InstalledBrowser, query: Option<&str>) -> Result<profiles::ProfileInfo> {
+    let Some(query) = query.filter(|s| !s.trim().is_empty()).map(str::trim) else {
+        return browser.profiles.first().cloned().ok_or_else(|| anyhow!("{} 프로필이 없습니다", browser.name));
+    };
+    // Resolve only detected IDs/names; never turn a caller's profile string into a file path.
+    if let Some(p) = browser.profiles.iter().find(|p| p.dir.eq_ignore_ascii_case(query)) {
+        return Ok(p.clone());
+    }
+    let matches: Vec<_> = browser.profiles.iter().filter(|p| p.name.eq_ignore_ascii_case(query)).collect();
+    if let [profile] = matches.as_slice() {
+        return Ok((*profile).clone());
+    }
+    bail!("프로필 '{query}' 를 하나로 선택할 수 없습니다. 감지된 프로필 ID 를 지정하세요: {}", browser.profiles.iter().map(|p| format!("{} ({})", p.dir, p.name)).collect::<Vec<_>>().join(", "))
+}
+
+/// Map the public mode while preserving workspace and login-source options.
 fn apply_mode(p: &Value) -> Result<Value> {
+    for key in ["browser", "browser_profile", "workspace"] {
+        if p.get(key).is_some_and(|v| !v.is_null() && !v.is_string()) {
+            bail!("{key} 는 문자열이어야 합니다");
+        }
+    }
+    if p.get("refresh_login").is_some_and(|v| !v.is_null() && !v.is_boolean()) {
+        bail!("refresh_login 은 true 또는 false 여야 합니다");
+    }
     let Some(mode) = p.get("mode").filter(|v| !v.is_null()) else { return Ok(p.clone()) };
     let (kind, opt): (&str, Option<(&str, Value)>) = match mode.as_str().unwrap_or("") {
         "web" => ("browser", None),
@@ -1406,10 +1440,10 @@ const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 �
 /// Per-screen usage notes for external agents.
 pub fn guide(k: DeskKind) -> &'static str {
     match k {
-        DeskKind::Browser => "격리된 headless 브라우저입니다. 스크린샷은 페이지 영역만 보이며 주소창이 없으니 desk_browser(navigate/back/new_tab...)로 이동하세요. 좌표는 스크린샷 픽셀입니다.",
+        DeskKind::Browser => "격리된 headless 브라우저입니다. 스크린샷은 페이지 영역만 보이며 주소창이 없으니 desk_browser(navigate/back/new_tab...)로 이동하세요. 확인·입력 대화상자가 뜨면 desk_browser {action:dialog} 로 읽고 respond_dialog 로 현재 id 에 명시적으로 응답하세요. 좌표는 스크린샷 픽셀입니다.",
         DeskKind::Remote => "별도 원격 데스크톱(VNC)입니다. 좌표는 스크린샷 픽셀입니다. 한글 입력은 서버에 따라 안 될 수 있습니다.",
-        DeskKind::Electron => "보이지 않게 띄운 Electron 앱 창입니다. 네이티브 메뉴는 desk_app {action:list|click, path:\"File > ...\"} 로 쓰세요. 대화상자는 자동 취소되고 notes 로 알려집니다. 이 앱은 사용자의 실제 시스템 클립보드를 쓰므로 cmd/ctrl+c·x·v 는 거부됩니다 — 글자 입력은 type 을 쓰세요.",
-        DeskKind::Session if cfg!(windows) => "같은 Windows 계정의 자식 세션 화면 전체입니다. 사용자 화면이 아니므로 시작 메뉴·작업 표시줄·alt+tab 을 자유롭게 써도 됩니다. 사용자의 파일·로그인은 실제 계정의 것입니다.",
+        DeskKind::Electron => "보이지 않게 띄운 Electron 앱 창입니다. 네이티브 메뉴는 desk_app {action:list|click, path:\"File > ...\"} 로 쓰세요. 확인·입력 대화상자는 desk_app {action:dialog} 로 읽고 respond_dialog 에 현재 source 와 id 를 지정해 응답하세요. 파일 열기·저장 대화상자는 notes 안내를 따르세요. 이 앱은 사용자의 실제 시스템 클립보드를 쓰므로 cmd/ctrl+c·x·v 는 거부됩니다. 글자 입력은 type 을 쓰세요.",
+        DeskKind::Session if cfg!(windows) => "같은 Windows 계정의 자식 세션 화면 전체입니다. 시작 메뉴·작업 표시줄·alt+tab 을 사용할 수 있습니다. 정확한 클릭·입력은 desk_app {action:list_windows|switch_window|ui_tree|press|set_value|read|focus|select|choose} 를 쓰세요. id 는 다음 ui_tree 전까지 유효합니다. menus/menu 는 지원하지 않으므로 메뉴는 스크린샷과 키보드 단축키로 조작하세요. helper 재시작 안내가 나오면 업데이트된 GhostDesk 로 자식 세션을 다시 연결하세요. 사용자의 파일·로그인은 실제 계정의 것입니다.",
         DeskKind::Session => "전용 에이전트 계정의 별도 로그인 세션 전체 화면입니다. 사용자 화면이 아니므로 Dock·메뉴 막대·cmd+tab 을 자유롭게 써도 됩니다. 사용자의 로그인은 공유되지 않습니다.",
         DeskKind::VDisplay => crate::vdisplay::CONTROL_HINT,
         DeskKind::Native => {
@@ -1768,6 +1802,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_browser_and_profile_do_not_silently_use_another_login() {
+        let browser = profiles::InstalledBrowser {
+            name: "Microsoft Edge".into(), exe: "msedge.exe".into(), data_dir: "browser-data".into(),
+            profiles: vec![
+                profiles::ProfileInfo { dir: "Default".into(), name: "Personal".into() },
+                profiles::ProfileInfo { dir: "Profile 1".into(), name: "Work".into() },
+            ],
+        };
+        let browsers = vec![browser];
+        assert_eq!(browser_choice(&browsers, "").unwrap().name, "Microsoft Edge");
+        assert_eq!(browser_choice(&browsers, "edge").unwrap().name, "Microsoft Edge");
+        assert!(browser_choice(&browsers, "Chrome").is_err(), "an explicit browser must not fall back to another account source");
+        let b = &browsers[0];
+        assert_eq!(profile_choice(b, None).unwrap().dir, "Default");
+        assert_eq!(profile_choice(b, Some("Work")).unwrap().dir, "Profile 1");
+        assert_eq!(profile_choice(b, Some("profile 1")).unwrap().dir, "Profile 1");
+        assert!(profile_choice(b, Some("../../other-user")).is_err());
+        let mut duplicate = b.clone();
+        duplicate.profiles.push(profiles::ProfileInfo { dir: "Profile 2".into(), name: "Work".into() });
+        assert!(profile_choice(&duplicate, Some("Work")).is_err(), "ambiguous profile names require the detected directory ID");
+        let mut beta = b.clone();
+        beta.name = "Microsoft Edge Beta".into();
+        assert!(browser_choice(&[b.clone(), beta], "edge").is_err(), "partial browser names must not choose an arbitrary login source");
+    }
+
+    #[test]
     fn namespaces_never_collide() {
         // no slug put into a no-login name can overlap the login clone namespace
         for w in ["login-foo", "login", "-login-foo", "LOGIN-foo", "foo", "x_y-z"] {
@@ -1941,6 +2001,13 @@ mod tests {
         assert!(apply_mode(&json!({"mode": "hidden"})).unwrap_err().to_string().contains("web_login"));
         // without a mode, old arguments pass through as is
         assert_eq!(apply_mode(&json!({"kind": "remote"})).unwrap(), json!({"kind": "remote"}));
+        let q = apply_mode(&json!({"mode":"web_login", "browser":"Edge", "browser_profile":"Profile 1", "workspace":"travel", "refresh_login":true})).unwrap();
+        assert_eq!(q["browser_profile"], "Profile 1");
+        assert_eq!(q["workspace"], "travel");
+        assert_eq!(q["refresh_login"], true);
+        for invalid in [json!({"browser":4}), json!({"browser_profile":["Default"]}), json!({"workspace":false}), json!({"refresh_login":"true"})] {
+            assert!(apply_mode(&invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

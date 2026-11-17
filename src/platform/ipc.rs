@@ -3,6 +3,7 @@
 //! - Unix: a Unix domain socket `control.sock` in the data root (mode 0600 plus a peer uid
 //!   check), as before.
 //! - Windows: the named pipe `\\.\pipe\GhostDesk-control-<user SID>`.
+//!   Explicit isolated data folders get their own suffix, as Unix data roots already do.
 //!   - Security descriptor: owner = this user, DACL = this user + SYSTEM only (other users can't
 //!     open it)
 //!   - Remote (SMB) clients are rejected; the first-instance flag detects "another window is
@@ -23,6 +24,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub type Reader = Box<dyn AsyncRead + Send + Unpin>;
 pub type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Keep preview/test instances separate without changing the installed app's default names.
+#[cfg(any(windows, test))]
+pub fn instance_suffix(data_dir: Option<&std::ffi::OsStr>) -> String {
+    use std::hash::{Hash, Hasher};
+    let Some(dir) = data_dir.filter(|d| !d.is_empty()) else { return String::new() };
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hash);
+    format!("-{:016x}", hash.finish())
+}
 
 /// A connection endpoint.
 #[derive(Clone, Debug)]
@@ -46,7 +57,8 @@ impl Endpoint {
                 // failing to get the SID practically never happens, but keep the name per-user anyway
                 std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
             });
-            Endpoint { name: format!(r"\\.\pipe\GhostDesk-control-{who}") }
+            let scope = instance_suffix(std::env::var_os("GHOSTDESK_DATA_DIR").as_deref());
+            Endpoint { name: format!(r"\\.\pipe\GhostDesk-control-{who}{scope}") }
         }
     }
 
@@ -394,6 +406,17 @@ impl Listener {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn isolated_data_instances_have_separate_names() {
+        use std::ffi::OsStr;
+        assert_eq!(instance_suffix(None), "");
+        assert_eq!(instance_suffix(Some(OsStr::new(""))), "");
+        let first = instance_suffix(Some(OsStr::new(r"C:\qa\first")));
+        assert!(!first.is_empty());
+        assert_eq!(first, instance_suffix(Some(OsStr::new(r"C:\qa\first"))));
+        assert_ne!(first, instance_suffix(Some(OsStr::new(r"C:\qa\second"))));
+    }
 
     #[tokio::test]
     async fn roundtrip_and_single_instance() {

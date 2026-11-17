@@ -2,48 +2,7 @@
 
 use super::*;
 use super::detail::preparing;
-use super::labels::{attention, humanize_error, is_error, status_text};
-
-/// Greetings for the middle of the home screen (one is picked at each launch).
-pub(super) const GREETINGS: &[&str] = &[
-    "오늘은 어떤 일을 대신 맡아 드릴까요?",
-    "무엇을 도와 드릴까요?",
-    "귀찮은 일, 저에게 넘겨 주세요",
-    "오늘 할 일 중 하나를 맡겨 보세요",
-    "어떤 일부터 시작할까요?",
-    "반복되는 일은 제가 할게요",
-    "손 놓고 지켜보기만 하세요",
-    "클릭 대신 한 줄로 말해 주세요",
-    "오늘은 뭘 끝내 볼까요?",
-    "커피 한 잔 하는 동안 해 둘게요",
-    "내 화면은 그대로, 일은 따로",
-    "무엇이든 말만 하세요",
-    "미뤄 둔 일이 있나요?",
-    "오늘의 첫 번째 부탁은 무엇인가요?",
-    "웹 검색부터 앱 조작까지, 맡겨 주세요",
-    "어디서부터 도와 드릴까요?",
-    "할 일을 적으면 바로 시작할게요",
-    "지루한 일은 제 몫이에요",
-    "어떤 화면에서 일해 볼까요?",
-    "오늘도 대신 움직여 드릴게요",
-    "잠깐 쉬세요, 제가 할게요",
-    "무엇을 찾아 드릴까요?",
-    "어떤 일을 자동으로 해 둘까요?",
-    "몇 번의 클릭을 아껴 드릴까요?",
-    "오늘 해치울 일을 알려 주세요",
-    "생각만 말해 주세요, 손은 제가 쓸게요",
-    "필요한 걸 말하면 찾아올게요",
-    "한 번 맡기면 끝까지 해 둘게요",
-    "오늘은 무엇을 맡겨 보실래요?",
-    "준비됐어요. 무엇부터 할까요?",
-];
-
-/// A different greeting each launch, picked from the clock's nanoseconds; it only has to look
-/// varied.
-pub(super) fn random_greeting() -> usize {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
-    nanos % GREETINGS.len()
-}
+use super::labels::{attention, display_status, humanize_error, is_error};
 
 impl GhostApp {
     /// Opens the screen wall.
@@ -65,9 +24,11 @@ impl GhostApp {
     pub(super) fn welcome(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             let w = ui.available_width().min(680.0);
-            ui.add_space((ui.available_height() * 0.28).max(24.0));
-            ui.label(RichText::new(tr(GREETINGS[self.greeting])).size(28.0).color(theme::text()));
-            ui.add_space(28.0);
+            ui.add_space((ui.available_height() * 0.24).max(24.0));
+            ui.label(RichText::new(tr("내 화면은 그대로, 일은 따로")).size(28.0).color(theme::text()));
+            ui.add_space(8.0);
+            ui.label(RichText::new(tr("웹사이트와 앱 작업을 맡기고, 진행 화면을 지켜보세요")).color(theme::muted()));
+            ui.add_space(24.0);
             // task box: Enter (or the ↵ button) opens the new-agent window with the typed task
             let id = egui::Id::unique("welcome_composer");
             let focused = ui.memory(|m| m.has_focus(id));
@@ -102,6 +63,8 @@ impl GhostApp {
                 ui.add_space(4.0);
                 self.model_picker(ui);
             });
+            ui.add_space(4.0);
+            ui.label(theme::hint(tr("Enter로 시작 · Shift+Enter로 줄바꿈")));
             if submit {
                 self.open_wizard();
             }
@@ -208,19 +171,25 @@ impl GhostApp {
             }
             // top-left name tag: ● name · status (border and status text in the attention color if a
             // person is needed)
-            let attn = attention(&st, a.takeover);
+            let paused = a.shared.paused.load(Ordering::Relaxed);
+            let attn = if paused && !a.takeover { None } else { attention(&st, a.takeover) };
             let mut job = egui::text::LayoutJob::default();
             let fmt = |color: Color32| egui::TextFormat { font_id: egui::FontId::proportional(12.0), color, ..Default::default() };
             job.append(&a.shared.name, 0.0, fmt(Color32::WHITE));
-            let status = status_text(&st);
+            let (status, _) = display_status(&st, paused, a.takeover);
             let status = if is_error(&st) { humanize_error(&status) } else { status };
             job.append(&format!("  ·  {}", crate::llm::short(&status, 28)), 0.0, fmt(attn.unwrap_or(Color32::from_gray(205))));
+            job.wrap.max_width = (rect.width() - 48.0).max(1.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
             let g = p.layout_job(job);
             let at = rect.left_top() + Vec2::new(10.0, 9.0);
             let pill = egui::Rect::from_min_size(at, Vec2::new(g.size().x + 16.0, g.size().y)).expand2(Vec2::new(8.0, 4.0));
             p.rect_filled(pill, 255, Color32::from_black_alpha(170));
             p.circle_filled(egui::pos2(at.x + 4.0, at.y + g.size().y / 2.0), 4.0, crate::cursor::agent_color(a.shared.id));
             p.galley(at + Vec2::new(14.0, 0.0), g, Color32::WHITE);
+            theme::focus_outline(ui, &resp, theme::CARD_RADIUS);
+            let resp = resp.on_hover_text(format!("{}\n{status}", a.shared.name));
             if let Some(c) = attn {
                 p.rect_stroke(rect, theme::CARD_RADIUS, Stroke::new(3.0, c), StrokeKind::Outside);
             } else if resp.hovered() {

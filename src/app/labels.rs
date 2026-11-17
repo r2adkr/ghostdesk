@@ -54,6 +54,17 @@ pub(super) fn status_text(st: &AgentStatus) -> String {
     }
 }
 
+/// Human control and pause describe what is happening now, even if the last AI action is pending.
+pub(super) fn display_status(st: &AgentStatus, paused: bool, takeover: bool) -> (String, Color32) {
+    if takeover {
+        (tr("직접 조작 중").into(), theme::takeover())
+    } else if paused {
+        (tr("일시정지됨").into(), theme::muted())
+    } else {
+        (status_text(st), status_color(st))
+    }
+}
+
 /// Reason strings the agent (`agent.rs`, `agent/workspace.rs`) puts into its status. They must
 /// be in the translation table to show up in the UI language.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -124,6 +135,16 @@ pub(super) fn profile_short(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_status_prioritizes_human_control_and_pause() {
+        let st = AgentStatus::Thinking;
+        assert_eq!(display_status(&st, false, false), (status_text(&st), status_color(&st)));
+        assert_eq!(display_status(&st, true, false), (tr("일시정지됨").into(), theme::muted()));
+        assert_eq!(display_status(&st, true, true), (tr("직접 조작 중").into(), theme::takeover()));
+        let error = AgentStatus::Error("연결 실패".into());
+        assert_eq!(display_status(&error, false, false), (status_text(&error), theme::danger()));
+    }
 
     #[test]
     fn attention_and_names() {

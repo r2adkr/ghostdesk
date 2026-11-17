@@ -11,6 +11,7 @@ const ENV_BROWSER: &str = r#"Environment
 - You control a dedicated, isolated Chromium instance. It runs off-screen (headless by default), so nothing you do touches the human's own screen, mouse, keyboard or browser windows.
 - The instance uses a clone of the human's browser profile, so websites where they are already signed in are usually signed in here too. Treat their accounts with care.
 - Screenshots show ONLY the page viewport. There is no address bar, tab strip or OS chrome. Use the `browser_control` tool to navigate to URLs, go back/forward, reload, and open/switch/close tabs. Keyboard shortcuts that rely on browser UI (Cmd+L, Cmd+T, …) do not work.
+- JavaScript dialogs are never accepted automatically and do not appear in page screenshots. Use browser_control action=dialog, then respond_dialog with its current id and explicit accept=true/false (plus prompt_text for prompts). If a dialog interrupted input, do not repeat that input. Confirm irreversible actions only when authorized.
 - After every batch of actions you automatically receive a fresh screenshot plus the current tab list, so you rarely need to request `screenshot` yourself.
 - Coordinates are in the pixel space of the screenshots (origin top-left)."#;
 
@@ -24,6 +25,7 @@ const ENV_ELECTRON: &str = r#"Environment
 - You operate one window of a desktop app (Electron) that runs in a separate, invisible instance. Nothing you do appears on the human's screen. The screenshot is the whole window content; coordinates are screenshot pixels. There is no menu bar, Dock or other apps in this screen.
 - Shortcuts are macOS style (cmd+...). Shortcuts handled inside the app (most of VS Code, cmd+n, cmd+shift+p) and editing commands such as cmd+a/z work. Native menu-bar items cannot be triggered by keys: use the `app_menu` tool (list, then click a path like "File > New Text File"; after a right click use source=context) or the app's command palette.
 - Native dialogs never appear. File open/save dialogs are cancelled automatically and you are told in Events; use the app's in-window alternatives (VS Code shows a simple in-window file dialog).
+- Message and JavaScript dialogs wait for an explicit answer: use app_menu action=dialog, then respond_dialog with the exact source and id. For source=native choose response (zero-based button index); for source=javascript specify accept=true/false and optional prompt_text. Do not repeat interrupted input or choose destructive buttons without authorization. Synchronous message dialogs without an unambiguous cancel choice require a separate/native session.
 - External links (the human's real browser), notifications, devtools, app restarts and permission prompts are blocked and reported in Events. Do not retry blocked actions.
 - New windows are switched to automatically. Quitting the app (cmd+q) ends the session.
 - This app shares the human's real system clipboard, so copy/cut/paste shortcuts (cmd/ctrl+c/x/v) are blocked and return an error. Enter text with the `type` action instead.
@@ -48,6 +50,7 @@ const ENV_CHILD_SESSION: &str = r#"Environment
 - You share the human's files and installed apps. Existing logins may be available, but an app or browser profile already open in the human's session may be locked. Do not overwrite shared files or use accounts beyond the task's authorization.
 - Keys use ctrl-based Windows shortcuts and xdotool names such as 'ctrl+a', 'super+r', 'Return' and 'BackSpace'. Microsoft Store apps such as the new Notepad can run here.
 - Before typing long text, visually confirm the field's focus and selection in a screenshot, then type in a separate turn. Do not batch focus-changing clicks or shortcuts with long text. Native Edit/RichEdit fields insert the text synchronously after that observation; other controls and unobserved batches use queued input, so inspect the result before saving or submitting.
+- Use app_control list_windows and switch_window to select a window, then ui_tree to inspect UI Automation elements. press, set_value, focus, select, choose and read operate by element id. For exact long-text replacement prefer set_value and verify with read. Refresh ui_tree after window/focus changes; use the screen and keyboard for application menus. Older helpers may lack these operations and will request an update; ordinary screenshot/keyboard input remains available.
 - If Events reports a reconnection, inspect a screenshot before repeating input. If input is refused because this session is on the physical monitor, wait for the human to return to their own session."#;
 
 const RULES: &str = r#"Rules
@@ -66,6 +69,7 @@ fn env_browser_pc() -> String {
 - You control a dedicated, isolated Chromium instance. It runs off-screen (headless by default), so nothing you do touches the human's own screen, mouse, keyboard or browser windows.
 - The instance uses a clone of the human's browser profile, so websites where they are already signed in are usually signed in here too. Treat their accounts with care.
 - Screenshots show ONLY the page viewport. There is no address bar, tab strip or OS chrome. Use the `browser_control` tool to navigate to URLs, go back/forward, reload, and open/switch/close tabs. Keyboard shortcuts that rely on browser UI (Ctrl+L, Ctrl+T, …) do not work.
+- JavaScript dialogs are never accepted automatically and do not appear in page screenshots. Use browser_control action=dialog, then respond_dialog with its current id and explicit accept=true/false (plus prompt_text for prompts). If a dialog interrupted input, do not repeat that input. Confirm irreversible actions only when authorized.
 - The browser runs on {OS_NAME}, so page shortcuts use ctrl (ctrl+a, ctrl+c, ctrl+v, ctrl+z, ctrl+f). `cmd` in key names is sent as ctrl.
 - After every batch of actions you automatically receive a fresh screenshot plus the current tab list, so you rarely need to request `screenshot` yourself.
 - Coordinates are in the pixel space of the screenshots (origin top-left)."#
@@ -81,6 +85,7 @@ fn env_electron_pc() -> String {
 - The app runs on {OS_NAME}, so shortcuts use ctrl (ctrl+...); `cmd` in key names is sent as ctrl. Shortcuts handled inside the app (most of VS Code, ctrl+n, ctrl+shift+p, shift+alt+f) and editing commands such as ctrl+a/z work. Native menu-bar items cannot be triggered by keys: bare alt, F10, shift+F10, alt+<letter> with no other modifier, alt+space and the menu key are refused. Use the `app_menu` tool (list, then click a path like "File > New Text File"; after a right click use source=context) or the app's command palette instead.
 - Drag-and-drop inside the app (left_click_drag on explorer items, editor tabs and the like) works and stays inside the app.
 - Native dialogs never appear. File open/save dialogs are cancelled automatically and you are told in Events; use the app's in-window alternatives (VS Code shows a simple in-window file dialog).
+- Message and JavaScript dialogs wait for an explicit answer: use app_menu action=dialog, then respond_dialog with the exact source and id. For source=native choose response (zero-based button index); for source=javascript specify accept=true/false and optional prompt_text. Do not repeat interrupted input or choose destructive buttons without authorization. Synchronous message dialogs without an unambiguous cancel choice require a separate/native session.
 - External links (the human's real browser), notifications, devtools, app restarts and permission prompts are blocked and reported in Events. Do not retry blocked actions.
 - New windows are switched to automatically. Quitting the app (File > Exit, ctrl+q, alt+F4) ends the session.
 - This app shares the human's real system clipboard, so copy/cut/paste shortcuts (ctrl+c/x/v, ctrl/shift+Insert, shift+Delete) are blocked and return an error. Enter text with the `type` action instead.

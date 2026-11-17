@@ -369,7 +369,9 @@ fn filled(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8) -> Respons
     let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered() && r.enabled());
     let h = ui.ctx().animate_bool_with_time(id.with("hover_t"), hovered, 0.12);
     let fill = accent().lerp_to_gamma(pal().accent_hover, h);
-    ui.add(egui::Button::new(label.color(on_accent()).strong()).fill(fill).stroke(Stroke::NONE).corner_radius(radius).min_size(size))
+    let resp = ui.add(egui::Button::new(label.color(on_accent()).strong()).fill(fill).stroke(Stroke::NONE).corner_radius(radius).min_size(size));
+    focus_outline(ui, &resp, radius);
+    resp
 }
 
 /// Primary action button (accent color).
@@ -384,12 +386,14 @@ pub fn secondary(ui: &mut egui::Ui, label: impl Into<String>) -> Response {
 
 /// Icon-only button (background only on hover).
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> Response {
-    ui.add(
+    let resp = ui.add(
         egui::Button::new(RichText::new(icon).size(16.0).color(body()))
             .frame_when_inactive(false)
             .min_size(Vec2::splat(32.0)),
-    )
-    .on_hover_text(tip)
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, resp.enabled(), tip));
+    focus_outline(ui, &resp, RADIUS);
+    resp.on_hover_text(tip)
 }
 
 /// One tab in a tab row: plain text, with an accent underline when selected.
@@ -398,16 +402,17 @@ pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> Response {
     let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(14.0), color);
     let size = Vec2::new(galley.size().x + 20.0, 34.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, resp.enabled(), selected, label));
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
-        let color = if resp.hovered() && !selected { body() } else { color };
+        let color = if (resp.hovered() || resp.has_focus()) && !selected { body() } else { color };
         p.galley_with_override_text_color(rect.center() - galley.size() / 2.0 - Vec2::new(0.0, 1.0), galley, color);
         if selected {
             let bar = egui::Rect::from_min_max(egui::pos2(rect.left() + 6.0, rect.bottom() - 2.0), egui::pos2(rect.right() - 6.0, rect.bottom()));
             p.rect_filled(bar, 1, accent());
         }
     }
+    focus_outline(ui, &resp, RADIUS);
     resp
 }
 
@@ -443,7 +448,8 @@ impl egui::Widget for Switch<'_> {
         let on = *self.on;
         resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, &self.text));
         if ui.is_rect_visible(rect) {
-            let t = ui.ctx().animate_bool_responsive(resp.id, on);
+            let keyboard = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter));
+            let t = ui.ctx().animate_bool_with_time(resp.id, on, if keyboard { 0.0 } else { 0.125 });
             let tr = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.center().y - track.y / 2.0), track);
             let p = pal();
             let fill = lerp_color(p.switch_off, p.accent, t);
@@ -458,6 +464,7 @@ impl egui::Widget for Switch<'_> {
             painter.circle_filled(egui::pos2(cx, tr.center().y), r, if enabled { knob } else { p.muted });
             painter.galley(egui::pos2(tr.right() + 8.0, rect.center().y - galley.size().y / 2.0), galley, p.text);
         }
+        focus_outline(ui, &resp, RADIUS);
         resp
     }
 }
@@ -471,7 +478,17 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 pub fn icon_toggle(ui: &mut egui::Ui, on: bool, icon: &str, tip: &str) -> Response {
     let b = egui::Button::new(RichText::new(icon).size(15.0).color(if on { text() } else { muted() })).min_size(Vec2::splat(32.0));
     let b = if on { b.fill(pal().accent_tint).stroke(Stroke::NONE) } else { b.frame_when_inactive(false) };
-    ui.add(b).on_hover_text(tip)
+    let resp = ui.add(b);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, resp.enabled(), on, tip));
+    focus_outline(ui, &resp, RADIUS);
+    resp.on_hover_text(tip)
+}
+
+/// Keyboard focus is separate from hover and selection, and appears without a transition.
+pub fn focus_outline(ui: &egui::Ui, resp: &Response, radius: u8) {
+    if resp.has_focus() && resp.enabled() {
+        ui.painter().rect_stroke(resp.rect.expand(4.0), radius.saturating_add(4), Stroke::new(2.0, accent()), StrokeKind::Inside);
+    }
 }
 
 // ---- sidebar ----
@@ -480,7 +497,7 @@ pub fn icon_toggle(ui: &mut egui::Ui, on: bool, icon: &str, tip: &str) -> Respon
 /// lighter one on hover.
 pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badge: Option<Color32>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, resp.enabled(), selected, label));
     if ui.is_rect_visible(rect) {
         let h = hover_t(ui.ctx(), &resp);
         let p = ui.painter();
@@ -497,13 +514,14 @@ pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badg
             p.circle_filled(egui::pos2(rect.right() - 14.0, rect.center().y), 3.5, c);
         }
     }
+    focus_outline(ui, &resp, RADIUS);
     resp
 }
 
 /// Send button: an Enter icon (Lucide corner-down-left) in an accent-colored circle.
 pub fn enter_button(ui: &mut egui::Ui, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, resp.enabled(), tip));
     if ui.is_rect_visible(rect) {
         let h = hover_t(ui.ctx(), &resp);
         let p = ui.painter();
@@ -512,6 +530,7 @@ pub fn enter_button(ui: &mut egui::Ui, tip: &str) -> Response {
         p.circle_filled(rect.center(), r, fill);
         p.text(rect.center(), egui::Align2::CENTER_CENTER, crate::icon::CORNER_DOWN_LEFT, FontId::proportional(17.0), on_accent());
     }
+    focus_outline(ui, &resp, RADIUS);
     resp.on_hover_text(tip)
 }
 
@@ -579,7 +598,8 @@ pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Ve
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     let p = pal();
     let h = hover_t(ui.ctx(), &resp);
-    let sel = ui.ctx().animate_bool_with_time(resp.id.with("sel_t"), selected, 0.15);
+    let keyboard = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter));
+    let sel = ui.ctx().animate_bool_with_time(resp.id.with("sel_t"), selected, if keyboard { 0.0 } else { 0.15 });
     let fill = p.card.lerp_to_gamma(p.card_hover, h).lerp_to_gamma(p.accent_tint, sel);
     let stroke = Stroke::new(1.0, p.border.lerp_to_gamma(p.border_hover, h).lerp_to_gamma(p.accent, sel));
     let painter = ui.painter();
@@ -592,7 +612,8 @@ pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Ve
     let cy = rect.center().y;
     painter.galley(egui::pos2(x, cy - is.y / 2.0), ig, p.text);
     painter.galley(egui::pos2(x + is.x + gap, cy - ts.y / 2.0), tg, p.text);
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, title));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, resp.enabled(), selected, title));
+    focus_outline(ui, &resp, CARD_RADIUS);
     resp
 }
 
@@ -659,7 +680,7 @@ pub fn appear(ctx: &egui::Context, id: egui::Id, key: u64, dur: f32) -> f32 {
 /// A value that moves smoothly between 0 and 1 on hover in/out (for fading background and border
 /// colors).
 pub fn hover_t(ctx: &egui::Context, resp: &Response) -> f32 {
-    ctx.animate_bool_with_time(resp.id.with("hover_t"), resp.hovered() || resp.has_focus(), 0.12)
+    if resp.has_focus() { 1.0 } else { ctx.animate_bool_with_time(resp.id.with("hover_t"), resp.hovered(), 0.12) }
 }
 
 /// Working indicator: eight rays rotating, fading from the tail.

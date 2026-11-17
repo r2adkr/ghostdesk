@@ -156,6 +156,10 @@ pub trait SessionPlatform: Send + Sync + 'static {
     /// A screenshot can acknowledge only the input generation it started with.
     fn input_epoch(&self) -> u64 { 0 }
     fn observe_input(&self, _epoch: u64) {}
+    fn supports_app_control(&self) -> bool { false }
+    fn app_control(&self, _input: &Value, _state: &mut AppControlState, _frame: (u32, u32), _check: &dyn Fn() -> Result<()>) -> Result<String> {
+        bail!("이 세션 헬퍼는 앱 요소 조작을 지원하지 않습니다");
+    }
     /// Current cursor position (global points).
     fn cursor(&self) -> Result<(f64, f64)>;
     /// Whether this session is currently on the physical display (console session).
@@ -376,9 +380,18 @@ impl ServerHandle {
 
 /// Per-connection state (pressed buttons are released on disconnect).
 #[derive(Default)]
+pub struct AppControlState {
+    #[cfg(windows)]
+    pub(crate) windows: crate::winapp::child::AppControl,
+    #[cfg(test)]
+    mock_calls: usize,
+}
+
+#[derive(Default)]
 struct ConnState {
     pressed: Vec<u8>,
     last_pt: Option<(f64, f64)>,
+    app_control: AppControlState,
 }
 
 /// Listener the helper accepts connections on. Unix = socket (client uid checked), Windows =
@@ -646,6 +659,8 @@ impl Server {
                     "on_console": self.platform.on_console(),
                     "allow_on_console": self.cfg.allow_on_console,
                     "server_pid": std::process::id(),
+                    "server_version": env!("CARGO_PKG_VERSION"),
+                    "capabilities": {"app_control": self.platform.supports_app_control()},
                 }))
             }
             "ping" => Ok(json!({"pong": true, "on_console": self.platform.on_console()})),
@@ -824,6 +839,19 @@ impl Server {
                 let _g = self.input_lock.lock().await;
                 self.guarded(move |p, check| p.type_text(&text, check)).await?;
                 Ok(json!({}))
+            }
+            "app_control" => {
+                self.gate()?;
+                let input = v["input"].as_object().ok_or_else(|| anyhow!("input 객체가 필요합니다"))?.clone();
+                let frame = (uint_or(v, "fw", 0).min(32768) as u32, uint_or(v, "fh", 0).min(32768) as u32);
+                let _g = self.input_lock.lock().await;
+                let mut state = std::mem::take(&mut cs.app_control);
+                let (state, result) = self.guarded(move |p, check| {
+                    let result = p.app_control(&Value::Object(input), &mut state, frame, check);
+                    Ok((state, result))
+                }).await?;
+                cs.app_control = state;
+                Ok(json!({"text": result?}))
             }
             "cursor" => {
                 let fw = uint_or(v, "fw", 0) as u32;
@@ -1172,6 +1200,8 @@ struct ClientState {
     last_agent_shot: Option<Instant>,
     on_console: bool,
     server_label: String,
+    server_version: String,
+    app_control_supported: bool,
 }
 
 /// Backend driving the entire screen of the dedicated agent login session (session helper client).
@@ -1407,6 +1437,8 @@ impl SessionDesk {
         let mut st = self.st.lock();
         st.display = display;
         st.server_label = h["label"].as_str().unwrap_or_default().to_string();
+        st.server_version = h["server_version"].as_str().unwrap_or("알 수 없음").to_string();
+        st.app_control_supported = h["capabilities"]["app_control"] == true;
         if frame.0 > 0 && frame.1 > 0 {
             if first {
                 st.size = frame;
@@ -1769,6 +1801,21 @@ impl SessionDesk {
         Ok(())
     }
 
+    pub async fn app_control(&self, input: &Value) -> Result<String> {
+        {
+            let st = self.st.lock();
+            if !st.app_control_supported {
+                bail!("이 세션 헬퍼({})는 앱 요소 조작을 지원하지 않습니다. GhostDesk 앱과 자식 세션의 GhostDesk 헬퍼를 최신 버전으로 다시 시작하세요. 기존 화면·키보드 조작은 계속 사용할 수 있습니다.", st.server_version);
+            }
+        }
+        if !matches!(input["action"].as_str(), Some("list_windows" | "ui_tree" | "read")) {
+            self.ensure_canary().await?;
+        }
+        let (fw, fh) = self.size();
+        let result = self.call(json!({"op":"app_control", "input":input, "fw":fw, "fh":fh}), false, Duration::from_secs(30)).await?;
+        result["text"].as_str().map(str::to_string).ok_or_else(|| anyhow!("앱 요소 조작 응답에 text 가 없습니다"))
+    }
+
     pub fn mouse_pos(&self) -> (f64, f64) {
         self.st.lock().mouse
     }
@@ -2067,6 +2114,14 @@ impl MockPlatform {
 }
 
 impl SessionPlatform for MockPlatform {
+    #[cfg(test)]
+    fn supports_app_control(&self) -> bool { true }
+    #[cfg(test)]
+    fn app_control(&self, input: &Value, state: &mut AppControlState, _frame: (u32, u32), check: &dyn Fn() -> Result<()>) -> Result<String> {
+        check()?;
+        state.mock_calls += 1;
+        Ok(format!("mock {} {}", input["action"].as_str().unwrap_or(""), state.mock_calls))
+    }
     #[cfg(test)]
     fn observe_input(&self, _epoch: u64) {
         self.observations.fetch_add(1, Ordering::SeqCst);
@@ -2525,6 +2580,18 @@ pub(crate) async fn pipe_roundtrip() -> Result<()> {
     let sink: FrameSink = Arc::new(|_: &[u8]| {});
     let opts = SessionOptions { live_fps: 0.0, ..Default::default() };
     let d = SessionDesk::connect_target(ep, None, "mock", sink, opts).await?;
+    #[cfg(test)]
+    {
+        anyhow::ensure!(d.app_control(&json!({"action":"ui_tree"})).await? == "mock ui_tree 1");
+        {
+            let mut state = d.st.lock();
+            state.app_control_supported = false;
+            state.server_version = "0.6.0".into();
+        }
+        let error = d.app_control(&json!({"action":"ui_tree"})).await.unwrap_err().to_string();
+        anyhow::ensure!(error.contains("0.6.0") && error.contains("다시 시작") && !d.is_closed(), "{error}");
+        d.st.lock().app_control_supported = true;
+    }
     let shot = d.screenshot().await?;
     anyhow::ensure!(shot.starts_with(&[0x89, b'P', b'N', b'G']), "스크린샷이 PNG 가 아닙니다");
     d.click(Some((640.0, 400.0)), MouseButton::Left, 1, 0).await?;
@@ -2559,6 +2626,25 @@ mod safety_tests {
     }
 
     #[tokio::test]
+    async fn app_control_keeps_element_state_per_connection() {
+        let srv = server(Arc::new(MockPlatform::new()));
+        let mut a = ConnState::default();
+        let mut b = ConnState::default();
+        let request = json!({"op":"app_control", "input":{"action":"ui_tree"}});
+        assert_eq!(srv.dispatch(&request, &mut a).await.unwrap()["text"], "mock ui_tree 1");
+        assert_eq!(srv.dispatch(&request, &mut b).await.unwrap()["text"], "mock ui_tree 1");
+        assert_eq!(srv.dispatch(&request, &mut a).await.unwrap()["text"], "mock ui_tree 2");
+    }
+
+    #[tokio::test]
+    async fn helper_hello_reports_semantic_capabilities_and_app_version() {
+        let srv = server(Arc::new(MockPlatform::new()));
+        let hello = srv.dispatch(&json!({"op":"hello", "version":PROTO_VERSION}), &mut ConnState::default()).await.unwrap();
+        assert_eq!(hello["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello["capabilities"]["app_control"], true);
+    }
+
+    #[tokio::test]
     async fn only_explicit_agent_screenshots_observe_input() {
         let mock = Arc::new(MockPlatform::new());
         let srv = server(mock.clone());
@@ -2578,6 +2664,7 @@ mod safety_tests {
             json!({"op":"key", "combo":"a"}),
             json!({"op":"hold_key", "combo":"a", "secs":1}),
             json!({"op":"type", "text":"hello"}),
+            json!({"op":"app_control", "input":{"action":"press", "id":1}}),
         ] {
             let mock = Arc::new(MockPlatform::new());
             let srv = server(mock.clone());

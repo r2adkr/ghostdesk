@@ -275,6 +275,9 @@ async fn exec_custom(
 pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Result<Outcome> {
     match name {
         "app_control" => {
+            if cfg!(windows) {
+                if let Some(session) = desk.as_session() { return ok(session.app_control(input).await?); }
+            }
             if let Some(v) = desk.as_vdisplay() {
                 return ok(v.app_control(input).await?);
             }
@@ -285,12 +288,20 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
             ok(ws.app_control(input).await?)
         }
         "app_menu" => {
-            use crate::electron::MenuSource;
             let ws = desk
                 .as_electron()
                 .ok_or_else(|| anyhow!("app_menu 는 Electron 앱 작업공간에서만 쓸 수 있습니다"))?;
-            let src = if input["source"].as_str() == Some("context") { MenuSource::Context } else { MenuSource::App };
             match input["action"].as_str().unwrap_or("list") {
+                "dialog" => ok(ws.dialog().await?.to_string()),
+                "respond_dialog" => {
+                    let id = dialog_id(input)?;
+                    let source = input["source"].as_str().ok_or_else(|| anyhow!("source (javascript/native)가 필요합니다"))?;
+                    let response = input.get("response").map(|value| value.as_u64()
+                        .and_then(|value| usize::try_from(value).ok()).ok_or_else(|| anyhow!("response 는 0 이상의 버튼 번호여야 합니다"))).transpose()?;
+                    let accept = input.get("accept").map(|value| value.as_bool().ok_or_else(|| anyhow!("accept 는 true/false 여야 합니다"))).transpose()?;
+                    ws.respond_dialog(source, id, response, accept, dialog_prompt(input)?).await?;
+                    ok("대화상자에 응답했습니다")
+                }
                 "click" => {
                     let path = input["path"].as_str().ok_or_else(|| anyhow!("path 가 필요합니다"))?;
                     // block copy/cut/paste menu items for the same reason as the shortcuts: the clipboard is the user's
@@ -300,10 +311,10 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                              텍스트를 넣으려면 `type` 동작을 쓰세요. (Clipboard menu items are blocked on Electron desks; use the `type` action instead.)"
                         ));
                     }
-                    ok(ws.menu_click(src, path).await?)
+                    ok(ws.menu_click(menu_source(input)?, path).await?)
                 }
-                _ => {
-                    let t = ws.menu_text(src).await?;
+                "list" => {
+                    let t = ws.menu_text(menu_source(input)?).await?;
                     if t.trim().is_empty() {
                         ok("메뉴가 비어 있습니다. 앱이 아직 메뉴를 만들지 않았을 수 있으니 잠시 후(wait 1~2초) 다시 시도하세요. \
                             source=context 는 우클릭 직후에만 내용이 있습니다.")
@@ -311,6 +322,7 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                         ok(t)
                     }
                 }
+                action => Err(anyhow!("알 수 없는 action: {action}")),
             }
         }
         "browser_control" => {
@@ -328,6 +340,12 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                 "switch_tab" => ws.switch_tab(idx).await?,
                 "close_tab" => ws.close_tab(idx).await?,
                 "list_tabs" => return ok(ws.tabs_text()),
+                "dialog" => return ok(ws.dialog().unwrap_or(Value::Null).to_string()),
+                "respond_dialog" => {
+                    let accept = input["accept"].as_bool().ok_or_else(|| anyhow!("accept (true/false)를 명시해야 합니다"))?;
+                    ws.respond_dialog(dialog_id(input)?, accept, dialog_prompt(input)?).await?;
+                    return ok("대화상자에 응답했습니다");
+                }
                 a => return Err(anyhow!("알 수 없는 action: {a}")),
             }
             let t = ws.active_tab().map(|t| format!("현재 탭: {} — {}", t.title, t.url)).unwrap_or_default();
@@ -335,6 +353,24 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
         }
         other => Err(anyhow!("알 수 없는 도구: {other}")),
     }
+}
+
+fn dialog_id(input: &Value) -> Result<u64> {
+    input["id"].as_u64().filter(|id| *id > 0).ok_or_else(|| anyhow!("dialog 에서 확인한 id (1 이상의 정수)가 필요합니다"))
+}
+
+fn menu_source(input: &Value) -> Result<crate::electron::MenuSource> {
+    use crate::electron::MenuSource;
+    match input.get("source") {
+        None => Ok(MenuSource::App),
+        Some(Value::String(source)) if source == "app" => Ok(MenuSource::App),
+        Some(Value::String(source)) if source == "context" => Ok(MenuSource::Context),
+        _ => Err(anyhow!("메뉴 list/click 의 source 는 app / context 중 하나입니다. 대화상자는 dialog/respond_dialog 를 쓰세요.")),
+    }
+}
+
+fn dialog_prompt(input: &Value) -> Result<Option<&str>> {
+    input.get("prompt_text").map(|value| value.as_str().ok_or_else(|| anyhow!("prompt_text 는 문자열이어야 합니다"))).transpose()
 }
 
 /// Whether a menu path ("Edit > Paste") names copy, cut or paste. Matches whole words, so
@@ -374,6 +410,29 @@ pub(crate) fn describe(name: &str, input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_sources_never_fall_back_from_dialog_or_invalid_sources() {
+        use crate::electron::MenuSource;
+        assert!(matches!(menu_source(&json!({})).unwrap(), MenuSource::App));
+        assert!(matches!(menu_source(&json!({"source":"app"})).unwrap(), MenuSource::App));
+        assert!(matches!(menu_source(&json!({"source":"context"})).unwrap(), MenuSource::Context));
+        for source in [json!("native"), json!("javascript"), json!("other"), json!(42), Value::Null] {
+            assert!(menu_source(&json!({"source":source})).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn dialog_identifiers_and_prompt_text_do_not_silently_coerce() {
+        for input in [json!({}), json!({"id":0}), json!({"id":-1}), json!({"id":"1"}), json!({"id":true})] {
+            assert!(dialog_id(&input).is_err(), "{input}");
+        }
+        assert_eq!(dialog_id(&json!({"id":3})).unwrap(), 3);
+        assert_eq!(dialog_prompt(&json!({})).unwrap(), None);
+        let input = json!({"prompt_text":"재용👋"});
+        assert_eq!(dialog_prompt(&input).unwrap(), Some("재용👋"));
+        assert!(dialog_prompt(&json!({"prompt_text":false})).is_err());
+    }
 
     #[test]
     fn clipboard_menu_paths() {
