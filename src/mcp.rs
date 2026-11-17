@@ -157,9 +157,13 @@ fn server_instructions_for(pl: &Plat) -> String {
     let apps = pl.local_apps;
     let app_tools = if pl.app_kind { format!(", {apps}은 desk_app 으로 메뉴·접근성 요소를") } else { String::new() };
     // 모드는 에이전트가 할 일에 맞게 스스로 고른다 (사용자에게 먼저 묻지 않는다). 민감한 모드는 GhostDesk 창의 승인 창이 지킨다.
+    // 사용자가 GhostDesk 를 말하지 않았어도 쓸 만한 일이면, 쓸지만 한 번 묻는다.
     // 모드 목록은 desk_open 의 mode 설명에 한 번만 둔다.
     format!(
-        "사용자가 'GhostDesk 로', '고스트데스크에서', '내 화면 건드리지 말고' 같은 말로 작업을 맡기면, 사용자에게 모드를 묻지 말고 desk_open 의 mode 목록에서 할 일에 가장 알맞은 것을 스스로 골라 바로 desk_open 하세요. \
+        "사용자가 GhostDesk 를 말하지 않았더라도, 웹사이트나 앱 화면을 직접 눌러 보고 입력해야 하는 일(사이트에서 찾기·양식 채우기·화면 확인, 앱 조작 등)이고 \
+         GhostDesk 로 하면 사용자의 화면·마우스를 빼앗지 않아 더 낫다고 판단되면, 시작하기 전에 \"GhostDesk 로 할까요?\" 처럼 한 문장으로 쓸지 물어보세요. \
+         파일·명령어·API 로 끝낼 수 있는 일에는 묻지 마세요. 같은 대화에서 이미 답을 들었으면 다시 묻지 말고 그 답을 따르세요. \
+         사용자가 'GhostDesk 로', '고스트데스크에서', '내 화면 건드리지 말고' 같은 말로 작업을 맡기면, 사용자에게 모드를 묻지 말고 desk_open 의 mode 목록에서 할 일에 가장 알맞은 것을 스스로 골라 바로 desk_open 하세요. \
          고르는 기준: 웹사이트에서 할 일이면 web, 그중 내 로그인(메일·쇼핑·SNS 계정 등)이 필요하면 web_login, 이 컴퓨터의 특정 앱에서 할 일이면 app, \
          그 앱에 이미 로그인된 상태가 필요하면 app_login. 사용자가 모드를 말했으면 그것을 쓰세요. 로그인 복제·실행 중인 앱·원격 접속 같은 모드는 \
          GhostDesk 창에서 사용자가 승인하므로 따로 묻지 않아도 됩니다. desk_open(mode) → desk_action/desk_browser/desk_app 반복 → 결과 보고 → desk_close 로 끝까지 진행하세요. \
@@ -184,7 +188,7 @@ fn tools_for(pl: &Plat) -> Value {
     let mut t = json!([
         {
             "name": "desk_open",
-            "description": "격리된 화면을 연다 (사용자가 고른 mode). 결과로 desk_id 와 첫 스크린샷을 돌려준다.",
+            "description": "격리된 화면을 연다 (할 일에 맞는 mode). 결과로 desk_id 와 첫 스크린샷을 돌려준다.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1014,6 +1018,8 @@ mod tests {
         let ins = server_instructions();
         // 모드는 묻지 않고 스스로 고르게 안내한다
         assert!(ins.contains("스스로 골라") && !ins.contains("어떤 모드로 할지") && ins.contains("mode"), "{ins}");
+        // GhostDesk 를 말하지 않아도 알맞은 일이면 쓸지 먼저 묻게 한다
+        assert!(ins.contains("GhostDesk 로 할까요?") && ins.contains("묻지 마세요"), "{ins}");
         if cfg!(windows) {
             assert!(modes.contains(&"app_current_session".into()) && modes.contains(&"app_running".into()));
             let desc = props["mode"]["description"].as_str().unwrap();

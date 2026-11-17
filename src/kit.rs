@@ -46,7 +46,7 @@ pub fn skill_markdown(exe: &Path) -> String {
     format!(
         "---\n\
 name: ghostdesk\n\
-description: Operate websites and desktop apps in GhostDesk's isolated, invisible screens without touching the user's own mouse, keyboard or screen. Use when the user asks to do something \"with GhostDesk\" / \"GhostDesk 로\", or to work on a site or app without disturbing their screen.\n\
+description: Operate websites and desktop apps in GhostDesk's isolated, invisible screens without touching the user's own mouse, keyboard or screen. Use when the user asks to do something \"with GhostDesk\" / \"GhostDesk 로\", or to work on a site or app without disturbing their screen. Also use it, after asking the user once, when a task needs clicking and typing in a website or app UI and the user did not mention GhostDesk.\n\
 ---\n\n\
 # GhostDesk\n\n\
 GhostDesk gives you hidden browsers, hidden app windows and remote desktops that the user watches live in the GhostDesk window. \
