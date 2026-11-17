@@ -108,6 +108,7 @@ impl GhostApp {
                         ui.label(theme::hint(tr("연결 상태를 확인하는 중…")));
                     });
                 }
+                self.other_agents_card(ui, st.busy);
                 if st.busy {
                     ui.horizontal(|ui| {
                         theme::spinner(ui, 14.0, theme::muted());
@@ -160,6 +161,47 @@ impl GhostApp {
             self.notify(ctx, e);
         }
     }
+}
+
+impl GhostApp {
+    /// 목록에 없는 AI 앱: MCP 설정을 복사하거나, MCP 설정·스킬·플러그인을 담은 연결 패키지를 만든다
+    fn other_agents_card(&mut self, ui: &mut egui::Ui, busy: bool) {
+        theme::card_frame().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tr("다른 AI 앱")).strong().color(theme::text()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled_ui(!busy, |ui| theme::secondary(ui, tr("연결 패키지 만들기"))).inner.clicked() {
+                        spawn_kit(&self.rt, self.connect_state.clone(), ui.ctx().clone());
+                    }
+                    if theme::secondary(ui, trf("{}  MCP 설정 복사", &[&icon::COPY])).clicked() {
+                        let config = crate::kit::mcp_config(&crate::install::stable_exe());
+                        ui.ctx().copy_text(serde_json::to_string_pretty(&config).unwrap_or_default());
+                    }
+                });
+            });
+            ui.label(theme::hint(tr("MCP 를 지원하는 앱이면 어디든 연결할 수 있어요. 설정을 복사해 그 앱의 MCP 서버 설정에 붙여 넣거나, 스킬·플러그인이 든 패키지를 만들어 쓰세요.")));
+        });
+    }
+}
+
+/// 연결 패키지를 내려받기 폴더에 만들고 Finder / 탐색기에서 연다 (백그라운드: 설치본 복사가 포함됨)
+fn spawn_kit(rt: &Handle, st: Arc<parking_lot::Mutex<ConnectState>>, ctx: egui::Context) {
+    st.lock().busy = true;
+    rt.spawn_blocking(move || {
+        let r = crate::install::install_app().and_then(|exe| crate::kit::write_kit(&crate::kit::default_parent(), &exe));
+        let msg = match r {
+            Ok(dir) => {
+                crate::kit::reveal(&dir);
+                trf("연결 패키지를 만들었어요: {}", &[&dir.display()])
+            }
+            Err(e) => trf("연결 패키지를 만들지 못했어요: {}", &[&format!("{:#}", e)]),
+        };
+        let mut s = st.lock();
+        s.busy = false;
+        s.messages = vec![msg];
+        ctx.request_repaint();
+    });
 }
 
 /// 클라이언트 상태와 표시용 값을 읽는다 (파일 조회 — UI 스레드에서 부르지 않는다)

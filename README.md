@@ -57,6 +57,10 @@ GhostDesk 를 켜면 자동으로 `~/Applications/GhostDesk.app` 에 설치되�
 - **pi 는 MCP 를 기본 지원하지 않습니다.** 등록 뒤 한 번 `pi install npm:pi-mcp-adapter` 로 MCP 확장을 설치하고 pi 를 다시 시작하세요. 이 확장은 쉬는 서버를 끊는데 연결이 끊기면 GhostDesk 화면도 닫히므로, 항목에 `"lifecycle": "lazy-keep-alive"` 를 넣어 둡니다.
 - 상태 확인·해제·자동 연결 끄기: 상단의 **외부 연결** 창
 - 터미널: `ghostdesk --connect` / `ghostdesk --disconnect`
+- **목록에 없는 AI 앱** (Cursor · VS Code · Gemini CLI · Windsurf · Cline · Zed 등 MCP 를 지원하는 앱): **외부 연결** 창의 **다른 AI 앱** 에서
+  - **MCP 설정 복사** → 그 앱의 MCP 서버 설정에 붙여 넣기 (표준 `mcpServers` 형식)
+  - **연결 패키지 만들기** → 내려받기 폴더에 `GhostDesk 연결 패키지` 를 만든다: `ghostdesk.mcp.json`(MCP 설정) · `skills/ghostdesk/SKILL.md`(스킬) · `claude-plugin/`(MCP 설정 + 스킬을 묶은 Claude 형식 플러그인)
+  - 터미널: `ghostdesk --export-kit [폴더]`
 
 직접 설정하려면 (고급):
 
@@ -241,4 +245,5 @@ cargo test
 | `build.rs`, `windows/ghostdesk.exe.manifest` | Windows 실행 파일 매니페스트 (탐색기 실행 시 콘솔 없음) |
 | `src/rfb.rs` | VNC(RFB) 클라이언트 |
 | `src/control.rs`, `src/mcp.rs` | 외부 에이전트용 제어 소켓과 MCP 서버 |
+| `src/kit.rs` | 목록에 없는 에이전트용 연결 패키지 (MCP 설정 · 스킬 · 플러그인, 스킬 내용은 `mcp.rs` 의 안내문·도구 목록에서 만든다) |
 | `src/llm.rs` | Claude Messages API (computer_toolset_20260801) |

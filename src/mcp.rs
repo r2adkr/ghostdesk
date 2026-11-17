@@ -110,8 +110,13 @@ impl Plat {
     };
 }
 
-fn server_instructions() -> String {
+pub(crate) fn server_instructions() -> String {
     server_instructions_for(&Plat::CURRENT)
+}
+
+/// 이 OS 의 desk_open mode 목록 (연결 패키지의 스킬 문서용)
+pub(crate) fn current_modes() -> Vec<(&'static str, String)> {
+    modes(&Plat::CURRENT)
 }
 
 /// 이 OS 의 desk_open mode: (이름, 사용자에게 보여 줄 설명). 이름은 control.rs `apply_mode` 와 같아야 한다.
@@ -157,7 +162,7 @@ fn server_instructions_for(pl: &Plat) -> String {
     )
 }
 
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     tools_for(&Plat::CURRENT)
 }
 
