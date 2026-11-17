@@ -47,6 +47,9 @@ pub(super) struct Prefs {
     /// 'OpenAI 호환 API' 의 주소
     #[serde(skip_serializing)]
     custom_url: String,
+    /// 이 버전이 모르는 칸 (나중 버전이 쓴 것). 그대로 다시 써서, 예전 버전으로 한 번 켰다가 돌아와도 지워지지 않게 한다
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 저장하는 연결 하나 (키는 암호화한 값, 기억하지 않으면 빈 글)
@@ -106,6 +109,7 @@ impl GhostApp {
 
     fn apply_prefs(&mut self, p: Prefs) {
         self.lang = Lang::from_code(&p.lang);
+        self.prefs_other = p.other.clone();
         let (saved, current) = match &p.conns {
             Some(c) => (c.clone(), p.current),
             None => migrate(&p),
@@ -172,6 +176,7 @@ impl GhostApp {
             remember_keys: Some(self.remember_keys),
             keep_awake: Some(self.keep_awake),
             tour_seen: Some(self.tour_seen),
+            other: self.prefs_other.clone(),
             ..Default::default()
         }
     }
@@ -272,6 +277,19 @@ mod tests {
         // 새 형식으로 쓸 때 예전 칸은 남기지 않는다
         let json = serde_json::to_string(&Prefs { conns: Some(conns), ..Default::default() }).unwrap();
         assert!(!json.contains("custom_url") && !json.contains("\"models\""), "{json}");
+    }
+
+    /// 이 버전이 모르는 칸은 읽었다가 그대로 다시 쓴다 (나중 버전의 설정을 지우지 않게)
+    #[test]
+    fn unknown_fields_survive_a_save() {
+        let p: Prefs = serde_json::from_str(r#"{"lang":"en","future_flag":true,"future_list":[1,2]}"#).unwrap();
+        assert_eq!(p.other.get("future_flag"), Some(&serde_json::json!(true)));
+        let again: serde_json::Value = serde_json::to_value(&Prefs { lang: p.lang.clone(), other: p.other.clone(), ..Default::default() }).unwrap();
+        assert_eq!(again["future_flag"], serde_json::json!(true));
+        assert_eq!(again["future_list"], serde_json::json!([1, 2]));
+        // 이 버전이 아는 예전 칸은 모르는 칸으로 섞여 들어가지 않는다
+        let old: Prefs = serde_json::from_str(r#"{"provider":"Claude","custom_url":"x"}"#).unwrap();
+        assert!(old.other.is_empty(), "{:?}", old.other);
     }
 
     #[test]

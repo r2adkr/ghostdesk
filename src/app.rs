@@ -196,6 +196,13 @@ pub struct GhostApp {
     tour_seen: bool,
     /// 사용 설명 사진 찍기 모드 (`GHOSTDESK_TOUR_CAPTURE`)
     tour_capture: Option<tour::Capture>,
+    /// macOS 권한 상태 (1초마다 다시 확인: `permissions`)
+    #[cfg(target_os = "macos")]
+    perm_cache: Option<(std::time::Instant, crate::macos::TccStatus)>,
+    /// 사이드바의 권한 알림을 이번 실행 동안 접었는가
+    perm_notice_hidden: bool,
+    /// prefs.json 에서 이 버전이 모르는 칸 (저장할 때 그대로 다시 쓴다)
+    prefs_other: serde_json::Map<String, serde_json::Value>,
     /// 화면이 잠겨도(디스플레이가 꺼져도) 에이전트가 일하는 동안 Mac/PC 가 잠자지 않게 한다
     keep_awake: bool,
     /// 지금 잠자기를 막고 있는가 (keep_awake 이고 일하는 에이전트가 있을 때)
@@ -302,6 +309,10 @@ impl GhostApp {
             tour: None,
             tour_seen: false,
             tour_capture: tour::Capture::from_env(),
+            #[cfg(target_os = "macos")]
+            perm_cache: None,
+            perm_notice_hidden: false,
+            prefs_other: Default::default(),
             awake: None,
             greeting: screens::random_greeting(),
             browsers,

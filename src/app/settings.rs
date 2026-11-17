@@ -390,6 +390,17 @@ impl GhostApp {
                     ui.end_row();
                 });
 
+                // 권한이 꺼져 있으면 찾기 쉽게 맨 위에 (다 켜지면 아래 원래 자리로)
+                #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+                let perm_first = !self.permissions_ok(ctx);
+                #[cfg(target_os = "macos")]
+                if perm_first {
+                    ui.add_space(18.0);
+                    theme::section(ui, tr("권한"));
+                    ui.add_space(4.0);
+                    self.permission_rows(ui);
+                }
+
                 ui.add_space(18.0);
                 theme::section(ui, tr("AI 연결"));
                 ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
@@ -446,6 +457,13 @@ impl GhostApp {
                 ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
                     .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
                 ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요.")));
+                #[cfg(target_os = "macos")]
+                if !perm_first {
+                    ui.add_space(18.0);
+                    theme::section(ui, tr("권한"));
+                    ui.add_space(4.0);
+                    self.permission_rows(ui);
+                }
                 if ti + to > 0 {
                     ui.add_space(10.0);
                     ui.label(theme::hint(trf("지금까지 쓴 양: 보낸 글 {} · 받은 글 {} 토큰", &[&ti, &to])));
@@ -459,6 +477,87 @@ impl GhostApp {
             self.show_settings = false;
             self.save_prefs();
         }
+    }
+
+    /// macOS 권한 상태. 매 프레임 묻지 않고 1초에 한 번만 다시 확인한다 (사이드바·설정·사용 설명이 같이 쓴다).
+    /// 시스템 설정에서 바꾼 것이 곧바로 보이게 1초 뒤 다시 그리게 한다 (손쉬운 사용은 바로 반영된다).
+    #[cfg(target_os = "macos")]
+    pub(super) fn permissions(&mut self, ctx: &egui::Context) -> crate::macos::TccStatus {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        let fresh = self.perm_cache.filter(|(at, _)| at.elapsed() < EVERY);
+        let t = match fresh {
+            Some((_, t)) => t,
+            None => {
+                let t = crate::macos::tcc_status();
+                self.perm_cache = Some((std::time::Instant::now(), t));
+                t
+            }
+        };
+        ctx.request_repaint_after(EVERY);
+        t
+    }
+
+    /// Mac 앱 조작에 필요한 권한이 다 켜져 있는가 (macOS 밖은 늘 그렇다)
+    pub(super) fn permissions_ok(&mut self, ctx: &egui::Context) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let t = self.permissions(ctx);
+            t.accessibility && t.screen_capture
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ctx;
+            true
+        }
+    }
+
+    /// macOS 권한 (Mac 앱 조작에 필요): 켜졌으면 ✓, 아니면 권한마다 '허용' (macOS 요청 창 하나만 띄운다)
+    #[cfg(target_os = "macos")]
+    pub(super) fn permission_rows(&mut self, ui: &mut egui::Ui) {
+        let t = self.permissions(ui.ctx());
+        let restart = crate::macos::screen_capture_needs_restart();
+        // 한 줄에 권한 하나: 켜졌으면 ✓, 아니면 '허용' (macOS 요청 창 하나만 뜬다). 화면 기록은 손쉬운 사용을 켠 뒤에 묻는다
+        let rows: [(bool, &str, fn()); 2] = [
+            (t.accessibility, tr("손쉬운 사용"), crate::macos::request_accessibility),
+            (t.screen_capture, tr("화면 기록"), crate::macos::request_screen_capture),
+        ];
+        let mut earlier_missing = false;
+        for (ok, name, request) in rows {
+            ui.horizontal(|ui| {
+                if ok {
+                    ui.label(RichText::new(icon::CIRCLE_CHECK).color(theme::success()));
+                } else {
+                    ui.label(RichText::new(icon::SHIELD_ALERT).color(theme::warn()));
+                }
+                ui.label(RichText::new(name).color(theme::text()));
+                ui.label(theme::hint(if ok { tr("켜짐") } else { tr("꺼짐") }));
+                if !ok {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = ui.add_enabled_ui(!earlier_missing, |ui| theme::secondary(ui, tr("허용"))).inner;
+                        if btn.on_hover_text(tr("macOS 의 요청 창이 떠요. 그 창의 '시스템 설정 열기'에서 GhostDesk 스위치를 켜세요.")).clicked() {
+                            request();
+                            // 누른 뒤 바로 다시 확인한다
+                            self.perm_cache = None;
+                        }
+                    });
+                }
+            });
+            earlier_missing |= !ok;
+        }
+        if t.accessibility && t.screen_capture {
+            ui.label(theme::hint(tr("Mac 앱을 조작하는 데 필요한 권한이 모두 켜져 있어요.")));
+            return;
+        }
+        if restart {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요.")).color(theme::warn()));
+                if theme::secondary(ui, tr("다시 시작")).clicked() {
+                    self.save_prefs();
+                    crate::update::request_relaunch(ui.ctx());
+                }
+            });
+        }
+        ui.label(theme::hint(tr("스위치가 이미 켜져 있는데 여기서 꺼짐으로 보이면 업데이트로 앱 서명이 바뀐 거예요. '허용'을 누르면 옛 항목을 지우고 새로 요청해요.")));
     }
 
     /// 연결마다 카드 하나: 이름(OpenAI 호환은 고칠 수 있음) · 회사 · ✕, 그 아래 주소 · 키 칸

@@ -41,25 +41,67 @@ pub fn tcc_status() -> TccStatus {
 }
 
 /// 네이티브 앱 백엔드에 필요한 권한이 없으면 사용자가 할 일을 알려주는 오류를 돌려준다.
-/// (CGRequestScreenCaptureAccess 는 반복 호출하면 사용자를 귀찮게 하므로 부르지 않는다.)
+/// (권한을 묻는 창은 사용자가 '허용' 을 누를 때만 띄운다: `request_accessibility` · `request_screen_capture`)
 pub fn preflight() -> Result<TccStatus> {
     let s = tcc_status();
     let mut missing = Vec::new();
     if !s.accessibility {
-        missing.push(
-            "• 손쉬운 사용: 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 GhostDesk(또는 GhostDesk 를 실행한 터미널 앱)를 켜세요.",
-        );
+        missing.push("손쉬운 사용");
     }
     if !s.screen_capture {
-        missing.push(
-            "• 화면 기록: 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 기록 에서 GhostDesk(또는 실행한 터미널 앱)를 켜세요.",
-        );
+        missing.push("화면 기록");
     }
     if !missing.is_empty() {
         bail!(
-            "네이티브 앱 제어에 필요한 macOS 권한이 없습니다:\n{}\n권한을 켠 뒤 GhostDesk 를 다시 실행해야 적용됩니다.",
-            missing.join("\n")
+            "Mac 앱을 조작하려면 GhostDesk 에 macOS 권한({})이 필요합니다. 사용자에게 GhostDesk 창의 설정 > 권한 에서 권한마다 \
+             '허용' 을 누르고, 뜨는 macOS 창의 '시스템 설정 열기' 에서 GhostDesk 스위치를 켜 달라고 하세요. 화면 기록은 켠 뒤 GhostDesk 를 다시 시작해야 반영됩니다.",
+            missing.join(" · ")
         );
     }
     Ok(s)
+}
+
+/// 이번 실행에서 화면 기록을 이미 요청했는가. 화면 기록 상태(CGPreflightScreenCaptureAccess)는 다시 시작해야 바뀌므로,
+/// 요청한 뒤 사용자가 켰더라도 이번 실행에서는 여전히 꺼짐으로 보인다 → 그때 다시 지우면 방금 켠 것을 없애게 된다.
+static SCREEN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 이번 실행에서 화면 기록을 요청했는가 (그러면 화면 기록은 다시 시작해야 반영된다)
+pub fn screen_capture_needs_restart() -> bool {
+    SCREEN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) && !tcc_status().screen_capture
+}
+
+/// GhostDesk 의 권한 항목을 지운다 (이 번들 id 의 항목만, 관리자 권한 없이).
+/// GhostDesk 는 개발자 서명이 없는 자체 서명이라 macOS 가 권한을 '그 빌드의 지문' 에 묶는다. 업데이트하면 지문이 바뀌어
+/// 시스템 설정의 스위치는 켜져 보여도 지금 빌드에는 적용되지 않는다. 그 낡은 항목을 지워야 지금 빌드로 새로 요청할 수 있다.
+fn reset_permission(service: &str) {
+    let _ = std::process::Command::new("/usr/bin/tccutil").args(["reset", service, crate::install::BUNDLE_ID]).output();
+}
+
+/// 손쉬운 사용 '허용': 낡은 항목을 지우고 macOS 의 요청 창만 띄운다 (그 창의 '시스템 설정 열기' 로 스위치를 켠다).
+/// 창을 하나만 띄우려고 시스템 설정은 직접 열지 않는다. 이미 켜져 있으면 아무것도 하지 않는다.
+/// 손쉬운 사용은 바로 반영되므로, 지금 꺼져 있으면 켜 둔 스위치가 있어도 옛 빌드 것이다.
+pub fn request_accessibility() {
+    use objc2_application_services::{kAXTrustedCheckOptionPrompt, AXIsProcessTrustedWithOptions};
+    use objc2_core_foundation::{CFBoolean, CFDictionary};
+    if tcc_status().accessibility {
+        return;
+    }
+    reset_permission("Accessibility");
+    // 프롬프트를 켜고 물으면 macOS 가 GhostDesk 를 손쉬운 사용 목록에 (꺼진 채로) 넣고 안내 창을 띄운다
+    let key = unsafe { kAXTrustedCheckOptionPrompt };
+    let opts = CFDictionary::from_slices(&[key], &[CFBoolean::new(true)]);
+    unsafe { AXIsProcessTrustedWithOptions(Some(opts.as_opaque())) };
+}
+
+/// 화면 기록 '허용': (이번 실행에서 처음이면) 낡은 항목을 지우고 macOS 의 요청 창만 띄운다.
+/// 화면 기록은 다시 시작해야 반영되므로 두 번째부터는 지우지 않는다 (사용자가 방금 켰을 수 있다).
+pub fn request_screen_capture() {
+    use std::sync::atomic::Ordering;
+    if tcc_status().screen_capture {
+        return;
+    }
+    if !SCREEN_REQUESTED.swap(true, Ordering::SeqCst) {
+        reset_permission("ScreenCapture");
+    }
+    objc2_core_graphics::CGRequestScreenCaptureAccess();
 }

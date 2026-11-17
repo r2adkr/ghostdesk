@@ -48,6 +48,13 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     platform::win::harden_std_handles();
     let args: Vec<String> = std::env::args().collect();
+    // 외부 에이전트가 GhostDesk 를 시험용으로 하나 더 띄웠다 (control.rs 의 app_target):
+    // 빈 데이터 폴더를 쓰고(설정·키·제어 연결이 따로) 다른 AI 앱에 자동으로 연결·설치하지 않는다.
+    // 다른 스레드가 생기기 전이라 환경변수를 바꿔도 안전하다.
+    if let Some(dir) = args.iter().position(|a| a == control::ISOLATED_DATA_ARG).and_then(|i| args.get(i + 1)) {
+        std::env::set_var("GHOSTDESK_DATA_DIR", dir);
+        std::env::set_var("GHOSTDESK_NO_AUTOCONNECT", "1");
+    }
     let rt = tokio::runtime::Runtime::new()?;
     if args.get(1).map(String::as_str) == Some("--selftest") {
         return rt.block_on(selftest::run(args.get(2).cloned()));

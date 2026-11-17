@@ -598,7 +598,14 @@ impl GhostApp {
                 {
                     let t = crate::macos::tcc_status();
                     if !(t.accessibility && t.screen_capture) {
-                        ui.colored_label(theme::warn(), tr("이 방식은 시스템 설정 > 개인정보 보호 및 보안 에서 '손쉬운 사용'과 '화면 및 시스템 오디오 기록' 권한이 필요합니다."));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(theme::warn(), tr("이 방식은 macOS 의 '손쉬운 사용'과 '화면 기록' 권한이 필요해요."));
+                            if ui.link(tr("권한 설정")).on_hover_text(tr("설정의 '권한'에서 하나씩 허용할 수 있어요")).clicked() {
+                                // 창 두 개가 겹치지 않게 새 에이전트 창은 닫는다 (적던 내용은 남는다)
+                                self.wizard_open = false;
+                                self.show_settings = true;
+                            }
+                        });
                     }
                 }
                 ui.label(theme::hint(pick(

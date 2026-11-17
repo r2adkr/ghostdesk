@@ -68,6 +68,11 @@ pub(super) const PAGES: &[Page] = &[
     },
 ];
 
+/// 사용 설명의 쪽 수: 사진 쪽들 + (macOS) 마지막 권한 쪽
+fn page_count() -> usize {
+    PAGES.len() + usize::from(cfg!(target_os = "macos"))
+}
+
 /// 열려 있는 사용 설명: 지금 쪽과, 풀어 둔 사진
 #[derive(Default)]
 pub(super) struct Tour {
@@ -100,35 +105,43 @@ impl GhostApp {
     pub(super) fn tour_window(&mut self, ctx: &egui::Context) {
         let Some(tour) = self.tour.as_mut() else { return };
         const W: f32 = 640.0;
-        let i = tour.page.min(PAGES.len() - 1);
-        let page = &PAGES[i];
-        let tex = tour.texture(ctx, i);
+        let count = page_count();
+        let i = tour.page.min(count - 1);
+        let last = i + 1 == count;
+        // 사진 쪽이면 그 사진, 마지막 권한 쪽이면 없음
+        let page = PAGES.get(i);
+        let tex = page.and_then(|_| tour.texture(ctx, i));
         let mut done = false;
         let mut go: isize = 0;
-        let m = egui::Modal::new(egui::Id::unique("tour")).frame(theme::modal_frame()).show(ctx, |ui| {
+        // 건너뛰기는 없다: 끝까지 넘겨 '시작하기' 로만 닫는다 (Esc·바깥 누르기로도 닫히지 않음)
+        egui::Modal::new(egui::Id::unique("tour")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(W);
-            if let Some(t) = &tex {
-                let size = t.size_vec2();
-                let h = W * size.y / size.x.max(1.0);
-                let r = ui.add(egui::Image::new(t).fit_to_exact_size(Vec2::new(W, h)).corner_radius(theme::CARD_RADIUS)).rect;
-                // 어두운 사진이 창 바탕과 섞이지 않게 테두리를 두른다
-                let line = ui.visuals().widgets.noninteractive.bg_stroke;
-                ui.painter().rect_stroke(r, theme::CARD_RADIUS, line, egui::StrokeKind::Inside);
+            match page {
+                Some(page) => {
+                    if let Some(t) = &tex {
+                        let size = t.size_vec2();
+                        let h = W * size.y / size.x.max(1.0);
+                        let r = ui.add(egui::Image::new(t).fit_to_exact_size(Vec2::new(W, h)).corner_radius(theme::CARD_RADIUS)).rect;
+                        // 어두운 사진이 창 바탕과 섞이지 않게 테두리를 두른다
+                        let line = ui.visuals().widgets.noninteractive.bg_stroke;
+                        ui.painter().rect_stroke(r, theme::CARD_RADIUS, line, egui::StrokeKind::Inside);
+                    }
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(tr(page.title)).size(20.0).color(theme::text()));
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(tr(page.body)).color(theme::body()));
+                }
+                None => self.permission_page(ui),
             }
-            ui.add_space(16.0);
-            ui.label(RichText::new(tr(page.title)).size(20.0).color(theme::text()));
-            ui.add_space(6.0);
-            ui.label(RichText::new(tr(page.body)).color(theme::body()));
             ui.add_space(18.0);
             ui.horizontal(|ui| {
                 // 몇 번째 쪽인지: 점
-                for j in 0..PAGES.len() {
+                for j in 0..count {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     let c = if j == i { theme::text() } else { theme::overlay_pressed() };
                     ui.painter().circle_filled(r.center(), 3.5, c);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let last = i + 1 == PAGES.len();
                     if theme::primary(ui, if last { tr("시작하기") } else { tr("다음") }).clicked() {
                         if last {
                             done = true;
@@ -139,31 +152,41 @@ impl GhostApp {
                     if i > 0 && theme::secondary(ui, tr("이전")).clicked() {
                         go = -1;
                     }
-                    if !last && ui.link(theme::hint(tr("건너뛰기"))).clicked() {
-                        done = true;
-                    }
                 });
             });
         });
-        if let Some(t) = self.tour.as_mut() {
-            t.page = (t.page as isize + go).clamp(0, PAGES.len() as isize - 1) as usize;
-        }
         // 키보드: → / ← 로 넘기기
         let (right, left) = ctx.input(|inp| (inp.key_pressed(egui::Key::ArrowRight), inp.key_pressed(egui::Key::ArrowLeft)));
-        if let Some(t) = self.tour.as_mut() {
-            if right && t.page + 1 < PAGES.len() {
-                t.page += 1;
-            } else if left && t.page > 0 {
-                t.page -= 1;
-            }
+        if right && !last {
+            go = 1;
+        } else if left && i > 0 {
+            go = -1;
         }
-        if done || m.should_close() {
+        if let Some(t) = self.tour.as_mut() {
+            t.page = (i as isize + go).clamp(0, count as isize - 1) as usize;
+        }
+        if done {
             self.tour = None;
             self.tour_seen = true;
             self.save_prefs();
         }
     }
 
+    /// 마지막 쪽 (macOS): Mac 앱을 조작하는 데 필요한 권한을 하나씩 켠다. 설정의 '권한' 과 같은 줄을 쓴다.
+    fn permission_page(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.label(RichText::new(icon::SHIELD_ALERT).size(36.0).color(theme::text()));
+        ui.add_space(10.0);
+        ui.label(RichText::new(tr("마지막으로 권한을 켜 주세요")).size(20.0).color(theme::text()));
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(tr("이 컴퓨터의 Mac 앱을 맡기려면 두 권한이 필요해요. '허용'을 누르면 macOS 의 요청 창이 하나 뜨고, 그 창의 '시스템 설정 열기'에서 GhostDesk 를 켜면 돼요. 웹사이트만 쓸 거라면 나중에 설정 > 권한 에서 해도 돼요."))
+                .color(theme::body()),
+        );
+        ui.add_space(12.0);
+        #[cfg(target_os = "macos")]
+        self.permission_rows(ui);
+    }
     /// 사진 찍기 모드면 한 프레임 진행한다 (`Capture`)
     pub(super) fn tour_capture_tick(&mut self, ctx: &egui::Context) {
         let Some(mut cap) = self.tour_capture.take() else { return };

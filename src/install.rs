@@ -32,7 +32,7 @@ use crate::platform::fsx;
 
 pub const SERVER_NAME: &str = "ghostdesk";
 #[cfg(not(windows))]
-const BUNDLE_ID: &str = "dev.ghostdesk.app";
+pub(crate) const BUNDLE_ID: &str = "dev.ghostdesk.app";
 
 /// Codex 의 MCP 도구 호출 시간 제한(초). 기본값 60초로는 desk_open 이 끝나기 전에 끊긴다
 /// (사용자 승인 대기 최대 180초 + GUI 실행 대기 + 프로필·앱 데이터 복제).

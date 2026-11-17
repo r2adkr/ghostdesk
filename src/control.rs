@@ -48,7 +48,8 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(180);
 /// 로그인 미사용(빈 프로필)으로 만든 MCP 작업공간 표식. 이 표식 없이 내용이 있는 폴더는 빈 프로필로 열지 않는다.
 const BLANK_MARKER: &str = "ghostdesk-mcp-blank";
 
-/// 외부 에이전트가 절대 열 수 없는 앱 (셸·스크립트·자격 증명·보안 설정 계열과 GhostDesk 자신).
+/// 외부 에이전트가 절대 열 수 없는 앱 (셸·스크립트·자격 증명·보안 설정 계열).
+/// GhostDesk 자신은 여기 없다: 따로 떼어 낸 시험용 인스턴스로만 연다 (`is_ghostdesk`, `app_target`).
 /// 번들 id 는 대소문자 구분 없이 비교한다.
 const EXTERNAL_DENY: &[&str] = &[
     // 터미널·셸
@@ -83,9 +84,10 @@ const EXTERNAL_DENY: &[&str] = &[
     "com.apple.DiskUtility",
     "com.apple.DirectoryUtility",
     "com.apple.installer",
-    // GhostDesk 자신
-    "dev.ghostdesk.app",
 ];
+
+/// GhostDesk 자신의 번들 id
+const GHOSTDESK_BUNDLE_ID: &str = "dev.ghostdesk.app";
 
 /// 번들 id 를 못 읽었을 때를 위한 이름(번들 파일 이름, 소문자) 기준 차단 목록
 const EXTERNAL_DENY_NAMES: &[&str] = &[
@@ -115,7 +117,6 @@ const EXTERNAL_DENY_NAMES: &[&str] = &[
     "1password 7",
     "bitwarden",
     "keepassxc",
-    "ghostdesk",
 ];
 
 /// GUI 로 보내는 이벤트
@@ -690,12 +691,37 @@ impl ControlServer {
             None => bid,
         };
 
-        // 셸·스크립트·자격 증명·보안 설정 계열 앱과 GhostDesk 자신은 외부 에이전트에게 열어 주지 않는다
+        // 셸·스크립트·자격 증명·보안 설정 계열 앱은 외부 에이전트에게 열어 주지 않는다
         if is_denied(&r) {
             bail!(
-                "보안상 외부 에이전트는 '{}' ({bid}) 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱과 GhostDesk 자신은 차단됩니다.",
+                "보안상 외부 에이전트는 '{}' ({bid}) 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.",
                 r.name
             );
+        }
+        // GhostDesk 자신: 지금 창을 조작하면 승인 창을 스스로 누르거나 설정·키·연결을 바꿀 수 있으므로,
+        // 빈 데이터 폴더를 쓰는 시험용 인스턴스로 새로 띄울 때만 연다 (설정·키·외부 연결·제어 연결이 모두 따로)
+        if is_ghostdesk(&r) {
+            if cfg!(windows) || attach || current_session || use_login || p["virtual_display"].as_bool().unwrap_or(false) {
+                bail!("GhostDesk 자신은 따로 떼어 낸 시험용 인스턴스(mode=app)로만 열 수 있습니다. 지금 쓰는 GhostDesk 창(app_running)이나 로그인 복제로는 열지 않습니다.");
+            }
+            let data = crate::platform::paths::data_root().join("nested").join(profiles::slug(workspace));
+            self.ask(
+                conn,
+                "GhostDesk 시험용 인스턴스 실행 요청",
+                format!(
+                    "{client} 이(가) GhostDesk 를 하나 더, 보이지 않는 창으로 띄워 조작하려고 합니다.\n경로: {}\n새 GhostDesk 는 빈 데이터 폴더({})를 써서 이 창의 설정·API 키·외부 연결·승인과 섞이지 않고, 다른 AI 앱에 자동으로 연결하지도 않습니다.",
+                    r.path.display(),
+                    data.display()
+                ),
+            )
+            .await?;
+            return Ok(DeskTarget::Native(crate::native::NativeOptions {
+                app: r.path.display().to_string(),
+                new_instance: true,
+                extra_args: vec![ISOLATED_DATA_ARG.into(), data.display().to_string()],
+                host,
+                ..Default::default()
+            }));
         }
         // 이 OS 에서 아직 못 쓰는 백엔드면 승인을 묻기 전에 거절한다
         // (Electron 앱을 일반 앱 방식으로 대신 열면 사용자의 실제 데이터로 뜨므로 그렇게 넘기지 않는다)
@@ -1133,6 +1159,16 @@ fn own_bundle() -> Option<PathBuf> {
     outer_bundle(&exe)
 }
 
+/// GhostDesk 를 따로 떼어 낸 인스턴스로 띄울 때 넘기는 인자 (main.rs 가 읽어 데이터 폴더를 바꾸고 자동 연결을 끈다)
+pub const ISOLATED_DATA_ARG: &str = "--isolated-data";
+
+/// 열려는 앱이 GhostDesk 자신인가 (번들 id · 이 실행 파일의 번들 · 번들 이름)
+fn is_ghostdesk(r: &ResolvedApp) -> bool {
+    r.bundle_id.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(GHOSTDESK_BUNDLE_ID))
+        || own_bundle().is_some_and(|o| o == r.path)
+        || r.path.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("ghostdesk"))
+}
+
 fn is_denied(r: &ResolvedApp) -> bool {
     if let Some(b) = &r.bundle_id {
         if EXTERNAL_DENY.iter().any(|d| d.eq_ignore_ascii_case(b)) {
@@ -1148,7 +1184,7 @@ fn is_denied(r: &ResolvedApp) -> bool {
     if win_policy::denied(r) {
         return true;
     }
-    own_bundle().map(|o| o == r.path).unwrap_or(false)
+    false
 }
 
 /// macOS 밖: kind=remote 대상이 이 컴퓨터 자신(루프백·미지정·이 컴퓨터의 주소, localhost)인가 — 사람에게 승인을 묻기 전에 본다.
@@ -1640,8 +1676,14 @@ mod tests {
         assert!(is_denied(&mk("/System/Applications/Utilities/Terminal.app", Some("com.apple.Terminal"))));
         assert!(is_denied(&mk("/x/Renamed.app", Some("COM.APPLE.SCRIPTEDITOR2"))));
         assert!(is_denied(&mk("/x/Script Editor.app", None)));
-        assert!(is_denied(&mk("/x/Foo.app", Some("dev.ghostdesk.app"))));
         assert!(!is_denied(&mk("/System/Applications/TextEdit.app", Some("com.apple.TextEdit"))));
+        // GhostDesk 자신은 차단 목록이 아니라 시험용 인스턴스로만 여는 대상이다 (app_target)
+        if !cfg!(windows) {
+            assert!(!is_denied(&mk("/x/Foo.app", Some("dev.ghostdesk.app"))));
+        }
+        assert!(is_ghostdesk(&mk("/x/Foo.app", Some("DEV.GHOSTDESK.APP"))));
+        assert!(is_ghostdesk(&mk("/Applications/GhostDesk.app", None)));
+        assert!(!is_ghostdesk(&mk("/System/Applications/TextEdit.app", Some("com.apple.TextEdit"))));
     }
 
     #[test]

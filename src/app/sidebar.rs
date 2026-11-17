@@ -54,9 +54,12 @@ impl GhostApp {
             {
                 self.open_connect(ui.ctx());
             }
-            self.update_notice(ui);
             ui.add_space(4.0);
+            // 메뉴 바로 아래(남은 공간의 위쪽부터): 알림 카드 → 에이전트 목록.
+            // 알림을 아래에서 위로 쌓는 쪽에 두면 카드 테두리가 남은 높이만큼 늘어나므로 이쪽에 둔다.
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                self.update_notice(ui);
+                self.permission_notice(ui);
                 if !self.agents.is_empty() {
                     ui.add_space(20.0);
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.agent_list(ui));
@@ -65,7 +68,45 @@ impl GhostApp {
         });
     }
 
-    /// 새 버전 알림 카드 (외부 연결 위): 알림 → 내려받기(진행 막대) → 다시 시작해서 적용
+    /// macOS 권한 알림 카드 (메뉴 아래): Mac 앱을 맡기는 데 필요한 권한이 꺼져 있으면 늘 보인다.
+    /// '권한 설정' 은 설정 창을 열고, 설정은 권한이 꺼져 있는 동안 권한 칸을 맨 위에 둔다.
+    fn permission_notice(&mut self, ui: &mut egui::Ui) {
+        if self.perm_notice_hidden || self.permissions_ok(ui.ctx()) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let restart = crate::macos::screen_capture_needs_restart();
+        #[cfg(not(target_os = "macos"))]
+        let restart = false;
+        ui.add_space(8.0);
+        theme::tinted(theme::warn()).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(RichText::new(tr("Mac 앱 권한이 꺼져 있어요")).strong().color(theme::text()));
+                if restart {
+                    ui.label(theme::hint(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요.")));
+                } else {
+                    ui.label(theme::hint(tr("이 컴퓨터의 앱을 맡기려면 필요해요.")));
+                }
+                ui.horizontal(|ui| {
+                    if restart {
+                        if theme::primary(ui, tr("다시 시작")).clicked() {
+                            self.save_prefs();
+                            crate::update::request_relaunch(ui.ctx());
+                        }
+                    } else if theme::primary(ui, tr("권한 설정")).clicked() {
+                        self.show_settings = true;
+                    }
+                    if ui.link(theme::hint(tr("나중에"))).on_hover_text(tr("다음에 켤 때 다시 알려 드려요")).clicked() {
+                        self.perm_notice_hidden = true;
+                    }
+                });
+            });
+        });
+    }
+
+    /// 새 버전 알림 카드 (메뉴 아래): 알림 → 내려받기(진행 막대) → 다시 시작해서 적용
     fn update_notice(&mut self, ui: &mut egui::Ui) {
         use crate::update::State;
         let st = self.update.lock().clone();
@@ -75,7 +116,6 @@ impl GhostApp {
         };
         ui.add_space(8.0);
         theme::tinted(theme::info()).show(ui, |ui| {
-            // 사이드바 아래쪽은 아래에서 위로 쌓이므로 카드 안은 위에서 아래로 다시 놓는다
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 6.0;
