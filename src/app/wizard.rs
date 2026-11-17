@@ -105,7 +105,7 @@ pub(super) struct AppListItem {
 
 impl GhostApp {
     pub(super) fn spawn_agent(&mut self, ctx: &egui::Context) {
-        if self.missing_key() {
+        if let Some(msg) = self.missing_setup() {
             self.key_warn = true;
             if self.wizard_open {
                 // 새 에이전트 창 안에서는 키 칸 아래 안내 + 키 칸으로 포커스 (아래쪽 알림은 겹치므로 생략)
@@ -113,7 +113,7 @@ impl GhostApp {
                 self.focus_key = true;
                 return;
             }
-            return self.notify(ctx, trf("설정에서 {} API 키를 넣어 주세요.", &[&self.provider.short_name()]));
+            return self.notify(ctx, msg);
         }
         self.key_warn = false;
         let ws_name = self.form.workspace.trim().to_string();
@@ -248,6 +248,7 @@ impl GhostApp {
             reply_lang: self.lang.english_name(),
             llm: Llm::new(
                 self.provider,
+                self.base_url(self.pi()),
                 self.key().trim().to_string(),
                 self.models[self.pi()].trim().to_string(),
                 EFFORTS[self.effort_idx].to_string(),
@@ -271,7 +272,7 @@ impl GhostApp {
         self.wizard_open = true;
         self.form.choice = None;
         self.key_warn = false;
-        self.wizard_key_field = self.missing_key();
+        self.wizard_key_field = self.missing_setup().is_some();
     }
 
     /// Windows 자식 세션 기능 상태 + 켜기(관리자 승인) 버튼
@@ -411,6 +412,9 @@ impl GhostApp {
                     ui.add_space(4.0);
                     self.provider_combo(ui, W);
                     ui.add_space(4.0);
+                    if self.provider.needs_url() && self.custom_url_field(ui, W).changed() {
+                        self.key_warn = false;
+                    }
                     ui.horizontal(|ui| {
                         let link_w = 96.0;
                         if self.key_warn && self.missing_key() {
@@ -433,8 +437,10 @@ impl GhostApp {
                         }
                     });
                     self.key_help(ui);
-                    if self.key_warn && self.missing_key() {
-                        ui.label(RichText::new(tr("시작하려면 API 키를 넣어 주세요")).size(12.0).color(theme::warn()));
+                    if self.key_warn {
+                        if let Some(msg) = self.missing_setup() {
+                            ui.label(RichText::new(msg).size(12.0).color(theme::warn()));
+                        }
                     }
                 }
             });

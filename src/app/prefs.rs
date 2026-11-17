@@ -28,6 +28,8 @@ pub(super) struct Prefs {
     remember_keys: Option<bool>,
     /// 회사 → 암호화한 API 키 (base64)
     keys: BTreeMap<String, String>,
+    /// 'OpenAI 호환 API' 의 주소
+    custom_url: String,
 }
 
 fn path() -> std::path::PathBuf {
@@ -67,6 +69,7 @@ impl GhostApp {
             self.show_cursor = c;
         }
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
+        self.custom_url = p.custom_url;
     }
 
     fn to_prefs(&self) -> Prefs {
@@ -77,6 +80,7 @@ impl GhostApp {
             models: names.clone().zip(self.models.iter().cloned()).collect(),
             effort: Some(self.effort_idx),
             show_cursor: Some(self.show_cursor),
+            custom_url: self.custom_url.trim().to_string(),
             remember_keys: Some(self.remember_keys),
             keys: if self.remember_keys {
                 // 환경변수에서 온 키와 같으면 저장하지 않는다 (그 자리에 이미 있으므로)

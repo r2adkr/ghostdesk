@@ -49,6 +49,6 @@ impl Llm {
         body["thinking"] = thinking;
         let beta = betas.join(",");
         let headers = [("anthropic-version", "2023-06-01"), ("anthropic-beta", beta.as_str())];
-        self.post(&format!("{}/v1/messages", self.provider.base_url()), &body, &headers).await
+        self.post(&format!("{}/v1/messages", self.base_url), &body, &headers).await
     }
 }

@@ -22,6 +22,8 @@ pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 pub struct Llm {
     http: reqwest::Client,
     pub provider: Provider,
+    /// API 뿌리 주소 (`Provider::default_base_url` 또는 사용자가 넣은 OpenAI 호환 주소)
+    pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub effort: String,
@@ -32,8 +34,8 @@ fn http() -> reqwest::Client {
 }
 
 impl Llm {
-    pub fn new(provider: Provider, api_key: String, model: String, effort: String) -> Self {
-        Llm { http: http(), provider, api_key, model, effort }
+    pub fn new(provider: Provider, base_url: String, api_key: String, model: String, effort: String) -> Self {
+        Llm { http: http(), provider, base_url, api_key, model, effort }
     }
 
     /// 백엔드 종류에 맞는 도구 목록 (Claude 형식). 대화 중에는 바꾸지 않는다.
@@ -146,16 +148,16 @@ fn auth(req: reqwest::RequestBuilder, p: Provider, key: &str) -> reqwest::Reques
 }
 
 /// 제공자가 실제로 쓸 수 있는 모델 이름 목록 (`GET /models`). 글·이미지 대화와 상관없는 모델은 뺀다.
-pub async fn list_models(p: Provider, key: &str) -> Result<Vec<String>> {
+pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<String>> {
     const SKIP: &[&str] = &["embed", "tts", "whisper", "dall-e", "image", "audio", "realtime", "moderation", "transcribe", "veo", "imagen", "aqa"];
     let mut ids: Vec<String> = Vec::new();
     // Anthropic 은 한 번에 100개까지만 주므로 has_more 가 꺼질 때까지 다음 쪽(after_id)을 이어 받는다
     let mut after: Option<String> = None;
     for _ in 0..20 {
         let url = match (p, &after) {
-            (Provider::Anthropic, None) => format!("{}/v1/models?limit=100", p.base_url()),
-            (Provider::Anthropic, Some(a)) => format!("{}/v1/models?limit=100&after_id={a}", p.base_url()),
-            _ => format!("{}/models", p.base_url()),
+            (Provider::Anthropic, None) => format!("{base_url}/v1/models?limit=100"),
+            (Provider::Anthropic, Some(a)) => format!("{base_url}/v1/models?limit=100&after_id={a}"),
+            _ => format!("{base_url}/models"),
         };
         let mut req = auth(http().get(url), p, key).timeout(Duration::from_secs(20));
         if p == Provider::Anthropic {

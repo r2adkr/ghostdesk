@@ -10,7 +10,7 @@ Rust + egui 데스크톱 앱입니다 (**macOS · Windows 10/11**). 마우스·�
 
 1. Download [GhostDesk v0.2.0 for Windows x64](https://github.com/r2adkr/ghostdesk/releases/download/v0.2.0/GhostDesk-0.2.0-windows-x64.exe) and double-click it. No installer, Rust, or separate runtime installation is required. Later versions show an **update notice** in the sidebar; click **Update**, then **Restart to update**.
 2. **Home (홈)** opens first. Enter a task to configure a new agent. **All agents (모든 에이전트)** shows the agents' actual live screens; click a screen to open its details.
-3. Use your own API key (Claude, OpenAI, Gemini, OpenRouter, … or a local Ollama) for the built-in agent and pick the model under the home composer, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
+3. Use your own API key (Claude, OpenAI, Gemini, OpenRouter, …, any OpenAI-compatible API by URL such as DeepSeek, Groq or LM Studio, or a local Ollama) for the built-in agent and pick the model under the home composer, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
 
 The UI is available in Korean, English, Japanese, and Chinese (Settings → Language). Windows 10/11 x64 is supported; a supported Chromium browser such as Edge is required for web workspaces. The executable is unsigned, so Windows may show a security warning. Windows child sessions remain experimental, require an administrator account, and have not been verified with real capture/input.
 

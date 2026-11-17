@@ -176,6 +176,8 @@ pub struct GhostApp {
     /// 에이전트를 움직일 AI 회사. 키와 모델은 회사마다 따로 기억한다 (`Provider::ALL` 순서)
     provider: Provider,
     api_keys: Vec<String>,
+    /// 'OpenAI 호환 API' 의 주소 (사용자가 넣은 그대로, 쓸 때 다듬는다)
+    custom_url: String,
     models: Vec<String>,
     /// '모델' 목록을 열 때 API 에서 불러온 실제 모델 목록 (회사마다)
     model_fetch: Arc<parking_lot::Mutex<Vec<ModelFetch>>>,
@@ -278,7 +280,8 @@ impl GhostApp {
             // 환경변수에 키가 있는 첫 회사를 고른다 (없으면 Claude)
             provider: Provider::ALL.into_iter().find(|p| p.needs_key() && !p.env_key().is_empty()).unwrap_or(Provider::Anthropic),
             api_keys: Provider::ALL.iter().map(|p| p.env_key()).collect(),
-            models: Provider::ALL.iter().map(|p| p.default_models()[0].to_string()).collect(),
+            custom_url: String::new(),
+            models: Provider::ALL.iter().map(|p| p.default_models().first().copied().unwrap_or_default().to_string()).collect(),
             model_fetch: Arc::new(parking_lot::Mutex::new(vec![ModelFetch::Idle; Provider::ALL.len()])),
             model_query: String::new(),
             remember_keys: prefs::CAN_REMEMBER_KEYS,

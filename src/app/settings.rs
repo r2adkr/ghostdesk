@@ -14,16 +14,43 @@ impl GhostApp {
         &self.api_keys[self.pi()]
     }
 
+    /// `i` 번째 회사의 API 주소 (OpenAI 호환은 사용자가 넣은 주소를 다듬어서)
+    pub(super) fn base_url(&self, i: usize) -> String {
+        match Provider::ALL[i] {
+            p if p.needs_url() => Provider::normalize_base_url(&self.custom_url),
+            p => p.default_base_url(),
+        }
+    }
+
+    /// 지금 회사로 일을 시작하기에 빠진 설정 (키 또는 주소). 다 있으면 None
+    pub(super) fn missing_setup(&self) -> Option<String> {
+        let p = self.provider;
+        if p.needs_url() && self.base_url(self.pi()).is_empty() {
+            Some(tr("설정에서 OpenAI 호환 API 주소를 넣어 주세요.").to_string())
+        } else if p.needs_key() && self.key().trim().is_empty() {
+            Some(trf("설정에서 {} API 키를 넣어 주세요.", &[&p.short_name()]))
+        } else {
+            None
+        }
+    }
+
     /// 키가 필요한 회사인데 키가 비어 있는가
     pub(super) fn missing_key(&self) -> bool {
         self.provider.needs_key() && self.key().trim().is_empty()
     }
 
-    /// 바로 쓸 수 있게 준비된 회사인가: 키가 있거나, 키가 필요 없는데(Ollama) 지금 쓰고 있는 회사
+    /// `i` 번째 회사가 모델 목록을 부를 수 있게 준비됐는가 (주소·필수 키)
+    fn configured(&self, i: usize) -> bool {
+        let p = Provider::ALL[i];
+        !(p.needs_url() && self.base_url(i).is_empty()) && !(p.needs_key() && self.api_keys[i].trim().is_empty())
+    }
+
+    /// 바로 쓸 수 있게 준비된 회사인가: 키가 필요하면 키가, 주소가 필요하면 주소가 있는 회사.
+    /// 아무것도 필요 없는 Ollama 는 지금 쓰고 있을 때만 (켜 두지 않은 PC 가 많다)
     fn ready(&self, i: usize) -> bool {
         let p = Provider::ALL[i];
-        if p.needs_key() {
-            !self.api_keys[i].trim().is_empty()
+        if p.needs_key() || p.needs_url() {
+            self.configured(i)
         } else {
             p == self.provider
         }
@@ -46,7 +73,7 @@ impl GhostApp {
     fn key_field_for(&mut self, ui: &mut egui::Ui, i: usize, width: f32, id: egui::Id) -> egui::Response {
         let p = Provider::ALL[i];
         let r = ui.add_enabled(
-            p.needs_key(),
+            p.takes_key(),
             egui::TextEdit::singleline(&mut self.api_keys[i])
                 .id(id)
                 .password(true)
@@ -64,11 +91,11 @@ impl GhostApp {
     fn fetch_models(&mut self, ctx: &egui::Context, i: usize) -> ModelFetch {
         let p = Provider::ALL[i];
         let state = self.model_fetch.lock()[i].clone();
-        if matches!(state, ModelFetch::Idle) && !(p.needs_key() && self.api_keys[i].trim().is_empty()) {
+        if matches!(state, ModelFetch::Idle) && self.configured(i) {
             self.model_fetch.lock()[i] = ModelFetch::Loading;
-            let (slot, key, ctx) = (self.model_fetch.clone(), self.api_keys[i].clone(), ctx.clone());
+            let (slot, key, url, ctx) = (self.model_fetch.clone(), self.api_keys[i].clone(), self.base_url(i), ctx.clone());
             self.rt.spawn(async move {
-                let r = crate::llm::list_models(p, &key).await.map_err(|e| format!("{e:#}"));
+                let r = crate::llm::list_models(p, &url, &key).await.map_err(|e| format!("{e:#}"));
                 slot.lock()[i] = ModelFetch::Done(r);
                 ctx.request_repaint();
             });
@@ -282,12 +309,38 @@ impl GhostApp {
         .on_hover_text(tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"));
     }
 
+    /// 'OpenAI 호환 API' 의 주소 칸 (설정 창·새 에이전트 창). 바뀌면 모델 목록을 다시 불러온다.
+    pub(super) fn custom_url_field(&mut self, ui: &mut egui::Ui, width: f32) -> egui::Response {
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut self.custom_url)
+                .desired_width(width)
+                .margin(Margin::symmetric(10, 6))
+                .hint_text(tr("API 주소 (예: https://api.deepseek.com/v1)")),
+        );
+        if r.changed() {
+            let i = Provider::ALL.iter().position(|p| p.needs_url()).unwrap_or(0);
+            self.model_fetch.lock()[i] = ModelFetch::Idle;
+        }
+        r
+    }
+
+    /// 'OpenAI 호환 API' 줄: 주소 칸, 그 아래 (선택) 키 칸. 주소·키가 바뀌면 모델 목록을 다시 불러온다.
+    fn custom_rows(&mut self, ui: &mut egui::Ui, i: usize, field: f32) {
+        self.custom_url_field(ui, field);
+        ui.end_row();
+        ui.label("");
+        self.key_field_for(ui, i, field, egui::Id::unique(("settings_key", i)));
+        ui.end_row();
+    }
+
     /// 키를 어디서 받는지 · 어디에 두는지 한 줄로 (새 에이전트 창)
     pub(super) fn key_help(&self, ui: &mut egui::Ui) {
         let p = self.provider;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if p.needs_key() {
+            if p.needs_url() {
+                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요. 주소는 설정에서 넣어요.")));
+            } else if p.needs_key() {
                 ui.label(theme::hint(tr("키가 없나요?")));
                 ui.hyperlink_to(RichText::new(trf("{} 에서 만들기", &[&p.short_name()])).size(12.0), p.key_page());
                 ui.label(theme::hint(format!("· {}", self.key_storage_note())));
@@ -397,6 +450,10 @@ impl GhostApp {
         egui::Grid::new("settings_keys").num_columns(2).min_col_width(label_w).spacing([14.0, 8.0]).show(ui, |ui| {
             for (i, p) in Provider::ALL.into_iter().enumerate() {
                 ui.label(p.short_name()).on_hover_text(tr(p.label()));
+                if p.needs_url() {
+                    self.custom_rows(ui, i, field);
+                    continue;
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if p.needs_key() {

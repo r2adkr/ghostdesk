@@ -22,7 +22,7 @@ impl Llm {
         if self.provider.takes_effort() {
             body["reasoning_effort"] = json!(effort(&self.effort));
         }
-        let url = format!("{}/chat/completions", self.provider.base_url());
+        let url = format!("{}/chat/completions", self.base_url);
         let resp = match self.post(&url, &body, &[]).await {
             // 생각 깊이를 받지 않는 모델(예: gpt-4.1)이면 빼고 한 번 더
             Err(e) if body.get("reasoning_effort").is_some() && format!("{e:#}").contains("reasoning") => {

@@ -170,7 +170,9 @@ pub async fn run(out: Option<String>) -> Result<()> {
 }
 
 /// `ghostdesk --agent-test "<작업>"` : GUI 없이 에이전트 루프 하나를 빈 프로필로 실행한다.
-/// (ANTHROPIC_BASE_URL 로 가짜 서버를 지정해 루프를 검증할 때 사용)
+/// (ANTHROPIC_BASE_URL 로 가짜 서버를 지정해 루프를 검증할 때 사용.
+///  GHOSTDESK_TEST_OPENAI_URL 을 주면 그 주소의 OpenAI 호환 API('Custom')로 돌린다:
+///  키는 GHOSTDESK_TEST_OPENAI_KEY, 모델은 GHOSTDESK_TEST_OPENAI_MODEL)
 pub async fn run_agent_cli(task: String) -> Result<()> {
     use crate::{agent::{self, AgentConfig, AgentShared, DeskTarget, ProfileSource}, llm::Llm};
     let browser = profiles::detect().into_iter().next().ok_or_else(|| anyhow::anyhow!("브라우저 없음"))?;
@@ -211,12 +213,22 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         } },
         max_steps: 10,
         reply_lang: "Korean",
-        llm: Llm::new(
-            crate::llm::Provider::Anthropic,
-            std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "test".into()),
-            "claude-opus-5-5".into(),
-            "medium".into(),
-        ),
+        llm: match std::env::var("GHOSTDESK_TEST_OPENAI_URL") {
+            Ok(url) => Llm::new(
+                crate::llm::Provider::Custom,
+                crate::llm::Provider::normalize_base_url(&url),
+                std::env::var("GHOSTDESK_TEST_OPENAI_KEY").unwrap_or_default(),
+                std::env::var("GHOSTDESK_TEST_OPENAI_MODEL").unwrap_or_else(|_| "test-model".into()),
+                "medium".into(),
+            ),
+            Err(_) => Llm::new(
+                crate::llm::Provider::Anthropic,
+                crate::llm::Provider::Anthropic.default_base_url(),
+                std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "test".into()),
+                "claude-opus-5-5".into(),
+                "medium".into(),
+            ),
+        },
     };
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let h = tokio::spawn(agent::run_agent(shared.clone(), cfg, rx));
