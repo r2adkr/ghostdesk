@@ -1,34 +1,46 @@
-# 👻 GhostDesk
+# GhostDesk
 
-AI 에이전트가 **지금 보고 계신 화면이 아니라 보이지 않는 별도 공간**에서 웹사이트와 앱을 조작하게 해 주는
-Rust + egui 데스크톱 앱입니다 (**macOS · Windows 10/11**). 마우스·키보드를 빼앗지 않고, 에이전트가 하는 일은 GhostDesk 창에서
-**가상 마우스**(에이전트별 색 화살표, 미끄러지는 이동, 클릭 파문, 입력 말풍선)로 실시간으로 지켜볼 수 있습니다.
+AI 에이전트에게 웹사이트나 앱 일을 맡기는 동안에도 내 컴퓨터를 평소처럼 쓸 수 있게 해 주는 데스크톱 앱입니다.
+에이전트는 화면 밖에 따로 띄운 브라우저나 앱 창에서 일하고, 마우스와 키보드는 계속 내가 씁니다.
+에이전트가 무엇을 누르고 무엇을 입력하는지는 GhostDesk 창에서 실시간으로 볼 수 있습니다.
+로그인이나 2단계 인증처럼 사람이 해야 하는 단계가 나오면 그 화면을 넘겨받아 직접 처리하면 됩니다.
 
-> Windows 에서의 차이(지원하는 화면 종류, 설치·설정 파일 위치, 빌드 방법)는 아래 **[Windows](#-windows)** 절에 모아 두었습니다.
+macOS 13 이상과 Windows 10/11 에서 돌아가고, Rust 와 egui 로 만들었습니다.
+Windows 에서 달라지는 점(쓸 수 있는 화면 종류, 설치 위치, 빌드 방법)은 아래 [Windows](#-windows) 절에 모았습니다.
 
-## Download and run (Windows)
+## 내려받기
 
-1. Download GhostDesk v0.3.0 — [Windows x64](https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/GhostDesk-0.3.0-windows-x64.exe) (double-click it) or [macOS, Apple Silicon and Intel](https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/GhostDesk-0.3.0-macos-universal.zip) (unzip and move GhostDesk.app to Applications). No installer, Rust, or separate runtime installation is required. Later versions show an **update notice** in the sidebar; click **Update**, then **Restart to update** — the app downloads the build for your OS and CPU.
-2. **Home (홈)** opens first. Enter a task to configure a new agent. **All agents (모든 에이전트)** shows the agents' actual live screens; click a screen to open its details.
-3. Use your own API key (Claude, OpenAI, Gemini, OpenRouter, …, any number of OpenAI-compatible APIs by URL such as DeepSeek, Groq or LM Studio, or a local Ollama — add and remove them in Settings) for the built-in agent and pick the model under the home composer, or connect an external agent through MCP. GhostDesk automatically installs a stable copy and registers its MCP server for supported clients; clients may need a restart to load the connection.
+- Windows x64: [GhostDesk-0.3.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/GhostDesk-0.3.0-windows-x64.exe)
+  받은 파일을 실행하면 됩니다. 따로 설치하는 과정은 없습니다.
+- macOS (Apple Silicon, Intel): [GhostDesk-0.3.0-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/GhostDesk-0.3.0-macos-universal.zip)
+  압축을 풀고 GhostDesk.app 을 응용 프로그램 폴더로 옮기세요. Apple 공증을 받지 않은 앱이라 처음 열 때 막히면
+  시스템 설정 → 개인정보 보호 및 보안 맨 아래에서 '그래도 열기'를 누르세요. 한 번 허용하면 다음부터는 그냥 열립니다.
 
-The UI is available in Korean, English, Japanese, and Chinese (Settings → Language). Windows 10/11 x64 is supported; a supported Chromium browser such as Edge is required for web workspaces. The executable is unsigned, so Windows may show a security warning. Windows child sessions remain experimental, require an administrator account, and have not been verified with real capture/input.
+새 버전이 나오면 사이드바에 알림이 뜹니다. '업데이트'를 누르면 지금 쓰는 OS 와 CPU 에 맞는 파일을 받아 바꿔 넣고, '다시 시작'을 누르면 적용됩니다.
+Windows 실행 파일은 서명이 없어서 처음 실행할 때 보안 경고가 나올 수 있습니다.
 
-## 두 가지 사용법
+## 쓰는 방법
 
-| | 여기서 바로 실행 | 다른 앱의 에이전트가 사용 (MCP) |
+GhostDesk 안의 에이전트에게 직접 일을 맡길 수도 있고, 이미 쓰고 있는 AI 앱이 GhostDesk 를 도구로 쓰게 할 수도 있습니다.
+
+| | GhostDesk 에서 직접 | 다른 AI 앱에서 (MCP) |
 |---|---|---|
-| 누가 일하나 | GhostDesk 안의 Claude 에이전트 | Claude 앱 · Claude Code · Codex · Kimi Code · OpenCode · pi 등 |
-| 필요한 것 | Claude API 키 (⚙ 설정) | 없음 (연결만) |
-| 시작 | **+ 새 에이전트** → 무엇을 조작할지 고르고 할 일 입력 | 상단의 **외부 연결** → 모두 연결 (또는 설정 붙여 넣기) |
+| 일하는 쪽 | GhostDesk 안의 에이전트 | Claude 앱, Claude Code, Codex, Kimi Code, OpenCode, pi, 그 밖에 MCP 를 지원하는 앱 |
+| 필요한 것 | 내 API 키 (Claude, OpenAI, Gemini, Grok, OpenRouter, Mistral, OpenAI 호환 API) 또는 내 PC 의 Ollama | 없음 |
+| 시작 | 홈에 할 일을 적고 Enter | '외부 연결'에서 '모두 연결'을 누른 뒤, 그 앱에 "GhostDesk 로 …해줘" 라고 말하기 |
+
+API 키는 설정의 'AI 연결'에서 회사별로 추가합니다. OpenAI 호환 API(DeepSeek, Groq, LM Studio 등)는 주소마다 여러 개 둘 수 있고,
+홈 입력 칸 아래 모델 단추에서 언제든 바꿔 쓸 수 있습니다. 화면 언어는 한국어, 영어, 일본어, 중국어 중에서 고릅니다.
+
+## 직접 빌드하기
 
 ```bash
 cargo build --release
 ./target/release/ghostdesk            # GUI
-./target/release/ghostdesk --mcp      # 외부 에이전트용 MCP 서버 (stdio, GUI 를 자동으로 띄움)
+./target/release/ghostdesk --mcp      # 외부 에이전트용 MCP 서버 (stdio, 필요하면 GUI 를 띄움)
 ```
 
-빌드에는 **Rust 1.95 이상**이 필요합니다. rustup 을 사용하면 `rust-toolchain.toml` 에 지정된 1.95.0 을 자동으로 설치·선택합니다.
+Rust 1.95 이상이 필요합니다. rustup 을 쓰면 `rust-toolchain.toml` 에 적힌 1.95.0 을 알아서 설치합니다.
 
 ## 에이전트가 일하는 "보이지 않는 화면" 종류 (macOS)
 
@@ -104,7 +116,7 @@ GhostDesk.app 으로 묶어 고정 위치(/Applications)에 두는 것을 권장
 
 ## 데이터
 - 작업공간(복제된 쿠키·앱 데이터 포함): `~/Library/Application Support/GhostDesk/workspaces/<이름>` — 필요 없으면 지우세요.
-- API 키는 저장하지 않습니다(메모리 + `ANTHROPIC_API_KEY` 환경변수).
+- macOS 에서는 API 키를 파일에 저장하지 않습니다. 켤 때마다 설정에서 넣거나, `ANTHROPIC_API_KEY` · `OPENAI_API_KEY` · `GEMINI_API_KEY` 같은 환경변수로 넘기세요. 회사·모델·주소 같은 나머지 설정은 `~/Library/Application Support/GhostDesk/prefs.json` 에 남습니다.
 
 ## 테스트
 
