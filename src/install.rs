@@ -2755,7 +2755,8 @@ mod tests {
         std::fs::write(&src, b"new build v3 (longer)").unwrap();
         install_exe_into(&src, &dir).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new build v3 (longer)");
-        assert_eq!(names(), vec!["ghostdesk.exe".to_string(), "ghostdesk.src-sha256".to_string()]);
+        // 설치 폴더에는 설치본 · 원본 지문 · 설치한 버전(옛 exe 가 새 설치본을 덮지 않게)만 남는다
+        assert_eq!(names(), vec!["ghostdesk.exe".to_string(), "ghostdesk.src-sha256".to_string(), "ghostdesk.version".to_string()]);
         // 지문은 맞는데 설치본이 바뀌었으면(크기 다름) 다시 설치
         std::fs::write(&target, b"tampered").unwrap();
         install_exe_into(&src, &dir).unwrap();
