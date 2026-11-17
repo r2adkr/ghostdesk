@@ -30,6 +30,14 @@ impl GhostApp {
         if theme::nav_item(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None).clicked() {
             self.view = View::Grid;
         }
+        // green dot while any agent is in a team
+        let active = self.teams_ui_active();
+        if theme::nav_item(ui, self.view == View::Teams, icon::LIST_TODO, tr("팀"), active.then(theme::success))
+            .on_hover_text(tr("여러 에이전트가 같은 목표·메모·할 일을 보며 함께 일해요"))
+            .clicked()
+        {
+            self.view = View::Teams;
+        }
         if !self.agents.is_empty()
             && theme::nav_item(ui, false, icon::LAYOUT_DASHBOARD, tr("화면 모아보기"), None)
                 .on_hover_text(pick(

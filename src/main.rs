@@ -35,6 +35,7 @@ mod llm;
 mod profiles;
 mod rfb;
 mod selftest;
+mod team;
 mod update;
 
 fn main() -> anyhow::Result<()> {

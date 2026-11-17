@@ -142,6 +142,7 @@ mod tests {
             ("settings.rs", include_str!("settings.rs")),
             ("setup.rs", include_str!("setup.rs")),
             ("sidebar.rs", include_str!("sidebar.rs")),
+            ("teams.rs", include_str!("teams.rs")),
             ("theme.rs", include_str!("theme.rs")),
             ("titlebar.rs", include_str!("titlebar.rs")),
             ("tour.rs", include_str!("tour.rs")),

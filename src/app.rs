@@ -27,6 +27,7 @@ mod prefs;
 pub mod setup;
 mod screens;
 mod settings;
+mod teams;
 mod sidebar;
 mod theme;
 mod titlebar;
@@ -125,6 +126,8 @@ enum View {
     Detail,
     /// Screen wall: every agent's screen filling the window (no list or panels).
     Wall,
+    /// Teams: shared work boards for agents working together.
+    Teams,
 }
 
 /// Kind of isolated screen a new agent uses.
@@ -255,6 +258,9 @@ pub struct GhostApp {
     show_settings: bool,
     /// Tab shown when Settings opens (kept between openings).
     settings_tab: settings::SettingsTab,
+    /// Shared work boards (team.rs), the same store the control server uses.
+    teams: Arc<crate::team::TeamStore>,
+    teams_ui: teams::TeamsUi,
     /// Settings > About > License, while open (the parsed package list is dropped when it closes)
     license_view: Option<settings::LicenseView>,
     show_session_guide: bool,
@@ -294,8 +300,10 @@ impl GhostApp {
         let native_apps = wizard::native_app_list(&rt, &cc.egui_ctx);
         let (ctl_tx, control_rx) = mpsc::unbounded_channel();
         let control_error = Arc::new(parking_lot::Mutex::new(None));
+        let teams;
         {
             let server = crate::control::ControlServer::new(ctl_tx, cc.egui_ctx.clone());
+            teams = server.teams();
             let err = control_error.clone();
             rt.spawn(async move {
                 if let Err(e) = server.serve().await {
@@ -316,6 +324,8 @@ impl GhostApp {
             wizard_open: false,
             show_settings: false,
             settings_tab: Default::default(),
+            teams,
+            teams_ui: Default::default(),
             license_view: None,
             show_session_guide: false,
             child_enabled: None,
@@ -618,6 +628,7 @@ impl GhostApp {
                 match self.view {
                     View::Home => self.welcome(ui),
                     View::Detail => self.detail_view(ui, self.selected.unwrap()),
+                    View::Teams => self.teams_view(ui),
                     _ => self.grid(ui),
                 }
             });
@@ -643,6 +654,7 @@ impl GhostApp {
             View::Grid => 1,
             View::Detail => 2,
             View::Wall => 3,
+            View::Teams => 4,
         };
         let agent = self.selected.and_then(|i| self.agents.get(i)).map_or(0, |a| a.shared.id);
         view << 48 | agent

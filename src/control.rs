@@ -220,6 +220,8 @@ pub struct ControlServer {
     /// Tag that changes with every GUI run (so a desk_id from before a restart doesn't point at a new
     /// screen).
     instance: String,
+    /// Shared work boards for agents working together (team.rs). The GUI shows the same store.
+    teams: Arc<crate::team::TeamStore>,
 }
 
 impl ControlServer {
@@ -232,7 +234,14 @@ impl ControlServer {
             next_id: AtomicU64::new(101),
             next_conn: AtomicU64::new(1),
             instance: instance_tag(),
+            // tests never read or write the user's saved teams
+            teams: Arc::new(if cfg!(test) { crate::team::TeamStore::in_memory() } else { crate::team::TeamStore::load() }),
         })
+    }
+
+    /// The teams store, shared with the GUI.
+    pub fn teams(&self) -> Arc<crate::team::TeamStore> {
+        self.teams.clone()
     }
 
     /// Opens the control endpoint (socket/named pipe) and accepts connections. Errors if another
@@ -305,6 +314,9 @@ impl ControlServer {
         // the connection is over (EOF, error, write failure): close every screen it created (so headless
         // browsers and hidden instances don't pile up, and user apps hidden by attach are restored)
         self.close_conn_desks(conn_id).await;
+        // and leaves every team it joined (its claimed tasks are open again)
+        self.teams.leave_all(conn_id);
+        self.ctx.request_repaint();
         Ok(())
     }
 
@@ -315,6 +327,11 @@ impl ControlServer {
             "open" => self.open(p, conn).await,
             "act" => self.act(p, conn).await,
             "close" => self.close(p, conn).await,
+            "team" => {
+                let r = self.team(p, conn).await;
+                self.ctx.request_repaint();
+                r
+            }
             other => Err(anyhow!("알 수 없는 요청: {other}")),
         }
     }
@@ -419,6 +436,78 @@ impl ControlServer {
             }));
         }
         json!({ "desks": out })
+    }
+
+    /// Team requests (MCP `team` and `team_task`): `action` plus its arguments. Agents write as the
+    /// member they joined as; deleting a team needs the user's approval in the GhostDesk window.
+    async fn team(&self, p: &Value, conn: &Conn) -> Result<Value> {
+        let t = &self.teams;
+        let action = p["action"].as_str().unwrap_or_default();
+        let team = || p["team"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| anyhow!("team(팀 이름)이 필요합니다"));
+        let task = || p["task"].as_u64().ok_or_else(|| anyhow!("task(할 일 번호)가 필요합니다"));
+        let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+        let client = p["client"].as_str().filter(|c| !c.is_empty()).unwrap_or("외부 에이전트").to_string();
+        let ok = |msg: String| Ok(json!({ "text": msg }));
+        match action {
+            "list" => Ok(json!({ "teams": t.list_json(conn.id) })),
+            "create" => {
+                let name = s("name");
+                t.create(&name, &s("goal"), &client)?;
+                // whoever creates a team is in it
+                t.join(&name, conn.id, &client, &s("role"))?;
+                ok(format!("팀 '{name}' 을(를) 만들고 들어왔습니다. 다른 에이전트도 같은 이름으로 join 하면 이 작업판을 같이 씁니다"))
+            }
+            "delete" => {
+                let name = team()?.to_string();
+                let snap = t.read_json(&name, None)?;
+                let notes = t.snapshot().into_iter().find(|x| x.name.eq_ignore_ascii_case(name.trim())).map_or(0, |x| x.notes.len());
+                self.ask(
+                    conn,
+                    "팀 삭제 요청",
+                    format!(
+                        "{client} 이(가) 팀 '{}' 을(를) 지우려고 합니다.\n메모 {notes}개와 할 일 {}개가 함께 사라집니다.",
+                        snap["team"].as_str().unwrap_or(&name),
+                        snap["tasks"].as_array().map_or(0, |a| a.len())
+                    ),
+                )
+                .await?;
+                ok(format!("팀 '{}' 을(를) 지웠습니다", t.delete(&name)?))
+            }
+            "join" => {
+                t.join(team()?, conn.id, &client, &s("role"))?;
+                Ok(t.read_json(team()?, None)?)
+            }
+            "leave" => {
+                t.leave(team()?, conn.id)?;
+                ok("팀에서 나왔습니다. 맡았던 할 일은 다시 열렸습니다".into())
+            }
+            "read" => Ok(t.read_json(team()?, p["before"].as_u64())?),
+            "note" => {
+                let id = t.note(team()?, Some(conn.id), &s("text"))?;
+                ok(format!("메모 {id} 을(를) 남겼습니다"))
+            }
+            "goal" => {
+                t.set_goal(team()?, &s("goal"))?;
+                ok("목표를 바꿨습니다".into())
+            }
+            "task_add" => {
+                let id = t.task_add(team()?, Some(conn.id), &s("title"), &s("detail"))?;
+                ok(format!("할 일 {id} 을(를) 추가했습니다"))
+            }
+            "task_claim" => {
+                t.task_claim(team()?, conn.id, task()?)?;
+                ok(format!("할 일 {} 을(를) 맡았습니다. 끝나면 done 으로 결과를 남기세요", task()?))
+            }
+            "task_done" => {
+                t.task_done(team()?, Some(conn.id), task()?, &s("result"))?;
+                ok(format!("할 일 {} 을(를) 끝냈습니다", task()?))
+            }
+            "task_release" => {
+                t.task_release(team()?, Some(conn.id), task()?)?;
+                ok(format!("할 일 {} 을(를) 내려놓았습니다", task()?))
+            }
+            other => bail!("알 수 없는 team 동작: {other}"),
+        }
     }
 
     /// Shows an approval dialog in the GUI and waits. On timeout or requester disconnect, drops the

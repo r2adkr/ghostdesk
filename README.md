@@ -166,7 +166,8 @@ puts the command, as an array, under `mcp`:
 The tools are `desk_open`, `desk_action` (click, type, scroll; returns a
 screenshot. Pass several steps in `actions` to run them in order with a single
 screenshot at the end), `desk_browser` (navigation and tabs), `desk_app` (app
-menus and accessibility elements), `desk_list` and `desk_close`. The
+menus and accessibility elements), `desk_list`, `desk_close`, and `team` and
+`team_task` for [teams](#teams). The
 `desk_open` `mode` is one of `web`, `web_login`, `app`, `app_login`,
 `app_running`, `app_vdisplay`, `session` or `remote` (`app_current_session`
 instead of `app_vdisplay` on Windows); agents pick the one that fits the task.
@@ -189,6 +190,30 @@ responses require `accept: true|false` and optionally `prompt_text`.
 Electron also requires the returned `source` (`javascript` or `native`);
 native message boxes take a zero-based `response` button index. File dialogs
 continue to provide their existing notes. A stale ID cannot answer a new dialog.
+
+## Teams
+
+When one job is bigger than one agent, put several agents on a team. A team is a
+shared work board: a goal, notes everyone can read, and tasks that one agent at a
+time can claim. Create teams in the **Teams** screen (or let an agent create one),
+then tell each AI app something like "Join GhostDesk team 'Jeju trip' as the
+researcher". The Teams screen shows who joined with which role, who is on which
+task, the results of finished tasks and every note, and you can add notes and
+tasks or reopen and delete them there.
+
+- Agents use two MCP tools. `team` (`list`, `create`, `join` with a `role`,
+  `read`, `note`, `goal`, `leave`, `delete`) and `team_task` (`add`, `claim`,
+  `done` with a `result`, `release`). Joining returns the goal, all tasks and
+  the latest 30 notes; `read` with `before` pages back.
+- A task belongs to the agent that claimed it until it is done or released. When
+  an agent disconnects, it leaves its teams and its claimed tasks open again.
+- Screens stay per agent; a team shares what agents know and who does what, not
+  input on one screen.
+- An agent can create a team on its own, but deleting one needs your approval
+  in the GhostDesk window. In the Teams screen, **Delete team** asks for a second
+  click.
+- Teams, notes and tasks are kept in `teams.json` in the data folder and survive
+  a restart (members don't, so claimed tasks are open again after one).
 
 ## Safety restrictions
 
@@ -470,6 +495,7 @@ cargo test
 | `src/llm.rs` | Claude, OpenAI-compatible, Gemini and other AI APIs |
 | `assets/tour/` | App screenshots used by the guide and this README (the app captures its own window) |
 | `packaging/macos/` | App icon and the .dmg window (background, layout); `swift packaging/macos/make-art.swift` redraws the art |
+| `src/team.rs`, `src/app/teams.rs` | Teams: shared boards (goal, notes, claimable tasks) for agents working together, and their screen |
 | `src/licenses.rs`, `assets/third-party-licenses.json` | License page in Settings → About: GhostDesk's license and every open-source package built in |
 
 ## License

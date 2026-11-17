@@ -183,7 +183,9 @@ fn server_instructions_for(pl: &Plat) -> String {
          GhostDesk 창에서 사용자가 승인하므로 따로 묻지 않아도 됩니다. desk_open(mode) → desk_action/desk_browser/desk_app 반복 → 결과 보고 → desk_close 로 끝까지 진행하세요. \
          고른 모드가 실패하거나 승인이 거절되면 이유를 짧게 알리고, 더 알맞은 다른 모드가 있으면 그것으로 다시 시도하세요 (같은 승인을 되풀이해 요청하지는 마세요). \
          화면은 사용자의 화면·마우스·키보드와 분리되어 있고, 동작마다 스크린샷이 돌아옵니다. 좌표는 최신 스크린샷의 픽셀입니다. 브라우저는 desk_browser 로 URL·탭을{app_tools} 다룹니다. \
-         사용자가 GhostDesk 창에서 실시간으로 지켜봅니다. 메시지 전송·결제·삭제처럼 되돌릴 수 없는 동작은 먼저 확인받으세요."
+         사용자가 GhostDesk 창에서 실시간으로 지켜봅니다. 메시지 전송·결제·삭제처럼 되돌릴 수 없는 동작은 먼저 확인받으세요. \
+         사용자가 팀 이름을 주거나 여러 에이전트가 함께 하라고 하면 team(action=join, role=맡을 분야) 으로 들어가 목표·할 일·메모를 읽고, \
+         할 일은 team_task 로 claim → done(결과) 하며, 다른 팀원에게 필요한 발견·결정은 team(action=note) 로 짧게 남기세요. 일을 시작하기 전과 끝낸 뒤에 team(action=read) 로 새 메모를 확인하세요."
     )
 }
 
@@ -310,6 +312,39 @@ fn tools_for(pl: &Plat) -> Value {
             "name": "desk_close",
             "description": "화면을 닫고 그 프로그램을 종료한다 (작업공간 데이터는 남는다).",
             "inputSchema": { "type": "object", "properties": { "desk_id": { "type": "string" } }, "required": ["desk_id"] }
+        },
+        {
+            "name": "team",
+            "description": "여러 에이전트가 함께 쓰는 팀 작업판 (목표·메모·할 일). action: list | create(name, goal, role) | join(team, role: 맡을 분야) | read(team, before: 이 메모 번호보다 오래된 것) | note(team, text: 알아낸 것·결정·진행 상황) | goal(team, goal) | leave(team) | delete(team, 사용자 승인). join 하면 목표·할 일·최근 메모가 돌아온다. 화면(desk)은 팀원끼리 공유되지 않는다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "create", "join", "read", "note", "goal", "leave", "delete"] },
+                    "team": { "type": "string", "description": "팀 이름" },
+                    "name": { "type": "string", "description": "create: 새 팀 이름" },
+                    "goal": { "type": "string" },
+                    "role": { "type": "string", "description": "이 팀에서 맡는 분야 (예: 조사, 구현, 검증)" },
+                    "text": { "type": "string" },
+                    "before": { "type": "integer" }
+                },
+                "required": ["action"]
+            }
+        },
+        {
+            "name": "team_task",
+            "description": "팀의 할 일. action: add(team, title, detail) | claim(team, task: 번호, 한 할 일은 한 에이전트만) | done(team, task, result: 결과 요약) | release(team, task: 맡은 것 내려놓기). 먼저 team(action=join) 해야 한다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["add", "claim", "done", "release"] },
+                    "team": { "type": "string" },
+                    "task": { "type": "integer" },
+                    "title": { "type": "string" },
+                    "detail": { "type": "string" },
+                    "result": { "type": "string" }
+                },
+                "required": ["action", "team"]
+            }
         }
     ]);
     // don't advertise arguments or tools this OS can't use (so agents don't pick them and then fail
@@ -763,6 +798,19 @@ async fn call_tool(conn: &Conn, name: &str, args: &Value) -> Result<Vec<Value>> 
         "desk_close" => {
             let r = conn.call("close", json!({ "desk_id": desk_id })).await?;
             vec![text(format!("닫음: {}", r["closed"]))]
+        }
+        "team" | "team_task" => {
+            let mut p = args.clone();
+            if name == "team_task" {
+                let a = args["action"].as_str().unwrap_or_default();
+                p["action"] = json!(format!("task_{a}"));
+            }
+            p["client"] = json!(std::env::var("GHOSTDESK_CLIENT_NAME").unwrap_or_else(|_| "외부 에이전트".into()));
+            let r = conn.call("team", p).await?;
+            match r["text"].as_str() {
+                Some(t) => vec![text(t.to_string())],
+                None => vec![text(serde_json::to_string_pretty(&r)?)],
+            }
         }
         other => bail!("알 수 없는 도구: {other}"),
     };
@@ -1585,7 +1633,7 @@ mod tests {
         let r = recv(&mut rx).await;
         assert_eq!(r["id"], 1);
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["desk_open", "desk_action", "desk_browser", "desk_app", "desk_list", "desk_close"]);
+        assert_eq!(names, ["desk_open", "desk_action", "desk_browser", "desk_app", "desk_list", "desk_close", "team", "team_task"]);
         assert_eq!(r["result"]["tools"], tools());
         send_line(&mut w, r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#).await;
         assert_eq!(recv(&mut rx).await["id"], "p");

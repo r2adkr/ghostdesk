@@ -66,7 +66,7 @@ impl GhostApp {
             ui.add_space(4.0);
             // shortcuts as keycaps: Enter starts, Shift+Enter adds a line
             // (centered with last frame's width, since the labels differ per language)
-            let wid = ui.id().with("shortcut_hint_w");
+            let wid = egui::Id::new("shortcut_hint_w");
             let last_w: f32 = ui.data(|d| d.get_temp(wid)).unwrap_or(0.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
