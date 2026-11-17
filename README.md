@@ -40,7 +40,9 @@ screen types, install location, building) are collected in the
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
   notarized, so macOS blocks it the first time: open System Settings → Privacy
   & Security and click **Open Anyway** at the bottom. A newer installed app is
-  never replaced by an older one.
+  never replaced by an older one. If you drag it into /Applications instead,
+  that copy just opens the one in `~/Applications`, which is the only copy
+  that runs.
 
 When a new version is released, a notice shows up in the sidebar. **Update**
 downloads the build for your OS and CPU and swaps it in; **Restart** applies it.
@@ -216,16 +218,20 @@ sidebar shows a notice; **Settings → Permissions → Allow** brings up the mac
 prompts one at a time. Turn GhostDesk on from the prompt's **Open System
 Settings** button. Screen Recording takes effect after a restart.
 
-GhostDesk is ad-hoc signed, so macOS may ask for permissions again after each
-update. If a switch is on in System Settings but GhostDesk still reports it as
-off, click **Allow** again; this removes the stale entry and asks again.
+The installed copy is signed with a certificate GhostDesk creates on your Mac
+(kept in its own keychain, `~/Library/Keychains/ghostdesk-signing.keychain-db`),
+so permissions stay on after restarts and updates. The first launch after
+switching from an older version reopens once, and the two permissions have to
+be turned on one more time. If GhostDesk is missing from the Screen Recording
+list, **Settings → Permissions** has a link that opens that page and shows the
+app in Finder so you can add it with **+**.
 
 For a separate account session, follow **How to set it up** in the app
 (create a dedicated account, install the helper LaunchAgent, and grant
 permissions inside that account).
 
-Permissions and external connections are tied to the executable path, so keep
-GhostDesk.app in one place such as Applications.
+External connections point at `~/Applications/GhostDesk.app`; other copies
+hand over to it when opened.
 
 ## Data
 

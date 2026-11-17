@@ -496,13 +496,17 @@ fn plist_string(plist: &str, key: &str) -> Option<String> {
     Some(rest[start..end].trim().to_string())
 }
 
-/// When a freshly downloaded GhostDesk is opened right where it was unpacked (macOS runs it from a
-/// read-only translocated location): if the installed copy (~/Applications/GhostDesk.app) is
-/// missing or older, gracefully quits the running old copy, swaps this app in and opens the
-/// installed copy. Returns true if so (this process then exits without opening a window).
+/// Makes sure only the installed copy (~/Applications/GhostDesk.app) runs as the GhostDesk app.
 ///
-/// Does nothing if the installed copy is newer, when running with separate data, or when
-/// auto-connect is off.
+/// macOS ties Screen Recording and Accessibility to one signed copy, so a second copy running
+/// itself (opened where it was unpacked, straight from the .dmg, or dragged into /Applications)
+/// would show the permissions as off and its Allow would reset them. Any such copy hands over: if
+/// the installed copy is missing or older, it gracefully quits the running old copy and swaps this
+/// app in; then it opens the installed copy. The installed copy itself, if still signed ad-hoc, is
+/// re-signed with the local certificate once and reopened. Returns true if this process should
+/// exit without opening a window.
+///
+/// Does nothing when running with separate data or when auto-connect is off.
 #[cfg(target_os = "macos")]
 pub fn take_over_install() -> bool {
     if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() || !auto_connect_enabled() {
@@ -526,12 +530,8 @@ pub fn take_over_install() -> bool {
         }
         return Command::new("/usr/bin/open").arg("-n").arg(&target).status().map(|s| s.success()).unwrap_or(false);
     }
-    // opened from where it was unpacked (translocated) or straight from the mounted .dmg
-    if !me.to_string_lossy().contains("/AppTranslocation/") && !me.starts_with("/Volumes/") {
-        return false;
-    }
-    // The installed copy is the one that holds the macOS permissions, so this downloaded copy never
-    // runs itself: if the installed copy is newer it is simply opened instead.
+    // Any other copy (unpacked download, mounted .dmg, /Applications, …) never runs itself: the
+    // installed copy holds the permissions. If the installed copy is newer it is simply opened.
     let installed_newer = bundle_version(&target).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION")));
     if !installed_newer {
         if !crate::macos::apps::quit_instances_at(BUNDLE_ID, &target, Duration::from_secs(8)) {
