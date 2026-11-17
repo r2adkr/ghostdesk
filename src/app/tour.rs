@@ -68,6 +68,30 @@ pub(super) const PAGES: &[Page] = &[
     },
 ];
 
+/// 사용 설명을 끝까지 봤다는 표시 파일 (<데이터 루트>/tour-seen).
+/// prefs.json 에도 적지만, 그 칸을 모르는 예전 버전이 설정을 다시 쓰면 지워지므로 따로 둔다.
+fn seen_marker() -> std::path::PathBuf {
+    crate::platform::paths::data_root().join("tour-seen")
+}
+
+/// 사용 설명을 이미 봤는가 (표시 파일이 있거나 설정에 적혀 있으면). 설정에만 있으면 표시 파일도 남겨 둔다.
+pub(super) fn already_seen(in_prefs: bool) -> bool {
+    let marker = seen_marker().exists();
+    if in_prefs && !marker {
+        mark_seen();
+    }
+    in_prefs || marker
+}
+
+/// 사용 설명을 봤다고 남긴다 (실패해도 설정 파일에는 남는다)
+fn mark_seen() {
+    let p = seen_marker();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(p, env!("CARGO_PKG_VERSION"));
+}
+
 /// 사용 설명의 쪽 수: 사진 쪽들 + (macOS) 마지막 권한 쪽
 fn page_count() -> usize {
     PAGES.len() + usize::from(cfg!(target_os = "macos"))
@@ -168,6 +192,7 @@ impl GhostApp {
         if done {
             self.tour = None;
             self.tour_seen = true;
+            mark_seen();
             self.save_prefs();
         }
     }

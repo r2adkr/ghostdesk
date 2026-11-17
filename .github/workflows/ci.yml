@@ -1,0 +1,28 @@
+# push·PR 마다 Windows 와 macOS 에서 빌드하고 단위 테스트를 돌린다.
+# (macOS 에서 개발하면 Windows 전용 코드가 컴파일되는지 볼 수 없어서 — 반대도 마찬가지)
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 의 버전을 rustup 이 받아 쓴다
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked

@@ -338,6 +338,7 @@ impl GhostApp {
         // 저장해 둔 언어·AI·키를 적용하고, 그 언어에 맞는 글꼴을 올린다
         app.load_prefs();
         // 처음 켰으면 사용 설명을 띄운다 (사진 찍기 모드에서는 띄우지 않는다)
+        app.tour_seen = tour::already_seen(app.tour_seen);
         if !app.tour_seen && app.tour_capture.is_none() {
             app.open_tour();
         }
