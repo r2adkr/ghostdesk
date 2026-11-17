@@ -71,6 +71,7 @@ pub fn run(mode: Mode) -> Result<()> {
     i18n::set(lang);
     let viewport = egui::ViewportBuilder::default()
         .with_title(if mode == Mode::Install { "GhostDesk Setup" } else { "GhostDesk Uninstall" })
+        .with_icon(super::window_icon())
         .with_inner_size([520.0, 360.0])
         .with_resizable(false)
         .with_maximize_button(false)
@@ -94,9 +95,32 @@ pub fn run(mode: Mode) -> Result<()> {
 
 /// Keeps the installer's registration in step after the app updated itself (the updater swaps
 /// the exe but knows nothing about the uninstall entry).
+///
+/// An install that never went through the setup window (updated in the app from a version before
+/// the installer, or installed by the app itself on first launch) has no entry at all: when this is
+/// the installed copy, it gets what the installer would have made, a Start menu shortcut and the
+/// uninstall entry (no desktop shortcut, which the installer only makes when asked).
 pub fn refresh_registration() {
-    if win::reg_string(win::HKEY_CURRENT_USER, UNINSTALL_KEY, Some("DisplayVersion")).is_some_and(|v| v != VERSION) {
-        let _ = reg_set(UNINSTALL_KEY, &[("DisplayVersion", Val::Str(VERSION.into()))]);
+    match win::reg_string(win::HKEY_CURRENT_USER, UNINSTALL_KEY, Some("DisplayVersion")) {
+        Some(v) if v != VERSION => {
+            let _ = reg_set(UNINSTALL_KEY, &[("DisplayVersion", Val::Str(VERSION.into()))]);
+        }
+        Some(_) => {}
+        None => {
+            if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() {
+                return;
+            }
+            let exe = install::stable_exe();
+            let is_installed_copy = std::env::current_exe().is_ok_and(|me| paths::same_path(&me, &exe));
+            if !is_installed_copy {
+                return;
+            }
+            let link = start_menu_link();
+            if !link.exists() {
+                let _ = shortcut(&link, &exe);
+            }
+            let _ = register_uninstall(&exe, &install::stable_app());
+        }
     }
 }
 

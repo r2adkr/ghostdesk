@@ -140,6 +140,7 @@ fn main() -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("GhostDesk")
+        .with_icon(app::window_icon())
         .with_inner_size(initial_window_size())
         .with_min_inner_size([900.0, 600.0]);
     #[cfg(windows)]

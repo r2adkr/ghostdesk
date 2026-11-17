@@ -32,7 +32,9 @@ screen types, install location, building) are collected in the
   (and a desktop one if you leave that on) and registers an uninstaller under
   Settings → Apps. Running a newer setup updates the installed copy and keeps
   your settings and workspaces. The installer is unsigned, so SmartScreen may
-  warn you the first time (**More info** → **Run anyway**).
+  warn you the first time (**More info** → **Run anyway**). If you update from a
+  version older than the installer through the in-app update, the next launch
+  adds the Start menu shortcut and the uninstaller entry by itself.
 
 - **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.2-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.2/GhostDesk-0.6.2-macos-universal.dmg)
 

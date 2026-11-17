@@ -1,4 +1,8 @@
-// Draws the macOS app icon (AppIcon.icns) and the .dmg window background (dmg-background.tiff).
+// Draws the app icon in every form the builds need and the .dmg window background:
+//   packaging/macos/AppIcon.icns          macOS bundle icon
+//   packaging/macos/dmg-background.tiff   .dmg window background (1x + 2x)
+//   assets/app-icon.png                   window icon set at runtime (Windows taskbar, macOS Dock)
+//   windows/ghostdesk.res                 Windows exe icon resource (linked by build.rs)
 //
 //   swift packaging/macos/make-art.swift
 //
@@ -145,6 +149,37 @@ tiff.arguments = ["-cathidpicheck", bg1.path, bg2.path, "-out", outDir.appending
 try! tiff.run()
 tiff.waitUntilExit()
 precondition(tiff.terminationStatus == 0, "tiffutil failed")
+// ---- window icon and Windows exe icon ----
+
+// window/taskbar icon set at runtime (otherwise eframe shows its own default icon)
+try! png(256, drawIcon).write(to: root.appendingPathComponent("assets/app-icon.png"))
+
+/// Windows resource file with the exe icon (RT_ICON entries as PNG, plus the RT_GROUP_ICON that
+/// Explorer uses), linked into ghostdesk.exe by build.rs. Written by hand so the build needs no
+/// resource compiler.
+func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)] }
+func le32(_ v: Int) -> [UInt8] { le16(v & 0xffff) + le16((v >> 16) & 0xffff) }
+func resEntry(type: Int, name: Int, flags: Int, data: [UInt8]) -> [UInt8] {
+    var h: [UInt8] = []
+    h += le32(data.count) + le32(32)
+    h += le16(0xffff) + le16(type) + le16(0xffff) + le16(name)
+    h += le32(0) + le16(flags) + le16(0) + le32(0) + le32(0)
+    var out = h + data
+    while out.count % 4 != 0 { out.append(0) }
+    return out
+}
+var res: [UInt8] = resEntry(type: 0, name: 0, flags: 0, data: [])
+let icoSizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
+var group: [UInt8] = le16(0) + le16(1) + le16(icoSizes.count)
+for (i, px) in icoSizes.enumerated() {
+    let data = [UInt8](png(px, drawIcon))
+    res += resEntry(type: 3, name: i + 1, flags: 0x1010, data: data)
+    let dim = UInt8(px >= 256 ? 0 : px)
+    group += [dim, dim, 0, 0] + le16(1) + le16(32) + le32(data.count) + le16(i + 1)
+}
+res += resEntry(type: 14, name: 1, flags: 0x1030, data: group)
+try! Data(res).write(to: root.appendingPathComponent("windows/ghostdesk.res"))
+
 // previews for review
 try? FileManager.default.copyItem(at: bg2, to: work.appendingPathComponent("preview-bg.png"))
 try! png(512, drawIcon).write(to: work.appendingPathComponent("preview-icon.png"))

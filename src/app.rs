@@ -33,6 +33,12 @@ mod titlebar;
 mod tour;
 mod wizard;
 
+/// GhostDesk's icon for its windows (Windows title bar and taskbar, macOS Dock while running).
+/// Without it eframe shows its own default icon. Drawn by packaging/macos/make-art.swift.
+pub fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png")).unwrap_or_default()
+}
+
 use connect::ConnectState;
 use detail::{spawn_input_queue, TakeoverInput};
 use i18n::{tr, trf, Lang};
@@ -781,5 +787,46 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "b");
         drop(rx2);
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    #[test]
+    fn window_icon_decodes() {
+        let i = super::window_icon();
+        assert_eq!((i.width, i.height), (256, 256));
+        assert_eq!(i.rgba.len(), 256 * 256 * 4);
+    }
+
+    /// The Windows icon resource is well formed: an empty first entry, PNG icons, and one icon
+    /// group whose entries point at them (windows/ghostdesk.res, linked by build.rs).
+    #[test]
+    fn windows_icon_resource_is_well_formed() {
+        let d = include_bytes!("../windows/ghostdesk.res");
+        let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+        let u16_at = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as usize;
+        let (mut o, mut icons, mut group) = (0, Vec::new(), None);
+        while o < d.len() {
+            let (size, header) = (u32_at(o), u32_at(o + 4));
+            let (typ, name) = (u16_at(o + 10), u16_at(o + 14));
+            let data = &d[o + header..o + header + size];
+            match typ {
+                3 => {
+                    assert!(data.starts_with(b"\x89PNG"));
+                    icons.push(name);
+                }
+                14 => group = Some(data.to_vec()),
+                _ => assert_eq!(size, 0),
+            }
+            o = (o + header + size + 3) & !3;
+        }
+        let g = group.expect("icon group");
+        let count = u16::from_le_bytes([g[4], g[5]]) as usize;
+        assert_eq!(count, icons.len());
+        for i in 0..count {
+            let id = u16::from_le_bytes([g[6 + i * 14 + 12], g[6 + i * 14 + 13]]) as usize;
+            assert!(icons.contains(&id), "{id}");
+        }
     }
 }

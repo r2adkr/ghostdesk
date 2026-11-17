@@ -1,5 +1,5 @@
-//! Windows(MSVC): 실행 파일에 매니페스트(windows/ghostdesk.exe.manifest)를 넣고, 정적 가져오기 DLL 을
-//! System32 에서만 찾게 한다. 다른 OS 에서는 아무것도 하지 않는다.
+//! Windows(MSVC): 실행 파일에 매니페스트(windows/ghostdesk.exe.manifest)와 아이콘(windows/ghostdesk.res)을
+//! 넣고, 정적 가져오기 DLL 을 System32 에서만 찾게 한다. 다른 OS 에서는 아무것도 하지 않는다.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -15,5 +15,10 @@ fn main() {
         // 실행 파일의 정적 가져오기를 System32 에서만 찾는다 (LOAD_LIBRARY_SEARCH_SYSTEM32, Windows 10 1607+).
         // 실행 중에 LoadLibrary 로 읽는 DLL(그래픽 드라이버 등)은 main 의 SetDefaultDllDirectories 가 맡는다.
         println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+        // exe icon: a prebuilt resource file (packaging/macos/make-art.swift writes it), which
+        // link.exe takes as an input like an object file, so no resource compiler is needed
+        let res = dir.join("windows").join("ghostdesk.res");
+        println!("cargo:rerun-if-changed={}", res.display());
+        println!("cargo:rustc-link-arg-bins={}", res.display());
     }
 }
