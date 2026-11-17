@@ -494,7 +494,7 @@ mod rdp {
     use super::*;
     use windows::core::{Interface, BSTR, GUID, HRESULT, IUnknown, PCWSTR};
     use windows::Win32::System::Com::{
-        CoInitializeEx, IDispatch, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
+        CoInitializeEx, IDispatch, COINIT_APARTMENTTHREADED, EXCEPINFO, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
         DISPATCH_PROPERTYPUT, DISPPARAMS,
     };
     use windows::Win32::System::Variant::{VariantClear, VARIANT, VARIANT_0_0, VT_BOOL, VT_BSTR, VT_I2, VT_I4};
@@ -564,13 +564,28 @@ mod rdp {
             cNamedArgs: put as u32,
         };
         let mut out = VARIANT::default();
-        let r = unsafe { d.Invoke(id, &GUID::zeroed(), LOCALE_USER_DEFAULT, flags, &params, Some(&mut out), None, None) };
+        let mut ex = EXCEPINFO::default();
+        let r = unsafe { d.Invoke(id, &GUID::zeroed(), LOCALE_USER_DEFAULT, flags, &params, Some(&mut out), Some(&mut ex), None) };
         for a in &mut args {
             unsafe {
                 let _ = VariantClear(a);
             }
         }
-        r.with_context(|| format!("RDP 컨트롤 '{name}' 호출 실패"))?;
+        // DISP_E_EXCEPTION alone says nothing: the control's own error is in EXCEPINFO
+        let (code, desc) = unsafe {
+            if let Some(fill) = ex.pfnDeferredFillIn {
+                let _ = fill(&mut ex);
+            }
+            let desc = ex.bstrDescription.to_string();
+            for b in [&mut ex.bstrSource, &mut ex.bstrDescription, &mut ex.bstrHelpFile] {
+                std::mem::ManuallyDrop::drop(b);
+            }
+            (ex.scode, desc)
+        };
+        r.with_context(|| match (code, desc.trim()) {
+            (0, "") => format!("RDP 컨트롤 '{name}' 호출 실패"),
+            (c, d) => format!("RDP 컨트롤 '{name}' 호출 실패: {d} (0x{c:08X})"),
+        })?;
         Ok(out)
     }
 
@@ -648,6 +663,10 @@ mod rdp {
             invoke(&disp, "DesktopWidth", DISPATCH_PROPERTYPUT, Some(v_i4(DESK_W)))?;
             invoke(&disp, "DesktopHeight", DISPATCH_PROPERTYPUT, Some(v_i4(DESK_H)))?;
             put_extended(&unk, "ConnectToChildSession", &v_bool(true)).context("ConnectToChildSession 설정 실패")?;
+            // without CredSSP, recent Windows 11 builds (MSTSCAX 10.0.26100) reject Connect with E_INVALIDARG
+            let adv = invoke(&disp, "AdvancedSettings", DISPATCH_PROPERTYGET, None)?;
+            let adv = unsafe { (*adv.Anonymous.Anonymous.Anonymous.pdispVal).clone() }.context("RDP 컨트롤 AdvancedSettings 가 없습니다")?;
+            invoke(&adv, "EnableCredSspSupport", DISPATCH_PROPERTYPUT, Some(v_bool(true)))?;
             invoke(&disp, "Connect", DISPATCH_METHOD, None)?;
 
             let start = Instant::now();
@@ -706,3 +725,4 @@ mod tests {
         assert!(endpoint().display().starts_with(r"\\.\pipe\GhostDesk-child-"));
     }
 }
+
