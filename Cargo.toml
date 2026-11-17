@@ -1,6 +1,6 @@
 [package]
 name = "ghostdesk"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.95"
 description = "사용자 화면을 건드리지 않는 격리 브라우저 위에서 동작하는 다중 Claude computer-use 에이전트"
@@ -69,6 +69,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
 ] }
 
 [profile.release]

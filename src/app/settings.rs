@@ -21,7 +21,7 @@ impl GhostApp {
     /// What the current connection still needs before it can start work. `None` when ready.
     pub(super) fn missing_setup(&self) -> Option<String> {
         match self.cur() {
-            None => Some(tr("설정에서 쓸 AI 를 추가해 주세요.").to_string()),
+            None => Some(tr("설정에서 쓸 AI 를 추가해 주세요").to_string()),
             Some(c) => c.missing(),
         }
     }
@@ -345,7 +345,7 @@ impl GhostApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if p.needs_url() {
-                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요.")));
+                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요")));
             } else if p.needs_key() {
                 ui.label(theme::hint(tr("키가 없나요?")));
                 ui.hyperlink_to(RichText::new(trf("{} 에서 만들기", &[&p.short_name()])).size(12.0), p.key_page());
@@ -359,9 +359,9 @@ impl GhostApp {
 
     fn key_storage_note(&self) -> &'static str {
         if self.remember_keys {
-            tr("키는 Windows 계정으로 암호화해 이 PC 에만 저장해요.")
+            tr("키는 Windows 계정으로 암호화해 이 PC 에만 저장해요")
         } else {
-            tr("키는 이 PC 에 저장되지 않아요.")
+            tr("키는 이 PC 에 저장되지 않아요")
         }
     }
 
@@ -439,7 +439,7 @@ impl GhostApp {
         egui::Grid::new("settings_lang").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
             ui.label(tr("언어"));
             // language names always in their own language (findable even if you can't read the current one)
-            egui::ComboBox::from_id_salt("lang").width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("lang").icon(theme::combo_icon).width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
                 for l in Lang::ALL {
                     ui.selectable_value(lang, l, l.native_name());
                 }
@@ -464,13 +464,21 @@ impl GhostApp {
         ui.add_space(4.0);
         ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
             .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
-        ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요.")));
+        ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요")));
+
+        ui.add_space(18.0);
+        theme::section(ui, tr("승인"));
+        ui.add_space(4.0);
+        ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기")));
+        // the warning stays visible while it's on, not only on hover
+        let warn = tr("외부 에이전트가 로그인 복제, 실행 중인 앱, 원격 접속을 묻지 않고 바로 시작해요. 믿는 에이전트만 연결했을 때 켜세요");
+        ui.label(if self.auto_approve { RichText::new(warn).size(12.0).color(theme::warn()) } else { theme::hint(warn) });
     }
 
     /// AI tab: connections (keys) and the AI/model in use.
     fn settings_ai(&mut self, ui: &mut egui::Ui, width: f32, label_w: f32, field: f32) {
         theme::section(ui, tr("AI 연결"));
-        ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요.")));
+        ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요")));
         ui.add_space(4.0);
         self.conn_cards(ui, width);
         self.add_conn_button(ui);
@@ -491,7 +499,7 @@ impl GhostApp {
         egui::Grid::new("settings_ai").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
             ui.label(tr("AI"));
             let title = self.cur().map(AiConn::title).unwrap_or_default();
-            egui::ComboBox::from_id_salt("current_ai").width(field).selected_text(title).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("current_ai").icon(theme::combo_icon).width(field).selected_text(title).show_ui(ui, |ui| {
                 for c in &self.ai {
                     ui.selectable_value(&mut self.ai_current, c.id, c.title());
                 }
@@ -598,12 +606,12 @@ impl GhostApp {
             earlier_missing |= !ok;
         }
         if t.accessibility && t.screen_capture {
-            ui.label(theme::hint(tr("Mac 앱을 조작하는 데 필요한 권한이 모두 켜져 있어요.")));
+            ui.label(theme::hint(tr("Mac 앱을 조작하는 데 필요한 권한이 모두 켜져 있어요")));
             return;
         }
         if restart {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요.")).color(theme::warn()));
+                ui.label(RichText::new(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요")).color(theme::warn()));
                 if theme::secondary(ui, tr("다시 시작")).clicked() {
                     self.save_prefs();
                     crate::update::request_relaunch(ui.ctx());

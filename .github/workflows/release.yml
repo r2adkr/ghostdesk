@@ -1,7 +1,8 @@
 # v* 태그를 올리면 Windows x64 실행 파일과 macOS 앱(유니버설: Apple Silicon + Intel)을 빌드해 GitHub 릴리스로 올린다.
 # 릴리스 설명은 태그 메시지(git tag -a … --cleanup=verbatim)를 그대로 쓴다.
 # 자산 이름은 앱의 업데이트 확인(src/update.rs 의 asset_suffixes)이 찾는 이름과 같아야 한다:
-#   GhostDesk-<버전>-windows-x64.exe, GhostDesk-<버전>-macos-universal.zip, SHA256SUMS.txt
+#   GhostDesk-Setup-<버전>-windows-x64.exe (이름에 setup 이 있으면 자체 설치 창이 열린다: src/app/setup.rs),
+#   GhostDesk-<버전>-macos-universal.zip (업데이트용), GhostDesk-<버전>-macos-universal.dmg (처음 설치용), SHA256SUMS.txt
 name: Release
 
 on:
@@ -28,7 +29,7 @@ jobs:
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ($cargo -ne $version) { throw "태그 $version 과 Cargo.toml 버전 $cargo 이 다릅니다" }
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/ghostdesk.exe "dist/GhostDesk-$version-windows-x64.exe"
+          Copy-Item target/release/ghostdesk.exe "dist/GhostDesk-Setup-$version-windows-x64.exe"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -56,6 +57,10 @@ jobs:
           lipo -create -output ghostdesk-universal \
             target/aarch64-apple-darwin/release/ghostdesk target/x86_64-apple-darwin/release/ghostdesk
           ./ghostdesk-universal --package-macos ghostdesk-universal "dist/GhostDesk-$version-macos-universal.zip"
+          # first-install disk image: opening the app from it installs into ~/Applications (install.rs take_over_install)
+          mkdir dmgroot
+          ditto -x -k "dist/GhostDesk-$version-macos-universal.zip" dmgroot
+          hdiutil create -volname GhostDesk -srcfolder dmgroot -ov -format UDZO "dist/GhostDesk-$version-macos-universal.dmg"
 
       - uses: actions/upload-artifact@v4
         with:

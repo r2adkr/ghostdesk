@@ -376,12 +376,23 @@ fn filled(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8) -> Respons
 
 /// Primary action button (accent color).
 pub fn primary(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
-    filled(ui, RichText::new(text.into()), Vec2::new(0.0, 32.0), RADIUS)
+    filled(ui, RichText::new(text.into()), Vec2::new(BUTTON_MIN_W, 32.0), RADIUS)
 }
+
+/// Narrowest text button, so one-word actions ("OK", "Start") still get a comfortable target.
+const BUTTON_MIN_W: f32 = 72.0;
 
 /// Secondary button (translucent background).
 pub fn secondary(ui: &mut egui::Ui, label: impl Into<String>) -> Response {
-    ui.add(egui::Button::new(RichText::new(label.into()).color(text())).min_size(Vec2::new(0.0, 32.0)))
+    let resp = ui.add(egui::Button::new(RichText::new(label.into()).color(text())).min_size(Vec2::new(BUTTON_MIN_W, 32.0)));
+    focus_outline(ui, &resp, RADIUS);
+    resp
+}
+
+/// Drop-down arrow for `ComboBox::icon`: the same chevron as the other drop-downs, instead of
+/// egui's filled triangle.
+pub fn combo_icon(ui: &egui::Ui, rect: egui::Rect, visuals: &egui::style::WidgetVisuals, _open: bool) {
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, crate::icon::CHEVRON_DOWN, egui::FontId::proportional(14.0), visuals.fg_stroke.color);
 }
 
 /// Icon-only button (background only on hover).

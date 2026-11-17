@@ -82,7 +82,7 @@ impl GhostApp {
                 ui.add_space((ui.available_height() * 0.3).max(24.0));
                 ui.label(RichText::new(tr("아직 에이전트가 없습니다")).size(20.0).color(theme::text()));
                 ui.add_space(8.0);
-                ui.label(theme::hint(tr("홈에서 할 일을 적거나 새 에이전트를 만들어 보세요.")));
+                ui.label(theme::hint(tr("홈에서 할 일을 적거나 새 에이전트를 만들어 보세요")));
                 ui.add_space(20.0);
                 if theme::primary(ui, tr("새 에이전트")).clicked() {
                     self.open_wizard();

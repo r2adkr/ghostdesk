@@ -193,7 +193,7 @@ impl GhostApp {
         self.key_warn = false;
         let ws_name = self.form.workspace.trim().to_string();
         if ws_name.is_empty() {
-            return self.notify(ctx, tr("작업공간 이름을 입력하세요."));
+            return self.notify(ctx, tr("작업공간 이름을 입력하세요"));
         }
         if self.agents.iter().any(|a| profiles::slug(&a.shared.workspace_name) == profiles::slug(&ws_name)) {
             return self.notify(ctx, tr("같은 작업공간을 쓰는 에이전트가 이미 있습니다. 다른 이름을 쓰세요."));
@@ -230,7 +230,7 @@ impl GhostApp {
                 }
                 let apps = self.electron_apps.lock().clone().unwrap_or_default();
                 let Some(app) = self.form.electron_idx.and_then(|i| apps.get(i)).cloned() else {
-                    return self.notify(ctx, tr("Electron 앱을 선택하세요."));
+                    return self.notify(ctx, tr("Electron 앱을 선택하세요"));
                 };
                 if !app.hideable {
                     return self.notify(ctx, trf("{} 은(는) 지원하지 않습니다: {}", &[&app.name, &app.reason.clone().unwrap_or_default()]));
@@ -257,7 +257,7 @@ impl GhostApp {
                 if app.is_empty() {
                     return self.notify(
                         ctx,
-                        pick(tr("앱(.app 경로 또는 번들 id)을 입력하거나 고르세요."), tr("앱(실행 파일 .exe 경로 또는 이름)을 입력하거나 고르세요.")),
+                        pick(tr("앱(.app 경로 또는 번들 id)을 입력하거나 고르세요"), tr("앱(실행 파일 .exe 경로 또는 이름)을 입력하거나 고르세요")),
                     );
                 }
                 #[cfg(target_os = "macos")]
@@ -267,7 +267,7 @@ impl GhostApp {
                 // virtual display only where this OS supports it (on Windows the check box isn't even shown)
                 if self.form.native_vdisplay && caps::VDISPLAY {
                     if !self.form.native_vdisplay_consent {
-                        return self.notify(ctx, tr("가상 디스플레이 사용에 대한 안내를 확인하고 동의 체크를 켜세요."));
+                        return self.notify(ctx, tr("가상 디스플레이 사용에 대한 안내를 확인하고 동의 체크를 켜세요"));
                     }
                     let (w, h) = SIZES[self.form.size_idx];
                     DeskTarget::VDisplay(crate::vdisplay::VirtualDisplayOptions {
@@ -297,13 +297,13 @@ impl GhostApp {
                 }
                 // Windows child sessions use the same account, so no account name is needed
                 if cfg!(target_os = "macos") && self.form.session_account.trim().is_empty() {
-                    return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요."));
+                    return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요"));
                 }
                 DeskTarget::Session { account: self.form.session_account.trim().to_string() }
             }
             FormKind::Remote => {
                 if self.form.remote_host.trim().is_empty() {
-                    return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요."));
+                    return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요"));
                 }
                 DeskTarget::Remote(RemoteTarget {
                     host: self.form.remote_host.trim().to_string(),
@@ -513,7 +513,7 @@ impl GhostApp {
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ready = self.form.choice.is_some();
-                if ui.add_enabled_ui(ready, |ui| theme::primary(ui, tr("   시작   "))).inner.clicked() {
+                if ui.add_enabled_ui(ready, |ui| theme::primary(ui, tr("에이전트 시작"))).inner.clicked() {
                     start = true;
                 }
                 if theme::secondary(ui, tr("취소")).clicked() {
@@ -544,7 +544,7 @@ impl GhostApp {
             AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
         };
         ui.label(RichText::new(line).color(theme::text()));
-        ui.label(theme::hint(tr("다르게 하려면 위에서 직접 고르세요.")));
+        ui.label(theme::hint(tr("다르게 하려면 위에서 직접 고르세요")));
     }
 
     /// Auto mode's decision: the app if the task names an app on this computer, otherwise the web.
@@ -568,7 +568,7 @@ impl GhostApp {
 
     pub(super) fn simple_web(&mut self, ui: &mut egui::Ui) {
         if self.browsers.is_empty() {
-            ui.colored_label(theme::danger(), tr("Chrome·Edge·Brave·Whale 같은 Chromium 계열 브라우저를 찾지 못했어요."));
+            ui.colored_label(theme::danger(), tr("Chrome·Edge·Brave·Whale 같은 Chromium 계열 브라우저를 찾지 못했어요"));
             return;
         }
         egui::Grid::new("simple_web").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -593,7 +593,7 @@ impl GhostApp {
             // Keep the login choice beside its switch so the source account is visible before starting.
             if self.form.web_use_login && profiles.len() > 1 {
                 let selected = self.form.profile_idx.and_then(|i| profiles.get(i)).map(|p| profile_short(&p.name)).unwrap_or_default();
-                egui::ComboBox::from_id_salt("simple_profile").selected_text(selected).width(160.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("simple_profile").icon(theme::combo_icon).selected_text(selected).width(160.0).show_ui(ui, |ui| {
                     for (i, p) in profiles.iter().enumerate() {
                         ui.selectable_value(&mut self.form.profile_idx, Some(i), &p.name);
                     }
@@ -661,7 +661,7 @@ impl GhostApp {
             });
         } else if self.form.native_app.is_empty() && items.iter().any(|it| it.electron.is_some()) {
             ui.label(theme::hint(trf("{} 표시 앱은 완전히 숨겨서 실행돼요", &[&icon::STAR])))
-                .on_hover_text(pick(tr("나머지 앱은 창을 숨긴 채 조작해요."), tr("나머지 앱은 창을 화면 밖에 두고 조작해요.")));
+                .on_hover_text(pick(tr("나머지 앱은 창을 숨긴 채 조작해요"), tr("나머지 앱은 창을 화면 밖에 두고 조작해요")));
         }
         ui.add_space(8.0);
         // Windows: run as the current account on a hidden screen (child session). It changes the list
@@ -707,7 +707,7 @@ impl GhostApp {
                 // virtual display (CGVirtualDisplay) is macOS-only: elsewhere the switch is hidden and off
                 if caps::VDISPLAY {
                     ui.add(theme::switch(&mut self.form.native_vdisplay, trf("{}  가상 디스플레이에서 실행 (실험)", &[&icon::FLASK])))
-                        .on_hover_text(tr("앱 창을 숨기는 대신 보이지 않는 가상 모니터 위에 띄워 드래그·우클릭 같은 실제 마우스 동작을 그대로 써요."));
+                        .on_hover_text(tr("앱 창을 숨기는 대신 보이지 않는 가상 모니터 위에 띄워 드래그·우클릭 같은 실제 마우스 동작을 그대로 써요"));
                 } else {
                     self.form.native_vdisplay = false;
                 }
@@ -726,7 +726,7 @@ impl GhostApp {
                     let t = crate::macos::tcc_status();
                     if !(t.accessibility && t.screen_capture) {
                         ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(theme::warn(), tr("이 방식은 macOS 의 '손쉬운 사용'과 '화면 기록' 권한이 필요해요."));
+                            ui.colored_label(theme::warn(), tr("이 방식은 macOS 의 '손쉬운 사용'과 '화면 기록' 권한이 필요해요"));
                             if ui.link(tr("권한 설정")).on_hover_text(tr("설정의 '권한'에서 하나씩 허용할 수 있어요")).clicked() {
                                 // close the new-agent window so the two don't overlap (typed text is kept)
                                 self.wizard_open = false;
@@ -737,7 +737,7 @@ impl GhostApp {
                 }
                 ui.label(theme::hint(pick(
                     tr("클릭은 버튼 누르기·입력칸 선택 같은 동작으로 바뀌어요 (드래그·우클릭 불가). 캡처 중 메뉴 막대에 화면 기록 표시가 나타나요."),
-                    tr("일부 앱(게임 등)은 화면이 비어 보일 수 있어요."),
+                    tr("일부 앱(게임 등)은 화면이 비어 보일 수 있어요"),
                 )));
             }
         }
@@ -768,7 +768,7 @@ impl GhostApp {
             }
             Some(Choice::App) => {
                 if self.form.native_app.trim().is_empty() {
-                    return self.notify(ctx, tr("조작할 앱을 고르세요."));
+                    return self.notify(ctx, tr("조작할 앱을 고르세요"));
                 }
                 if cfg!(windows) && self.form.native_current_session {
                     let electrons = self.electron_apps.lock().clone().unwrap_or_default();
@@ -808,7 +808,7 @@ impl GhostApp {
             Some(Choice::Remote) => self.form.kind = FormKind::Remote,
             Some(Choice::Session) => self.form.kind = FormKind::Session,
             // auto was already turned into web or app above and never gets here
-            Some(Choice::Auto) | None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요.")),
+            Some(Choice::Auto) | None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요")),
         }
         let before = self.agents.len();
         self.spawn_agent(ctx);
@@ -895,7 +895,7 @@ impl GhostApp {
                 Choice::App => {
                     ui.label(tr("직접 지정"));
                     ui.add(field(&mut self.form.native_app).hint_text(pick(tr("번들 id 또는 .app 경로"), tr("실행 파일(.exe) 경로 또는 프로그램 이름"))))
-                        .on_hover_text(tr("목록에 없는 앱을 쓸 때만 적어요."));
+                        .on_hover_text(tr("목록에 없는 앱을 쓸 때만 적어요"));
                     ui.end_row();
                 }
                 Choice::Remote | Choice::Session => {}
@@ -908,7 +908,7 @@ impl GhostApp {
     fn browser_rows(&mut self, ui: &mut egui::Ui) {
         ui.label(tr("브라우저"));
         let bname = self.browsers.get(self.form.browser_idx).map(|b| b.name.clone()).unwrap_or(tr("(없음)").into());
-        egui::ComboBox::from_id_salt("browser").selected_text(bname).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("browser").icon(theme::combo_icon).selected_text(bname).show_ui(ui, |ui| {
             for (i, b) in self.browsers.iter().enumerate() {
                 if ui.selectable_label(self.form.browser_idx == i, &b.name).clicked() {
                     self.form.browser_idx = i;
@@ -924,7 +924,7 @@ impl GhostApp {
         // profile" turns it off (neither overrides the other)
         let picked = if self.form.web_use_login { self.form.profile_idx.and_then(|i| profiles.get(i)) } else { None };
         let ptext = picked.map_or_else(|| tr("빈 프로필 (로그인 없음)").to_string(), |p| trf("복사: {}", &[&p.name]));
-        egui::ComboBox::from_id_salt("profile").selected_text(ptext).width(220.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("profile").icon(theme::combo_icon).selected_text(ptext).width(220.0).show_ui(ui, |ui| {
             for (i, p) in profiles.iter().enumerate() {
                 let sel = self.form.web_use_login && self.form.profile_idx == Some(i);
                 if ui.selectable_label(sel, trf("복사: {}", &[&p.name])).clicked() {
@@ -944,7 +944,7 @@ impl GhostApp {
 
         ui.label(tr("화면 크기"));
         let (w, h) = SIZES[self.form.size_idx];
-        egui::ComboBox::from_id_salt("size").selected_text(format!("{w}x{h}")).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("size").icon(theme::combo_icon).selected_text(format!("{w}x{h}")).show_ui(ui, |ui| {
             for (i, (w, h)) in SIZES.iter().enumerate() {
                 ui.selectable_value(&mut self.form.size_idx, i, format!("{w}x{h}"));
             }
@@ -985,7 +985,7 @@ fn kinds() -> Vec<Kind> {
         choice: Choice::Auto,
         icon: icon::STAR,
         title: tr("자동"),
-        about: tr("할 일을 보고 웹사이트와 이 컴퓨터의 앱 중에서 알맞은 곳을 골라요."),
+        about: tr("할 일을 보고 웹사이트와 이 컴퓨터의 앱 중에서 알맞은 곳을 골라요"),
     }];
     v.push(Kind {
         choice: Choice::Web,
@@ -1007,7 +1007,7 @@ fn kinds() -> Vec<Kind> {
             ),
         });
     }
-    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터나 가상 머신에 VNC 로 접속해서 일해요.") });
+    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터나 가상 머신에 VNC 로 접속해서 일해요") });
     v
 }
 

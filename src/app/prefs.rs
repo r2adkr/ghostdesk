@@ -34,6 +34,8 @@ pub(super) struct Prefs {
     remember_keys: Option<bool>,
     /// Keep working while the screen is locked (prevents sleep during work).
     keep_awake: Option<bool>,
+    /// Permission bypass (approve external agents' requests without asking).
+    auto_approve: Option<bool>,
     /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
     // ---- old format (read only) ----
@@ -65,6 +67,14 @@ struct SavedConn {
     url: String,
     model: String,
     key: String,
+}
+
+/// Language saved by an earlier run (Korean if none): the installer opens in the same language.
+pub(super) fn saved_lang() -> Lang {
+    std::fs::read(path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Prefs>(&b).ok())
+        .map_or(Lang::Ko, |p| Lang::from_code(&p.lang))
 }
 
 fn path() -> std::path::PathBuf {
@@ -150,6 +160,7 @@ impl GhostApp {
         if let Some(k) = p.keep_awake {
             self.keep_awake = k;
         }
+        self.auto_approve = p.auto_approve.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
     }
@@ -179,6 +190,7 @@ impl GhostApp {
             show_cursor: Some(self.show_cursor),
             remember_keys: Some(self.remember_keys),
             keep_awake: Some(self.keep_awake),
+            auto_approve: Some(self.auto_approve),
             tour_seen: Some(self.tour_seen),
             other: self.prefs_other.clone(),
             ..Default::default()

@@ -113,6 +113,31 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     }
 }
 
+/// Title bar of a small fixed-size window (the installer): app name, drag to move, minimize and
+/// close only.
+pub fn dialog_bar(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    let rect = ui.max_rect();
+    let p = ui.painter().clone();
+    p.rect_filled(rect, 0, theme::bg());
+    let fg = theme::text();
+    p.text(pos2(rect.left() + 28.0, rect.center().y), egui::Align2::CENTER_CENTER, crate::icon::GHOST, FontId::proportional(17.0), fg);
+    p.text(pos2(rect.left() + 46.0, rect.center().y), egui::Align2::LEFT_CENTER, "GhostDesk", FontId::proportional(14.0), fg);
+    let drag = ui.interact(rect.with_max_x(rect.right() - BUTTON_W * 2.0), ui.scope_id().with("dialog_drag"), Sense::drag());
+    if drag.drag_started_by(egui::PointerButton::Primary) {
+        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+    let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+    let mut x = rect.right() - BUTTON_W;
+    for kind in [Caption::Close, Caption::Minimize] {
+        let r = Rect::from_min_size(pos2(x, rect.top()), vec2(BUTTON_W, rect.height()));
+        if caption_button(ui, r, kind, focused).clicked() {
+            ctx.send_viewport_cmd(if kind == Caption::Close { ViewportCommand::Close } else { ViewportCommand::Minimized(true) });
+        }
+        x -= BUTTON_W;
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Caption {
     Minimize,

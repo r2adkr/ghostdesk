@@ -48,6 +48,13 @@ impl GhostApp {
             {
                 self.show_settings = true;
             }
+            if self.auto_approve
+                && theme::nav_item(ui, false, icon::SHIELD_ALERT, tr("권한 확인 꺼짐"), Some(theme::warn()))
+                    .on_hover_text(tr("외부 에이전트의 요청을 묻지 않고 허용하고 있어요. 눌러서 설정 열기"))
+                    .clicked()
+            {
+                self.open_settings(settings::SettingsTab::General);
+            }
             // green dot when connected, red when the control server failed
             if theme::nav_item(ui, false, icon::PLUG, tr("외부 연결"), self.connect_badge())
                 .on_hover_text(tr("Claude 앱 · Claude Code · Codex 에서 GhostDesk 쓰기 (키 필요 없음)"))
@@ -86,9 +93,9 @@ impl GhostApp {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.label(RichText::new(tr("Mac 앱 권한이 꺼져 있어요")).strong().color(theme::text()));
                 if restart {
-                    ui.label(theme::hint(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요.")));
+                    ui.label(theme::hint(tr("화면 기록을 켰다면 GhostDesk 를 다시 시작해야 반영돼요")));
                 } else {
-                    ui.label(theme::hint(tr("이 컴퓨터의 앱을 맡기려면 필요해요.")));
+                    ui.label(theme::hint(tr("이 컴퓨터의 앱을 맡기려면 필요해요")));
                 }
                 ui.horizontal(|ui| {
                     if restart {

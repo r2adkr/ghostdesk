@@ -104,6 +104,13 @@ fn main() -> anyhow::Result<()> {
     let background = args.iter().skip(1).any(|a| a == "--background");
     // Windows: when a freshly downloaded exe is run, close the old GhostDesk, replace the installed
     // copy with this one, and launch the installed copy
+    // Windows: the setup exe (or `--uninstall`) opens the installer window instead of the app
+    #[cfg(windows)]
+    if let Some(mode) = app::setup::mode(&args) {
+        return app::setup::run(mode);
+    }
+    #[cfg(windows)]
+    app::setup::refresh_registration();
     #[cfg(windows)]
     if !background && install::take_over_install() {
         return Ok(());

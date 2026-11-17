@@ -25,22 +25,22 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-0.6.1-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.1/GhostDesk-0.6.1-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.6.2-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.2/GhostDesk-Setup-0.6.2-windows-x64.exe)
 
-  Download it and run it; there is no installer. The executable is unsigned, so
-  SmartScreen may warn you the first time. If GhostDesk is already installed,
-  running a newer exe closes the running GhostDesk, replaces the installed copy
-  (`%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe`) and starts it. A newer
-  installed copy is never replaced by an older one.
+  Run the setup and click **Install**. It installs for your user only (no admin
+  rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
+  (and a desktop one if you leave that on) and registers an uninstaller under
+  Settings → Apps. Running a newer setup updates the installed copy and keeps
+  your settings and workspaces. The installer is unsigned, so SmartScreen may
+  warn you the first time (**More info** → **Run anyway**).
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.1-macos-universal.zip](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.1/GhostDesk-0.6.1-macos-universal.zip)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.2-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.2/GhostDesk-0.6.2-macos-universal.dmg)
 
-  Unzip it and move GhostDesk.app to Applications. The app is not notarized,
-  so macOS blocks it the first time: open System Settings → Privacy & Security
-  and click **Open Anyway** at the bottom. If GhostDesk is already installed,
-  opening a newer app straight from the unzipped folder closes the running
-  GhostDesk, replaces `~/Applications/GhostDesk.app` and reopens it from there.
-  A newer installed app is never replaced by an older one.
+  Open the disk image and double-click GhostDesk.app: it installs itself to
+  `~/Applications/GhostDesk.app` and reopens from there. The app is not
+  notarized, so macOS blocks it the first time: open System Settings → Privacy
+  & Security and click **Open Anyway** at the bottom. A newer installed app is
+  never replaced by an older one.
 
 When a new version is released, a notice shows up in the sidebar. **Update**
 downloads the build for your OS and CPU and swaps it in; **Restart** applies it.

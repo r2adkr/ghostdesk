@@ -140,6 +140,7 @@ mod tests {
             ("prefs.rs", include_str!("prefs.rs")),
             ("screens.rs", include_str!("screens.rs")),
             ("settings.rs", include_str!("settings.rs")),
+            ("setup.rs", include_str!("setup.rs")),
             ("sidebar.rs", include_str!("sidebar.rs")),
             ("theme.rs", include_str!("theme.rs")),
             ("titlebar.rs", include_str!("titlebar.rs")),

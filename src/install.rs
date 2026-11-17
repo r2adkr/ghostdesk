@@ -398,7 +398,8 @@ pub fn take_over_install() -> bool {
         return false;
     }
     let Some(me) = current_bundle() else { return false };
-    if !me.to_string_lossy().contains("/AppTranslocation/") {
+    // opened from where it was unpacked (translocated) or straight from the mounted .dmg
+    if !me.to_string_lossy().contains("/AppTranslocation/") && !me.starts_with("/Volumes/") {
         return false;
     }
     let target = stable_app();
@@ -579,7 +580,7 @@ fn old_exe_name(target: &Path) -> PathBuf {
 const VERSION_STAMP: &str = "ghostdesk.version";
 
 #[cfg(windows)]
-fn installed_version(dir: &Path) -> Option<String> {
+pub(crate) fn installed_version(dir: &Path) -> Option<String> {
     let v = std::fs::read_to_string(dir.join(VERSION_STAMP)).ok()?;
     let v = v.trim();
     (!v.is_empty()).then(|| v.to_string())
@@ -637,7 +638,7 @@ pub fn take_over_install() -> bool {
 /// Sends close to this user's other GhostDesk windows (title "GhostDesk", executable name starting
 /// with ghostdesk) and waits up to `wait` for those processes to exit. false if any remain.
 #[cfg(windows)]
-fn close_gui_windows(wait: Duration) -> bool {
+pub(crate) fn close_gui_windows(wait: Duration) -> bool {
     use crate::platform::win;
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
     let me = std::process::id();

@@ -23,6 +23,8 @@ mod i18n;
 mod labels;
 mod pip;
 mod prefs;
+#[cfg(windows)]
+pub mod setup;
 mod screens;
 mod settings;
 mod sidebar;
@@ -212,6 +214,9 @@ pub struct GhostApp {
     prefs_other: serde_json::Map<String, serde_json::Value>,
     /// Keeps the Mac/PC from sleeping while agents work, even with the screen locked (display off).
     keep_awake: bool,
+    /// Permission bypass: approve external agents' sensitive requests (login cloning, running apps,
+    /// remote access, …) without asking. Hard refusals in `control.rs` still apply.
+    auto_approve: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
     awake: Option<crate::platform::awake::KeepAwake>,
     browsers: Vec<InstalledBrowser>,
@@ -320,6 +325,7 @@ impl GhostApp {
             lang: Lang::Ko,
             effort_idx: 1,
             keep_awake: true,
+            auto_approve: false,
             tour: None,
             tour_seen: false,
             tour_capture: tour::Capture::from_env(),
@@ -395,12 +401,14 @@ impl GhostApp {
             });
             ui.add_space(6.0);
             ui.label(RichText::new(&detail).color(theme::body()));
+            ui.add_space(8.0);
+            ui.label(theme::hint(tr("묻지 않게 하려면 설정 > 일반 > 승인에서 바꿀 수 있어요")));
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::primary(ui, tr("   허용   ")).clicked() {
+                if theme::primary(ui, tr("허용")).clicked() {
                     answer = Some(true);
                 }
-                if theme::secondary(ui, tr("   거부   ")).clicked() {
+                if theme::secondary(ui, tr("거부")).clicked() {
                     answer = Some(false);
                 }
             });
@@ -495,6 +503,11 @@ impl eframe::App for GhostApp {
                     let (tx, _rx) = mpsc::unbounded_channel();
                     let task = self.rt.spawn(async {});
                     self.agents.push(AgentHandle::new(&self.rt, shared, tx, task));
+                }
+                crate::control::ControlEvent::Approval { title, reply, .. } if self.auto_approve => {
+                    // permission bypass: answer at once, and say what was allowed so it never happens unseen
+                    let _ = reply.send(true);
+                    self.notify(&ctx, trf("자동 허용됨: {}", &[&title]));
                 }
                 crate::control::ControlEvent::Approval { title, detail, reply } => {
                     self.approvals.push((title, detail, Some(reply)));
