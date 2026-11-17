@@ -26,8 +26,8 @@ pub(super) struct ConnectState {
     /// clients 와 같은 순서: 지금 설치본으로 연결돼 있는가
     ok: Vec<bool>,
     messages: Vec<String>,
-    /// '켤 때 자동으로 연결' 설정
-    auto: bool,
+    /// '켤 때 자동으로 연결' 설정 (사용 설명 사진을 찍을 때는 tour.rs 가 화면에만 켜 둔다)
+    pub(super) auto: bool,
     /// 설치 위치 (표시용)
     install_dir: String,
 }

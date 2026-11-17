@@ -81,7 +81,8 @@ impl GhostApp {
             self.form.kind = FormKind::Browser;
             self.form.profile_idx = None;
             self.form.start_url = "about:blank".into();
-            self.form.task = tr("데모 작업").into();
+            // 사용 설명 사진(tour.rs)처럼 그럴듯한 작업이 필요하면 GHOSTDESK_DEMO_TASK 로 바꾼다
+            self.form.task = std::env::var("GHOSTDESK_DEMO_TASK").unwrap_or_else(|_| tr("데모 작업").into());
             self.spawn_agent(ctx);
         }
     }

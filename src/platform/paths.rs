@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 /// GhostDesk 데이터 루트 (작업공간·설정·제어 소켓의 부모)
 pub fn data_root() -> PathBuf {
+    // 시험·사진 찍기용: 사용자 설정을 건드리지 않게 따로 둔 폴더를 쓴다
+    if let Some(d) = std::env::var_os("GHOSTDESK_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
     #[cfg(windows)]
     let base = dirs::data_local_dir();
     #[cfg(not(windows))]

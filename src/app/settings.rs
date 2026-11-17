@@ -433,6 +433,12 @@ impl GhostApp {
                 ui.add_space(4.0);
                 ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
                     .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
+                ui.add_space(6.0);
+                if theme::secondary(ui, tr("사용 설명 다시 보기")).clicked() {
+                    self.show_settings = false;
+                    self.save_prefs();
+                    self.open_tour();
+                }
 
                 ui.add_space(18.0);
                 theme::section(ui, tr("작업"));

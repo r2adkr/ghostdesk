@@ -27,6 +27,7 @@ mod settings;
 mod sidebar;
 mod theme;
 mod titlebar;
+mod tour;
 mod wizard;
 
 use connect::ConnectState;
@@ -189,6 +190,12 @@ pub struct GhostApp {
     /// 화면 언어
     lang: Lang,
     effort_idx: usize,
+    /// 열려 있는 사용 설명 (처음 켤 때 · 설정에서 다시 보기)
+    tour: Option<tour::Tour>,
+    /// 사용 설명을 끝까지 보거나 건너뛰었는가 (그러면 다음부터 띄우지 않는다)
+    tour_seen: bool,
+    /// 사용 설명 사진 찍기 모드 (`GHOSTDESK_TOUR_CAPTURE`)
+    tour_capture: Option<tour::Capture>,
     /// 화면이 잠겨도(디스플레이가 꺼져도) 에이전트가 일하는 동안 Mac/PC 가 잠자지 않게 한다
     keep_awake: bool,
     /// 지금 잠자기를 막고 있는가 (keep_awake 이고 일하는 에이전트가 있을 때)
@@ -292,6 +299,9 @@ impl GhostApp {
             lang: Lang::Ko,
             effort_idx: 1,
             keep_awake: true,
+            tour: None,
+            tour_seen: false,
+            tour_capture: tour::Capture::from_env(),
             awake: None,
             greeting: screens::random_greeting(),
             browsers,
@@ -314,6 +324,10 @@ impl GhostApp {
         app.ai_current = app.ai[0].id;
         // 저장해 둔 언어·AI·키를 적용하고, 그 언어에 맞는 글꼴을 올린다
         app.load_prefs();
+        // 처음 켰으면 사용 설명을 띄운다 (사진 찍기 모드에서는 띄우지 않는다)
+        if !app.tour_seen && app.tour_capture.is_none() {
+            app.open_tour();
+        }
         i18n::set(app.lang);
         fonts::setup_fonts(&cc.egui_ctx, app.lang);
         app
@@ -465,6 +479,7 @@ impl eframe::App for GhostApp {
         self.spawn_demos(&ctx);
         self.update_textures(&ctx);
         self.update_keep_awake();
+        self.tour_capture_tick(&ctx);
 
         // 화면 모아보기: 다른 패널 없이 화면만 (에이전트가 모두 사라지면 처음 화면으로)
         if self.view == View::Wall
@@ -555,6 +570,7 @@ impl GhostApp {
             self.settings_window(&ctx);
             self.connect_window(&ctx);
             self.new_agent_window(&ctx);
+            self.tour_window(&ctx);
             // 별도 세션 안내 (macOS: LaunchAgent, Windows: 자식 세션 켜기)
             if caps::SESSION {
                 self.session_guide_window(&ctx);

@@ -139,6 +139,7 @@ mod tests {
             ("sidebar.rs", include_str!("sidebar.rs")),
             ("theme.rs", include_str!("theme.rs")),
             ("titlebar.rs", include_str!("titlebar.rs")),
+            ("tour.rs", include_str!("tour.rs")),
             ("wizard.rs", include_str!("wizard.rs")),
         ];
         let mut missing = Vec::new();

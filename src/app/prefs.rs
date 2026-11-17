@@ -32,6 +32,8 @@ pub(super) struct Prefs {
     remember_keys: Option<bool>,
     /// 화면이 잠겨도 계속 작업 (작업 중 잠자기 방지)
     keep_awake: Option<bool>,
+    /// 처음 켤 때의 사용 설명을 이미 봤는가
+    tour_seen: Option<bool>,
     // ── 예전 형식 (읽기만 한다) ──
     /// 지금 쓰는 AI 회사 (`Provider::short_name`)
     #[serde(skip_serializing)]
@@ -140,6 +142,7 @@ impl GhostApp {
         if let Some(k) = p.keep_awake {
             self.keep_awake = k;
         }
+        self.tour_seen = p.tour_seen.unwrap_or(false);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
     }
 
@@ -168,6 +171,7 @@ impl GhostApp {
             show_cursor: Some(self.show_cursor),
             remember_keys: Some(self.remember_keys),
             keep_awake: Some(self.keep_awake),
+            tour_seen: Some(self.tour_seen),
             ..Default::default()
         }
     }
