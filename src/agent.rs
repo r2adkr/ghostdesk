@@ -430,7 +430,12 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         }
         messages.push(user_msg);
         msg_bytes += user_len;
-        msg_bytes = msg_bytes.saturating_sub(prune_images(&mut messages));
+        // Claude binds each thinking block to the exact history before it, so editing earlier turns
+        // gets the request rejected. Its server already clears old tool results (screenshots
+        // included), so the history is only pruned here for other providers.
+        if !cfg.llm.provider.clears_old_tool_results() {
+            msg_bytes = msg_bytes.saturating_sub(prune_images(&mut messages));
+        }
         shared.set_status(AgentStatus::Thinking);
         let resp = match cfg.llm.send(&system, &tools, &messages).await {
             Ok(r) => r,

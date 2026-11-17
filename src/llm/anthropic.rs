@@ -5,6 +5,8 @@
 //! - Old tool results are also trimmed server-side with context editing
 //!   (`clear_tool_uses_20250919`). The agent already drops old screenshots itself, so this
 //!   mostly catches long text results.
+//! - Thinking blocks are bound to the history before them, so the agent never edits earlier
+//!   turns for Claude; `drop_block` keeps a stray mismatch from failing the request.
 //! - Safety-classifier refusals fall back server-side (`fallbacks: "default"`).
 
 use anyhow::Result;
@@ -23,8 +25,10 @@ impl Llm {
     pub(super) async fn send_anthropic(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
         // Haiku supports neither progress notes nor server-side fallback
         let haiku = self.model.contains("haiku");
-        let mut betas = vec!["context-management-2025-06-27"];
-        let mut thinking = json!({ "type": "adaptive" });
+        let mut betas = vec!["context-management-2025-06-27", "thinking-binding-controls-2026-08-01"];
+        // if the history ever stops matching a thinking block, drop that reasoning instead of
+        // failing the request (newer accounts get a 400 by default)
+        let mut thinking = json!({ "type": "adaptive", "block_binding": { "prefix_mismatch_behavior": "drop_block" } });
         let mut body = json!({
             "model": self.model,
             "max_tokens": 16000,
