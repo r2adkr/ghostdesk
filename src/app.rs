@@ -128,6 +128,8 @@ enum FormKind {
 /// 새 에이전트 창의 첫 선택
 #[derive(Clone, Copy, PartialEq)]
 enum Choice {
+    /// 할 일을 보고 웹사이트와 이 컴퓨터의 앱 중에서 고른다 (`wizard::auto_pick`)
+    Auto,
     Web,
     App,
     Session,

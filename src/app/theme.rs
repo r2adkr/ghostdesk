@@ -529,6 +529,20 @@ pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
         .response
 }
 
+/// 작은 개수 배지 (예: 사이드바 '에이전트' 옆의 숫자). 글자 크기에 맞춘 알약 모양을 줄 가운데에 그린다.
+/// Frame 으로 감싸면 가로 줄의 높이만큼 위아래로 늘어나므로, 크기를 정해 두고 직접 그린다.
+pub fn count_badge(ui: &mut egui::Ui, text: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), muted());
+    let pad = Vec2::new(6.0, 2.0);
+    let h = galley.size().y + pad.y * 2.0;
+    let size = Vec2::new((galley.size().x + pad.x * 2.0).max(h), h);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 255, card());
+    p.galley(rect.center() - galley.size() / 2.0, galley, muted());
+    resp
+}
+
 /// 고를 수 있는 낮은 타일 (아이콘 + 제목을 가운데 한 줄로). 누르면 clicked.
 pub fn tile(ui: &mut egui::Ui, selected: bool, icon: &str, title: &str, size: Vec2) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());

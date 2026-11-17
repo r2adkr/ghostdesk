@@ -199,7 +199,7 @@ MCP에서도 `desk_open`에 다음 인자를 사용합니다 (GhostDesk의 원�
 
 기존 외부 요청의 앱 차단·승인 규칙은 그대로 적용됩니다.
 
-MCP `desk_open`은 `mode` 하나로 화면 종류를 고릅니다: `web` · `web_login` · `app` · `app_login` · `app_current_session` · `app_running` · `session`(자식 세션) · `remote` (macOS는 `app_current_session` 대신 `app_vdisplay`). 외부 에이전트는 작업 전에 사용자에게 어떤 모드로 할지 물어봅니다.
+MCP `desk_open`은 `mode` 하나로 화면 종류를 고릅니다: `web` · `web_login` · `app` · `app_login` · `app_current_session` · `app_running` · `session`(자식 세션) · `remote` (macOS는 `app_current_session` 대신 `app_vdisplay`). 외부 에이전트는 사용자에게 묻지 않고 할 일에 가장 알맞은 모드를 스스로 고릅니다 (로그인 복제·실행 중인 앱·원격처럼 민감한 모드는 GhostDesk 창에서 승인).
 
 ### 외부 에이전트 연결 (Windows)
 

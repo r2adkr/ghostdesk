@@ -104,6 +104,59 @@ pub(super) struct AppListItem {
     disabled: Option<String>,
 }
 
+/// 자동 모드가 고른 곳
+#[derive(Debug, Clone, PartialEq)]
+enum AutoPick {
+    Web,
+    App { label: String, path: String, electron: Option<usize> },
+}
+
+/// 할 일 문장에 나오는 이 컴퓨터의 앱 (고를 수 없는 앱은 뺀다). 여럿이면 이름이 가장 긴 것
+/// ('Visual Studio Code' 와 'Code' 가 함께 맞으면 앞의 것). 주소(http·www)가 있으면 웹으로 본다.
+/// 영어 이름은 낱말 경계에서만 맞춘다 ('Notes' 가 'footnotes' 에 맞지 않게). 두 글자 미만 이름은 보지 않는다.
+/// 운영체제 기본 앱(날씨·메모·사진·뉴스 …)은 흔한 낱말과 이름이 같아 '날씨 앱'·'Notes app' 처럼 '앱' 을 함께 말할 때만 고른다
+/// ("오늘 날씨 찾아줘" 는 웹으로).
+fn auto_app<'a>(task: &str, items: &'a [AppListItem]) -> Option<&'a AppListItem> {
+    let t = task.to_lowercase();
+    if t.contains("http://") || t.contains("https://") || t.contains("www.") {
+        return None;
+    }
+    let word_at = |hay: &str, needle: &str| -> bool {
+        hay.match_indices(needle).any(|(i, m)| {
+            let before = hay[..i].chars().next_back();
+            let after = hay[i + m.len()..].chars().next();
+            let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+            edge(before) && edge(after)
+        })
+    };
+    items
+        .iter()
+        .filter(|it| it.disabled.is_none())
+        .filter_map(|it| {
+            // 보이는 이름(메모)과 파일 이름(Notes) 둘 다로 찾는다
+            let file = std::path::Path::new(&it.path).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let shown = it.label.trim().trim_end_matches(".app").to_lowercase();
+            let system = is_system_app(&it.path);
+            let hit = |name: &str| {
+                name.chars().count() >= 2
+                    && if system {
+                        ["앱", " 앱", " app"].iter().any(|suffix| word_at(&t, &format!("{name}{suffix}")))
+                    } else {
+                        word_at(&t, name)
+                    }
+            };
+            [shown, file].into_iter().filter(|n| hit(n)).map(|n| n.chars().count()).max().map(|n| (n, it))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, it)| it)
+}
+
+/// 운영체제에 기본으로 들어 있는 앱인가 (macOS: /System/Applications, Windows: Windows 폴더 아래)
+fn is_system_app(path: &str) -> bool {
+    let p = path.to_lowercase().replace('\\', "/");
+    p.starts_with("/system/") || p.contains("/windows/system32/") || p.contains(":/windows/")
+}
+
 impl GhostApp {
     pub(super) fn spawn_agent(&mut self, ctx: &egui::Context) {
         if let Some(msg) = self.missing_setup() {
@@ -266,7 +319,8 @@ impl GhostApp {
 
     pub(super) fn open_wizard(&mut self) {
         self.wizard_open = true;
-        self.form.choice = None;
+        // 자동이 미리 골라져 있다: 할 일만 적고 시작하면 된다 (창 높이도 처음부터 같아 위치가 튀지 않는다)
+        self.form.choice = Some(Choice::Auto);
         self.key_warn = false;
         self.wizard_key_field = self.missing_setup().is_some();
     }
@@ -385,6 +439,7 @@ impl GhostApp {
                 }
                 ui.add_space(14.0);
                 match choice {
+                    Choice::Auto => self.simple_auto(ui),
                     Choice::Web => self.simple_web(ui),
                     Choice::App => self.simple_app(ui),
                     Choice::Remote => self.form_remote(ui),
@@ -457,6 +512,31 @@ impl GhostApp {
     }
 
     /// 웹사이트: 시작 주소 + 내 브라우저 로그인 사용. 브라우저·프로필·화면 크기는 고급 설정.
+    /// 자동: 지금 할 일로 어디서 일할지 미리 보여 준다 (시작할 때 `auto_pick` 그대로 쓴다)
+    fn simple_auto(&mut self, ui: &mut egui::Ui) {
+        let line = match self.auto_pick() {
+            AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
+            AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 어디서 일할지 정해요 (적지 않으면 웹사이트)").to_string(),
+            AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
+        };
+        ui.label(RichText::new(line).color(theme::text()));
+        ui.label(theme::hint(tr("다르게 하려면 위에서 직접 고르세요.")));
+    }
+
+    /// 자동 모드의 결정: 할 일에 이 컴퓨터의 앱 이름이 있으면 그 앱, 아니면 웹사이트
+    fn auto_pick(&self) -> AutoPick {
+        if !LOCAL_APP_CARD {
+            return AutoPick::Web;
+        }
+        let electrons = self.electron_apps.lock().clone().unwrap_or_default();
+        let natives = self.native_apps.lock().clone().unwrap_or_default();
+        let items = app_list_items(&electrons, &natives, false);
+        match auto_app(&self.form.task, &items) {
+            Some(it) => AutoPick::App { label: it.label.clone(), path: it.path.clone(), electron: it.electron },
+            None => AutoPick::Web,
+        }
+    }
+
     pub(super) fn simple_web(&mut self, ui: &mut egui::Ui) {
         if self.browsers.is_empty() {
             ui.colored_label(theme::danger(), tr("Chrome·Edge·Brave·Whale 같은 Chromium 계열 브라우저를 찾지 못했어요."));
@@ -617,6 +697,16 @@ impl GhostApp {
     }
 
     pub(super) fn start_from_wizard(&mut self, ctx: &egui::Context) {
+        if self.form.choice == Some(Choice::Auto) {
+            match self.auto_pick() {
+                AutoPick::App { path, electron, .. } => {
+                    self.form.choice = Some(Choice::App);
+                    self.form.native_app = path;
+                    self.form.electron_idx = electron;
+                }
+                AutoPick::Web => self.form.choice = Some(Choice::Web),
+            }
+        }
         match self.form.choice {
             Some(Choice::Web) => {
                 self.form.kind = FormKind::Browser;
@@ -669,7 +759,8 @@ impl GhostApp {
             }
             Some(Choice::Remote) => self.form.kind = FormKind::Remote,
             Some(Choice::Session) => self.form.kind = FormKind::Session,
-            None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요.")),
+            // 자동은 위에서 웹·앱으로 바뀌어 여기 오지 않는다
+            Some(Choice::Auto) | None => return self.notify(ctx, tr("무엇을 조작할지 먼저 고르세요.")),
         }
         let before = self.agents.len();
         self.spawn_agent(ctx);
@@ -750,7 +841,7 @@ impl GhostApp {
             });
             ui.end_row();
             match choice {
-                Choice::Web => self.browser_rows(ui),
+                Choice::Web | Choice::Auto => self.browser_rows(ui),
                 Choice::App => {
                     ui.label(tr("직접 지정"));
                     ui.add(field(&mut self.form.native_app).hint_text(pick(tr("번들 id 또는 .app 경로"), tr("실행 파일(.exe) 경로 또는 프로그램 이름"))))
@@ -841,11 +932,17 @@ struct Kind {
 /// 이 OS 에서 쓸 수 있는 곳만 (지원하지 않는 종류는 보이지 않는다 — platform::caps)
 fn kinds() -> Vec<Kind> {
     let mut v = vec![Kind {
+        choice: Choice::Auto,
+        icon: icon::STAR,
+        title: tr("자동"),
+        about: tr("할 일을 보고 웹사이트와 이 컴퓨터의 앱 중에서 알맞은 곳을 골라요."),
+    }];
+    v.push(Kind {
         choice: Choice::Web,
         icon: icon::GLOBE,
         title: tr("웹사이트"),
         about: tr("보이지 않는 브라우저에서 일해요. 내 화면 · 마우스 · 키보드는 그대로예요."),
-    }];
+    });
     if LOCAL_APP_CARD {
         v.push(Kind { choice: Choice::App, icon: text::APP_ICON, title: tr(text::LOCAL_APPS), about: tr("앱을 보이지 않게 띄워서 일해요. 내 화면은 그대로예요.") });
     }
@@ -925,15 +1022,23 @@ pub(super) fn app_list_items(electrons: &[crate::electron::ElectronApp], native_
 
 /// /Applications, /System/Applications 의 앱 목록 (이름, 경로)
 #[cfg(target_os = "macos")]
+/// 이름은 Finder 처럼 사용자 언어로 보이는 이름 ('Notes' 대신 '메모'). 영어 파일 이름은 경로에 남아 검색·자동 판단에 쓰인다.
 pub(super) fn list_mac_apps() -> Vec<(String, String)> {
+    use objc2_foundation::{NSFileManager, NSString};
+    let fm = NSFileManager::defaultManager();
     let mut v = Vec::new();
     for dir in ["/Applications", "/System/Applications", "/System/Applications/Utilities"] {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().map(|x| x == "app").unwrap_or(false) {
-                    let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    v.push((name, p.display().to_string()));
+                    let path = p.display().to_string();
+                    let shown = fm.displayNameAtPath(&NSString::from_str(&path)).to_string();
+                    let name = match shown.trim().trim_end_matches(".app") {
+                        "" => p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                        n => n.to_string(),
+                    };
+                    v.push((name, path));
                 }
             }
         }
@@ -1050,7 +1155,38 @@ mod tests {
         assert_eq!(pick("mac", "other"), if cfg!(target_os = "macos") { "mac" } else { "other" });
         // 새 에이전트 창의 칸도 같은 caps 를 따른다: 웹이 맨 앞, 원격이 맨 뒤
         let k = kinds();
-        assert_eq!(k.len(), 2 + LOCAL_APP_CARD as usize + caps::SESSION as usize);
-        assert!(k.first().unwrap().choice == Choice::Web && k.last().unwrap().choice == Choice::Remote);
+        assert_eq!(k.len(), 3 + LOCAL_APP_CARD as usize + caps::SESSION as usize);
+        assert!(k[0].choice == Choice::Auto && k[1].choice == Choice::Web && k.last().unwrap().choice == Choice::Remote);
+    }
+
+    #[test]
+    fn auto_mode_finds_the_app_named_in_the_task() {
+        let app = |label: &str, disabled: bool| AppListItem {
+            label: label.into(),
+            path: format!("/Applications/{label}.app"),
+            electron: None,
+            disabled: disabled.then(|| "x".to_string()),
+        };
+        let items = vec![app("Code", false), app("Visual Studio Code", false), app("카카오톡", false), app("Notes", false), app("Slack", true)];
+        let pick = |t: &str| auto_app(t, &items).map(|it| it.label.as_str());
+        assert_eq!(pick("카카오톡으로 엄마한테 안부 보내줘"), Some("카카오톡"));
+        assert_eq!(pick("Open Visual Studio Code and run the tests"), Some("Visual Studio Code"), "긴 이름 우선");
+        assert_eq!(pick("notes 앱에 장보기 목록 적어줘"), Some("Notes"));
+        assert_eq!(pick("Write footnotes for the paper"), None, "낱말 안의 일부는 아님");
+        assert_eq!(pick("슬랙 대신 Slack 에 올려줘"), None, "고를 수 없는 앱은 빼고");
+        assert_eq!(pick("https://code.org 에서 강의 찾아줘"), None, "주소가 있으면 웹");
+        assert_eq!(pick("네이버에서 오늘 날씨 찾아줘"), None);
+
+        // 기본 앱은 '앱' 을 함께 말할 때만
+        let sys = |label: &str| AppListItem { label: label.into(), path: format!("/System/Applications/{label}.app"), electron: None, disabled: None };
+        let items = vec![sys("날씨"), sys("메모"), sys("Notes"), AppListItem { label: "계산기".into(), path: "/System/Applications/Calculator.app".into(), electron: None, disabled: None }];
+        let pick = |t: &str| auto_app(t, &items).map(|it| it.label.as_str());
+        assert_eq!(pick("오늘 날씨 찾아줘"), None);
+        assert_eq!(pick("날씨 앱에서 서울 날씨 봐줘"), Some("날씨"));
+        assert_eq!(pick("메모앱에 장보기 목록 적어줘"), Some("메모"));
+        assert_eq!(pick("open the Notes app"), Some("Notes"));
+        // 보이는 이름이 한국어여도 영어 파일 이름으로 찾는다
+        assert_eq!(pick("open the Calculator app"), Some("계산기"));
+        assert!(is_system_app(r"C:\Windows\System32\notepad.exe") && !is_system_app(r"C:\Program Files\Slack\slack.exe"));
     }
 }

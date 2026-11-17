@@ -270,6 +270,7 @@ fn info_plist() -> String {
 <key>CFBundleShortVersionString</key><string>{v}</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>CFBundleAllowMixedLocalizations</key><true/>
 </dict></plist>
 "#
     )

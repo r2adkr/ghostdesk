@@ -165,9 +165,7 @@ impl GhostApp {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             theme::section(ui, tr("에이전트"));
-            egui::Frame::new().fill(theme::card()).corner_radius(255).inner_margin(Margin::symmetric(7, 1)).show(ui, |ui| {
-                ui.label(RichText::new(self.agents.len().to_string()).size(11.0).color(theme::muted()));
-            });
+            theme::count_badge(ui, &self.agents.len().to_string());
         });
         ui.add_space(2.0);
         let mut clicked = None;
