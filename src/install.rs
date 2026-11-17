@@ -253,21 +253,73 @@ fn current_bundle() -> Option<PathBuf> {
     exe.ancestors().find(|p| p.extension().map(|e| e == "app").unwrap_or(false)).map(|p| p.to_path_buf())
 }
 
+/// 번들의 Info.plist (버전은 이 빌드의 Cargo.toml 버전)
 #[cfg(not(windows))]
-const INFO_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+fn info_plist() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>GhostDesk</string>
 <key>CFBundleDisplayName</key><string>GhostDesk</string>
-<key>CFBundleIdentifier</key><string>dev.ghostdesk.app</string>
+<key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
 <key>CFBundleExecutable</key><string>ghostdesk</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>0.1.0</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>{v}</string>
+<key>CFBundleShortVersionString</key><string>{v}</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
-"#;
+"#
+    )
+}
+
+/// 번들을 마무리한다: 원본 지문을 적고(서명 봉인에 들어가야 하므로 서명 전에) ad-hoc 서명.
+/// 지문을 못 구했으면 옛 지문이 남지 않게 지운다.
+#[cfg(not(windows))]
+fn seal_bundle(bundle: &Path, src_hash: Option<&str>) -> Result<()> {
+    match src_hash {
+        Some(h) => write_source_stamp(bundle, h)?,
+        None => {
+            let _ = std::fs::remove_file(source_stamp_path(bundle));
+        }
+    }
+    let _ = run(
+        Command::new("/usr/bin/codesign").args(["--force", "-s", "-", "--identifier", BUNDLE_ID]).arg(bundle),
+        Duration::from_secs(120),
+    );
+    Ok(())
+}
+
+/// 실행 파일 `exe` 하나로 GhostDesk.app 번들을 `dest` 에 새로 만든다 (Info.plist · 실행 파일 · 원본 지문 · 서명).
+/// 설치(번들 밖에서 실행했을 때)와 릴리스 패키징(`package_macos`)이 같이 쓴다.
+#[cfg(not(windows))]
+pub fn build_bundle(exe: &Path, dest: &Path) -> Result<()> {
+    let _ = std::fs::remove_dir_all(dest);
+    let macos = dest.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos)?;
+    std::fs::write(dest.join("Contents/Info.plist"), info_plist())?;
+    std::fs::copy(exe, macos.join("ghostdesk")).with_context(|| format!("{} 를 복사하지 못했습니다", exe.display()))?;
+    seal_bundle(dest, sha256_file(exe).ok().as_deref())
+}
+
+/// `ghostdesk --package-macos <실행 파일> <출력.zip>` — 릴리스용 GhostDesk.app 을 만들어 zip 으로 묶는다
+/// (zip 안에는 GhostDesk.app 하나. 앱 안 업데이트(`update.rs`)가 이 모양을 풀어 바꿔 넣는다).
+#[cfg(not(windows))]
+pub fn package_macos(args: &[String]) -> Result<()> {
+    let [exe, out] = args else { anyhow::bail!("사용법: ghostdesk --package-macos <실행 파일> <출력.zip>") };
+    let work = std::env::temp_dir().join(format!("ghostdesk-package-{}", std::process::id()));
+    let app = work.join("GhostDesk.app");
+    let res = (|| {
+        build_bundle(Path::new(exe), &app)?;
+        let _ = std::fs::remove_file(out);
+        run(Command::new("/usr/bin/ditto").args(["-c", "-k", "--keepParent"]).arg(&app).arg(out), Duration::from_secs(300))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    res
+}
 
 /// 설치본 안에 "어떤 원본 실행 파일에서 설치했는지" 를 적어 두는 파일.
 /// macOS: codesign 이 설치본의 실행 파일을 다시 쓰므로 설치본과 원본을 바이트로 비교할 수는 없다.
@@ -327,26 +379,11 @@ pub fn install_app() -> Result<PathBuf> {
         match current_bundle() {
             Some(bundle) => {
                 run(Command::new("/usr/bin/ditto").arg(&bundle).arg(&staging), Duration::from_secs(120))?;
+                // 지문은 서명 전에 기록한다 (서명 뒤에 Resources 를 바꾸면 번들 봉인이 깨짐)
+                seal_bundle(&staging, src_hash.as_deref())?;
             }
-            None => {
-                let macos = staging.join("Contents/MacOS");
-                std::fs::create_dir_all(&macos)?;
-                std::fs::write(staging.join("Contents/Info.plist"), INFO_PLIST)?;
-                std::fs::copy(&me, macos.join("ghostdesk"))?;
-            }
+            None => build_bundle(&me, &staging)?,
         }
-        // 지문은 서명 전에 기록한다 (서명 뒤에 Resources 를 바꾸면 번들 봉인이 깨짐)
-        match &src_hash {
-            Some(h) => write_source_stamp(&staging, h)?,
-            None => {
-                // 지문을 못 구했으면 옛 지문(원본에서 ditto 로 딸려 온 것)이 남지 않게 지운다
-                let _ = std::fs::remove_file(source_stamp_path(&staging));
-            }
-        }
-        let _ = run(
-            Command::new("/usr/bin/codesign").args(["--force", "-s", "-", "--identifier", BUNDLE_ID]).arg(&staging),
-            Duration::from_secs(120),
-        );
         // 바꿔치기: 기존 설치본을 옆으로 옮긴 뒤 새 것을 제자리에 (실행 중인 기존 프로세스는 옛 파일을 계속 씀)
         let old = parent.join(".GhostDesk.app.old");
         let _ = std::fs::remove_dir_all(&old);

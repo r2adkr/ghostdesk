@@ -1,9 +1,12 @@
 //! 새 버전 알림: GitHub 릴리스에서 최신판을 찾아 지금 버전보다 새로우면 화면에 알린다.
 //!
-//! Windows x64 는 '업데이트' 를 누르면 새 exe 를 내려받아(SHA256SUMS 로 확인) 실행 중인 exe 자리에 바꿔 넣고,
-//! '다시 시작' 을 누르면 앱이 완전히 끝난 뒤 새 exe 를 띄운다. 지금 실행 중인 파일 자체를 바꾸므로
-//! 사용자가 다음에 같은 파일(내려받은 폴더의 exe 든 설치본이든)을 열어도 새 버전이 뜬다.
-//! 내려받을 파일이 없는 OS(macOS 등)는 릴리스 페이지를 연다.
+//! '업데이트' 를 누르면 지금 OS·CPU 에 맞는 릴리스 파일(`asset_suffixes`)을 내려받아 SHA256SUMS 로 확인한 뒤
+//! 지금 실행 중인 것 자리에 바꿔 넣고, '다시 시작' 을 누르면 앱이 완전히 끝난 뒤 새 버전을 띄운다.
+//! 실행 중인 것 자체를 바꾸므로 사용자가 다음에 같은 것(내려받은 exe 든 설치본이든)을 열어도 새 버전이 뜬다.
+//! - Windows: `GhostDesk-<버전>-windows-<x64|arm64>.exe` → 실행 중인 exe 를 옆으로 옮기고 새 exe 를 제자리에
+//! - macOS: `GhostDesk-<버전>-macos-<arm64|x64|universal>.zip` (안에 GhostDesk.app) → 실행 중인 .app 번들을 통째로 바꿈
+//!
+//! 이 OS·CPU 용 파일이 릴리스에 없거나, macOS 에서 .app 번들 밖에서 실행 중이면 릴리스 페이지를 연다.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +20,17 @@ use tokio::runtime::Handle;
 
 /// 릴리스를 올리는 저장소
 const REPO: &str = "r2adkr/ghostdesk";
-/// 이 OS 에서 바로 바꿔 넣을 실행 파일의 이름 끝 (릴리스 자산: GhostDesk-<버전>-windows-x64.exe)
-const ASSET_SUFFIX: Option<&str> = if cfg!(all(windows, target_arch = "x86_64")) { Some("-windows-x64.exe") } else { None };
+/// 이 OS·CPU 에서 받을 릴리스 파일의 이름 끝. 앞의 것부터 찾는다 (macOS 는 이 CPU 전용이 없으면 유니버설).
+/// 릴리스 파일 이름은 .github/workflows/release.yml 과 같아야 한다.
+fn asset_suffixes() -> &'static [&'static str] {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => &["-windows-x64.exe"],
+        ("windows", "aarch64") => &["-windows-arm64.exe"],
+        ("macos", "aarch64") => &["-macos-arm64.zip", "-macos-universal.zip"],
+        ("macos", "x86_64") => &["-macos-x64.zip", "-macos-universal.zip"],
+        _ => &[],
+    }
+}
 /// 켜 둔 채 오래 쓰는 앱이라 하루에 한 번 다시 확인한다
 const RECHECK: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -98,9 +110,9 @@ pub fn download(rt: &Handle, st: Shared, ctx: egui::Context) {
             }
             ctx.request_repaint();
         };
-        let res = match std::env::current_exe() {
-            Ok(me) => install(&asset, &me, progress).await,
-            Err(e) => Err(anyhow::Error::from(e).context("실행 파일 경로를 알 수 없습니다")),
+        let res = match update_target() {
+            Ok(target) => install(&asset, &target, progress).await,
+            Err(e) => Err(e),
         };
         *st.lock() = match res {
             Ok(()) => State::Ready(r),
@@ -123,8 +135,21 @@ pub fn relaunch_if_requested() {
     if !RELAUNCH.load(Ordering::SeqCst) {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let mut cmd = std::process::Command::new(exe);
+    // macOS: 바꿔 넣은 .app 번들을 LaunchServices 로 새로 띄운다 (-n: 끝나 가는 지금 프로세스와 따로)
+    #[cfg(target_os = "macos")]
+    let mut cmd = match update_target() {
+        Ok(bundle) => {
+            let mut c = std::process::Command::new("/usr/bin/open");
+            c.arg("-n").arg(bundle);
+            c
+        }
+        Err(_) => return,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe),
+        Err(_) => return,
+    };
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
@@ -157,11 +182,26 @@ async fn latest(current: &str) -> Result<Option<Release>> {
         .error_for_status()?
         .json()
         .await?;
-    Ok(parse_release(&v, current, ASSET_SUFFIX))
+    // 바꿔 넣을 곳이 없으면(macOS 에서 번들 밖 실행) 파일을 고르지 않는다 → 릴리스 페이지를 연다
+    let suffixes = if update_target().is_ok() { asset_suffixes() } else { &[] };
+    Ok(parse_release(&v, current, suffixes))
 }
 
-/// GitHub 릴리스 JSON → 지금(`current`)보다 새 정식 릴리스. `suffix` 로 이 OS 용 실행 파일을 고른다.
-fn parse_release(v: &Value, current: &str, suffix: Option<&str>) -> Option<Release> {
+/// 업데이트로 바꿔 넣을 것: Windows 는 실행 중인 exe, macOS 는 그것을 담은 .app 번들
+fn update_target() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("실행 파일 경로를 알 수 없습니다")?;
+    if cfg!(target_os = "macos") {
+        exe.ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"))
+            .map(Path::to_path_buf)
+            .context("GhostDesk.app 번들 안에서 실행 중이 아니라 앱 안에서 업데이트할 수 없습니다")
+    } else {
+        Ok(exe)
+    }
+}
+
+/// GitHub 릴리스 JSON → 지금(`current`)보다 새 정식 릴리스. `suffixes` 의 앞에서부터 처음 맞는 파일을 고른다.
+fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release> {
     if v["draft"].as_bool() == Some(true) || v["prerelease"].as_bool() == Some(true) {
         return None;
     }
@@ -172,7 +212,7 @@ fn parse_release(v: &Value, current: &str, suffix: Option<&str>) -> Option<Relea
     let assets = v["assets"].as_array().map(Vec::as_slice).unwrap_or_default();
     let url_of = |a: &Value| a["browser_download_url"].as_str().map(str::to_string);
     let sums_url = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(url_of);
-    let asset = suffix.and_then(|suf| {
+    let asset = suffixes.iter().find_map(|suf| {
         let a = assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suf)))?;
         Some(Asset { name: a["name"].as_str()?.to_string(), url: url_of(a)?, size: a["size"].as_u64()?, sums_url: sums_url.clone() })
     });
@@ -200,7 +240,7 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// 내려받기 → 크기·해시 확인 → `target`(실행 중인 exe) 과 바꿔치기. 실패하면 받던 파일은 지운다.
+/// 내려받기 → 크기·해시 확인 → `target`(실행 중인 exe 또는 .app 번들) 과 바꿔치기. 실패하면 받던 파일은 지운다.
 async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let me = target.to_path_buf();
@@ -251,7 +291,32 @@ fn swap(staging: &Path, me: &Path) -> Result<()> {
     crate::install::swap_in(staging, me)
 }
 
-#[cfg(not(windows))]
+/// macOS: 받은 zip 을 옆 폴더에 풀어 그 안의 GhostDesk.app 을 확인한 뒤, 실행 중인 번들을 옆(`<이름>.old-<시각>`)으로
+/// 옮기고 새 번들을 제자리에 넣는다 (실행 중인 프로세스는 옮겨진 옛 파일을 계속 쓴다). 넣다가 실패하면 되돌린다.
+#[cfg(target_os = "macos")]
+fn swap(zip: &Path, bundle: &Path) -> Result<()> {
+    let unpacked = sibling(bundle, &format!(".update-{}.d", std::process::id()));
+    let res = (|| -> Result<()> {
+        let _ = std::fs::remove_dir_all(&unpacked);
+        let out = std::process::Command::new("/usr/bin/ditto").args(["-x", "-k"]).arg(zip).arg(&unpacked).output()?;
+        anyhow::ensure!(out.status.success(), "받은 파일을 풀지 못했습니다: {}", String::from_utf8_lossy(&out.stderr).trim());
+        let new_app = unpacked.join("GhostDesk.app");
+        anyhow::ensure!(new_app.join("Contents/MacOS/ghostdesk").is_file(), "받은 파일 안에 GhostDesk.app 이 없습니다");
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let old = sibling(bundle, &format!(".old-{secs}"));
+        std::fs::rename(bundle, &old).context("지금 앱을 옮기지 못했습니다")?;
+        if let Err(e) = std::fs::rename(&new_app, bundle) {
+            let _ = std::fs::rename(&old, bundle);
+            return Err(anyhow::Error::from(e).context("새 앱을 제자리에 넣지 못했습니다"));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&unpacked);
+    let _ = std::fs::remove_file(zip);
+    res
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn swap(_staging: &Path, _me: &Path) -> Result<()> {
     anyhow::bail!("이 OS 에서는 앱 안에서 업데이트할 수 없습니다")
 }
@@ -263,10 +328,10 @@ fn sibling(p: &Path, suffix: &str) -> PathBuf {
     p.with_file_name(name)
 }
 
-/// 지난 업데이트가 남긴 파일 (옆으로 옮긴 옛 exe · 받다 만 파일). 아직 실행 중인 옛 exe 는 지워지지 않아 다음에 다시.
-/// 이 exe 이름으로 시작하는, 업데이트가 만든 이름의 파일만 지운다.
+/// 지난 업데이트가 남긴 것 (옆으로 옮긴 옛 exe·번들 · 받다 만 파일·폴더). 아직 실행 중인 옛 exe 는 지워지지 않아 다음에 다시.
+/// 바꿔 넣는 대상(exe 또는 .app) 이름으로 시작하는, 업데이트가 만든 이름의 것만 지운다.
 fn sweep_leftovers() {
-    let Ok(me) = std::env::current_exe() else { return };
+    let Ok(me) = update_target() else { return };
     let (Some(dir), Some(name)) = (me.parent(), me.file_name()) else { return };
     let name = name.to_string_lossy().to_lowercase();
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -274,7 +339,8 @@ fn sweep_leftovers() {
         let n = e.file_name().to_string_lossy().to_lowercase();
         if let Some(rest) = n.strip_prefix(&name) {
             if rest.starts_with(".old-") || rest.starts_with(".update-") {
-                let _ = std::fs::remove_file(e.path());
+                let p = e.path();
+                let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
             }
         }
     }
@@ -305,18 +371,40 @@ mod tests {
                 {"name": "GhostDesk-0.3.0-windows-x64.exe", "size": 123, "browser_download_url": "https://x/a.exe"}
             ]
         });
-        let r = parse_release(&v, "0.2.0", Some("-windows-x64.exe")).unwrap();
+        let r = parse_release(&v, "0.2.0", &["-windows-x64.exe"]).unwrap();
         assert_eq!(r.version, "0.3.0");
         assert!(r.installable());
         let a = r.asset.unwrap();
         assert_eq!((a.size, a.url.as_str(), a.sums_url.as_deref()), (123, "https://x/a.exe", Some("https://x/SHA256SUMS.txt")));
         // 내려받을 파일이 없는 OS: 알리기만 (페이지 열기)
-        assert!(!parse_release(&v, "0.2.0", None).unwrap().installable());
+        assert!(!parse_release(&v, "0.2.0", &[]).unwrap().installable());
         // 같은 버전 · 미리보기 · 초안은 알리지 않는다
-        assert_eq!(parse_release(&v, "0.3.0", None), None);
+        assert_eq!(parse_release(&v, "0.3.0", &[]), None);
         let mut pre = v.clone();
         pre["prerelease"] = json!(true);
-        assert_eq!(parse_release(&pre, "0.2.0", None), None);
+        assert_eq!(parse_release(&pre, "0.2.0", &[]), None);
+    }
+
+    /// macOS: 이 CPU 전용 파일이 있으면 그것, 없으면 유니버설. Windows 파일은 고르지 않는다
+    #[test]
+    fn picks_the_mac_build_for_this_cpu() {
+        let rel = |names: &[&str]| {
+            json!({
+                "tag_name": "v0.3.0", "draft": false, "prerelease": false,
+                "assets": names.iter().map(|n| json!({"name": n, "size": 1, "browser_download_url": format!("https://x/{n}")})).collect::<Vec<_>>()
+            })
+        };
+        let arm = ["-macos-arm64.zip", "-macos-universal.zip"];
+        let both = rel(&["GhostDesk-0.3.0-windows-x64.exe", "GhostDesk-0.3.0-macos-universal.zip", "GhostDesk-0.3.0-macos-arm64.zip"]);
+        assert_eq!(parse_release(&both, "0.2.0", &arm).unwrap().asset.unwrap().name, "GhostDesk-0.3.0-macos-arm64.zip");
+        let universal = rel(&["GhostDesk-0.3.0-windows-x64.exe", "GhostDesk-0.3.0-macos-universal.zip"]);
+        assert_eq!(parse_release(&universal, "0.2.0", &arm).unwrap().asset.unwrap().name, "GhostDesk-0.3.0-macos-universal.zip");
+        let win_only = rel(&["GhostDesk-0.3.0-windows-x64.exe"]);
+        assert!(!parse_release(&win_only, "0.2.0", &arm).unwrap().installable(), "macOS 파일이 없으면 페이지만 연다");
+        // 지금 실행 환경의 목록이 비어 있지 않다 (지원하는 OS·CPU)
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(!asset_suffixes().is_empty());
+        }
     }
 
     #[test]
@@ -346,6 +434,39 @@ mod tests {
         assert!((*last.lock().unwrap() - 1.0).abs() < 1e-6, "진행률이 끝까지 가야 함");
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 1, "받던 파일이 남으면 안 됨: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// macOS: 받은 zip(안에 GhostDesk.app)을 풀어 실행 중인 번들 자리에 넣고, 옛 번들은 옆으로 옮기고, 받은 것들은 치운다
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_swap_replaces_the_bundle() {
+        let dir = std::env::temp_dir().join(format!("ghostdesk-swap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |app: &Path, body: &str| {
+            std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+            std::fs::write(app.join("Contents/MacOS/ghostdesk"), body).unwrap();
+        };
+        let target = dir.join("GhostDesk.app");
+        write(&target, "old");
+        let new_app = dir.join("new").join("GhostDesk.app");
+        write(&new_app, "new");
+        let zip = dir.join("GhostDesk.app.update-1");
+        let ok = std::process::Command::new("/usr/bin/ditto").args(["-c", "-k", "--keepParent"]).arg(&new_app).arg(&zip).status().unwrap();
+        assert!(ok.success());
+
+        swap(&zip, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/ghostdesk")).unwrap(), "new");
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.iter().any(|n| n.starts_with("GhostDesk.app.old-")), "{left:?}");
+        assert!(!left.iter().any(|n| n.contains(".update-")), "받은 zip·푼 폴더가 남으면 안 됨: {left:?}");
+
+        // zip 안에 GhostDesk.app 이 없으면 아무것도 바꾸지 않는다
+        let bad = dir.join("bad.zip");
+        std::fs::write(dir.join("x.txt"), "x").unwrap();
+        std::process::Command::new("/usr/bin/ditto").args(["-c", "-k"]).arg(dir.join("x.txt")).arg(&bad).status().unwrap();
+        assert!(swap(&bad, &target).is_err());
+        assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/ghostdesk")).unwrap(), "new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

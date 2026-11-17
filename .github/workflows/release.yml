@@ -1,7 +1,7 @@
-# v* 태그를 올리면 Windows x64 실행 파일을 빌드해 GitHub 릴리스로 올린다.
+# v* 태그를 올리면 Windows x64 실행 파일과 macOS 앱(유니버설: Apple Silicon + Intel)을 빌드해 GitHub 릴리스로 올린다.
 # 릴리스 설명은 태그 메시지(git tag -a … --cleanup=verbatim)를 그대로 쓴다.
-# 자산 이름은 앱의 업데이트 확인(src/update.rs)이 찾는 이름과 같아야 한다:
-#   GhostDesk-<버전>-windows-x64.exe, SHA256SUMS.txt
+# 자산 이름은 앱의 업데이트 확인(src/update.rs 의 asset_suffixes)이 찾는 이름과 같아야 한다:
+#   GhostDesk-<버전>-windows-x64.exe, GhostDesk-<버전>-macos-universal.zip, SHA256SUMS.txt
 name: Release
 
 on:
@@ -17,11 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # checkout 은 태그를 커밋을 가리키는 가벼운 태그로 받아 온다 → 그대로 두면 릴리스 설명이 커밋 메시지가 된다.
-      # 주석 달린 태그(메시지 = 릴리스 설명)를 다시 받는다.
-      - name: Fetch tag message
-        run: git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
-
       # rust-toolchain.toml 의 버전을 rustup 이 받아 쓴다
       - name: Build
         run: cargo build --release --locked
@@ -32,13 +27,63 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart('v')
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ($cargo -ne $version) { throw "태그 $version 과 Cargo.toml 버전 $cargo 이 다릅니다" }
-          $name = "GhostDesk-$version-windows-x64.exe"
-          Copy-Item target/release/ghostdesk.exe $name
-          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
-          [IO.File]::WriteAllText("SHA256SUMS.txt", "$hash  $name`n")
-          "ASSET=$name" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/ghostdesk.exe "dist/GhostDesk-$version-windows-x64.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  macos-universal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Apple Silicon + Intel)
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # 두 CPU 의 실행 파일을 하나로 묶고, 앱이 직접 GhostDesk.app 을 만들어 zip 으로 묶는다 (install.rs 의 package_macos)
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$cargo_version" = "$version" ] || { echo "태그 $version 과 Cargo.toml 버전 $cargo_version 이 다릅니다"; exit 1; }
+          mkdir -p dist
+          lipo -create -output ghostdesk-universal \
+            target/aarch64-apple-darwin/release/ghostdesk target/x86_64-apple-darwin/release/ghostdesk
+          ./ghostdesk-universal --package-macos ghostdesk-universal "dist/GhostDesk-$version-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+
+  publish:
+    needs: [windows-x64, macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # checkout 은 태그를 커밋을 가리키는 가벼운 태그로 받아 온다 → 그대로 두면 릴리스 설명이 커밋 메시지가 된다.
+      # 주석 달린 태그(메시지 = 릴리스 설명)를 다시 받는다.
+      - name: Fetch tag message
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" "$env:ASSET" SHA256SUMS.txt --verify-tag --notes-from-tag --title "GhostDesk ${{ github.ref_name }} (Windows x64)"
+        run: |
+          cd dist
+          sha256sum GhostDesk-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" GhostDesk-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --notes-from-tag --title "GhostDesk $GITHUB_REF_NAME"

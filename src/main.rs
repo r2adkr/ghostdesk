@@ -71,6 +71,9 @@ fn main() -> anyhow::Result<()> {
         Some("--disconnect") => return install::cli(&args[2..], false),
         // 목록에 없는 에이전트용 연결 패키지(MCP 설정·스킬·플러그인)를 만든다
         Some("--export-kit") => return kit::cli(&args[2..]),
+        // 릴리스용 macOS 앱 번들(zip) 만들기 (.github/workflows/release.yml)
+        #[cfg(target_os = "macos")]
+        Some("--package-macos") => return install::package_macos(&args[2..]),
         _ => {}
     }
     if args.get(1).map(String::as_str) == Some("--agent-test") {
