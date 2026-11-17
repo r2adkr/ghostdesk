@@ -98,6 +98,11 @@ fn main() -> anyhow::Result<()> {
     // (예: MCP 서버가 자동으로 띄움) 포커스를 빼앗지 않는다.
     #[cfg(windows)]
     let background = args.iter().skip(1).any(|a| a == "--background");
+    // Windows: 새로 내려받은 exe 를 실행했으면 옛 GhostDesk 를 닫고 설치본을 이것으로 바꾼 뒤 설치본을 띄운다
+    #[cfg(windows)]
+    if !background && install::take_over_install() {
+        return Ok(());
+    }
     #[cfg(windows)]
     let _single = match gui_instance::acquire(!background) {
         gui_instance::Start::Proceed(guard) => guard,

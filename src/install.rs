@@ -477,6 +477,10 @@ fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
             return Ok(target);
         }
     }
+    // 설치본이 더 새 버전이면 옛 버전으로 덮어쓰지 않는다 (예전에 받은 옛 exe 를 다시 실행한 경우)
+    if target.is_file() && installed_version(dir).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION"))) {
+        return Ok(target);
+    }
     guard_write(dir);
     std::fs::create_dir_all(dir).with_context(|| format!("설치 폴더 {} 을(를) 만들지 못했습니다", dir.display()))?;
     sweep_install_leftovers(dir);
@@ -494,10 +498,11 @@ fn install_exe_into(me: &Path, dir: &Path) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&staging);
         return Err(e);
     }
-    // 지문 기록은 실패해도 설치는 끝난 것 (다음 실행 때 한 번 더 복사할 뿐)
+    // 지문·버전 기록은 실패해도 설치는 끝난 것 (다음 실행 때 한 번 더 복사할 뿐)
     if let Some(h) = &src_hash {
         let _ = write_source_stamp(dir, h);
     }
+    let _ = std::fs::write(dir.join(VERSION_STAMP), format!("{}\n", env!("CARGO_PKG_VERSION")));
     sweep_install_leftovers(dir);
     Ok(target)
 }
@@ -535,6 +540,94 @@ fn old_exe_name(target: &Path) -> PathBuf {
         .map(|n| with_suffix(target, &if n == 0 { format!(".old-{ts}") } else { format!(".old-{ts}-{n}") }))
         .find(|p| std::fs::symlink_metadata(p).is_err())
         .unwrap_or_else(|| with_suffix(target, ".old"))
+}
+
+/// 설치 폴더에 적어 두는 설치본의 버전 (exe 에는 버전 정보가 없어서). 0.4.1 전 설치본에는 없다.
+#[cfg(windows)]
+const VERSION_STAMP: &str = "ghostdesk.version";
+
+#[cfg(windows)]
+fn installed_version(dir: &Path) -> Option<String> {
+    let v = std::fs::read_to_string(dir.join(VERSION_STAMP)).ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// 새로 내려받은 GhostDesk exe 를 실행했을 때 (Windows): 설치본(%LOCALAPPDATA%\Programs\GhostDesk\ghostdesk.exe)과
+/// 다른 빌드이고 설치본이 더 새 버전이 아니면, 떠 있는 옛 GhostDesk 창을 닫고(창의 닫기 단추와 같음) 이 exe 로
+/// 바꿔 넣은 뒤 설치본을 실행한다. 그랬으면 true (이 프로세스는 창을 띄우지 않고 끝낸다).
+/// 설치본 자신이거나 같은 빌드이거나, 따로 둔 데이터로 실행 중이거나, 자동 연결을 껐으면 아무것도 하지 않는다.
+#[cfg(windows)]
+pub fn take_over_install() -> bool {
+    if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() || !auto_connect_enabled() {
+        return false;
+    }
+    let Ok(me) = std::env::current_exe() else { return false };
+    let dir = stable_app();
+    let target = installed_exe(&dir);
+    if crate::platform::paths::same_path(&me, &target) || is_displaced_copy(&me, &dir) {
+        return false;
+    }
+    if target.is_file() {
+        if installed_version(&dir).is_some_and(|v| !crate::update::newer(env!("CARGO_PKG_VERSION"), &v)) {
+            // 설치본이 같거나 더 새 버전: 바꿀 것이 없다 (같은 버전의 다른 빌드는 평소처럼 켤 때 설치가 맞춘다)
+            return false;
+        }
+        if sha256_file(&me).ok().is_some_and(|h| installed_from(&dir, &h) && same_len(&me, &target)) {
+            return false;
+        }
+    }
+    if !close_gui_windows(Duration::from_secs(8)) {
+        eprintln!("[ghostdesk] 떠 있는 GhostDesk 가 닫히지 않아 이 exe 를 그대로 실행합니다");
+        return false;
+    }
+    if let Err(e) = install_exe_into(&me, &dir) {
+        eprintln!("[ghostdesk] 설치본을 바꾸지 못했습니다: {e:#}");
+        return false;
+    }
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    Command::new(&target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .is_ok()
+}
+
+/// 이 사용자의 다른 GhostDesk 창(제목 "GhostDesk", 실행 파일 이름이 ghostdesk 로 시작)에 닫기를 보내고
+/// 최대 `wait` 동안 그 프로세스가 끝나기를 기다린다. 아직 남은 것이 있으면 false.
+#[cfg(windows)]
+fn close_gui_windows(wait: Duration) -> bool {
+    use crate::platform::win;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    let me = std::process::id();
+    let is_ghostdesk = |pid: u32| {
+        win::process_path(pid)
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .is_some_and(|n| n.starts_with("ghostdesk") && n.ends_with(".exe"))
+    };
+    let windows: Vec<win::TopWindow> = win::top_level_hwnds()
+        .into_iter()
+        .map(win::window_info)
+        .filter(|w| w.pid != me && w.title == "GhostDesk" && is_ghostdesk(w.pid))
+        .collect();
+    if windows.is_empty() {
+        return true;
+    }
+    for w in &windows {
+        unsafe { PostMessageW(w.hwnd as _, WM_CLOSE, 0, 0) };
+    }
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if windows.iter().all(|w| win::process_path(w.pid).is_none()) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 /// `me` 가 설치 폴더 안의 옆으로 옮겨진 옛 설치본(ghostdesk.exe.old-*)인가
@@ -1752,6 +1845,28 @@ mod tests {
         // 더 새 설치본은 그대로 두고 그 경로를 쓴다
         assert_eq!(install_app().unwrap(), stable_exe());
         assert_eq!(std::fs::read_to_string(app.join("Contents/MacOS/ghostdesk")).unwrap(), "newer build");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_records_version_and_never_downgrades() {
+        let h = FakeHome::new("win-version");
+        let dir = h.path("dir");
+        mkdir(&dir);
+        let src = h.path("GhostDesk-new.exe");
+        std::fs::write(&src, "new build").unwrap();
+        install_exe_into(&src, &dir).unwrap();
+        assert_eq!(installed_version(&dir).as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        // 설치본이 더 새 버전이면 다른(옛) exe 로 덮어쓰지 않는다
+        std::fs::write(dir.join(VERSION_STAMP), "999.0.0\n").unwrap();
+        let old = h.path("GhostDesk-old.exe");
+        std::fs::write(&old, "older build").unwrap();
+        assert_eq!(install_exe_into(&old, &dir).unwrap(), installed_exe(&dir));
+        assert_eq!(std::fs::read_to_string(installed_exe(&dir)).unwrap(), "new build");
+        // 버전 기록이 없는 옛 설치본은 바꾼다
+        std::fs::remove_file(dir.join(VERSION_STAMP)).unwrap();
+        install_exe_into(&old, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(installed_exe(&dir)).unwrap(), "older build");
     }
 
     #[cfg(not(windows))]
