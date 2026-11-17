@@ -289,13 +289,23 @@ macOS.
   sessions** asks for administrator approval (UAC). Only one child session can
   be connected system-wide. Installed apps and files are shared, but using the
   same browser profile concurrently or staying signed in to every app is not
-  guaranteed.
+  guaranteed. Use this mode for Microsoft Store apps such as the new Windows
+  Notepad, Calculator and Paint, which cannot run in hidden app mode. External
+  agents use `desk_open(mode="session")`; GhostDesk asks for approval before
+  opening it.
 - The child-session helper starts from HKCU `RunOnce`, so it needs an
   administrator account (including one normally used with standard rights).
   On a standard account the helper will not start even if another administrator
   approves UAC ([Microsoft docs](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/standard-user-cannot-run-commnad-via-runonce)).
-  Capture and input in a real child session have not been verified on hardware
-  yet.
+  Capture, Korean multiline text, tabs, emoji and immediate Save have been
+  verified in the new Notepad on Windows 11 x64.
+- For long text in a child session, inspect a screenshot after focusing the
+  input field or changing its selection, then type in a separate call. Native
+  Edit/RichEdit fields use a synchronous edit after that observation. Other
+  controls, and key/click-to-type batches without an intervening screenshot,
+  keep queued keyboard input; inspect the result before saving or submitting.
+  After upgrading, save documents in the child session, sign out of that
+  session and reconnect so its helper also runs the new version.
 - Virtual displays are macOS-only. On Windows, put a VNC server in something
   like a Hyper-V VM and connect to it as a remote computer.
 - Not supported in Windows app mode: Microsoft Store (UWP/MSIX) apps (including

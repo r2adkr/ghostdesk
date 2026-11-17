@@ -26,9 +26,17 @@ impl Llm {
         }
         let url = format!("{}/chat/completions", self.base_url);
         let resp = match self.post(&url, &body, &[]).await {
-            // models without reasoning effort (e.g. gpt-4.1): drop it and try once more
-            Err(e) if body.get("reasoning_effort").is_some() && format!("{e:#}").contains("reasoning") => {
-                body.as_object_mut().unwrap().remove("reasoning_effort");
+            Err(e) if body.get("reasoning_effort").is_some()
+                && format!("{e:#}").contains("400 Bad Request")
+                && format!("{e:#}").contains("reasoning_effort") => {
+                let why = format!("{e:#}");
+                if why.contains("Function tools") && why.contains("'none'") {
+                    // Omitting effort restores the default reasoning, which still rejects tools.
+                    body["reasoning_effort"] = json!("none");
+                } else {
+                    // Models without reasoning effort (e.g. gpt-4.1) reject the parameter itself.
+                    body.as_object_mut().unwrap().remove("reasoning_effort");
+                }
                 self.post(&url, &body, &[]).await?
             }
             r => r?,
@@ -259,6 +267,115 @@ fn from_response(resp: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Provider;
+
+    async fn send_mock(reply: fn(&Value) -> (u16, Value)) -> (Result<Value>, Vec<Value>) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim(), "POST /v1/chat/completions HTTP/1.1");
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let body = serde_json::from_slice(&bytes).unwrap();
+                let (status, response) = reply(&body);
+                received.lock().unwrap().push(body);
+                let response = response.to_string();
+                let headers = format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len());
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let llm = Llm::new(Provider::OpenAi, url, "test-key".into(), "gpt-6-luna".into(), "high".into());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            llm.send("test", &json!([{ "type": "computer_toolset_20260801" }]), &[json!({ "role": "user", "content": "test" })]),
+        )
+        .await
+        .expect("mock API should finish without transient retries");
+        server.abort();
+        let requests = requests.lock().unwrap().clone();
+        (result, requests)
+    }
+
+    fn completed() -> Value {
+        json!({ "choices": [{ "message": { "content": "done" }, "finish_reason": "stop" }] })
+    }
+
+    #[tokio::test]
+    async fn accepted_reasoning_effort_is_preserved() {
+        let (result, requests) = send_mock(|_| (200, completed())).await;
+        assert!(result.is_ok());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn function_tools_reasoning_error_retries_with_none() {
+        let (result, requests) = send_mock(|body| {
+            if body["reasoning_effort"] == "none" {
+                (200, completed())
+            } else {
+                (400, json!({ "error": {
+                    "message": "Function tools with reasoning_effort are not supported for gpt-6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+                    "type": "invalid_request_error", "param": "reasoning_effort"
+                } }))
+            }
+        }).await;
+        assert_eq!(result.unwrap()["content"][0]["text"], "done");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["reasoning_effort"], "high");
+        assert_eq!(requests[1]["reasoning_effort"], "none");
+        assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        assert_eq!(requests[0]["messages"], requests[1]["messages"]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_effort_parameter_still_retries_without_it() {
+        let (result, requests) = send_mock(|body| {
+            if body.get("reasoning_effort").is_none() {
+                (200, completed())
+            } else {
+                (400, json!({ "error": { "message": "Unsupported parameter: 'reasoning_effort'.", "param": "reasoning_effort" } }))
+            }
+        }).await;
+        assert!(result.is_ok());
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn authentication_error_is_not_retried_as_effort_incompatibility() {
+        let (result, requests) = send_mock(|_| (401, json!({ "error": { "message": "No access to reasoning_effort models" } }))).await;
+        assert!(result.unwrap_err().to_string().contains("401"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unrelated_reasoning_error_is_not_retried() {
+        let (result, requests) = send_mock(|_| (400, json!({ "error": { "message": "Invalid reasoning message in tool history", "param": "messages" } }))).await;
+        assert!(result.unwrap_err().to_string().contains("Invalid reasoning message"));
+        assert_eq!(requests.len(), 1);
+    }
 
     /// A Claude-format conversation converts to OpenAI format, and the reply's computer call
     /// converts back to Claude format.

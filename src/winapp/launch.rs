@@ -470,13 +470,15 @@ fn is_selftest_target(exe: &Path) -> bool {
         && std::env::current_exe().map(|c| paths::same_path(&c, exe)).unwrap_or(false)
 }
 
+const CHILD_SESSION_HINT: &str = "Windows 자식 세션을 사용하세요. 자식 세션 기능을 켜고 GhostDesk 창에서 승인해야 합니다. MCP: desk_open(mode=\"session\").";
+
 /// Errors with a user-facing reason if the target must not be launched.
 pub fn preflight(exe: &Path) -> Result<()> {
     let lower = exe.to_string_lossy().to_lowercase().replace('/', "\\");
     if lower.contains("\\windowsapps\\") {
         bail!(
             "{} 은(는) Microsoft Store(패키지) 앱 또는 그 실행 별칭입니다. 패키지 앱은 실행할 때 시작 화면과 창이 \
-             사용자 화면 앞에 나타나 숨길 수 없어 지원하지 않습니다 — 같은 기능의 일반(Win32) 프로그램을 쓰세요.",
+             사용자 화면 앞에 나타나 이 숨김 앱 모드에서는 지원하지 않습니다. {CHILD_SESSION_HINT}",
             exe.display()
         );
     }
@@ -489,7 +491,7 @@ pub fn preflight(exe: &Path) -> Result<()> {
     if is_alias_redirect(exe) {
         bail!(
             "{} 은(는) 실행하면 Microsoft Store 앱으로 넘어가는 실행 별칭입니다 (Windows 11 의 메모장 등). \
-             스토어 앱은 창이 사용자 화면에 나타나 숨길 수 없어 지원하지 않습니다.",
+             스토어 앱은 창이 사용자 화면에 나타나 이 숨김 앱 모드에서는 지원하지 않습니다. {CHILD_SESSION_HINT}",
             exe.display()
         );
     }
@@ -505,7 +507,7 @@ pub fn preflight(exe: &Path) -> Result<()> {
         if let Some((_, label)) = PACKAGED_STUBS.iter().find(|(n, _)| *n == name) {
             bail!(
                 "{}({name}) 은(는) Microsoft Store 앱({label})을 띄우는 실행기라 지원하지 않습니다 — \
-                 스토어 앱은 창이 사용자 화면에 나타나 숨길 수 없습니다.",
+                 스토어 앱은 창이 사용자 화면에 나타나 숨길 수 없습니다. {CHILD_SESSION_HINT}",
                 exe.display()
             );
         }
@@ -616,6 +618,12 @@ mod tests {
     }
 
     #[test]
+    fn packaged_app_error_explains_child_session() {
+        let e = preflight(Path::new(r"C:\Program Files\WindowsApps\x\y.exe")).unwrap_err().to_string();
+        assert!(e.contains("자식 세션") && e.contains("mode=\"session\"") && e.contains("승인"), "{e}");
+    }
+
+    #[test]
     fn preflight_rules() {
         let sys = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
         // console programs are refused
@@ -624,10 +632,12 @@ mod tests {
         if sys.join(r"System32\calc.exe").is_file() {
             let e = preflight(&sys.join(r"System32\calc.exe")).unwrap_err().to_string();
             assert!(e.contains("계산기"), "{e}");
+            assert!(e.contains("자식 세션") && e.contains("mode=\"session\""), "{e}");
         }
         // execution alias redirects (only when the IFEO filter exists, as on this PC)
         if is_alias_redirect(&sys.join(r"System32\notepad.exe")) {
-            assert!(preflight(&sys.join(r"System32\notepad.exe")).is_err());
+            let e = preflight(&sys.join(r"System32\notepad.exe")).unwrap_err().to_string();
+            assert!(e.contains("자식 세션") && e.contains("mode=\"session\""), "{e}");
         }
         assert!(preflight(Path::new(r"C:\Program Files\WindowsApps\x\y.exe")).is_err());
         // regular Win32 apps pass

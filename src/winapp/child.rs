@@ -22,7 +22,7 @@
 //! via UAC; see [`request_enable`].
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -167,6 +167,9 @@ struct ChildPlatform {
     session: u32,
 }
 
+static QUEUED_INPUT: AtomicU64 = AtomicU64::new(0);
+static OBSERVED_INPUT: AtomicU64 = AtomicU64::new(0);
+
 fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe {
         (
@@ -179,6 +182,12 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
 }
 
 fn send(inputs: &[INPUT]) -> Result<()> {
+    let changes_focus_or_selection = inputs.iter().any(|input| {
+        input.r#type == INPUT_KEYBOARD || (input.r#type == INPUT_MOUSE && unsafe {
+            input.Anonymous.mi.dwFlags & !(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK) != 0
+        })
+    });
+    if changes_focus_or_selection { QUEUED_INPUT.fetch_add(1, Ordering::SeqCst); }
     let n = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
     if n as usize != inputs.len() {
         bail!("SendInput 실패 ({}/{}): {}", n, inputs.len(), std::io::Error::last_os_error());
@@ -227,6 +236,18 @@ fn with_mods(mods: i64, events: Vec<INPUT>) -> Result<()> {
 }
 
 impl ChildPlatform {
+    fn text_target(&self, check: &dyn Fn() -> Result<()>) -> Result<super::w32::Hwnd> {
+        check()?;
+        let target = super::w32::thread_focus(0).map(|(_, h)| h).filter(|h| *h != 0)
+            .ok_or_else(|| anyhow!("입력할 텍스트 칸에 포커스가 없습니다. 입력 칸을 먼저 클릭하세요."))?;
+        let (_, pid) = super::w32::thread_pid(target);
+        let mut target_session = u32::MAX;
+        if unsafe { ProcessIdToSessionId(pid, &mut target_session) } == 0 || target_session != self.session {
+            bail!("입력 대상이 자식 세션에 속하지 않아 입력을 거부합니다");
+        }
+        Ok(target)
+    }
+
     /// Global pixel coordinates → SendInput absolute coordinates (virtual desktop 0..65535).
     fn abs(&self, x: f64, y: f64) -> (i32, i32) {
         let (vx, vy, vw, vh) = virtual_screen();
@@ -241,6 +262,8 @@ impl ChildPlatform {
 }
 
 impl SessionPlatform for ChildPlatform {
+    fn input_epoch(&self) -> u64 { QUEUED_INPUT.load(Ordering::SeqCst) }
+    fn observe_input(&self, epoch: u64) { OBSERVED_INPUT.store(epoch, Ordering::SeqCst); }
     fn name(&self) -> String {
         format!("Windows 자식 세션 {}", self.session)
     }
@@ -357,6 +380,28 @@ impl SessionPlatform for ChildPlatform {
         }
         check()?;
         send(&ev)
+    }
+    fn type_text(&self, text: &str, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        let (text, removed) = super::input::sanitize_text(text);
+        if removed != 0 {
+            bail!("줄바꿈과 탭 이외의 제어 문자는 입력할 수 없습니다");
+        }
+        if text.is_empty() { return Ok(()); }
+        // A synchronous edit must not overtake an earlier queued click or shortcut. Live-view
+        // polling does not count as the agent observing the resulting focus and selection.
+        if QUEUED_INPUT.load(Ordering::SeqCst) != OBSERVED_INPUT.load(Ordering::SeqCst) {
+            return crate::session::type_text_segmented(self, &text, check);
+        }
+        let target = self.text_target(check)?;
+        if super::workspace::is_edit_class(&super::w32::class_name(target)) {
+            // Modern Notepad ignores WM_CHAR line breaks; replace the selection as one edit.
+            check()?;
+            if super::w32::send_str(target, super::w32::EM_REPLACESEL, 1, &text.replace('\n', "\r\n"), 3000).is_none() {
+                bail!("앱이 문자 입력에 응답하지 않습니다. 일부만 입력되었을 수 있으니 내용을 확인하세요.");
+            }
+            return Ok(());
+        }
+        crate::session::type_text_segmented(self, &text, check)
     }
     fn cursor(&self) -> Result<(f64, f64)> {
         let mut p = POINT { x: 0, y: 0 };
@@ -708,6 +753,126 @@ mod rdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run only inside the marked child session: a deliberately slow real EDIT control catches
+    /// replies that acknowledge queued input before the application has actually inserted it.
+    #[tokio::test]
+    #[ignore = "requires the marked Windows child session; never drives the parent desktop"]
+    async fn multiline_text_is_complete_when_rpc_returns() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+        static RECEIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static INSERTED: AtomicBool = AtomicBool::new(false);
+        static KEYUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! { static ORIGINAL: std::cell::Cell<isize> = const { std::cell::Cell::new(0) }; }
+        unsafe extern "system" fn delayed_edit(h: windows_sys::Win32::Foundation::HWND, msg: u32, w: usize, l: isize) -> isize {
+            if msg == WM_CHAR {
+                std::thread::sleep(Duration::from_millis(2));
+                RECEIVED.fetch_add(1, Ordering::SeqCst);
+            }
+            if msg == WM_KEYDOWN {
+                std::thread::sleep(Duration::from_millis(100));
+                if w == 0x41 && GetKeyState(0x11) < 0 {
+                    SendMessageW(h, super::super::w32::EM_SETSEL, 0, -1);
+                    return 0;
+                }
+            }
+            if msg == WM_KEYUP { KEYUPS.fetch_add(1, Ordering::SeqCst); }
+            if msg == super::super::w32::EM_REPLACESEL {
+                std::thread::sleep(Duration::from_millis(100));
+                INSERTED.store(true, Ordering::SeqCst);
+            }
+            let proc: WNDPROC = std::mem::transmute(ORIGINAL.with(|p| p.get()));
+            CallWindowProcW(proc, h, msg, w, l)
+        }
+
+        let me = my_session_id();
+        helper_allowed(read_marker(), me, unsafe { WTSGetActiveConsoleSessionId() }).unwrap();
+        let (ready, window) = std::sync::mpsc::channel();
+        let ui = std::thread::spawn(move || unsafe {
+            let h = CreateWindowExW(
+                0, wide("EDIT").as_ptr(), wide("").as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE as u32 | ES_WANTRETURN as u32 | ES_AUTOVSCROLL as u32,
+                30, 30, 900, 600, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+            );
+            assert!(!h.is_null());
+            ORIGINAL.with(|p| p.set(SetWindowLongPtrW(h, GWLP_WNDPROC, delayed_edit as *const () as isize)));
+            SetForegroundWindow(h);
+            SetFocus(h);
+            ready.send(h as usize).unwrap();
+            let mut msg: MSG = std::mem::zeroed();
+            while IsWindow(h) != 0 && GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        });
+        let h = window.recv_timeout(Duration::from_secs(5)).unwrap();
+        struct Window(usize, Option<std::thread::JoinHandle<()>>);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe { PostMessageW(self.0 as _, WM_CLOSE, 0, 0) };
+                if let Some(t) = self.1.take() { t.join().unwrap(); }
+            }
+        }
+        let _window = Window(h, Some(ui));
+        assert_eq!(unsafe { GetForegroundWindow() } as usize, h, "test window did not receive foreground focus");
+
+        let ep = Endpoint::custom(&format!("ghostdesk-child-input-test-{}", std::process::id()));
+        let cfg = ServerConfig { allow_uids: vec![], allow_on_console: false, label: "input-test".into(), log: Arc::new(|_| {}) };
+        let srv = crate::session::spawn_server(
+            crate::session::HelperListener::bind(&ep).await.unwrap(), Arc::new(ChildPlatform { session: me }), cfg,
+        );
+        let (rd, mut wr) = crate::platform::ipc::connect(&ep).await.unwrap();
+        let mut rd = BufReader::new(rd);
+        let text = format!("{}끝👋", "재용머니 파산 👋\r\n둘째\t줄\n\n".repeat(130));
+        let request = serde_json::json!({"id":1,"op":"type","text":text});
+        wr.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        let mut response = String::new();
+        rd.read_line(&mut response).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        let actual = super::super::w32::control_text(h as _).unwrap();
+        // Keep focus on this test window until old queued input is drained, even on a red run.
+        let expected = text.replace("\r\n", "\n");
+        let end = Instant::now() + Duration::from_secs(30);
+        while !INSERTED.load(Ordering::SeqCst) && RECEIVED.load(Ordering::SeqCst) < expected.encode_utf16().count() && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let actual = actual.replace("\r\n", "\n");
+        assert!(actual == expected, "text was incomplete or reordered at RPC completion: actual {} chars, expected {}", actual.chars().count(), expected.chars().count());
+
+        for request in [serde_json::json!({"id":2,"op":"key","combo":"ctrl+a"}), serde_json::json!({"id":3,"op":"type","text":"새 글"})] {
+            wr.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+            let mut line = String::new();
+            rd.read_line(&mut line).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+        }
+        let mut replaced = super::super::w32::control_text(h as _).unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while (KEYUPS.load(Ordering::SeqCst) < 2 || replaced != "새 글") && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            replaced = super::super::w32::control_text(h as _).unwrap();
+        }
+        assert_eq!(replaced, "새 글", "queued Ctrl+A must be applied before typing replacement text");
+        for request in [
+            serde_json::json!({"id":4,"op":"screenshot","max_long_edge":8,"format":"png","observe_input":true}),
+            serde_json::json!({"id":5,"op":"pointer","action":"move","x":30,"y":30,"fw":1280,"fh":800}),
+            serde_json::json!({"id":6,"op":"type","text":" 확인"}),
+        ] {
+            wr.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+            let mut line = String::new();
+            rd.read_line(&mut line).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+        }
+        let after_observation = super::super::w32::control_text(h as _).unwrap();
+        wr.shutdown().await.unwrap();
+        srv.stop().await;
+        assert_eq!(after_observation, "새 글 확인", "observed typing must stay synchronous after a canary mouse move");
+    }
 
     #[test]
     fn helper_runs_only_in_marked_child_session() {

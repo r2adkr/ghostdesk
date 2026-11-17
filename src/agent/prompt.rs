@@ -43,6 +43,13 @@ const ENV_SESSION: &str = r#"Environment
 - If an action fails because the agent session is currently shown on the physical monitor, wait and retry later: the human is looking at it, so input is paused. If Events says the connection was re-established, take a screenshot to check whether your last input was applied before repeating it.
 - Typing supports Korean directly. Keys use xdotool names ('cmd+c', 'Return'); 'Delete' is forward delete, use 'BackSpace' to delete backwards."#;
 
+const ENV_CHILD_SESSION: &str = r#"Environment
+- You control a separate Windows child session on the same PC and same Windows account. Its whole desktop, Start menu, taskbar and alt+tab are yours; your input stays in that session. Coordinates are screenshot pixels.
+- You share the human's files and installed apps. Existing logins may be available, but an app or browser profile already open in the human's session may be locked. Do not overwrite shared files or use accounts beyond the task's authorization.
+- Keys use ctrl-based Windows shortcuts and xdotool names such as 'ctrl+a', 'super+r', 'Return' and 'BackSpace'. Microsoft Store apps such as the new Notepad can run here.
+- Before typing long text, visually confirm the field's focus and selection in a screenshot, then type in a separate turn. Do not batch focus-changing clicks or shortcuts with long text. Native Edit/RichEdit fields insert the text synchronously after that observation; other controls and unobserved batches use queued input, so inspect the result before saving or submitting.
+- If Events reports a reconnection, inspect a screenshot before repeating input. If input is refused because this session is on the physical monitor, wait for the human to return to their own session."#;
+
 const RULES: &str = r#"Rules
 - Use `ask_user` before anything irreversible or outward-facing (sending messages/emails, posting, purchases, payments, deleting data, accepting terms, changing account or security settings) unless the task explicitly authorizes that exact action.
 - Never type passwords, card numbers, or other credentials unless the human supplied them in this conversation for this purpose. If a login is missing, ask the human.
@@ -83,7 +90,7 @@ fn env_electron_pc() -> String {
 
 /// The Environment section for a screen type. On macOS this is the original text; elsewhere it
 /// describes that OS's shortcuts and screen setup. Remote, separate-session and virtual-display
-/// screens are the same on every OS (they describe the other machine or are macOS-only).
+/// screens describe the other machine; Windows child sessions share the current account.
 fn env_section(kind: DeskKind) -> Cow<'static, str> {
     let mac = cfg!(target_os = "macos");
     match kind {
@@ -95,6 +102,7 @@ fn env_section(kind: DeskKind) -> Cow<'static, str> {
         // local-app backends differ per OS, so the backend supplies the text (None = the macOS text)
         DeskKind::Native => Cow::Borrowed(crate::native::env_prompt().unwrap_or(ENV_NATIVE)),
         DeskKind::VDisplay => Cow::Borrowed(crate::vdisplay::ENV_VDISPLAY),
+        DeskKind::Session if cfg!(windows) => Cow::Borrowed(ENV_CHILD_SESSION),
         DeskKind::Session => Cow::Borrowed(ENV_SESSION),
     }
 }
@@ -142,7 +150,14 @@ mod tests {
         }
         // OS-independent screens always get the same text
         assert!(system_prompt(DeskKind::Remote).contains(ENV_REMOTE));
-        assert!(system_prompt(DeskKind::Session).contains(ENV_SESSION));
+        if cfg!(windows) {
+            let p = system_prompt(DeskKind::Session);
+            assert!(p.contains("same Windows account") && p.contains("share the human's files"), "{p}");
+            assert!(p.contains("focus and selection") && p.contains("separate turn"), "{p}");
+            assert!(!p.contains("macOS login session"), "{p}");
+        } else {
+            assert!(system_prompt(DeskKind::Session).contains(ENV_SESSION));
+        }
         assert!(system_prompt(DeskKind::VDisplay).contains(crate::vdisplay::ENV_VDISPLAY));
         // local apps get the OS backend's text (or the macOS one)
         assert!(system_prompt(DeskKind::Native).contains(crate::native::env_prompt().unwrap_or(ENV_NATIVE)));

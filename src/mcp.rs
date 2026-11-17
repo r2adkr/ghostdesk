@@ -82,7 +82,7 @@ impl Plat {
         local_apps: text::LOCAL_APPS,
         primary_mod: text::PRIMARY_MOD,
         app_hint: if cfg!(windows) {
-            "app: 앱 이름(예: 'Visual Studio Code', '카카오톡', 'Character Map'), 실행 파일 이름(예: 'charmap') 또는 .exe/.lnk 경로. 일반 Win32 데스크톱 앱만 된다 (Microsoft Store 앱·Windows 11 의 새 메모장/계산기, 콘솔 프로그램, 관리자 권한 앱은 안 됨)"
+            "app: 앱 이름(예: 'Visual Studio Code', '카카오톡', 'Character Map'), 실행 파일 이름(예: 'charmap') 또는 .exe/.lnk 경로. 일반 Win32 데스크톱 앱만 된다 (콘솔 프로그램, 관리자 권한 앱은 안 됨). Microsoft Store 앱·Windows 11 의 새 메모장/계산기는 mode=session 인 자식 세션을 사용한다 (기능 켜기·승인 필요)"
         } else {
             "app: 앱 이름(예: 'TextEdit', '계산기'), 번들 id 또는 .app 경로"
         },
@@ -164,6 +164,11 @@ fn modes(pl: &Plat) -> Vec<(&'static str, String)> {
 fn server_instructions_for(pl: &Plat) -> String {
     let apps = pl.local_apps;
     let app_tools = if pl.app_kind { format!(", {apps}은 desk_app 으로 메뉴·접근성 요소를") } else { String::new() };
+    let child_session_hint = if pl.child_session {
+        " Windows 의 새 메모장·계산기 같은 Microsoft Store 앱은 session 으로 여세요 (자식 세션 기능 켜기·GhostDesk 창에서 승인 필요)."
+    } else {
+        ""
+    };
     // agents pick the mode themselves to fit the task (without asking the user first); sensitive
     // modes are guarded by the approval dialog in the GhostDesk window. If the user didn't mention
     // GhostDesk but it suits the task, ask once whether to use it. The mode list lives only in
@@ -174,7 +179,7 @@ fn server_instructions_for(pl: &Plat) -> String {
          파일·명령어·API 로 끝낼 수 있는 일에는 묻지 마세요. 같은 대화에서 이미 답을 들었으면 다시 묻지 말고 그 답을 따르세요. \
          사용자가 'GhostDesk 로', '고스트데스크에서', '내 화면 건드리지 말고' 같은 말로 작업을 맡기면, 사용자에게 모드를 묻지 말고 desk_open 의 mode 목록에서 할 일에 가장 알맞은 것을 스스로 골라 바로 desk_open 하세요. \
          고르는 기준: 웹사이트에서 할 일이면 web, 그중 내 로그인(메일·쇼핑·SNS 계정 등)이 필요하면 web_login, 이 컴퓨터의 특정 앱에서 할 일이면 app, \
-         그 앱에 이미 로그인된 상태가 필요하면 app_login. 사용자가 모드를 말했으면 그것을 쓰세요. 로그인 복제·실행 중인 앱·원격 접속 같은 모드는 \
+         그 앱에 이미 로그인된 상태가 필요하면 app_login.{child_session_hint} 사용자가 모드를 말했으면 그것을 쓰세요. 로그인 복제·실행 중인 앱·원격 접속 같은 모드는 \
          GhostDesk 창에서 사용자가 승인하므로 따로 묻지 않아도 됩니다. desk_open(mode) → desk_action/desk_browser/desk_app 반복 → 결과 보고 → desk_close 로 끝까지 진행하세요. \
          고른 모드가 실패하거나 승인이 거절되면 이유를 짧게 알리고, 더 알맞은 다른 모드가 있으면 그것으로 다시 시도하세요 (같은 승인을 되풀이해 요청하지는 마세요). \
          화면은 사용자의 화면·마우스·키보드와 분리되어 있고, 동작마다 스크린샷이 돌아옵니다. 좌표는 최신 스크린샷의 픽셀입니다. 브라우저는 desk_browser 로 URL·탭을{app_tools} 다룹니다. \
@@ -188,6 +193,9 @@ pub(crate) fn tools() -> Value {
 
 fn tools_for(pl: &Plat) -> Value {
     let apps = pl.local_apps;
+    let child_type_hint = if pl.child_session {
+        " Windows 자식 세션에서 긴 글을 쓸 때는 입력 칸의 포커스·선택 상태를 스크린샷으로 확인한 뒤 다음 호출에서 type 하세요. 포커스를 바꾸는 키·클릭과 긴 글 입력은 묶지 마세요."
+    } else { "" };
     let modes = modes(pl);
     let names: Vec<&str> = modes.iter().map(|(n, _)| *n).collect();
     let mode_desc = modes.iter().map(|(n, d)| format!("{n}={d}")).collect::<Vec<_>>().join("; ");
@@ -220,7 +228,7 @@ fn tools_for(pl: &Plat) -> Value {
             "description": format!("화면에서 마우스/키보드 동작을 한다 (Claude computer-use 와 같은 동작 이름). action: screenshot, left_click, right_click, middle_click, double_click, triple_click, left_click_drag(start_coordinate→coordinate), mouse_move, left_mouse_down, left_mouse_up, scroll(scroll_direction up/down/left/right, scroll_amount), type(text, 한글 가능), key(text: 'Return', '{}+a', 'ctrl+shift+t'; repeat), hold_key(text, duration), wait(duration), zoom(region [x0,y0,x1,y1]), cursor_position. 동작 뒤 스크린샷을 돌려준다. \
                  여러 동작을 한 번에: action 대신 actions 에 동작 객체 배열을 넣으면 순서대로 실행하고 끝에 스크린샷 한 장만 돌려준다 \
                  (예: [{{\"action\":\"left_click\",\"coordinate\":[400,300]}},{{\"action\":\"type\",\"text\":\"서울 날씨\"}},{{\"action\":\"key\",\"text\":\"Return\"}}]). \
-                 결과를 보고 판단해야 하는 지점에서는 묶음을 끊으세요. 하나가 실패하면 거기서 멈추고 몇 번째까지 했는지 알려 준다 (최대 50개).", pl.primary_mod),
+                 결과를 보고 판단해야 하는 지점에서는 묶음을 끊으세요.{child_type_hint} 하나가 실패하면 거기서 멈추고 몇 번째까지 했는지 알려 준다 (최대 50개).", pl.primary_mod),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1081,6 +1089,8 @@ mod tests {
             let app = props["app"]["description"].as_str().unwrap();
             // example app names must be findable by their Start menu shortcut (.lnk) names
             assert!(app.contains(".exe") && app.contains("'Character Map'") && !app.contains("문자표"), "{app}");
+            assert!(app.contains("자식 세션") && app.contains("session"), "{app}");
+            assert!(ins.contains("메모장") && ins.contains("session"), "{ins}");
         }
         if !cfg!(target_os = "macos") {
             // it also lifts the protection for this computer's own VNC server, so it says to set it only when

@@ -149,6 +149,13 @@ pub trait SessionPlatform: Send + Sync + 'static {
     fn key(&self, combo: &str, hold: Duration, check: &dyn Fn() -> Result<()>) -> Result<()>;
     /// Unicode text (Korean included; the server turns newlines and tabs into keys).
     fn type_unicode(&self, text: &str, check: &dyn Fn() -> Result<()>) -> Result<()>;
+    /// Inserts a text request; platforms may keep line breaks in the same synchronous path.
+    fn type_text(&self, text: &str, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        type_text_segmented(self, text, check)
+    }
+    /// A screenshot can acknowledge only the input generation it started with.
+    fn input_epoch(&self) -> u64 { 0 }
+    fn observe_input(&self, _epoch: u64) {}
     /// Current cursor position (global points).
     fn cursor(&self) -> Result<(f64, f64)>;
     /// Whether this session is currently on the physical display (console session).
@@ -441,6 +448,17 @@ enum Seg {
     Key(&'static str),
 }
 
+pub(crate) fn type_text_segmented<P: SessionPlatform + ?Sized>(platform: &P, text: &str, check: &dyn Fn() -> Result<()>) -> Result<()> {
+    for seg in split_text(text) {
+        check()?;
+        match seg {
+            Seg::Text(t) => platform.type_unicode(&t, check)?,
+            Seg::Key(k) => platform.key(k, Duration::ZERO, check)?,
+        }
+    }
+    Ok(())
+}
+
 fn split_text(text: &str) -> Vec<Seg> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -636,8 +654,10 @@ impl Server {
                 let max = uint_or(v, "max_long_edge", DEFAULT_MAX_LONG_EDGE as u64) as u32;
                 let jpeg = v["format"].as_str() == Some("jpeg");
                 let quality = uint_or(v, "quality", 70) as u8;
+                let observe_input = v["observe_input"] == true;
                 let (bytes, w, h, cur) = self
                     .guarded(move |p, check| {
+                        let epoch = p.input_epoch();
                         let img = p.capture(max)?;
                         let (w, h) = img.dimensions();
                         let bytes = if jpeg { encode_jpeg(&img, quality)? } else { encode_png(&img)? };
@@ -646,6 +666,7 @@ impl Server {
                             _ => None,
                         };
                         check()?;
+                        if observe_input { p.observe_input(epoch); }
                         Ok((bytes, w, h, cur))
                     })
                     .await?;
@@ -801,17 +822,7 @@ impl Server {
                 self.gate()?;
                 let text = v["text"].as_str().ok_or_else(|| anyhow!("'text' 가 필요합니다"))?.to_string();
                 let _g = self.input_lock.lock().await;
-                self.guarded(move |p, check| {
-                    for seg in split_text(&text) {
-                        check()?;
-                        match seg {
-                            Seg::Text(t) => p.type_unicode(&t, check)?,
-                            Seg::Key(k) => p.key(k, Duration::ZERO, check)?,
-                        }
-                    }
-                    Ok(())
-                })
-                .await?;
+                self.guarded(move |p, check| p.type_text(&text, check)).await?;
                 Ok(json!({}))
             }
             "cursor" => {
@@ -1516,7 +1527,7 @@ impl SessionDesk {
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
         let r = self
             .call(
-                json!({"op": "screenshot", "max_long_edge": self.opts.max_long_edge, "format": "png"}),
+                json!({"op": "screenshot", "max_long_edge": self.opts.max_long_edge, "format": "png", "observe_input": true}),
                 true,
                 Duration::from_secs(20),
             )
@@ -2020,6 +2031,8 @@ struct MockPlatform {
     events: Mutex<Vec<String>>,
     console: AtomicBool,
     #[cfg(test)]
+    observations: AtomicU64,
+    #[cfg(test)]
     console_after_input: AtomicBool,
     cursor: Mutex<(f64, f64)>,
 }
@@ -2034,6 +2047,8 @@ impl MockPlatform {
             disp: DisplayInfo { origin_x: 0.0, origin_y: 0.0, width_pt: 1512.0, height_pt: 982.0, scale: 2.0 },
             events: Mutex::new(Vec::new()),
             console: AtomicBool::new(false),
+            #[cfg(test)]
+            observations: AtomicU64::new(0),
             #[cfg(test)]
             console_after_input: AtomicBool::new(false),
             cursor: Mutex::new((10.0, 10.0)),
@@ -2052,6 +2067,10 @@ impl MockPlatform {
 }
 
 impl SessionPlatform for MockPlatform {
+    #[cfg(test)]
+    fn observe_input(&self, _epoch: u64) {
+        self.observations.fetch_add(1, Ordering::SeqCst);
+    }
     fn name(&self) -> String {
         "mock".into()
     }
@@ -2537,6 +2556,18 @@ mod safety_tests {
             cfg: ServerConfig { allow_uids: vec![], allow_on_console: false, label: "test".into(), log: quiet_log("test") },
             input_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn only_explicit_agent_screenshots_observe_input() {
+        let mock = Arc::new(MockPlatform::new());
+        let srv = server(mock.clone());
+        srv.dispatch(&json!({"op":"screenshot", "max_long_edge":8, "format":"jpeg"}), &mut ConnState::default()).await.unwrap();
+        assert_eq!(mock.observations.load(Ordering::SeqCst), 0);
+        srv.dispatch(&json!({"op":"screenshot", "max_long_edge":8, "format":"png", "observe_input":true}), &mut ConnState::default()).await.unwrap();
+        assert_eq!(mock.observations.load(Ordering::SeqCst), 1);
+        srv.dispatch(&json!({"op":"screenshot", "max_long_edge":8, "format":"jpeg"}), &mut ConnState::default()).await.unwrap();
+        assert_eq!(mock.observations.load(Ordering::SeqCst), 1, "live view must not acknowledge queued input");
     }
 
     #[tokio::test]
