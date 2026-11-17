@@ -280,6 +280,7 @@ fn info_plist() -> String {
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleAllowMixedLocalizations</key><true/>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 </dict></plist>
 "#
     )
@@ -415,6 +416,10 @@ fn signing_keychain() -> Option<PathBuf> {
     Some(kc)
 }
 
+/// The macOS app icon, put into every bundle `build_bundle` makes.
+#[cfg(not(windows))]
+const APP_ICON: &[u8] = include_bytes!("../packaging/macos/AppIcon.icns");
+
 /// Builds a fresh GhostDesk.app bundle at `dest` from the single executable `exe` (Info.plist,
 /// executable, source fingerprint, signature).
 ///
@@ -425,6 +430,9 @@ pub fn build_bundle(exe: &Path, dest: &Path, local: bool) -> Result<()> {
     let macos = dest.join("Contents/MacOS");
     std::fs::create_dir_all(&macos)?;
     std::fs::write(dest.join("Contents/Info.plist"), info_plist())?;
+    // app icon (drawn by packaging/macos/make-art.swift)
+    std::fs::create_dir_all(dest.join("Contents/Resources"))?;
+    std::fs::write(dest.join("Contents/Resources/AppIcon.icns"), APP_ICON)?;
     std::fs::copy(exe, macos.join("ghostdesk")).with_context(|| format!("{} 를 복사하지 못했습니다", exe.display()))?;
     seal_bundle(dest, sha256_file(exe).ok().as_deref(), local)
 }

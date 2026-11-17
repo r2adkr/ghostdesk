@@ -64,7 +64,26 @@ impl GhostApp {
                 self.model_picker(ui);
             });
             ui.add_space(4.0);
-            ui.label(theme::hint(tr("Enter로 시작 · Shift+Enter로 줄바꿈")));
+            // shortcuts as keycaps: Enter starts, Shift+Enter adds a line
+            // (centered with last frame's width, since the labels differ per language)
+            let wid = ui.id().with("shortcut_hint_w");
+            let last_w: f32 = ui.data(|d| d.get_temp(wid)).unwrap_or(0.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_space(((ui.available_width() - last_w) / 2.0).max(0.0));
+                let start = ui.cursor().left();
+                theme::keycap(ui, "Enter");
+                ui.label(theme::hint(tr("바로 시작")));
+                ui.add_space(10.0);
+                theme::keycap(ui, "Shift");
+                theme::keycap(ui, "Enter");
+                let end = ui.label(theme::hint(tr("줄바꿈"))).rect.right();
+                let w = end - start;
+                if (w - last_w).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(wid, w));
+                    ui.ctx().request_repaint();
+                }
+            });
             if submit {
                 self.open_wizard();
             }

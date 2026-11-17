@@ -90,6 +90,8 @@ impl GhostApp {
                     theme::card_frame().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
+                            // every row as tall as one with a button, so the list has one rhythm
+                            ui.set_min_height(32.0);
                             ui.label(RichText::new(c.client.name()).strong().color(theme::text()));
                             let (txt, col) = match (&c.registered, c.installed) {
                                 (Some(_), _) if ok => (tr("연결됨"), theme::success()),

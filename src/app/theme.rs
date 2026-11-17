@@ -565,7 +565,8 @@ pub fn dot(ui: &mut egui::Ui, color: Color32, radius: f32) -> Response {
     resp
 }
 
-/// Status chip: ● text in a lightly tinted pill. The dot and text are one text run, so it looks
+/// Status: a small dot and the text in the status color, without a pill around it (a status reads
+/// as quiet text next to a name, not as a badge). The dot and text are one text run, so it looks
 /// the same regardless of the surrounding layout direction.
 pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
     let fmt = |size: f32| egui::TextFormat {
@@ -577,30 +578,25 @@ pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
     let mut job = egui::text::LayoutJob::default();
     job.append("● ", 0.0, fmt(9.0));
     job.append(text, 0.0, fmt(12.0));
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.14))
-        .corner_radius(255)
-        .inner_margin(Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(job).truncate().selectable(false));
-        })
-        .response
+    ui.add(egui::Label::new(job).truncate().selectable(false))
 }
 
-/// Small count badge (e.g. the number next to "Agents" in the sidebar). Draws a pill sized to the
-/// text, vertically centered in the row.
-///
-/// Wrapping it in a Frame would stretch it to the row's height, so it's sized and painted by
-/// hand.
+/// Small count next to a section label (e.g. "Agents 3" in the sidebar): quiet muted figures,
+/// not a pill.
 pub fn count_badge(ui: &mut egui::Ui, text: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(11.0), muted());
-    let pad = Vec2::new(6.0, 2.0);
-    let h = galley.size().y + pad.y * 2.0;
-    let size = Vec2::new((galley.size().x + pad.x * 2.0).max(h), h);
+    ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0).color(muted())).selectable(false))
+}
+
+/// A key on the keyboard drawn as a small keycap (shortcut hints like Enter, Shift).
+pub fn keycap(ui: &mut egui::Ui, key: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(key.to_string(), FontId::proportional(11.0), body());
+    let size = Vec2::new((galley.size().x + 12.0).max(20.0), 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, 255, card());
-    p.galley(rect.center() - galley.size() / 2.0, galley, muted());
+    p.rect(rect, 4, card(), Stroke::new(1.0, border()), StrokeKind::Inside);
+    // a slightly heavier bottom edge, like a real key
+    p.line_segment([rect.left_bottom() + Vec2::new(3.0, -0.5), rect.right_bottom() + Vec2::new(-3.0, -0.5)], Stroke::new(1.0, border_hover()));
+    p.galley(rect.center() - galley.size() / 2.0, galley, body());
     resp
 }
 

@@ -57,10 +57,14 @@ jobs:
           lipo -create -output ghostdesk-universal \
             target/aarch64-apple-darwin/release/ghostdesk target/x86_64-apple-darwin/release/ghostdesk
           ./ghostdesk-universal --package-macos ghostdesk-universal "dist/GhostDesk-$version-macos-universal.zip"
-          # first-install disk image: opening the app from it installs into ~/Applications (install.rs take_over_install)
+          # first-install disk image: GhostDesk.app and an Applications shortcut over the background from
+          # packaging/macos (make-art.swift). Dragging it or opening it from there both install into
+          # ~/Applications (install.rs take_over_install).
           mkdir dmgroot
           ditto -x -k "dist/GhostDesk-$version-macos-universal.zip" dmgroot
-          hdiutil create -volname GhostDesk -srcfolder dmgroot -ov -format UDZO "dist/GhostDesk-$version-macos-universal.dmg"
+          python3 -m venv .dmgbuild && .dmgbuild/bin/pip install --quiet "dmgbuild==1.6.5"
+          .dmgbuild/bin/dmgbuild -s packaging/macos/dmg_settings.py -D app=dmgroot/GhostDesk.app \
+            GhostDesk "dist/GhostDesk-$version-macos-universal.dmg"
 
       - uses: actions/upload-artifact@v4
         with:

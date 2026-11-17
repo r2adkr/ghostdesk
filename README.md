@@ -467,6 +467,7 @@ cargo test
 | `src/kit.rs` | Connection kit for unlisted apps (MCP config, skill, plugin; the skill is generated from the instructions and tool list in `mcp.rs`) |
 | `src/llm.rs` | Claude, OpenAI-compatible, Gemini and other AI APIs |
 | `assets/tour/` | App screenshots used by the guide and this README (the app captures its own window) |
+| `packaging/macos/` | App icon and the .dmg window (background, layout); `swift packaging/macos/make-art.swift` redraws the art |
 | `src/licenses.rs`, `assets/third-party-licenses.json` | License page in Settings → About: GhostDesk's license and every open-source package built in |
 
 ## License
