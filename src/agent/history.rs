@@ -21,6 +21,10 @@ const KEEP_IMAGES: usize = 3;
 /// KEEP_IMAGES + PRUNE_CHUNK 장이 쌓였을 때 한꺼번에 덜어 낸다.
 const PRUNE_CHUNK: usize = 3;
 const PRUNED_IMAGE: &str = "(older screenshot removed)";
+/// 직접 지운 오래된 도구 결과 자리에 남기는 글
+const CLEARED_RESULT: &str = "(older tool result cleared to save context)";
+/// 서버가 오래된 도구 결과를 지워 주지 않는 회사에서, 직전 입력 토큰이 이보다 많으면 직접 지운다 (Claude 서버와 같은 기준)
+pub(super) const CLEAR_TOOL_RESULTS_AT: u64 = crate::llm::CLEAR_TOOL_USES_AT;
 const SAME_SCREEN: &str = "(screen unchanged since the previous screenshot)";
 /// 스크린샷의 JPEG 품질 (PNG 보다 몇 배 작아 업로드·메모리가 준다. 토큰은 픽셀 수로 정해지므로 같다)
 const JPEG_QUALITY: u8 = 80;
@@ -169,6 +173,39 @@ pub(super) fn prune_images(messages: &mut [Value]) -> usize {
     freed
 }
 
+/// 최근 `keep` 개를 뺀 도구 결과의 글을 짧은 표시로 바꾼다 (이미지는 `prune_images` 가 따로 맡는다).
+/// 서버가 이 일을 해 주지 않는 회사(Claude 밖)용이다. 대화 앞부분이 바뀌면 프롬프트 캐시가 깨지므로
+/// 매 턴이 아니라 기록이 `CLEAR_TOOL_RESULTS_AT` 을 넘었을 때만 한꺼번에 부른다. 줄어든 바이트 수(대략)를 돌려준다.
+pub(super) fn clear_old_tool_results(messages: &mut [Value], keep: usize) -> usize {
+    let is_result = |b: &Value| b["type"] == "tool_result";
+    let total = messages.iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| is_result(b)).count();
+    let mut left = total.saturating_sub(keep);
+    let mut freed = 0;
+    for b in messages.iter_mut().flat_map(|m| m["content"].as_array_mut().into_iter().flatten()) {
+        if left == 0 {
+            break;
+        }
+        if !is_result(b) {
+            continue;
+        }
+        left -= 1;
+        match &mut b["content"] {
+            Value::String(t) if t != CLEARED_RESULT => {
+                freed += t.len();
+                *t = CLEARED_RESULT.into();
+            }
+            Value::Array(parts) => {
+                for c in parts.iter_mut().filter(|c| c["type"] == "text" && c["text"] != CLEARED_RESULT) {
+                    freed += c["text"].as_str().map_or(0, str::len);
+                    *c = json!({ "type": "text", "text": CLEARED_RESULT });
+                }
+            }
+            _ => {}
+        }
+    }
+    freed
+}
+
 /// 이전에 보낸 것과 같은 내용(화면·창 목록)을 다시 보내지 않게 기억한다.
 /// 모델이 그 내용을 아직 볼 수 있을 때만 생략한다: 최근 도구 호출 `KEEP_TOOL_USES` 개 밖으로 밀려나면
 /// 서버 측 정리(Claude)로 지워질 수 있으므로 다시 보낸다. 새 대화 구간에서는 새로 만든다.
@@ -230,6 +267,25 @@ mod tests {
         let mut out = std::io::Cursor::new(Vec::new());
         img.write_to(&mut out, image::ImageFormat::Png).unwrap();
         out.into_inner()
+    }
+
+    #[test]
+    fn old_tool_results_are_cleared_but_recent_ones_stay() {
+        let result = |i: usize| json!({ "type": "tool_result", "tool_use_id": format!("t{i}"), "content": [{ "type": "text", "text": format!("long output {i}") }] });
+        let mut messages: Vec<Value> = (0..5).map(|i| json!({ "role": "user", "content": [result(i)] })).collect();
+        messages[0]["content"][0]["content"] = json!("plain string result");
+        let freed = clear_old_tool_results(&mut messages, 2);
+        assert!(freed > 0);
+        assert_eq!(messages[0]["content"][0]["content"], CLEARED_RESULT);
+        for m in &messages[1..3] {
+            assert_eq!(m["content"][0]["content"][0]["text"], CLEARED_RESULT);
+        }
+        for (i, m) in messages.iter().enumerate().skip(3) {
+            assert_eq!(m["content"][0]["content"][0]["text"], format!("long output {i}"), "최근 결과는 그대로");
+        }
+        // tool_use_id 는 남아 짝이 맞는다. 다시 불러도 더 줄 것이 없다
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "t1");
+        assert_eq!(clear_old_tool_results(&mut messages, 2), 0);
     }
 
     #[test]

@@ -13,6 +13,8 @@ use super::Llm;
 
 /// 서버 측 정리가 결과를 남겨 두는 최근 도구 호출 수. 에이전트는 이 범위 안에서만 같은 화면을 다시 보내지 않는다.
 pub(crate) const KEEP_TOOL_USES: usize = 6;
+/// 입력 토큰이 이만큼 쌓이면 오래된 도구 결과를 지운다 (Claude 는 서버가, 다른 회사는 `agent::history` 가 직접)
+pub(crate) const CLEAR_TOOL_USES_AT: u64 = 60_000;
 
 impl Llm {
     pub(super) async fn send_anthropic(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
@@ -29,7 +31,7 @@ impl Llm {
             "context_management": {
                 "edits": [{
                     "type": "clear_tool_uses_20250919",
-                    "trigger": { "type": "input_tokens", "value": 60000 },
+                    "trigger": { "type": "input_tokens", "value": CLEAR_TOOL_USES_AT },
                     "keep": { "type": "tool_uses", "value": KEEP_TOOL_USES },
                     "clear_at_least": { "type": "input_tokens", "value": 10000 }
                 }]

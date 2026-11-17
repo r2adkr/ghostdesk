@@ -84,17 +84,27 @@ pub(super) fn humanize_error(s: &str) -> String {
     }
 }
 
-/// 생각 깊이 표시 (API 값은 그대로 괄호 안에)
-pub(super) fn effort_label(e: &str) -> String {
-    let ko = match e {
+/// 생각 깊이의 짧은 이름 (모델 단추처럼 좁은 곳)
+pub(super) fn effort_short(e: &str) -> String {
+    match e {
         "low" => tr("낮음"),
         "medium" => tr("보통"),
         "high" => tr("높음"),
         "xhigh" => tr("매우 높음"),
         "max" => tr("최대"),
-        _ => return e.to_string(),
-    };
-    format!("{ko} ({e})")
+        _ => e,
+    }
+    .to_string()
+}
+
+/// 생각 깊이 표시 (API 값은 그대로 괄호 안에)
+pub(super) fn effort_label(e: &str) -> String {
+    let short = effort_short(e);
+    if short == e {
+        short
+    } else {
+        format!("{short} ({e})")
+    }
 }
 
 /// 브라우저 프로필 표시 이름에서 계정 주소 부분 '(…@…)' 을 뗀다

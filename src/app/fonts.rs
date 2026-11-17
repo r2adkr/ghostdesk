@@ -85,15 +85,33 @@ pub(super) fn lang_font_candidates(lang: Lang) -> Vec<std::path::PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
 }
 
+/// 글꼴 파일을 메모리 맵으로 연다. 통째로 읽으면 macOS 한글 글꼴(여러 굵기가 든 .ttc, 약 55MB)이
+/// 그대로 힙에 올라가지만, 맵으로 열면 실제로 그린 글자의 쪽만 올라오고 그마저 운영체제가 언제든 회수할 수 있다.
+/// 한 번 연 파일은 프로그램이 끝날 때까지 맵을 유지하고 다시 쓴다 (언어를 바꿔 글꼴을 다시 등록해도 새로 열지 않음).
+fn map_font(path: &std::path::Path) -> Option<&'static [u8]> {
+    static OPEN: parking_lot::Mutex<Vec<(std::path::PathBuf, &'static [u8])>> = parking_lot::Mutex::new(Vec::new());
+    let mut open = OPEN.lock();
+    if let Some((_, bytes)) = open.iter().find(|(p, _)| p == path) {
+        return Some(bytes);
+    }
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: 시스템 글꼴 폴더의 파일이라 실행 중에 잘리거나 바뀌지 않는다 (macOS 는 시스템 볼륨이 읽기 전용,
+    // Windows 는 맵을 연 파일을 지우거나 줄일 수 없다). 맵은 일부러 놓지 않아 'static 으로 쓴다.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let bytes: &'static [u8] = Box::leak(Box::new(map));
+    open.push((path.to_path_buf(), bytes));
+    Some(bytes)
+}
+
 /// 글꼴을 등록한다. 켤 때와 언어를 바꿀 때 부른다.
 pub(super) fn setup_fonts(ctx: &egui::Context, lang: Lang) {
     let mut fonts = egui::FontDefinitions::default();
     // 앞에 둘수록 먼저 쓰인다: (일본어·중국어 글꼴) → 한글 글꼴 → egui 기본 글꼴.
     // 일본어·중국어는 같은 한자도 모양이 달라 그 언어 글꼴을 한글 글꼴보다 앞에 둔다.
-    let first = |c: Vec<std::path::PathBuf>| c.into_iter().find_map(|p| std::fs::read(p).ok());
+    let first = |c: Vec<std::path::PathBuf>| c.into_iter().find_map(|p| map_font(&p));
     for (name, bytes) in [("lang", first(lang_font_candidates(lang))), ("korean", first(font_candidates()))].into_iter().rev() {
         let Some(bytes) = bytes else { continue };
-        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
         // 본문 글꼴은 시스템 글꼴(맑은 고딕·Apple SD 산돌고딕 Neo 등)을 맨 앞에 두어 영문·한글 모양을 맞춘다.
         // 고정폭 글꼴은 기존 글꼴을 쓰고 한글·한자만 이 글꼴로 채운다.
         fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, name.into());

@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
-pub(crate) use anthropic::KEEP_TOOL_USES;
+pub(crate) use anthropic::{CLEAR_TOOL_USES_AT, KEEP_TOOL_USES};
 pub use provider::Provider;
 
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -147,31 +147,42 @@ fn auth(req: reqwest::RequestBuilder, p: Provider, key: &str) -> reqwest::Reques
 
 /// 제공자가 실제로 쓸 수 있는 모델 이름 목록 (`GET /models`). 글·이미지 대화와 상관없는 모델은 뺀다.
 pub async fn list_models(p: Provider, key: &str) -> Result<Vec<String>> {
-    let url = match p {
-        Provider::Anthropic => format!("{}/v1/models?limit=100", p.base_url()),
-        _ => format!("{}/models", p.base_url()),
-    };
-    let mut req = auth(http().get(url), p, key).timeout(Duration::from_secs(20));
-    if p == Provider::Anthropic {
-        req = req.header("anthropic-version", "2023-06-01");
-    }
-    let r = req.send().await.map_err(|e| anyhow!("{} 에 연결하지 못했습니다: {e}", p.short_name()))?;
-    let status = r.status();
-    let text = r.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("{} 오류 {status}: {}", p.short_name(), short(&text, 200));
-    }
-    let v: Value = serde_json::from_str(&text)?;
     const SKIP: &[&str] = &["embed", "tts", "whisper", "dall-e", "image", "audio", "realtime", "moderation", "transcribe", "veo", "imagen", "aqa"];
-    let mut ids: Vec<String> = v["data"]
-        .as_array()
-        .or_else(|| v["models"].as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["id"].as_str().or_else(|| m["name"].as_str()))
-        .map(|id| id.trim_start_matches("models/").to_string())
-        .filter(|id| !SKIP.iter().any(|s| id.to_lowercase().contains(s)))
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    // Anthropic 은 한 번에 100개까지만 주므로 has_more 가 꺼질 때까지 다음 쪽(after_id)을 이어 받는다
+    let mut after: Option<String> = None;
+    for _ in 0..20 {
+        let url = match (p, &after) {
+            (Provider::Anthropic, None) => format!("{}/v1/models?limit=100", p.base_url()),
+            (Provider::Anthropic, Some(a)) => format!("{}/v1/models?limit=100&after_id={a}", p.base_url()),
+            _ => format!("{}/models", p.base_url()),
+        };
+        let mut req = auth(http().get(url), p, key).timeout(Duration::from_secs(20));
+        if p == Provider::Anthropic {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        let r = req.send().await.map_err(|e| anyhow!("{} 에 연결하지 못했습니다: {e}", p.short_name()))?;
+        let status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("{} 오류 {status}: {}", p.short_name(), short(&text, 200));
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        ids.extend(
+            v["data"]
+                .as_array()
+                .or_else(|| v["models"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["id"].as_str().or_else(|| m["name"].as_str()))
+                .map(|id| id.trim_start_matches("models/").to_string())
+                .filter(|id| !SKIP.iter().any(|s| id.to_lowercase().contains(s))),
+        );
+        match v["last_id"].as_str() {
+            Some(last) if p == Provider::Anthropic && v["has_more"].as_bool() == Some(true) => after = Some(last.to_string()),
+            _ => break,
+        }
+    }
     ids.sort();
     ids.dedup();
     Ok(ids)

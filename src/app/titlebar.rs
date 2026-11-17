@@ -1,9 +1,11 @@
-//! 앱이 직접 그리는 제목 표시줄과 창 가장자리 (Windows).
+//! 앱이 직접 그리는 제목 표시줄과 창 가장자리 (Windows · macOS).
 //!
-//! Windows 기본 창 틀을 없애고(`main.rs` 의 `with_decorations(false)`), 그 자리를 아래 열과 같은 색으로 나눠 칠한다:
+//! Windows 는 기본 창 틀을 없애고(`main.rs` 의 `with_decorations(false)`), macOS 는 내용을 제목 줄 밑까지 넓히고
+//! 기본 제목 줄을 투명하게 숨긴 뒤(`with_fullsize_content_view`), 그 자리를 아래 열과 같은 색으로 나눠 칠한다:
 //! 사이드바 위는 사이드바 색, 작업 영역 위는 작업 영역 색, 상세 보기의 오른쪽 패널 위는 그 패널 색.
 //! 그래서 경계선 없이 각 열이 창 위끝까지 이어져 보인다. 앱 이름은 사이드바 머리 자리에 둔다.
-//! 빈 곳을 끌면 창 이동, 두 번 누르면 최대화/복원, 오른쪽 끝에 최소화·최대화·닫기.
+//! 빈 곳을 끌면 창 이동, 두 번 누르면 최대화/복원. Windows 는 오른쪽 끝에 최소화·최대화·닫기를 그리고,
+//! macOS 는 왼쪽 위의 기본 신호등 단추를 그대로 쓴다 (앱 이름은 그 오른쪽으로 비켜 둔다).
 //! 테두리가 없어진 창의 크기 바꾸기는 `resize_edges` 가 가장자리에서 운영체제에 넘긴다.
 //! Aero Snap·Windows 11 둥근 모서리·창 그림자는 winit 이 남겨 둔 창 스타일 덕분에 그대로 동작한다.
 
@@ -12,7 +14,10 @@ use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, FontId, Rect, Sense, S
 use super::i18n::tr;
 use super::theme;
 
-pub const HEIGHT: f32 = 40.0;
+/// 높이: macOS 는 신호등 단추가 놓인 기본 제목 줄 높이(28)에 맞춘다
+pub const HEIGHT: f32 = if cfg!(target_os = "macos") { 28.0 } else { 40.0 };
+/// macOS 신호등 단추(닫기·최소화·확대)가 차지하는 왼쪽 너비
+const MAC_TRAFFIC_W: f32 = 78.0;
 /// 창 단추 하나의 너비 (Windows 기본 단추와 같은 46px)
 const BUTTON_W: f32 = 46.0;
 /// 창 크기를 바꾸는 가장자리 두께
@@ -21,9 +26,9 @@ const EDGE: f32 = 7.0;
 const CLOSE_RED: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 const CLOSE_RED_PRESSED: Color32 = Color32::from_rgb(0xa3, 0x23, 0x17);
 
-/// 앱이 그린 제목 표시줄을 쓸 것인가: Windows 에서 전체 화면이 아닐 때 (macOS 는 기본 창 틀 그대로)
+/// 앱이 그린 제목 표시줄을 쓸 것인가: Windows·macOS 에서 전체 화면이 아닐 때
 pub fn visible(ctx: &egui::Context) -> bool {
-    cfg!(windows) && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+    (cfg!(windows) || cfg!(target_os = "macos")) && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
 }
 
 /// 제목 표시줄 아래에 놓인 옆 패널의 너비 (0 이면 그쪽 패널 없음)
@@ -58,14 +63,23 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     }
 
     // 앱 이름: 사이드바의 아이콘·글 줄과 같은 세로줄에 맞춘다 (사이드바 안쪽 여백 10 + 아이콘 가운데 18 / 글 36)
-    let cy = rect.center().y;
+    // macOS 는 신호등 단추 오른쪽으로 비켜 둔다
+    let mac = cfg!(target_os = "macos");
+    // macOS: 신호등 단추의 가운데(위에서 15.5)에 맞춰 조금 내린다
+    let cy = rect.center().y + if mac { 2.0 } else { 0.0 };
     let fg = theme::text();
-    p.text(pos2(rect.left() + 28.0, cy), egui::Align2::CENTER_CENTER, crate::icon::GHOST, FontId::proportional(17.0), fg);
-    p.text(pos2(rect.left() + 46.0, cy), egui::Align2::LEFT_CENTER, "GhostDesk", FontId::proportional(14.0), fg);
+    let x0 = rect.left() + if mac { MAC_TRAFFIC_W - 10.0 } else { 0.0 };
+    let (icon_size, text_size) = if mac { (15.0, 13.0) } else { (17.0, 14.0) };
+    p.text(pos2(x0 + 28.0, cy), egui::Align2::CENTER_CENTER, crate::icon::GHOST, FontId::proportional(icon_size), fg);
+    p.text(pos2(x0 + 46.0, cy), egui::Align2::LEFT_CENTER, "GhostDesk", FontId::proportional(text_size), fg);
 
     // 빈 곳: 끌면 이동, 두 번 누르면 최대화/복원 (단추보다 먼저 만들어 단추가 위에서 눌리게)
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-    let drag_rect = rect.with_max_x(rect.right() - BUTTON_W * 3.0);
+    let drag_rect = if mac {
+        rect.with_min_x(rect.left() + MAC_TRAFFIC_W)
+    } else {
+        rect.with_max_x(rect.right() - BUTTON_W * 3.0)
+    };
     let drag = ui.interact(drag_rect, ui.scope_id().with("titlebar_drag"), Sense::click_and_drag());
     if drag.double_clicked() {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
@@ -73,6 +87,10 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
+    // macOS 는 창 단추를 운영체제가 그린다
+    if mac {
+        return;
+    }
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
     let mut x = rect.right() - BUTTON_W;
     for kind in [Caption::Close, if maximized { Caption::Restore } else { Caption::Maximize }, Caption::Minimize] {

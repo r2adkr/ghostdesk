@@ -196,11 +196,11 @@ pub(super) fn spawn_connect(rt: &Handle, st: Arc<parking_lot::Mutex<ConnectState
         let mut msgs = Vec::new();
         match crate::install::connect_all() {
             Ok((_, res)) => {
+                // 성공은 각 앱 줄의 상태(연결됨 등)가 이미 보여 주므로 실패만 이유와 함께 적는다
                 for (c, r) in res {
-                    msgs.push(match r {
-                        Ok(m) => format!("{}: {m}", c.name()),
-                        Err(e) => trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]),
-                    });
+                    if let Err(e) = r {
+                        msgs.push(trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]));
+                    }
                 }
             }
             Err(e) => msgs.push(trf("설치 실패: {}", &[&format!("{:#}", e)])),
@@ -225,10 +225,9 @@ pub(super) fn run_client_action(rt: &Handle, st: Arc<parking_lot::Mutex<ConnectS
             } else {
                 crate::install::unregister(c)
             };
-            msgs.push(match r {
-                Ok(m) => format!("{}: {m}", c.name()),
-                Err(e) => trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]),
-            });
+            if let Err(e) = r {
+                msgs.push(trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]));
+            }
         }
         let fresh = load_connect_status();
         let mut s = st.lock();

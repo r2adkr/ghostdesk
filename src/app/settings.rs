@@ -2,7 +2,7 @@
 //! 새 에이전트 창도 키·모델 칸을 같이 쓴다.
 
 use super::*;
-use super::labels::effort_label;
+use super::labels::{effort_label, effort_short};
 
 impl GhostApp {
     /// 지금 고른 AI 회사의 순서 (`api_keys`·`models` 의 칸)
@@ -60,36 +60,65 @@ impl GhostApp {
         r
     }
 
-    /// `i` 번째 회사에서 쓸 수 있는 모델 목록을 그린다 (처음 열 때 API 에서 불러오고, 그동안은 기본 목록).
-    /// 고른 모델을 돌려준다.
-    fn model_list(&mut self, ui: &mut egui::Ui, i: usize) -> Option<String> {
+    /// `i` 번째 회사의 모델 목록을 아직 안 불러왔으면 API 에서 불러오기 시작한다 (키가 필요한데 없으면 하지 않음).
+    fn fetch_models(&mut self, ctx: &egui::Context, i: usize) -> ModelFetch {
         let p = Provider::ALL[i];
         let state = self.model_fetch.lock()[i].clone();
         if matches!(state, ModelFetch::Idle) && !(p.needs_key() && self.api_keys[i].trim().is_empty()) {
             self.model_fetch.lock()[i] = ModelFetch::Loading;
-            let (slot, key, ctx) = (self.model_fetch.clone(), self.api_keys[i].clone(), ui.ctx().clone());
+            let (slot, key, ctx) = (self.model_fetch.clone(), self.api_keys[i].clone(), ctx.clone());
             self.rt.spawn(async move {
                 let r = crate::llm::list_models(p, &key).await.map_err(|e| format!("{e:#}"));
                 slot.lock()[i] = ModelFetch::Done(r);
                 ctx.request_repaint();
             });
+            return ModelFetch::Loading;
         }
-        let fetched = match &state {
+        state
+    }
+
+    /// `i` 번째 회사에서 고를 수 있는 모델: API 에서 불러온 전체 목록 (불러오기 전·실패 때는 기본 목록).
+    /// 지금 고른 모델은 목록에 없어도(이름을 직접 적었어도) 맨 앞에 넣는다.
+    fn models_for(&self, i: usize, state: &ModelFetch) -> Vec<String> {
+        let mut list: Vec<String> = match state {
+            ModelFetch::Done(Ok(list)) if !list.is_empty() => list.clone(),
+            _ => Provider::ALL[i].default_models().iter().map(|s| s.to_string()).collect(),
+        };
+        let cur = self.models[i].trim();
+        if !cur.is_empty() && !list.iter().any(|m| m == cur) {
+            list.insert(0, cur.to_string());
+        }
+        list
+    }
+
+    /// 불러오는 중이면 작은 표시. 실패했으면 무슨 일인지와 '다시 시도' (API 원문 오류는 글에 마우스를 올리면).
+    fn fetch_status(&mut self, ui: &mut egui::Ui, i: usize, state: &ModelFetch) {
+        match state {
             ModelFetch::Loading => {
                 ui.horizontal(|ui| {
                     theme::spinner(ui, 14.0, theme::muted());
                     ui.label(theme::hint(tr("모델 목록을 불러오는 중…")));
                 });
-                None
             }
-            ModelFetch::Done(Ok(list)) if !list.is_empty() => Some(list.clone()),
             ModelFetch::Done(Err(e)) => {
-                ui.label(RichText::new(crate::llm::short(e, 120)).size(12.0).color(theme::warn()));
-                None
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(tr("모델 목록을 못 불러와서 기본 모델만 보여요")).size(12.0).color(theme::warn()))
+                        .on_hover_text(crate::llm::short(e, 300));
+                    if ui.link(RichText::new(tr("다시 시도")).size(12.0)).clicked() {
+                        self.model_fetch.lock()[i] = ModelFetch::Idle;
+                    }
+                });
             }
-            _ => None,
-        };
-        let list = fetched.unwrap_or_else(|| p.default_models().iter().map(|s| s.to_string()).collect());
+            _ => {}
+        }
+    }
+
+    /// `i` 번째 회사에서 쓸 수 있는 모델 목록을 그린다 (설정 창). 고른 모델을 돌려준다.
+    fn model_list(&mut self, ui: &mut egui::Ui, i: usize) -> Option<String> {
+        let p = Provider::ALL[i];
+        let state = self.fetch_models(ui.ctx(), i);
+        self.fetch_status(ui, i, &state);
+        let list = self.models_for(i, &state);
         let mut picked = None;
         egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
             for m in list {
@@ -123,34 +152,98 @@ impl GhostApp {
     /// 홈 입력 상자 아래의 모델 단추: 키를 넣어 둔 회사의 모델을 한 목록에서 골라 바로 바꾼다.
     pub(super) fn model_picker(&mut self, ui: &mut egui::Ui) {
         let i = self.pi();
-        let label = format!("{}  {}  {}", self.provider.short_name(), self.models[i], icon::CHEVRON_DOWN);
-        let button = egui::Button::new(RichText::new(label).size(13.0).color(theme::body())).frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
+        // 회사 이름(흐리게) · 모델 이름 · ▾ 를 한 줄 가운데에 맞춰 놓는다 (아이콘 글꼴은 기준선이 달라 가운데 정렬이 필요)
+        let mut label = egui::text::LayoutJob::default();
+        let part = |size: f32, color: Color32| egui::TextFormat {
+            font_id: egui::FontId::proportional(size),
+            color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        };
+        label.append(self.provider.short_name(), 0.0, part(13.0, theme::muted()));
+        label.append(&self.models[i], 6.0, part(13.0, theme::body()));
+        if self.provider.supports_effort() {
+            label.append(&format!("· {}", effort_short(EFFORTS[self.effort_idx])), 6.0, part(13.0, theme::muted()));
+        }
+        label.append(icon::CHEVRON_DOWN, 6.0, part(12.0, theme::muted()));
+        let button = egui::Button::new(label).frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
         let (r, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
-            ui.set_min_width(280.0);
+            // 폭을 고정한다 (검색 칸이 남는 폭을 다 차지하려 해서 메뉴가 화면만큼 넓어지지 않게)
+            ui.set_width(340.0);
+            // 머리글·검색 글·모델 이름을 모두 메뉴 줄의 글 시작점(단추 안쪽 여백)에 맞춘다
+            // (메뉴는 기본 안쪽 여백이 2px 라 선택 배경 끝에 글이 붙으므로 넓힌다)
+            ui.spacing_mut().button_padding.x = 10.0;
+            let pad = ui.spacing().button_padding.x;
             let mut chosen = None;
-            for (j, p) in Provider::ALL.into_iter().enumerate() {
-                if !self.ready(j) && p != self.provider {
-                    continue;
-                }
-                ui.add_space(4.0);
-                ui.label(theme::hint(tr(p.label())));
-                // 자주 쓰는 모델 몇 개 + 지금 고른 모델 (목록에 없는 이름을 직접 적었어도 보이게)
-                let mut models: Vec<String> = p.default_models().iter().map(|s| s.to_string()).collect();
-                if !models.contains(&self.models[j]) {
-                    models.insert(0, self.models[j].clone());
-                }
-                for m in models {
-                    let sel = self.provider == p && self.models[j] == m;
-                    if ui.selectable_label(sel, &m).clicked() {
-                        chosen = Some((j, m));
+            // 키를 넣어 둔(연결된) 모든 회사의 모델을 API 에서 불러와 한 목록에 다 보여 준다. 많으면 검색으로 좁힌다.
+            // 검색 칸에서 Enter: 맨 위에 보이는 모델을 고른다 (칸이 Enter 를 가져가기 전에 본다)
+            let qid = ui.make_persistent_id("model_query");
+            let enter = ui.ctx().memory(|m| m.has_focus(qid)) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let q = ui.add(
+                egui::TextEdit::singleline(&mut self.model_query)
+                    .id(qid)
+                    .desired_width(ui.available_width())
+                    .margin(Margin::symmetric(pad as i8, 6))
+                    .hint_text(tr("모델 검색")),
+            );
+            // 목록을 열면 바로 칠 수 있게 (다른 칸에 입력 중이 아닐 때)
+            if ui.ctx().memory(|m| m.focused().is_none()) {
+                q.request_focus();
+            }
+            let query = self.model_query.trim().to_lowercase();
+            let mut first: Option<(usize, String)> = None;
+            let mut shown = 0;
+            egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (j, p) in Provider::ALL.into_iter().enumerate() {
+                    if !self.ready(j) && p != self.provider {
+                        continue;
+                    }
+                    let state = self.fetch_models(ui.ctx(), j);
+                    let models: Vec<String> =
+                        self.models_for(j, &state).into_iter().filter(|m| query.is_empty() || m.to_lowercase().contains(&query)).collect();
+                    if models.is_empty() && !matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_))) {
+                        continue;
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(pad);
+                        ui.label(theme::hint(tr(p.label())));
+                        if let ModelFetch::Done(Ok(all)) = &state {
+                            ui.label(theme::hint(format!("· {}", all.len())));
+                        }
+                    });
+                    if matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_))) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(pad);
+                            ui.vertical(|ui| self.fetch_status(ui, j, &state));
+                        });
+                    }
+                    ui.add_space(2.0);
+                    for m in models {
+                        shown += 1;
+                        if first.is_none() {
+                            first = Some((j, m.clone()));
+                        }
+                        let sel = self.provider == p && self.models[j] == m;
+                        if ui.selectable_label(sel, &m).clicked() {
+                            chosen = Some((j, m));
+                        }
                     }
                 }
-                egui::containers::menu::SubMenuButton::new(theme::hint(tr("다른 모델"))).ui(ui, |ui| {
-                    ui.set_min_width(260.0);
-                    if let Some(m) = self.model_list(ui, j) {
-                        chosen = Some((j, m));
-                    }
-                });
+                if shown == 0 && !query.is_empty() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(pad);
+                        ui.label(theme::hint(tr("맞는 모델이 없어요")));
+                    });
+                }
+            });
+            if enter && chosen.is_none() && !query.is_empty() {
+                chosen = first;
+            }
+            if self.provider.supports_effort() {
+                ui.separator();
+                self.effort_row(ui, pad);
             }
             ui.separator();
             if ui.button(format!("{}  {}", icon::SETTINGS, tr("AI 회사 · API 키 관리"))).clicked() {
@@ -160,14 +253,33 @@ impl GhostApp {
             if let Some((j, m)) = chosen {
                 self.provider = Provider::ALL[j];
                 self.models[j] = m;
+                self.model_query.clear();
                 self.save_prefs();
                 ui.close();
             }
         });
         r.on_hover_text(tr(self.provider.label()));
-        if self.missing_key() && ui.link(RichText::new(tr("API 키 넣기")).size(12.0).color(theme::warn())).clicked() {
-            self.show_settings = true;
-        }
+    }
+
+    /// 모델 메뉴 안의 '생각 깊이' 줄: 낮음 … 최대 중 하나를 바로 고른다 (메뉴는 닫지 않는다)
+    fn effort_row(&mut self, ui: &mut egui::Ui, pad: f32) {
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.label(theme::hint(tr("생각 깊이")));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding.x = 8.0;
+            ui.add_space(pad - 8.0);
+            for (i, e) in EFFORTS.iter().enumerate() {
+                if ui.selectable_label(self.effort_idx == i, effort_short(e)).on_hover_text(effort_label(e)).clicked() && self.effort_idx != i {
+                    self.effort_idx = i;
+                    self.save_prefs();
+                }
+            }
+        })
+        .response
+        .on_hover_text(tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"));
     }
 
     /// 키를 어디서 받는지 · 어디에 두는지 한 줄로 (새 에이전트 창)

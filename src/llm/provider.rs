@@ -120,4 +120,14 @@ impl Provider {
     pub(super) fn takes_effort(self) -> bool {
         matches!(self, Provider::OpenAi | Provider::Gemini)
     }
+
+    /// 오래된 도구 결과를 서버가 지워 주는가 (Claude 의 context_management). 아니면 에이전트가 직접 지운다.
+    pub fn clears_old_tool_results(self) -> bool {
+        self == Provider::Anthropic
+    }
+
+    /// '생각 깊이'(effort) 설정이 요청에 실리는 제공자 (Claude 는 output_config.effort, 그 밖은 reasoning_effort)
+    pub fn supports_effort(self) -> bool {
+        self == Provider::Anthropic || self.takes_effort()
+    }
 }

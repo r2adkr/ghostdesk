@@ -112,6 +112,12 @@ fn main() -> anyhow::Result<()> {
     {
         viewport = viewport.with_decorations(false);
     }
+    // macOS: Windows 와 같은 모양으로, 내용을 제목 표시줄 밑까지 넓히고 기본 제목 줄은 투명하게 숨긴다.
+    // 창 단추(신호등)와 크기 바꾸기·전체 화면은 macOS 기본 동작을 그대로 쓴다.
+    #[cfg(target_os = "macos")]
+    {
+        viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
+    }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "GhostDesk",

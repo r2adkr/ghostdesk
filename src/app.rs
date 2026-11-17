@@ -179,6 +179,8 @@ pub struct GhostApp {
     models: Vec<String>,
     /// '모델' 목록을 열 때 API 에서 불러온 실제 모델 목록 (회사마다)
     model_fetch: Arc<parking_lot::Mutex<Vec<ModelFetch>>>,
+    /// 홈 모델 단추 목록의 검색어
+    model_query: String,
     /// API 키를 이 PC 에 (암호화해) 기억할지
     remember_keys: bool,
     /// 화면 언어
@@ -278,6 +280,7 @@ impl GhostApp {
             api_keys: Provider::ALL.iter().map(|p| p.env_key()).collect(),
             models: Provider::ALL.iter().map(|p| p.default_models()[0].to_string()).collect(),
             model_fetch: Arc::new(parking_lot::Mutex::new(vec![ModelFetch::Idle; Provider::ALL.len()])),
+            model_query: String::new(),
             remember_keys: prefs::CAN_REMEMBER_KEYS,
             lang: Lang::Ko,
             effort_idx: 1,
@@ -477,7 +480,8 @@ impl GhostApp {
         // 보기(또는 고른 에이전트)가 바뀌면 가운데와 오른쪽 패널이 0.2초 동안 서서히 나타난다
         let fade = theme::appear(&ctx, egui::Id::unique("view_in"), self.view_key(), 0.2);
         // 제목 표시줄이 있으면 그 아래로 바로 이어지게 위 여백을 줄인다
-        let top = if titlebar::visible(&ctx) { 4 } else { 14 };
+        // macOS 제목 줄은 더 낮아서(28) 조금 더 띄운다
+        let top = if titlebar::visible(&ctx) { if cfg!(target_os = "macos") { 10 } else { 4 } } else { 14 };
         let side = egui::Panel::left("left")
             .resizable(true)
             .default_size(248.0)

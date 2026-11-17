@@ -264,7 +264,7 @@ mod imp {
     use parking_lot::Mutex;
     use serde_json::Value;
 
-    use super::{NativeMode, NativeOptions};
+    use super::{NativeHost, NativeMode, NativeOptions};
     use crate::browser::{FrameSink, MouseButton};
     use crate::desk::ViewInfo;
     use crate::keys::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};

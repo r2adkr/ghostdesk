@@ -17,14 +17,14 @@ impl GhostApp {
             });
             ui.add_space(16.0);
         }
+        if theme::nav_item(ui, self.view == View::Home, icon::GHOST, tr("홈"), None).clicked() {
+            self.view = View::Home;
+        }
         if theme::nav_item(ui, false, icon::PLUS, tr("새 에이전트"), None)
             .on_hover_text(trf("에이전트가 일할 곳(웹사이트·{}·원격 컴퓨터)을 고르고 할 일을 맡겨요", &[&tr(text::LOCAL_APPS)]))
             .clicked()
         {
             self.open_wizard();
-        }
-        if theme::nav_item(ui, self.view == View::Home, icon::GHOST, tr("홈"), None).clicked() {
-            self.view = View::Home;
         }
         if theme::nav_item(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None).clicked() {
             self.view = View::Grid;

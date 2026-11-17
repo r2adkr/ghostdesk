@@ -29,7 +29,10 @@ use crate::{
     llm::{short, Llm},
     profiles::InstalledBrowser,
 };
-use history::{json_len, prune_images, remember, screenshot_context, segment_summary, Seen, MAX_CONTEXT_TOKENS, MAX_REQUEST_BYTES};
+use history::{
+    clear_old_tool_results, json_len, prune_images, remember, screenshot_context, segment_summary, Seen, CLEAR_TOOL_RESULTS_AT, MAX_CONTEXT_TOKENS,
+    MAX_REQUEST_BYTES,
+};
 
 pub(crate) use tools::{coord, describe, exec_computer, exec_desk_tool};
 #[cfg(not(target_os = "macos"))]
@@ -443,6 +446,10 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             t.1 += u["output_tokens"].as_u64().unwrap_or(0);
         }
         too_long = input > MAX_CONTEXT_TOKENS;
+        // Claude 는 서버가 오래된 도구 결과를 지운다. 다른 회사는 같은 기준으로 여기서 지운다 (다음 요청부터 적용)
+        if !cfg.llm.provider.clears_old_tool_results() && input > CLEAR_TOOL_RESULTS_AT {
+            msg_bytes = msg_bytes.saturating_sub(clear_old_tool_results(&mut messages, crate::llm::KEEP_TOOL_USES));
+        }
         let content = resp["content"].as_array().cloned().unwrap_or_default();
         // 빈 답은 기록하지 않는다: 내용 없는 assistant 턴은 다음 요청에서 거절된다
         // (이어지는 user 턴은 API 가 앞 user 턴과 합쳐 준다)
