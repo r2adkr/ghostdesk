@@ -349,6 +349,52 @@ fn write_source_stamp(app: &Path, src_hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// 앱 번들의 버전 (Info.plist 의 CFBundleShortVersionString)
+#[cfg(target_os = "macos")]
+fn bundle_version(app: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).ok()?;
+    plist_string(&plist, "CFBundleShortVersionString")
+}
+
+/// XML plist 에서 `<key>{key}</key>` 다음 `<string>` 값
+#[cfg(not(windows))]
+fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let rest = &plist[plist.find(&format!("<key>{key}</key>"))?..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = start + rest[start..].find("</string>")?;
+    Some(rest[start..end].trim().to_string())
+}
+
+/// 내려받은 새 GhostDesk 를 압축을 푼 자리에서 바로 열었을 때 (macOS 가 읽기 전용 임시 위치에서 실행):
+/// 설치본(~/Applications/GhostDesk.app)이 없거나 이것보다 오래됐으면 떠 있는 옛 설치본을 정상 종료하고
+/// 이 앱으로 바꿔 넣은 뒤, 설치본을 연다. 그랬으면 true (이 프로세스는 창을 띄우지 않고 끝낸다).
+/// 설치본이 더 새 버전이거나, 따로 둔 데이터로 실행 중이거나, 자동 연결을 껐으면 아무것도 하지 않는다.
+#[cfg(target_os = "macos")]
+pub fn take_over_install() -> bool {
+    if std::env::var_os("GHOSTDESK_DATA_DIR").is_some() || !auto_connect_enabled() {
+        return false;
+    }
+    let Some(me) = current_bundle() else { return false };
+    if !me.to_string_lossy().contains("/AppTranslocation/") {
+        return false;
+    }
+    let target = stable_app();
+    if let Some(v) = bundle_version(&target) {
+        if crate::update::newer(&v, env!("CARGO_PKG_VERSION")) {
+            return false;
+        }
+    }
+    if !crate::macos::apps::quit_instances_at(BUNDLE_ID, &target, Duration::from_secs(8)) {
+        eprintln!("[ghostdesk] 설치된 GhostDesk 가 종료되지 않아 이 앱을 그대로 엽니다");
+        return false;
+    }
+    if let Err(e) = install_app() {
+        eprintln!("[ghostdesk] 설치본을 바꾸지 못했습니다: {e:#}");
+        return false;
+    }
+    Command::new("/usr/bin/open").arg("-n").arg(&target).status().map(|s| s.success()).unwrap_or(false)
+}
+
 /// 지금 실행 중인 GhostDesk 를 고정 위치(`stable_app`)에 설치(또는 갱신)하고 그 실행 파일 경로를 돌려준다.
 /// 이미 같은 원본에서 설치한 것이면 아무것도 하지 않는다. 실행 중인 설치본도 안전하게 갱신한다
 /// (macOS: 새 번들 폴더로 바꿔치기, Windows: 실행 중인 exe 를 옆으로 옮긴 뒤 새 exe 를 제자리에).
@@ -372,6 +418,11 @@ pub fn install_app() -> Result<PathBuf> {
                 return Ok(target_exe);
             }
         }
+        // 설치본이 더 새 버전이면 옛 버전으로 덮어쓰지 않는다 (예전에 받은 옛 앱을 다시 연 경우)
+        #[cfg(target_os = "macos")]
+        if bundle_version(&target_app).is_some_and(|v| crate::update::newer(&v, env!("CARGO_PKG_VERSION"))) {
+            return Ok(target_exe);
+        }
         let parent = target_app.parent().ok_or_else(|| anyhow!("설치 경로 오류"))?;
         guard_write(parent);
         std::fs::create_dir_all(parent)?;
@@ -379,7 +430,8 @@ pub fn install_app() -> Result<PathBuf> {
         let _ = std::fs::remove_dir_all(&staging);
         match current_bundle() {
             Some(bundle) => {
-                run(Command::new("/usr/bin/ditto").arg(&bundle).arg(&staging), Duration::from_secs(120))?;
+                // --noqtn: 내려받은 앱의 격리 표시를 옮기지 않는다 (남아 있으면 설치본을 열 때도 macOS 가 임시 위치로 옮겨 실행한다)
+                run(Command::new("/usr/bin/ditto").arg("--noqtn").arg(&bundle).arg(&staging), Duration::from_secs(120))?;
                 // 지문은 서명 전에 기록한다 (서명 뒤에 Resources 를 바꾸면 번들 봉인이 깨짐)
                 seal_bundle(&staging, src_hash.as_deref())?;
             }
@@ -1687,6 +1739,29 @@ mod tests {
     }
 
     const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn newer_installed_app_is_not_downgraded() {
+        let h = FakeHome::new("no-downgrade");
+        let app = h.path("home/Applications/GhostDesk.app");
+        mkdir(app.join("Contents/MacOS"));
+        std::fs::write(app.join("Contents/MacOS/ghostdesk"), "newer build").unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), info_plist().replace(env!("CARGO_PKG_VERSION"), "999.0.0")).unwrap();
+        assert_eq!(bundle_version(&app).as_deref(), Some("999.0.0"));
+        // 더 새 설치본은 그대로 두고 그 경로를 쓴다
+        assert_eq!(install_app().unwrap(), stable_exe());
+        assert_eq!(std::fs::read_to_string(app.join("Contents/MacOS/ghostdesk")).unwrap(), "newer build");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn reads_plist_strings() {
+        let p = info_plist();
+        assert_eq!(plist_string(&p, "CFBundleShortVersionString").as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(plist_string(&p, "CFBundleIdentifier").as_deref(), Some(BUNDLE_ID));
+        assert_eq!(plist_string(&p, "NoSuchKey"), None);
+    }
 
     #[test]
     fn toml_edit_preserves_other_servers() {

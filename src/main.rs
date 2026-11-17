@@ -110,6 +110,12 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     std::thread::spawn(native::recover_parked_windows);
 
+    // macOS: 내려받은 새 버전을 압축 푼 자리에서 바로 열었으면, 옛 설치본을 이것으로 바꾸고 설치본으로 다시 연다
+    #[cfg(target_os = "macos")]
+    if install::take_over_install() {
+        return Ok(());
+    }
+
     let handle = rt.handle().clone();
     #[allow(unused_mut)]
     let mut viewport = eframe::egui::ViewportBuilder::default()

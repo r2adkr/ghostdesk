@@ -235,7 +235,7 @@ fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release>
 }
 
 /// `candidate` 가 `current` 보다 새 버전인가 ("0.2.0" > "0.1.10", "0.2" == "0.2.0", 꼬리표 -beta 등은 무시)
-fn newer(candidate: &str, current: &str) -> bool {
+pub(crate) fn newer(candidate: &str, current: &str) -> bool {
     let parts = |s: &str| -> Vec<u64> {
         s.split(['-', '+']).next().unwrap_or("").split('.').map(|p| p.trim().parse().unwrap_or(0)).collect()
     };

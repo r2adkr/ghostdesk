@@ -57,6 +57,41 @@ pub fn running_pids(bundle_id: &str) -> Vec<i32> {
         .collect()
 }
 
+/// `app`(.app 경로)에서 실행 중인 다른 인스턴스(이 프로세스 제외)에 종료를 요청하고(메뉴의 '종료'와 같은 정상 종료),
+/// 최대 `wait` 동안 끝나기를 기다린다. 아직 떠 있는 것이 있으면 false.
+pub fn quit_instances_at(bundle_id: &str, app: &Path, wait: Duration) -> bool {
+    let me = std::process::id() as i32;
+    let want = app.canonicalize().unwrap_or_else(|_| app.to_path_buf());
+    let at_app = |a: &NSRunningApplication| {
+        a.processIdentifier() != me
+            && !a.isTerminated()
+            && a.bundleURL()
+                .and_then(|u| u.path())
+                .map(|p| {
+                    let p = PathBuf::from(p.to_string());
+                    p.canonicalize().unwrap_or(p) == want
+                })
+                .unwrap_or(false)
+    };
+    let list = || NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(bundle_id));
+    let mut any = false;
+    for a in list().iter().filter(|a| at_app(a)) {
+        any = true;
+        a.terminate();
+    }
+    if !any {
+        return true;
+    }
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if !list().iter().any(|a| at_app(&a)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    false
+}
+
 /// 대상 앱의 실행 중인 인스턴스 pid — 번들 id 가 같거나, 번들 id 를 모르면 .app 경로가 같은 프로세스.
 pub fn running_pids_for(t: &AppTarget) -> Vec<i32> {
     let want_path = std::fs::canonicalize(&t.path).unwrap_or_else(|_| t.path.clone());
