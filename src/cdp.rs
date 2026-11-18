@@ -116,15 +116,11 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut msg = json!({ "id": id, "method": method, "params": params });
-        if let Some(s) = session {
-            msg["sessionId"] = json!(s);
-        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id, tx);
-        if self.out.send(msg.to_string()).is_err() {
+        if let Err(error) = self.send_command(id, method, params, session) {
             self.pending.lock().remove(&id);
-            return Err(anyhow!("CDP 연결이 닫혔습니다"));
+            return Err(error);
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
@@ -135,6 +131,20 @@ impl Cdp {
                 Err(anyhow!("CDP {method} 시간 초과"))
             }
         }
+    }
+
+    /// Enqueue a command whose reply carries no information for the caller.
+    pub fn send_untracked(&self, method: &str, params: Value, session: Option<&str>) -> Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send_command(id, method, params, session)
+    }
+
+    fn send_command(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> Result<()> {
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(s) = session {
+            msg["sessionId"] = json!(s);
+        }
+        self.out.send(msg.to_string()).map_err(|_| anyhow!("CDP 연결이 닫혔습니다"))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {

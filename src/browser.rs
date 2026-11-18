@@ -399,10 +399,8 @@ impl BrowserWorkspace {
             "Page.screencastFrame" => {
                 let sid = ev.session_id.clone();
                 if let Some(ack) = ev.params["sessionId"].as_i64() {
-                    let _ = self
-                        .cdp
-                        .call("Page.screencastFrameAck", json!({ "sessionId": ack }), sid.as_deref())
-                        .await;
+                    // Keep consuming events while Chromium is blocked on a modal dialog.
+                    self.cdp.send_untracked("Page.screencastFrameAck", json!({ "sessionId": ack }), sid.as_deref())?;
                 }
                 if sid.is_some() && sid == self.active_session() {
                     if let Some(data) = ev.params["data"].as_str() {
@@ -1951,6 +1949,10 @@ mod text_tests {
             while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = socket.next().await {
                 let event: Value = serde_json::from_str(&text).unwrap();
                 received.lock().push(event.clone());
+                if event["method"] == "Page.screencastFrameAck" {
+                    // Chromium may defer this reply until a JavaScript dialog is dismissed.
+                    continue;
+                }
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":event["id"],"result":{}}).to_string().into())).await.unwrap();
             }
         });
@@ -1963,6 +1965,25 @@ mod text_tests {
             ready: AtomicBool::new(true), closed: AtomicBool::new(false), sink: Arc::new(|_| {}), dialog_changed: tokio::sync::Notify::new(),
         };
         (ws, events, server)
+    }
+
+    #[tokio::test]
+    async fn a_delayed_frame_ack_does_not_block_dialog_events() {
+        let (ws, events, server) = mock_workspace().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            ws.handle_event(CdpEvent {
+                method: "Page.screencastFrame".into(), params: json!({"sessionId":7}),
+                session_id: Some("session".into()),
+            }).await.unwrap();
+            ws.handle_event(CdpEvent {
+                method: "Page.javascriptDialogOpening".into(), params: json!({"type":"confirm"}),
+                session_id: Some("session".into()),
+            }).await.unwrap();
+            assert_eq!(ws.dialog().unwrap()["type"], "confirm");
+            while events.lock().is_empty() { tokio::task::yield_now().await; }
+            assert_eq!(events.lock()[0]["params"]["sessionId"], 7);
+        }).await.expect("frame acknowledgement blocked the dialog");
+        server.abort();
     }
 
     #[tokio::test]
