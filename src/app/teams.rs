@@ -15,12 +15,28 @@ pub(super) struct TeamsUi {
     creating: bool,
     note: String,
     task: String,
-    /// team id whose delete button was pressed once (press again to delete)
-    confirm_delete: Option<u64>,
+    /// open confirm/rename popup
+    dialog: Option<Dialog>,
     /// copy of the store, refreshed when it changes
     cache: Vec<Team>,
     cache_version: Option<u64>,
     error: Option<String>,
+}
+
+/// Popups of the Teams screen.
+enum Dialog {
+    Delete { id: u64, name: String, notes: usize, tasks: usize },
+    Rename { id: u64, name: String, error: Option<String> },
+}
+
+impl Dialog {
+    fn delete(t: &Team) -> Self {
+        Dialog::Delete { id: t.id, name: t.name.clone(), notes: t.notes.len(), tasks: t.tasks.len() }
+    }
+
+    fn rename(t: &Team) -> Self {
+        Dialog::Rename { id: t.id, name: t.name.clone(), error: None }
+    }
 }
 
 const LIST_W: f32 = 240.0;
@@ -67,6 +83,7 @@ impl GhostApp {
             None => empty_board(&mut board_ui),
         }
         ui.allocate_rect(full, egui::Sense::hover());
+        dialog(ui.ctx(), ts, &store);
     }
 }
 
@@ -78,9 +95,19 @@ fn team_list(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore
         let r = theme::nav_item(ui, selected, icon::LIST_TODO, &t.name, (!t.members.is_empty()).then(theme::success));
         if r.clicked() {
             ts.selected = Some(t.id);
-            ts.confirm_delete = None;
             ts.error = None;
         }
+        // right click: rename or delete
+        r.context_menu(|ui| {
+            if ui.button(tr("이름 바꾸기")).clicked() {
+                ts.dialog = Some(Dialog::rename(t));
+                ui.close();
+            }
+            if ui.button(RichText::new(tr("팀 삭제")).color(theme::danger())).clicked() {
+                ts.dialog = Some(Dialog::delete(t));
+                ui.close();
+            }
+        });
     }
     ui.add_space(8.0);
     if ts.creating {
@@ -142,15 +169,11 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
     ui.horizontal(|ui| {
         ui.label(RichText::new(&team.name).size(17.0).color(theme::text()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let confirming = ts.confirm_delete == Some(team.id);
-            let label = if confirming { tr("한 번 더 누르면 삭제") } else { tr("팀 삭제") };
-            if theme::secondary(ui, label).on_hover_text(tr("메모와 할 일이 함께 지워져요")).clicked() {
-                if confirming {
-                    let _ = store.delete(&team.id.to_string());
-                    ts.confirm_delete = None;
-                } else {
-                    ts.confirm_delete = Some(team.id);
-                }
+            if theme::secondary(ui, tr("팀 삭제")).clicked() {
+                ts.dialog = Some(Dialog::delete(team));
+            }
+            if theme::secondary(ui, tr("이름 바꾸기")).clicked() {
+                ts.dialog = Some(Dialog::rename(team));
             }
         });
     });
@@ -289,6 +312,60 @@ fn notes_column(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamSt
                 ui.add_space(8.0);
             }
         });
+}
+
+/// The delete confirmation and rename popups.
+fn dialog(ctx: &egui::Context, ts: &mut TeamsUi, store: &crate::team::TeamStore) {
+    let Some(d) = &mut ts.dialog else { return };
+    let mut close = false;
+    let m = egui::Modal::new(egui::Id::unique("team_dialog")).frame(theme::modal_frame()).show(ctx, |ui| {
+        ui.set_width(400.0);
+        match d {
+            Dialog::Delete { id, name, notes, tasks } => {
+                close |= theme::modal_header(ui, tr("팀 삭제"));
+                ui.label(RichText::new(trf("'{}' 팀을 삭제할까요?", &[name])).color(theme::text()));
+                ui.add_space(4.0);
+                ui.label(theme::hint(trf("메모 {}개와 할 일 {}개가 함께 지워지고 되돌릴 수 없어요. 팀에 들어와 있는 에이전트는 팀에서 빠져요", &[notes, tasks])));
+                ui.add_space(16.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::destructive(ui, tr("삭제")).clicked() {
+                        let _ = store.delete(&id.to_string());
+                        close = true;
+                    }
+                    if theme::secondary(ui, tr("취소")).clicked() {
+                        close = true;
+                    }
+                });
+            }
+            Dialog::Rename { id, name, error } => {
+                close |= theme::modal_header(ui, tr("팀 이름 바꾸기"));
+                let edit = ui.add(egui::TextEdit::singleline(name).desired_width(ui.available_width()).margin(Margin::symmetric(10, 6)).hint_text(tr("팀 이름")));
+                if !edit.has_focus() && error.is_none() && ui.memory(|m| m.focused().is_none()) {
+                    edit.request_focus();
+                }
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.label(theme::hint(tr("에이전트는 새 이름으로 이 팀을 찾아요")));
+                if let Some(e) = error {
+                    ui.label(RichText::new(e.as_str()).size(12.0).color(theme::danger()));
+                }
+                ui.add_space(16.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::primary(ui, tr("바꾸기")).clicked() || enter {
+                        match store.rename(&id.to_string(), name) {
+                            Ok(()) => close = true,
+                            Err(e) => *error = Some(format!("{e:#}")),
+                        }
+                    }
+                    if theme::secondary(ui, tr("취소")).clicked() {
+                        close = true;
+                    }
+                });
+            }
+        }
+    });
+    if close || m.should_close() {
+        ts.dialog = None;
+    }
 }
 
 /// How long ago, in words ("방금", "5분 전", "2시간 전", "3일 전").

@@ -199,7 +199,8 @@ time can claim. Create teams in the **Teams** screen (or let an agent create one
 then tell each AI app something like "Join GhostDesk team 'Jeju trip' as the
 researcher". The Teams screen shows who joined with which role, who is on which
 task, the results of finished tasks and every note, and you can add notes and
-tasks or reopen and delete them there.
+tasks or reopen and delete them there. Right-click a team in the list to rename
+or delete it; deleting asks for confirmation first.
 
 - Agents use two MCP tools. `team` (`list`, `create`, `join` with a `role`,
   `read`, `note`, `goal`, `leave`, `delete`) and `team_task` (`add`, `claim`,
@@ -210,8 +211,8 @@ tasks or reopen and delete them there.
 - Screens stay per agent; a team shares what agents know and who does what, not
   input on one screen.
 - An agent can create a team on its own, but deleting one needs your approval
-  in the GhostDesk window. In the Teams screen, **Delete team** asks for a second
-  click.
+  in the GhostDesk window. In the Teams screen, deleting opens a confirmation
+  that shows how many notes and tasks go with it.
 - Teams, notes and tasks are kept in `teams.json` in the data folder and survive
   a restart (members don't, so claimed tasks are open again after one).
 

@@ -365,13 +365,23 @@ pub fn modal_header(ui: &mut egui::Ui, title: &str) -> bool {
 /// A button with a fixed fill that changes on hover. egui won't change an explicit fill, so the
 /// hover state comes from whether the same button was under the pointer last frame.
 fn filled(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8) -> Response {
+    filled_with(ui, label, size, radius, accent(), pal().accent_hover, on_accent())
+}
+
+fn filled_with(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8, base: Color32, hover: Color32, fg: Color32) -> Response {
     let id = ui.next_auto_id();
     let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered() && r.enabled());
     let h = ui.ctx().animate_bool_with_time(id.with("hover_t"), hovered, 0.12);
-    let fill = accent().lerp_to_gamma(pal().accent_hover, h);
-    let resp = ui.add(egui::Button::new(label.color(on_accent()).strong()).fill(fill).stroke(Stroke::NONE).corner_radius(radius).min_size(size));
+    let fill = base.lerp_to_gamma(hover, h);
+    let resp = ui.add(egui::Button::new(label.color(fg).strong()).fill(fill).stroke(Stroke::NONE).corner_radius(radius).min_size(size));
     focus_outline(ui, &resp, radius);
     resp
+}
+
+/// Button for an action that deletes something (danger color), used in confirm dialogs.
+pub fn destructive(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
+    let d = danger();
+    filled_with(ui, RichText::new(text.into()), Vec2::new(BUTTON_MIN_W, 32.0), RADIUS, d, d.gamma_multiply(0.85), Color32::WHITE)
 }
 
 /// Primary action button (accent color).

@@ -249,6 +249,22 @@ impl TeamStore {
         })
     }
 
+    /// Renames a team. Members keep using it under the new name.
+    pub fn rename(&self, key: &str, name: &str) -> Result<()> {
+        let name = clean(name, "팀 이름")?;
+        if name.chars().count() > 60 {
+            bail!("팀 이름은 60자까지입니다");
+        }
+        self.change(|s| {
+            let i = Self::find(s, key)?;
+            if s.teams.iter().enumerate().any(|(j, t)| j != i && t.name.eq_ignore_ascii_case(&name)) {
+                bail!("'{name}' 팀이 이미 있습니다");
+            }
+            s.teams[i].name = name;
+            Ok(())
+        })
+    }
+
     pub fn set_goal(&self, key: &str, goal: &str) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
@@ -472,6 +488,21 @@ mod tests {
         assert_eq!(s.snapshot().len(), 2);
         assert_eq!(s.delete("TRIP").unwrap(), "Trip");
         assert!(s.delete("Trip").is_err());
+    }
+
+    #[test]
+    fn rename_keeps_names_unique() {
+        let s = store();
+        s.create("Other", "", USER).unwrap();
+        assert!(s.rename("Trip", "other").is_err());
+        assert!(s.rename("Trip", " ").is_err());
+        s.join("Trip", 1, "Codex", "").unwrap();
+        s.rename("Trip", "Jeju trip").unwrap();
+        // same team, same members, found by the new name only
+        assert!(s.read_json("Trip", None).is_err());
+        assert_eq!(s.read_json("jeju TRIP", None).unwrap()["members"], json!(["Codex"]));
+        // changing only the case of its own name is fine
+        s.rename("Jeju trip", "Jeju Trip").unwrap();
     }
 
     #[test]
