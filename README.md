@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.7.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.0/GhostDesk-Setup-0.7.0-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.7.1-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.1/GhostDesk-Setup-0.7.1-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.7.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.0/GhostDesk-0.7.0-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.7.1-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.1/GhostDesk-0.7.1-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
@@ -201,6 +201,11 @@ researcher". The Teams screen shows who joined with which role, who is on which
 task, the results of finished tasks and every note, and you can add notes and
 tasks or reopen and delete them there. Right-click a team in the list to rename
 or delete it; deleting asks for confirmation first.
+
+**Team screens** on a team's board opens a screen wall with only that team's
+members' screens. In **All agents**, the screen wall and the sidebar, a member's
+screen carries a blue tag with its team and role (for example `Jeju trip ·
+research`).
 
 - Agents use two MCP tools. `team` (`list`, `create`, `join` with a `role`,
   `read`, `note`, `goal`, `leave`, `delete`) and `team_task` (`add`, `claim`,

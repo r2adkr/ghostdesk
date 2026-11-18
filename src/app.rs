@@ -284,6 +284,8 @@ pub struct GhostApp {
     /// Whether it was already full screen when the wall opened (the user's full screen is left alone
     /// on close).
     wall_fs_before: bool,
+    /// Screen wall showing only this team's members' screens (None = every screen).
+    wall_team: Option<u64>,
     /// Widths of the sidebar and detail right panel last frame (the title bar is painted in matching
     /// columns).
     title_cols: titlebar::Columns,
@@ -367,6 +369,7 @@ impl GhostApp {
             wizard_key_field: false,
             focus_key: false,
             wall_fs_before: false,
+            wall_team: None,
             title_cols: titlebar::Columns { left: 248.0, right: 0.0 },
         };
         app.ai = ai::initial(&mut app.ai_next_id);

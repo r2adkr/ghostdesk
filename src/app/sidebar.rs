@@ -186,6 +186,7 @@ impl GhostApp {
         });
         ui.add_space(2.0);
         let mut clicked = None;
+        let badges = self.team_badges();
         for (i, a) in self.agents.iter().enumerate() {
             let st = a.shared.status();
             let paused = a.shared.paused.load(Ordering::Relaxed);
@@ -225,8 +226,16 @@ impl GhostApp {
                                 }
                                 _ => {}
                             }
-                            if external {
-                                ui.label(theme::hint(tr("외부")));
+                            // a team member's screen shows its team instead of just "external"
+                            match badges.get(&a.shared.id) {
+                                Some((_, team)) => {
+                                    ui.label(RichText::new(format!("{} {}", icon::LIST_TODO, crate::llm::short(team, 14))).size(12.0).color(theme::info_text()))
+                                        .on_hover_text(team.as_str());
+                                }
+                                None if external => {
+                                    ui.label(theme::hint(tr("외부")));
+                                }
+                                None => {}
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 ui.add(egui::Label::new(RichText::new(&a.shared.name).color(theme::text())).truncate().selectable(false)).on_hover_text(&a.shared.name);

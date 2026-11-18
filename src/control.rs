@@ -707,6 +707,7 @@ impl ControlServer {
 
         let shared = AgentShared::new(n, label.clone(), workspace.clone(), self.ctx.clone());
         *shared.external.lock() = Some(client.clone());
+        shared.control_conn.store(conn.id, Ordering::Relaxed);
         shared.log(LogKind::Info, format!("{client} 이(가) 이 화면을 만들었습니다 (MCP)"));
         let _ = self.events.send(ControlEvent::Register(shared.clone()));
         self.ctx.request_repaint();

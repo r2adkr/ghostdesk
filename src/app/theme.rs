@@ -182,6 +182,8 @@ pub fn success() -> Color32 { pal().success }
 pub fn warn() -> Color32 { pal().warn }
 pub fn danger() -> Color32 { pal().danger }
 pub fn takeover() -> Color32 { pal().takeover }
+/// Tag on a team member's screen (drawn over screenshots, so the same in both themes).
+pub fn team_tag() -> Color32 { Color32::from_rgba_unmultiplied(0, 92, 200, 235) }
 
 /// Corner radius of buttons and fields (Astryx --radius-element).
 pub const RADIUS: u8 = 10;

@@ -41,6 +41,13 @@ impl Dialog {
 
 const LIST_W: f32 = 240.0;
 
+impl TeamsUi {
+    /// The teams as last read from the store.
+    pub(super) fn cache(&self) -> &[Team] {
+        &self.cache
+    }
+}
+
 impl GhostApp {
     /// Whether any agent is in a team right now (the sidebar's dot).
     pub(super) fn teams_ui_active(&mut self) -> bool {
@@ -53,6 +60,11 @@ impl GhostApp {
     }
 
     pub(super) fn teams_view(&mut self, ui: &mut egui::Ui) {
+        // screens per team (members' screens, by the connection that opened them)
+        let mut screens: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (team, _) in self.team_badges().into_values() {
+            *screens.entry(team).or_default() += 1;
+        }
         let store = self.teams.clone();
         let v = store.version();
         if self.teams_ui.cache_version != Some(v) {
@@ -78,12 +90,21 @@ impl GhostApp {
         let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(egui::Layout::top_down(egui::Align::Min)));
         team_list(&mut list_ui, ts, &store);
         let mut board_ui = ui.new_child(egui::UiBuilder::new().max_rect(board_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+        let mut open_wall = None;
         match ts.cache.iter().find(|t| Some(t.id) == ts.selected).cloned() {
-            Some(team) => board(&mut board_ui, ts, &store, &team),
+            Some(team) => {
+                if board(&mut board_ui, ts, &store, &team, screens.get(&team.id).copied().unwrap_or(0)) {
+                    open_wall = Some(team.id);
+                }
+            }
             None => empty_board(&mut board_ui),
         }
         ui.allocate_rect(full, egui::Sense::hover());
         dialog(ui.ctx(), ts, &store);
+        if let Some(t) = open_wall {
+            self.enter_wall(ui.ctx());
+            self.wall_team = Some(t);
+        }
     }
 }
 
@@ -163,8 +184,9 @@ fn empty_board(ui: &mut egui::Ui) {
     });
 }
 
-/// Right side: one team's board.
-fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, team: &Team) {
+/// Right side: one team's board. Returns true when "watch screens" was clicked.
+fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, team: &Team, screens: usize) -> bool {
+    let mut watch = false;
     // header: name · delete
     ui.horizontal(|ui| {
         ui.label(RichText::new(&team.name).size(17.0).color(theme::text()));
@@ -191,6 +213,15 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
             }
         }
     });
+    // the members' screens, on a wall of their own
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let btn = ui.add_enabled_ui(screens > 0, |ui| theme::secondary(ui, format!("{}  {}", icon::LAYOUT_DASHBOARD, tr("팀 화면 모아보기")))).inner;
+        if btn.on_hover_text(tr("이 팀 에이전트들이 연 화면만 크게 모아 봐요")).clicked() {
+            watch = true;
+        }
+        ui.label(theme::hint(if screens == 0 { tr("팀원이 연 화면이 아직 없어요").to_string() } else { trf("팀원 화면 {}개", &[&screens]) }));
+    });
     ui.add_space(12.0);
 
     let avail = ui.available_size();
@@ -200,6 +231,7 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
         ui.add_space(24.0);
         ui.allocate_ui_with_layout(egui::vec2(col_w, avail.y), egui::Layout::top_down(egui::Align::Min), |ui| notes_column(ui, ts, store, team));
     });
+    watch
 }
 
 fn tasks_column(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, team: &Team) {

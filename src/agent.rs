@@ -162,6 +162,9 @@ pub struct AgentShared {
     pub queue: Mutex<std::collections::VecDeque<String>>,
     /// Client description when an external (MCP) agent drives this screen (no LLM loop).
     pub external: Mutex<Option<String>>,
+    /// Control connection (one `ghostdesk --mcp`) that opened this screen, 0 if none. Teams use it
+    /// to know which screens belong to which member.
+    pub control_conn: AtomicU64,
     /// Stop after the current batch and wait for instructions (conversation context is kept).
     pub stop: AtomicBool,
     /// Removed in the GUI. A screen still being prepared must close as soon as it's ready (external
@@ -193,6 +196,7 @@ impl AgentShared {
             cursor: Mutex::new(Default::default()),
             queue: Mutex::new(Default::default()),
             external: Mutex::new(None),
+            control_conn: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             tokens: Mutex::new((0, 0)),

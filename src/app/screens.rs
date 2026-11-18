@@ -18,7 +18,26 @@ impl GhostApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
         self.wall_fullscreen = false;
+        self.wall_team = None;
         self.view = to;
+    }
+
+    /// For each agent id: the team it works in and its role there ("제주 출장 · 조사"), from the
+    /// control connection that opened the screen.
+    pub(super) fn team_badges(&mut self) -> std::collections::HashMap<u64, (u64, String)> {
+        self.teams_ui_active();
+        let mut out = std::collections::HashMap::new();
+        for a in &self.agents {
+            let conn = a.shared.control_conn.load(Ordering::Relaxed);
+            if conn == 0 {
+                continue;
+            }
+            if let Some((t, m)) = self.teams_ui.cache().iter().find_map(|t| t.members.iter().find(|m| m.conn == conn).map(|m| (t, m))) {
+                let label = if m.role.is_empty() { t.name.clone() } else { format!("{} · {}", t.name, m.role) };
+                out.insert(a.shared.id, (t.id, label));
+            }
+        }
+        out
     }
 
     pub(super) fn welcome(&mut self, ui: &mut egui::Ui) {
@@ -129,7 +148,23 @@ impl GhostApp {
         // screens only: the whole window is for the layout, with buttons overlaid at the top right
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
-        let n = self.agents.len();
+        let badges = self.team_badges();
+        // on the wall of one team, only its members' screens
+        let team = if immersive { self.wall_team } else { None };
+        let visible: Vec<usize> = (0..self.agents.len())
+            .filter(|&i| team.is_none_or(|t| badges.get(&self.agents[i].shared.id).is_some_and(|(id, _)| *id == t)))
+            .collect();
+        let team_name = team.and_then(|t| self.teams_ui.cache().iter().find(|x| x.id == t).map(|x| x.name.clone()));
+        if team.is_some() && visible.is_empty() {
+            ui.painter().text(
+                area.center(),
+                egui::Align2::CENTER_CENTER,
+                tr("이 팀 에이전트가 연 화면이 아직 없어요"),
+                egui::FontId::proportional(16.0),
+                theme::muted(),
+            );
+        }
+        let n = visible.len();
         let aspect_of = |a: &AgentHandle| {
             a.shared.workspace().map(|w| {
                 let (sw, sh) = w.size();
@@ -137,7 +172,7 @@ impl GhostApp {
             })
         };
         // size cells for the tallest screen so every screen fits with its aspect ratio intact
-        let aspect = self.agents.iter().filter_map(aspect_of).fold(0.0f32, f32::max);
+        let aspect = visible.iter().filter_map(|&i| aspect_of(&self.agents[i])).fold(0.0f32, f32::max);
         let aspect = if aspect > 0.0 { aspect } else { 0.625 };
         let gap = 10.0;
         let (cols, cell) = wall_layout(n, area.size(), aspect, gap);
@@ -147,8 +182,8 @@ impl GhostApp {
         let show_cursor = self.show_cursor;
         let mut open = None;
         let mut repaint = false;
-        for (i, a) in self.agents.iter_mut().enumerate() {
-            let (r, c) = (i / cols, i % cols);
+        for (k, (i, a)) in self.agents.iter_mut().enumerate().filter(|(i, _)| visible.contains(i)).enumerate() {
+            let (r, c) = (k / cols, k % cols);
             // center the last row
             let in_row = if r + 1 == rows { n - r * cols } else { cols };
             let row_w = in_row as f32 * cell.x + gap * (in_row as f32 - 1.0);
@@ -208,6 +243,15 @@ impl GhostApp {
             p.circle_filled(egui::pos2(at.x + 4.0, at.y + g.size().y / 2.0), 4.0, crate::cursor::agent_color(a.shared.id));
             p.galley(at + Vec2::new(14.0, 0.0), g, Color32::WHITE);
             theme::focus_outline(ui, &resp, theme::CARD_RADIUS);
+            // team member's screen: the team (and role) in a tag at the top right
+            if let Some((_, label)) = badges.get(&a.shared.id) {
+                let tg = p.layout_no_wrap(format!("{}  {}", icon::LIST_TODO, label), egui::FontId::proportional(12.0), Color32::WHITE);
+                let w = tg.size().x.min(rect.width() * 0.5);
+                let at = egui::pos2(rect.right() - 10.0 - w - 8.0, rect.top() + 9.0);
+                let tag = egui::Rect::from_min_size(at, Vec2::new(w, tg.size().y)).expand2(Vec2::new(8.0, 4.0));
+                p.rect_filled(tag, 255, theme::team_tag());
+                p.with_clip_rect(tag).galley(at, tg, Color32::WHITE);
+            }
             let resp = resp.on_hover_text(format!("{}\n{status}", a.shared.name));
             if let Some(c) = attn {
                 p.rect_stroke(rect, theme::CARD_RADIUS, Stroke::new(3.0, c), StrokeKind::Outside);
@@ -236,6 +280,9 @@ impl GhostApp {
                     theme::floating_frame().show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
+                            if let Some(name) = &team_name {
+                                ui.label(RichText::new(format!("{}  {}", icon::LIST_TODO, name)).color(theme::text()));
+                            }
                             ui.label(theme::hint(trf("화면 {}개", &[&n])));
                             if theme::icon_toggle(ui, self.show_cursor, icon::MOUSE_POINTER, tr("가상 마우스 표시")).clicked() {
                                 self.show_cursor = !self.show_cursor;
