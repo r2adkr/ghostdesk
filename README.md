@@ -520,7 +520,7 @@ cargo test
 
 ## License
 
-GhostDesk is released under the [Blue Oak Model License 1.0.0](LICENSE.md).
+GhostDesk is released under the [Apache License 2.0](LICENSE).
 
 The open-source packages built into the app, with their licenses, are listed in
 **Settings → About → License**. The list is generated from Cargo.lock; after

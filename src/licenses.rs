@@ -14,11 +14,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// GhostDesk's own license (Blue Oak Model License 1.0.0)
-pub const OWN: &str = include_str!("../LICENSE.md");
+/// GhostDesk's own license (Apache License 2.0)
+pub const OWN: &str = include_str!("../LICENSE");
 /// SPDX id of GhostDesk's license
-pub const OWN_SPDX: &str = "BlueOak-1.0.0";
-pub const OWN_URL: &str = "https://blueoakcouncil.org/license/1.0.0";
+pub const OWN_SPDX: &str = "Apache-2.0";
+/// Name shown on the License page
+pub const OWN_NAME: &str = "Apache License 2.0";
+pub const OWN_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
 
 const THIRD_PARTY: &str = include_str!("../assets/third-party-licenses.json");
 
@@ -44,6 +46,13 @@ pub struct ThirdParty {
 /// Parses the embedded list. Called only while the license view is open, and dropped with it.
 pub fn third_party() -> ThirdParty {
     serde_json::from_str(THIRD_PARTY).unwrap_or_default()
+}
+
+/// GhostDesk's own license laid out for the window: the file is indented and hard-wrapped for a
+/// fixed-width terminal, so the indentation is dropped and paragraphs are joined (`reflow`).
+pub fn own_text() -> String {
+    let flat: String = OWN.lines().map(str::trim).collect::<Vec<_>>().join("\n");
+    reflow(&flat)
 }
 
 /// License text for display: hard-wrapped lines inside a paragraph are joined so the text wraps
@@ -87,9 +96,9 @@ mod tests {
     const TARGETS: [&str; 3] = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"];
 
     #[test]
-    fn own_license_is_blue_oak() {
-        assert!(OWN.starts_with("# Blue Oak Model License"));
-        assert!(OWN.contains("Version 1.0.0") && OWN.contains("## No Liability"));
+    fn own_license_is_apache_2() {
+        assert!(OWN.trim_start().starts_with("Apache License"));
+        assert!(OWN.contains("Version 2.0, January 2004") && OWN.contains("END OF TERMS AND CONDITIONS"));
         assert_eq!(env!("CARGO_PKG_LICENSE"), OWN_SPDX);
     }
 
@@ -100,6 +109,14 @@ mod tests {
             reflow(t),
             "MIT License\n\nCopyright (c) 2020 A\n\nPermission is hereby granted, free of charge, to any person.\n\n1. First item\n2. Second\n   indented"
         );
+    }
+
+    #[test]
+    fn own_text_reads_as_paragraphs() {
+        let t = own_text();
+        assert!(t.starts_with("Apache License Version 2.0, January 2004"), "{}", &t[..80]);
+        // a definition is one paragraph, not a run of hard-wrapped lines
+        assert!(t.contains("\"License\" shall mean the terms and conditions for use, reproduction, and distribution as defined by Sections 1 through 9 of this document."));
     }
 
     #[test]

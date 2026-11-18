@@ -532,7 +532,7 @@ impl GhostApp {
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(theme::hint(trf("{} 라이선스 · 오픈소스 패키지 포함", &[&"Blue Oak Model License 1.0.0"])));
+            ui.label(theme::hint(trf("{} 라이선스 · 오픈소스 패키지 포함", &[&crate::licenses::OWN_NAME])));
             if theme::secondary(ui, tr("라이선스")).clicked() {
                 self.license_view = Some(LicenseView::new());
             }
@@ -749,10 +749,10 @@ fn license_page(ui: &mut egui::Ui, v: &mut LicenseView) -> bool {
 
     theme::section(ui, "GhostDesk");
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Blue Oak Model License 1.0.0").color(theme::text()));
+        ui.label(RichText::new(crate::licenses::OWN_NAME).color(theme::text()));
         ui.hyperlink_to(RichText::new(crate::licenses::OWN_URL).size(12.0), crate::licenses::OWN_URL);
     });
-    ui.label(theme::hint(tr("누구나 자유롭게 쓰고 고치고 나눠 줄 수 있어요. 나눠 줄 때는 이 라이선스 전문이나 링크를 함께 줘야 하고, 소프트웨어는 보증 없이 있는 그대로 제공돼요")));
+    ui.label(theme::hint(tr("누구나 자유롭게 쓰고 고치고 나눠 줄 수 있어요. 나눠 줄 때는 이 라이선스 전문을 함께 주고 고친 파일에는 고쳤다고 표시해야 해요. 'GhostDesk' 이름은 허락에 포함되지 않고, 소프트웨어는 보증 없이 있는 그대로 제공돼요")));
     let label = if v.own_open { tr("전문 접기") } else { tr("전문 보기") };
     if ui.link(RichText::new(label).size(12.0)).clicked() {
         v.own_open = !v.own_open;
@@ -760,7 +760,7 @@ fn license_page(ui: &mut egui::Ui, v: &mut LicenseView) -> bool {
     if v.own_open {
         theme::card_frame().inner_margin(Margin::same(10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(mono(crate::licenses::OWN)).wrap());
+            ui.add(egui::Label::new(mono(&crate::licenses::own_text())).wrap());
         });
     }
 

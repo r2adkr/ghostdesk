@@ -365,7 +365,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["새 소식", "What's new", "新機能", "更新内容"],
     ["{} 라이선스 · 오픈소스 패키지 포함", "{} · includes open-source packages", "{} ・オープンソースパッケージを含みます", "{} · 包含开源软件包"],
     ["라이선스", "License", "ライセンス", "许可证"],
-    ["누구나 자유롭게 쓰고 고치고 나눠 줄 수 있어요. 나눠 줄 때는 이 라이선스 전문이나 링크를 함께 줘야 하고, 소프트웨어는 보증 없이 있는 그대로 제공돼요", "Anyone may use, change and share it. Whoever shares it must pass on this license's text or a link to it. The software comes as is, without warranty", "誰でも自由に使用・改変・配布できます。配布する際はこのライセンスの全文かリンクを添える必要があり、ソフトウェアは無保証で現状のまま提供されます", "任何人都可以自由使用、修改和分发。分发时须附上本许可证全文或链接，软件按原样提供，不附带任何担保"],
+    ["누구나 자유롭게 쓰고 고치고 나눠 줄 수 있어요. 나눠 줄 때는 이 라이선스 전문을 함께 주고 고친 파일에는 고쳤다고 표시해야 해요. 'GhostDesk' 이름은 허락에 포함되지 않고, 소프트웨어는 보증 없이 있는 그대로 제공돼요", "Anyone may use, change and share it. Whoever shares it must include this license and mark the files they changed. The 'GhostDesk' name isn't covered, and the software comes as is, without warranty", "誰でも自由に使用・改変・配布できます。配布する際はこのライセンスの全文を添え、変更したファイルには変更した旨を記す必要があります。「GhostDesk」の名称は許諾に含まれず、ソフトウェアは無保証で現状のまま提供されます", "任何人都可以自由使用、修改和分发。分发时须附上本许可证全文，并在修改过的文件中注明已修改。“GhostDesk”名称不在许可范围内，软件按原样提供，不附带任何担保"],
     ["전문 보기", "Show full text", "全文を表示", "显示全文"],
     ["전문 접기", "Hide full text", "全文を閉じる", "收起全文"],
     ["오픈소스 라이선스", "Open-source licenses", "オープンソースライセンス", "开源许可证"],
