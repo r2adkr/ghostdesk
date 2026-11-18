@@ -34,8 +34,11 @@ pub(super) struct Prefs {
     remember_keys: Option<bool>,
     /// Keep working while the screen is locked (prevents sleep during work).
     keep_awake: Option<bool>,
+    pip_auto_open: Option<bool>,
+    pip_auto_close: Option<bool>,
     /// Permission bypass (approve external agents' requests without asking).
     auto_approve: Option<bool>,
+    allow_experimental: Option<bool>,
     /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
     // ---- old format (read only) ----
@@ -160,7 +163,10 @@ impl GhostApp {
         if let Some(k) = p.keep_awake {
             self.keep_awake = k;
         }
+        self.pip_auto_open = p.pip_auto_open.unwrap_or(false);
+        self.pip_auto_close = p.pip_auto_close.unwrap_or(true);
         self.auto_approve = p.auto_approve.unwrap_or(false);
+        self.allow_experimental = p.allow_experimental.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
     }
@@ -190,7 +196,10 @@ impl GhostApp {
             show_cursor: Some(self.show_cursor),
             remember_keys: Some(self.remember_keys),
             keep_awake: Some(self.keep_awake),
+            pip_auto_open: Some(self.pip_auto_open),
+            pip_auto_close: Some(self.pip_auto_close),
             auto_approve: Some(self.auto_approve),
+            allow_experimental: Some(self.allow_experimental),
             tour_seen: Some(self.tour_seen),
             other: self.prefs_other.clone(),
             ..Default::default()
@@ -267,6 +276,16 @@ mod secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_permission_is_explicit_and_persisted() {
+        let defaults: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.allow_experimental.unwrap_or(false));
+        let opted_in: Prefs = serde_json::from_str(r#"{"allow_experimental":true,"auto_approve":false}"#).unwrap();
+        let saved = serde_json::to_value(opted_in).unwrap();
+        assert_eq!(saved["allow_experimental"], true);
+        assert_eq!(saved["auto_approve"], false);
+    }
 
     #[cfg(windows)]
     #[test]

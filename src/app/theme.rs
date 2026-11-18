@@ -521,6 +521,7 @@ pub fn focus_outline(ui: &egui::Ui, resp: &Response, radius: u8) {
 pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badge: Option<Color32>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, resp.enabled(), selected, label));
+    let mut elided = false;
     if ui.is_rect_visible(rect) {
         let h = hover_t(ui.ctx(), &resp);
         let p = ui.painter();
@@ -532,13 +533,20 @@ pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badg
         }
         let fg = if selected { text() } else { body().lerp_to_gamma(text(), h) };
         p.text(egui::pos2(rect.left() + 18.0, rect.center().y), egui::Align2::CENTER_CENTER, icon, FontId::proportional(16.0), fg);
-        p.text(egui::pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(14.0), fg);
+        let text_left = rect.left() + 36.0;
+        let right_padding = if badge.is_some() { 26.0 } else { 8.0 };
+        let mut job = egui::text::LayoutJob::simple(label.to_owned(), FontId::proportional(14.0), fg, (rect.right() - text_left - right_padding).max(1.0));
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = p.layout_job(job);
+        elided = galley.elided;
+        p.with_clip_rect(rect).galley(egui::pos2(text_left, rect.center().y - galley.size().y / 2.0), galley, fg);
         if let Some(c) = badge {
             p.circle_filled(egui::pos2(rect.right() - 14.0, rect.center().y), 3.5, c);
         }
     }
     focus_outline(ui, &resp, RADIUS);
-    resp
+    if elided { resp.on_hover_text(label) } else { resp }
 }
 
 /// Send button: an Enter icon (Lucide corner-down-left) in an accent-colored circle.

@@ -86,7 +86,7 @@ key (text, xdotool style such as \"Return\", \"ctrl+s\", \"alt+Tab\"; repeat); h
     })
 }
 
-fn to_tools(tools: &Value) -> Value {
+pub(super) fn to_tools(tools: &Value) -> Value {
     let out = list(tools)
         .iter()
         .map(|t| {

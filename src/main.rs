@@ -34,6 +34,8 @@ mod licenses;
 mod llm;
 mod profiles;
 mod rfb;
+mod ssh;
+mod cli;
 mod selftest;
 mod team;
 mod turns;

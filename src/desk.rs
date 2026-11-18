@@ -36,6 +36,7 @@ pub enum DeskKind {
     Session,
     /// Experimental: macOS apps on a virtual display (real pixel input).
     VDisplay,
+    Ssh,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,7 @@ pub enum Desk {
     Native(Arc<NativeAppWorkspace>),
     Session(Arc<SessionDesk>),
     VDisplay(Arc<VirtualDisplayDesk>),
+    Ssh(Arc<crate::ssh::SshConnection>),
 }
 
 macro_rules! each {
@@ -57,6 +59,7 @@ macro_rules! each {
             Desk::Native($w) => $e,
             Desk::Session($w) => $e,
             Desk::VDisplay($w) => $e,
+            Desk::Ssh($w) => $e,
         }
     };
 }
@@ -107,6 +110,8 @@ fn localize_mods_for(kind: DeskKind, mods: i64) -> i64 {
 }
 
 impl Desk {
+    pub fn has_screen(&self) -> bool { self.kind() != DeskKind::Ssh }
+
     pub fn kind(&self) -> DeskKind {
         match self {
             Desk::Browser(_) => DeskKind::Browser,
@@ -115,6 +120,7 @@ impl Desk {
             Desk::Native(_) => DeskKind::Native,
             Desk::Session(_) => DeskKind::Session,
             Desk::VDisplay(_) => DeskKind::VDisplay,
+            Desk::Ssh(_) => DeskKind::Ssh,
         }
     }
 
@@ -293,6 +299,7 @@ impl Desk {
         match self.kind() {
             DeskKind::Browser => "Tabs",
             DeskKind::Remote => "Desktop",
+            DeskKind::Ssh => "SSH",
             DeskKind::Electron | DeskKind::Native | DeskKind::VDisplay => "Windows",
             DeskKind::Session => "Session",
         }

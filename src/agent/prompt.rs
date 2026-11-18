@@ -16,6 +16,7 @@ const ENV_BROWSER: &str = r#"Environment
 - Coordinates are in the pixel space of the screenshots (origin top-left)."#;
 
 const ENV_REMOTE: &str = r#"Environment
+- If SSH is configured, remote_control runs commands on this remote computer and receives a specified absolute file path on the GhostDesk computer. Receive files only when requested by the human.
 - You control a separate remote desktop session over VNC (a dedicated agent machine, VM or login session). It is not the human's own screen, so you may use the mouse and keyboard freely inside it.
 - Screenshots show that whole desktop. Coordinates are in the pixel space of the screenshots (origin top-left).
 - After every batch of actions you automatically receive a fresh screenshot.
@@ -102,6 +103,7 @@ fn env_section(kind: DeskKind) -> Cow<'static, str> {
         DeskKind::Browser if !mac => Cow::Owned(env_browser_pc()),
         DeskKind::Browser => Cow::Borrowed(ENV_BROWSER),
         DeskKind::Remote => Cow::Borrowed(ENV_REMOTE),
+        DeskKind::Ssh => Cow::Borrowed("SSH-only remote workspace. There is no screen. Use remote_control execute to run remote commands. Use receive only when the user requests result files, with an exact absolute remote path. Commands run on the remote host, and received files are saved on the requesting GhostDesk computer. Never claim a failed command or transfer succeeded."),
         DeskKind::Electron if !mac => Cow::Owned(env_electron_pc()),
         DeskKind::Electron => Cow::Borrowed(ENV_ELECTRON),
         // local-app backends differ per OS, so the backend supplies the text (None = the macOS text)

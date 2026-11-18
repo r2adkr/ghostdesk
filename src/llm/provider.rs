@@ -3,6 +3,8 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Provider {
     Anthropic,
+    ClaudeCli,
+    CodexCli,
     OpenAi,
     Gemini,
     Xai,
@@ -15,7 +17,8 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 8] = [
+    pub fn is_cli(self) -> bool { matches!(self, Self::ClaudeCli | Self::CodexCli) }
+    pub const ALL: [Provider; 10] = [
         Provider::Anthropic,
         Provider::OpenAi,
         Provider::Gemini,
@@ -24,10 +27,14 @@ impl Provider {
         Provider::Mistral,
         Provider::Ollama,
         Provider::Custom,
+        Provider::ClaudeCli,
+        Provider::CodexCli,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Provider::ClaudeCli => "Claude Code CLI",
+            Provider::CodexCli => "Codex CLI",
             Provider::Anthropic => "Claude (Anthropic)",
             Provider::OpenAi => "GPT (OpenAI)",
             Provider::Gemini => "Gemini (Google)",
@@ -42,6 +49,8 @@ impl Provider {
     /// Short name, for errors and hints.
     pub fn short_name(self) -> &'static str {
         match self {
+            Provider::ClaudeCli => "Claude Code CLI",
+            Provider::CodexCli => "Codex CLI",
             Provider::Anthropic => "Claude",
             Provider::OpenAi => "OpenAI",
             Provider::Gemini => "Gemini",
@@ -60,6 +69,8 @@ impl Provider {
     /// `Custom` has none; the user's URL is cleaned up with `normalize_base_url` instead.
     pub fn default_base_url(self) -> String {
         match self {
+            Provider::ClaudeCli => String::new(),
+            Provider::CodexCli => String::new(),
             Provider::Anthropic => std::env::var("ANTHROPIC_BASE_URL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -78,6 +89,8 @@ impl Provider {
     /// Environment variables to fill the key from, in order of preference.
     pub fn env_keys(self) -> &'static [&'static str] {
         match self {
+            Provider::ClaudeCli => &[],
+            Provider::CodexCli => &[],
             Provider::Anthropic => &["ANTHROPIC_API_KEY"],
             Provider::OpenAi => &["OPENAI_API_KEY"],
             Provider::Gemini => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
@@ -94,6 +107,8 @@ impl Provider {
 
     pub fn key_hint(self) -> &'static str {
         match self {
+            Provider::ClaudeCli => "",
+            Provider::CodexCli => "",
             Provider::Anthropic => "sk-ant-…",
             Provider::OpenAi => "sk-…",
             Provider::Gemini => "AIza…",
@@ -108,6 +123,8 @@ impl Provider {
     /// Where to create an API key (empty for `Custom`).
     pub fn key_page(self) -> &'static str {
         match self {
+            Provider::ClaudeCli => "https://code.claude.com/docs/en/setup",
+            Provider::CodexCli => "https://developers.openai.com/codex/cli/",
             Provider::Anthropic => "https://console.anthropic.com/settings/keys",
             Provider::OpenAi => "https://platform.openai.com/api-keys",
             Provider::Gemini => "https://aistudio.google.com/apikey",
@@ -121,12 +138,12 @@ impl Provider {
 
     /// Whether a key is required.
     pub fn needs_key(self) -> bool {
-        !matches!(self, Provider::Ollama | Provider::Custom)
+        !matches!(self, Provider::Ollama | Provider::Custom | Provider::ClaudeCli | Provider::CodexCli)
     }
 
     /// Whether to show a key field (`Custom` doesn't need one but accepts one).
     pub fn takes_key(self) -> bool {
-        self != Provider::Ollama
+        !self.is_cli() && self != Provider::Ollama
     }
 
     /// Whether the user must enter an API URL.
@@ -137,6 +154,8 @@ impl Provider {
     /// Models to show before the real list is fetched from the API (when the model field opens).
     pub fn default_models(self) -> &'static [&'static str] {
         match self {
+            Provider::ClaudeCli => &["sonnet", "opus", "haiku"],
+            Provider::CodexCli => &[],
             Provider::Anthropic => &["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5"],
             Provider::OpenAi => &["gpt-5.5", "gpt-5.5-mini"],
             Provider::Gemini => &["gemini-3.1-pro-preview", "gemini-3-flash-preview"],
@@ -203,7 +222,7 @@ mod tests {
         assert!(c.default_base_url().is_empty() && c.default_models().is_empty());
         // don't send options it might not accept; the agent clears old tool results itself
         assert!(!c.supports_effort() && !c.clears_old_tool_results());
-        for p in Provider::ALL.into_iter().filter(|p| *p != Provider::Custom) {
+        for p in Provider::ALL.into_iter().filter(|p| *p != Provider::Custom && !p.is_cli()) {
             assert!(!p.needs_url() && !p.default_base_url().is_empty() && !p.default_models().is_empty(), "{p:?}");
         }
     }

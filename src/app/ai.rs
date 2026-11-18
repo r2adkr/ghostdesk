@@ -48,7 +48,9 @@ impl AiConn {
 
     /// API base URL.
     pub fn base_url(&self) -> String {
-        if self.provider.needs_url() {
+        if self.provider.is_cli() {
+            self.url.trim().to_string()
+        } else if self.provider.needs_url() {
             Provider::normalize_base_url(&self.url)
         } else {
             self.provider.default_base_url()
@@ -95,6 +97,11 @@ pub(super) fn initial(next_id: &mut u64) -> Vec<AiConn> {
             AiConn::new(*next_id, p)
         })
         .collect();
+    for provider in [Provider::ClaudeCli, Provider::CodexCli] {
+        if crate::cli::executable(provider, "").is_some() {
+            *next_id += 1; list.push(AiConn::new(*next_id, provider));
+        }
+    }
     if list.is_empty() {
         *next_id += 1;
         list.push(AiConn::new(*next_id, Provider::Anthropic));

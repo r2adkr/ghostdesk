@@ -62,6 +62,19 @@ impl GhostApp {
                 });
             });
         });
+        let files = a.shared.received_files.lock().clone();
+        if !files.is_empty() {
+            theme::section(ui, tr("받은 파일"));
+            egui::ScrollArea::vertical().id_salt(("received", a.shared.id)).max_height(140.0).show(ui, |ui| {
+                for file in files.iter().rev() {
+                    ui.label(theme::hint(file.path.display().to_string()));
+                    ui.horizontal(|ui| {
+                        if ui.link(tr("파일 열기")).clicked() { crate::kit::reveal(&file.path); }
+                        if ui.link(tr("폴더 열기")).clicked() { if let Some(parent) = file.path.parent() { crate::kit::reveal(parent); } }
+                    });
+                }
+            });
+        }
         let tokens = *a.shared.tokens.lock();
         let paused = a.shared.paused.load(Ordering::Relaxed);
         let (status, color) = display_status(&st, paused, a.takeover);
@@ -101,18 +114,24 @@ impl GhostApp {
                 a.shared.stop.store(true, Ordering::SeqCst);
                 a.shared.paused.store(false, Ordering::Relaxed);
             }
-            let before = a.takeover;
-            if theme::toggle(ui, a.takeover, tr("직접 조작"), theme::takeover())
-                .on_hover_text(tr("에이전트를 멈추고 내가 직접 화면을 눌러요 (로그인 · 인증할 때)"))
-                .clicked()
-            {
-                a.takeover = !a.takeover;
+            let workspace = a.shared.workspace();
+            let has_screen = workspace.as_ref().is_none_or(|w| w.has_screen());
+            if has_screen {
+                let before = a.takeover;
+                if theme::toggle(ui, a.takeover, tr("직접 조작"), theme::takeover())
+                    .on_hover_text(tr("에이전트를 멈추고 내가 직접 화면을 눌러요 (로그인 · 인증할 때)"))
+                    .clicked()
+                {
+                    a.takeover = !a.takeover;
+                }
+                if a.takeover != before {
+                    a.shared.paused.store(a.takeover, Ordering::Relaxed);
+                }
             }
-            if a.takeover != before {
-                a.shared.paused.store(a.takeover, Ordering::Relaxed);
-            }
-            if theme::icon_toggle(ui, a.pip, icon::PICTURE_IN_PICTURE, tr("작은 창(PiP)으로 띄우기 — 다른 일을 하면서 지켜볼 수 있어요")).clicked() {
-                a.pip = !a.pip;
+            if a.pip.visible || workspace.is_some_and(|desk| desk.has_screen() && !desk.is_closed()) {
+                if theme::icon_toggle(ui, a.pip.visible, icon::PICTURE_IN_PICTURE, tr("작은 창(PiP)으로 띄우기 — 다른 일을 하면서 지켜볼 수 있어요")).clicked() {
+                    a.pip.visible = !a.pip.visible;
+                }
             }
         });
 
@@ -245,6 +264,15 @@ impl GhostApp {
     pub(super) fn detail_view(&mut self, ui: &mut egui::Ui, idx: usize) {
         let rt = self.rt.clone();
         let ws_opt = self.agents[idx].shared.workspace();
+        if ws_opt.as_ref().is_some_and(|w| !w.has_screen()) {
+            if theme::secondary(ui, tr("‹  모두 보기")).clicked() { self.view = View::Grid; }
+            theme::section(ui, tr("SSH 작업 로그"));
+            let log = self.agents[idx].shared.log.lock().clone();
+            egui::ScrollArea::vertical().id_salt(("ssh_log", self.agents[idx].shared.id)).stick_to_bottom(true).show(ui, |ui| {
+                for entry in &log { log_row(ui,entry,false); }
+            });
+            return;
+        }
         let browser = ws_opt.as_ref().and_then(|w| w.as_browser().cloned());
         let compact_browser = browser.is_some() && ui.available_width() < 520.0;
         let (views, active) = ws_opt.as_ref().map(|w| w.views()).unwrap_or_default();

@@ -32,7 +32,19 @@ pub(crate) async fn prepare_workspace_with(
         DeskTarget::Browser { source, headless, width, height, start_url } => {
             prepare_browser(shared, workspace, source, *headless, *width, *height, start_url).await
         }
-        DeskTarget::Remote(t) => prepare_remote(shared, t, remote_local_ok.unwrap_or(t.dedicated_ack)).await,
+        DeskTarget::Remote(t) => {
+            let desk = prepare_remote(shared, t, remote_local_ok.unwrap_or(t.dedicated_ack)).await?;
+            if let Some(options) = &t.ssh { *shared.ssh.lock() = Some(crate::ssh::SshConnection::new(options.clone())?); }
+            Ok(desk)
+        }
+        DeskTarget::Ssh(options) => {
+            let ssh = crate::ssh::SshConnection::new(options.clone())?;
+            // Verify authentication/host key before reporting this workspace as connected.
+            let result = ssh.execute("echo GhostDesk", 20, &shared.stop).await?;
+            if result["success"] != true { bail!("SSH connection failed: {}", result["stderr"]); }
+            *shared.ssh.lock() = Some(ssh.clone());
+            Ok(Desk::Ssh(ssh))
+        },
         DeskTarget::Electron { app, profile, width, height } => {
             prepare_electron(shared, workspace, app, profile, *width, *height).await
         }
@@ -461,7 +473,7 @@ mod tests {
             port
         }
         let shared = AgentShared::new(1, "t".into(), "t".into(), egui::Context::default());
-        let target = |port, ack| RemoteTarget { host: "127.0.0.1".into(), port, username: None, password: None, dedicated_ack: ack };
+        let target = |port, ack| RemoteTarget { host: "127.0.0.1".into(), port, username: None, password: None, dedicated_ack: ack, ssh: None };
         let err = |r: Result<Desk>| r.err().map(|e| format!("{e:#}")).unwrap_or_default();
 
         let port = fake(b"RFB 003.008\n").await;

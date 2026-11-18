@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.7.1-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.1/GhostDesk-Setup-0.7.1-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.8.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.8.0/GhostDesk-Setup-0.8.0-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.7.1-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.1/GhostDesk-0.7.1-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.8.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.8.0/GhostDesk-0.8.0-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
@@ -62,6 +62,16 @@ pick a provider and paste the key. Claude, OpenAI, Gemini, Grok, OpenRouter and
 Mistral are built in, any number of OpenAI-compatible endpoints (DeepSeek,
 Groq, LM Studio, …) can be added by URL, and a local Ollama works too. The
 model and thinking depth are picked from the button under the composer.
+
+**Use an existing CLI login.** In Settings → AI connections, choose **Find CLIs
+on this computer**, or add **Claude Code CLI** / **Codex CLI**. GhostDesk checks
+the installed CLI's login and loads its models without copying credentials or
+requiring another API key. Sign in first with `claude auth login` or `codex login`,
+then use **Check connection again**. A custom executable path can be set when
+automatic detection misses an installation. Codex uses its account model catalog;
+Claude shows the CLI's `sonnet`, `opus`, and `haiku` aliases and accepts a model
+ID entered by hand. CLI versions must support the required non-interactive and
+structured-output options; unsupported versions show an error.
 
 **New agent** lets you choose where the agent works: a website, a specific
 app, or a remote computer. The default, **Auto**, uses an app if the task names
@@ -91,6 +101,14 @@ cargo build --release
 
 GhostDesk requires Rust 1.95 or newer. With rustup, the version pinned in
 `rust-toolchain.toml` is installed automatically.
+
+Run `cargo test` for local tests, including a real local OpenSSH SFTP fixture on
+macOS. With Python 3 and Codex installed, `python3 scripts/check_cli_isolation.py`
+exercises the production CLI adapter against a localhost Responses fixture and
+checks that no native CLI tools are exposed. It uses synthetic authentication
+and makes no paid model requests. Pass `--codex /absolute/path/to/codex` when the
+executable is outside PATH. An optional live Codex model smoke test is separately
+marked ignored in `src/cli.rs` and requires explicit opt-in.
 
 ## Agent screens (macOS)
 
@@ -175,6 +193,37 @@ Screens opened by external agents are marked with a plug icon and show the
 virtual cursor. The control socket is
 `~/Library/Application Support/GhostDesk/control.sock` with mode 0600.
 
+### SSH work and requested result files
+
+Under **New agent → Remote computer**, choose **SSH only (no screen)** for
+command work, or keep VNC and enable **SSH commands and result files**. Set the
+SSH host, port, user and optional private key path separately from VNC login.
+System OpenSSH `ssh` and `sftp` must be installed. SSH keys, the SSH agent and
+OpenSSH host aliases are supported. Verify the host key and working key login
+in a terminal first: unknown or changed keys are never accepted automatically.
+
+Ask the agent to run a remote command or to bring back a specific result file.
+Files are received only when requested, one absolute remote file path at a
+time, under `Downloads/GhostDesk/<workspace>/` on the computer running GhostDesk.
+The detail view lists received files with **Open file** and **Open folder**.
+Existing files are never replaced, and failed transfers leave no result file.
+SSH-only tasks show execution logs instead of a desktop screen. Cancelling SSH
+closes the local connection; a remote child job may keep running, so check the
+remote host before retrying a command that changes data.
+
+External agents use `desk_open(mode="ssh", host=..., port=22, username=...,
+identity_file=...)`, then `desk_remote(desk_id=..., action="execute",
+command=..., timeout_seconds=120)` or `action="receive", remote_path="/absolute/file"`.
+For VNC plus SSH, use `mode="remote"` and a separate `ssh` object containing
+`host`, `port`, `username` and optional `identity_file`. The returned `local_path`
+belongs to the GhostDesk computer; an MCP client running on another computer
+does not automatically receive an additional copy there.
+
+Settings → General → **Allow experimental features** records consent once for
+experimental features such as virtual displays. Ordinary app, account and remote
+connection permissions remain separate. Turning it off restores individual
+experimental confirmations.
+
 For login continuity, give `desk_open` the same `workspace` on later visits.
 `web_login` accepts a detected `browser_profile` ID (for example `Profile 1`)
 or an unambiguous profile name. Unknown or ambiguous browser/profile choices
@@ -202,15 +251,27 @@ task, the results of finished tasks and every note, and you can add notes and
 tasks or reopen and delete them there. Right-click a team in the list to rename
 or delete it; deleting asks for confirmation first.
 
+To use a team with an API or CLI model configured inside GhostDesk, select
+**Start team agent** on the team's board or choose a team in **New agent**.
+You can add a role for that agent. It can read the board, claim and complete
+tasks, and share notes with any other member of the same team.
+
 **Team screens** on a team's board opens a screen wall with only that team's
 members' screens. In **All agents**, the screen wall and the sidebar, a member's
 screen carries a blue tag with its team and role (for example `Jeju trip ·
 research`).
 
-- Agents use two MCP tools. `team` (`list`, `create`, `join` with a `role`,
+- External agents use two MCP tools. `team` (`list`, `create`, `join` with a `role`,
   `read`, `note`, `goal`, `leave`, `delete`) and `team_task` (`add`, `claim`,
-  `done` with a `result`, `release`). Joining returns the goal, all tasks and
-  the latest 30 notes; `read` with `before` pages back.
+  `done` with a `result`, `release`). Joining returns the goal, all tasks,
+  active file claims, and the latest 30 notes. `read` with `before` pages back.
+- For shared code, reserve exact repository-relative paths before editing with
+  `claim_files` and release them with `release_files` on `team` (external MCP)
+  or `team_board` (app agents). A request either reserves all paths or reports
+  the existing owner. Agents can edit different files at the same time. The
+  team board shows each reserved path and its owner. Claims clear when an agent
+  leaves or an app agent finishes or returns to idle after an interruption. Reservations coordinate team agents
+  through these tools.
 - A task belongs to the agent that claimed it until it is done or released. When
   an agent disconnects, it leaves its teams and its claimed tasks open again.
 - Screens stay per agent; a team shares what agents know and who does what, not

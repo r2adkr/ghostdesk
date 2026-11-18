@@ -142,6 +142,7 @@ fn to_jpeg(img: &[u8]) -> Option<Vec<u8>> {
 /// The current screen, for messages that start a task or instruction. A short note if it's the
 /// same as the last one sent.
 pub(super) async fn screenshot_context(ws: &Desk, seen: &mut Seen) -> Value {
+    if !ws.has_screen() { return json!({"type":"text", "text":"SSH workspace: no screen; use remote_control"}); }
     match ws.screenshot().await {
         Ok(png) => seen.screen(&png, 0),
         Err(e) => json!({ "type": "text", "text": format!("(스크린샷 실패: {e})") }),

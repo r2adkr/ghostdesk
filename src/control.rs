@@ -44,6 +44,21 @@ use crate::{
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub(crate) fn approval_allowed(all: bool, allow_experimental: bool, experimental: bool) -> bool {
+    all || (allow_experimental && experimental)
+}
+
+#[cfg(test)]
+mod experimental_policy_tests {
+    #[test]
+    fn experimental_permission_does_not_approve_other_requests() {
+        assert!(super::approval_allowed(false, true, true));
+        assert!(!super::approval_allowed(false, true, false));
+        assert!(!super::approval_allowed(false, false, true));
+        assert!(super::approval_allowed(true, false, false));
+    }
+}
+
 /// How long external actions wait at most while the user has taken over or paused.
 const PAUSE_WAIT: Duration = Duration::from_secs(120);
 /// How long to wait at most for an answer to the approval dialog.
@@ -130,7 +145,7 @@ pub enum ControlEvent {
     Register(Arc<AgentShared>),
     /// User approval is needed. If the requester gives up (timeout, disconnect), the receiving side
     /// of `reply` is dropped (the GUI clears items whose `reply.is_closed()`).
-    Approval { title: String, detail: String, reply: oneshot::Sender<bool> },
+    Approval { title: String, detail: String, experimental: bool, reply: oneshot::Sender<bool> },
 }
 
 /// This OS's word for regular apps in approval dialogs and errors ("macOS 앱" / "Windows 앱").
@@ -311,12 +326,10 @@ impl ControlServer {
             }
         }
         reader.abort();
-        // the connection is over (EOF, error, write failure): close every screen it created (so headless
-        // browsers and hidden instances don't pile up, and user apps hidden by attach are restored)
-        self.close_conn_desks(conn_id).await;
-        // and leaves every team it joined (its claimed tasks are open again)
+        // No command is in flight here. Free team claims before waiting for desk teardown.
         self.teams.leave_all(conn_id);
         self.ctx.request_repaint();
+        self.close_conn_desks(conn_id).await;
         Ok(())
     }
 
@@ -353,6 +366,7 @@ impl ControlServer {
     /// Discards an entry: releases its reservation and shuts down any remaining screen in the
     /// background.
     fn discard(&self, e: DeskEntry) {
+        if let Some(ssh) = e.shared.ssh.lock().as_ref() { ssh.close(); }
         self.reserved.lock().remove(&e.reservation);
         let left = e.shared.workspace.lock().take();
         if let Some(d) = left {
@@ -362,6 +376,7 @@ impl ControlServer {
 
     /// Closes an entry: shuts the screen down, then releases the reservation.
     async fn shutdown_entry(&self, e: DeskEntry, why: &str) {
+        if let Some(ssh) = e.shared.ssh.lock().as_ref() { ssh.close(); }
         let desk = e.shared.workspace.lock().take();
         if let Some(d) = desk {
             d.shutdown().await;
@@ -442,6 +457,7 @@ impl ControlServer {
     /// member they joined as; deleting a team needs the user's approval in the GhostDesk window.
     async fn team(&self, p: &Value, conn: &Conn) -> Result<Value> {
         let t = &self.teams;
+        if let Some(error) = &t.load_error { bail!("{error}"); }
         let action = p["action"].as_str().unwrap_or_default();
         let team = || p["team"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| anyhow!("team(팀 이름)이 필요합니다"));
         let task = || p["task"].as_u64().ok_or_else(|| anyhow!("task(할 일 번호)가 필요합니다"));
@@ -452,42 +468,41 @@ impl ControlServer {
             "list" => Ok(json!({ "teams": t.list_json(conn.id) })),
             "create" => {
                 let name = s("name");
-                t.create(&name, &s("goal"), &client)?;
+                let id = t.create(&name, &s("goal"), &client)?;
                 // whoever creates a team is in it
-                t.join(&name, conn.id, &client, &s("role"))?;
+                t.join(id, conn.id, &client, &s("role"))?;
                 ok(format!("팀 '{name}' 을(를) 만들고 들어왔습니다. 다른 에이전트도 같은 이름으로 join 하면 이 작업판을 같이 씁니다"))
             }
             "delete" => {
-                let name = team()?.to_string();
-                let snap = t.read_json(&name, None)?;
-                let notes = t.snapshot().into_iter().find(|x| x.name.eq_ignore_ascii_case(name.trim())).map_or(0, |x| x.notes.len());
+                let target = t.team_snapshot(team()?)?;
                 self.ask(
                     conn,
                     "팀 삭제 요청",
                     format!(
-                        "{client} 이(가) 팀 '{}' 을(를) 지우려고 합니다.\n메모 {notes}개와 할 일 {}개가 함께 사라집니다.",
-                        snap["team"].as_str().unwrap_or(&name),
-                        snap["tasks"].as_array().map_or(0, |a| a.len())
+                        "{client} 이(가) 팀 '{}' 을(를) 지우려고 합니다.\n메모 {}개와 할 일 {}개가 함께 사라집니다.",
+                        target.name, target.notes.len(), target.tasks.len()
                     ),
                 )
                 .await?;
-                ok(format!("팀 '{}' 을(를) 지웠습니다", t.delete(&name)?))
+                ok(format!("팀 '{}' 을(를) 지웠습니다", t.delete(target.id)?))
             }
             "join" => {
-                t.join(team()?, conn.id, &client, &s("role"))?;
-                Ok(t.read_json(team()?, None)?)
+                let id = t.join(team()?, conn.id, &client, &s("role"))?;
+                t.read_for(id, None, Some(conn.id))
             }
             "leave" => {
                 t.leave(team()?, conn.id)?;
-                ok("팀에서 나왔습니다. 맡았던 할 일은 다시 열렸습니다".into())
+                ok("팀에서 나왔습니다. 맡았던 할 일과 파일이 해제됐습니다".into())
             }
-            "read" => Ok(t.read_json(team()?, p["before"].as_u64())?),
+            "read" => t.read_for(team()?, p["before"].as_u64(), Some(conn.id)),
+            "claim_files" => t.edit_files(team()?, conn.id, crate::team::FileEditAction::Claim, &p["paths"]),
+            "release_files" => t.edit_files(team()?, conn.id, crate::team::FileEditAction::Release, &p["paths"]),
             "note" => {
                 let id = t.note(team()?, Some(conn.id), &s("text"))?;
                 ok(format!("메모 {id} 을(를) 남겼습니다"))
             }
             "goal" => {
-                t.set_goal(team()?, &s("goal"))?;
+                t.set_goal(team()?, conn.id, &s("goal"))?;
                 ok("목표를 바꿨습니다".into())
             }
             "task_add" => {
@@ -513,12 +528,16 @@ impl ControlServer {
     /// Shows an approval dialog in the GUI and waits. On timeout or requester disconnect, drops the
     /// receiving side so the dialog goes away.
     async fn ask(&self, conn: &Conn, title: &str, detail: String) -> Result<()> {
+        self.ask_with(conn, title, detail, false).await
+    }
+
+    async fn ask_with(&self, conn: &Conn, title: &str, detail: String, experimental: bool) -> Result<()> {
         if conn.is_closed() {
             bail!("요청한 에이전트의 연결이 끊겨 승인 요청을 취소했습니다");
         }
         let (tx, rx) = oneshot::channel();
         self.events
-            .send(ControlEvent::Approval { title: title.to_string(), detail, reply: tx })
+            .send(ControlEvent::Approval { title: title.to_string(), detail, experimental, reply: tx })
             .map_err(|_| anyhow!("GhostDesk 창이 닫혀 있습니다"))?;
         self.ctx.request_repaint();
         let res = tokio::select! {
@@ -639,7 +658,10 @@ impl ControlServer {
                 let host = p["host"].as_str().ok_or_else(|| anyhow!("host 가 필요합니다"))?.to_string();
                 let port = p["port"].as_u64().unwrap_or(5900) as u16;
                 let dedicated = p["dedicated_machine"].as_bool().unwrap_or(false);
+                let ssh = p.get("ssh").filter(|v| !v.is_null()).map(|v| serde_json::from_value::<crate::ssh::SshOptions>(v.clone())).transpose()?;
+                if let Some(options) = &ssh { options.validate()?; }
                 let mut detail = format!("{client} 이(가) {host}:{port} 원격 데스크톱(VNC)에 접속하려고 합니다.");
+                if let Some(options) = &ssh { detail.push_str(&format!("\nSSH: {}:{} — remote commands and requested file receipt", options.host, options.port)); }
                 #[cfg(target_os = "macos")]
                 if dedicated {
                     detail.push_str(
@@ -686,9 +708,16 @@ impl ControlServer {
                     username: p["username"].as_str().map(String::from),
                     password: p["password"].as_str().map(String::from),
                     dedicated_ack: dedicated,
+                    ssh,
                 })
             }
-            other => bail!("kind 는 browser / app / session / remote 중 하나여야 합니다 (받은 값: {other})"),
+            "ssh" => {
+                let options: crate::ssh::SshOptions = serde_json::from_value(p.clone())?;
+                options.validate()?;
+                self.ask(conn, "SSH 원격 작업 접속 요청", format!("{client}: {}:{}\nRemote command execution and requested result file receipt using SSH key/agent authentication", options.host, options.port)).await?;
+                DeskTarget::Ssh(options)
+            }
+            other => bail!("kind 는 browser / app / session / remote / ssh 중 하나여야 합니다 (받은 값: {other})"),
         };
 
         // opening with an empty profile, but the folder has earlier data (login clone leftovers, …):
@@ -707,7 +736,7 @@ impl ControlServer {
 
         let shared = AgentShared::new(n, label.clone(), workspace.clone(), self.ctx.clone());
         *shared.external.lock() = Some(client.clone());
-        shared.control_conn.store(conn.id, Ordering::Relaxed);
+        shared.team_member_id.store(conn.id, Ordering::Relaxed);
         shared.log(LogKind::Info, format!("{client} 이(가) 이 화면을 만들었습니다 (MCP)"));
         let _ = self.events.send(ControlEvent::Register(shared.clone()));
         self.ctx.request_repaint();
@@ -896,7 +925,15 @@ impl ControlServer {
         // experimental: run on a virtual display (real pixel clicks and drags work, at the cost of an
         // extra virtual monitor)
         if p["virtual_display"].as_bool().unwrap_or(false) {
+            // Experimental opt-in only covers adding the display. Launching/attaching an app
+            // still needs the ordinary real-account permission, independently of that setting.
             self.ask(
+                conn,
+                if attach { "실행 중인 내 앱 사용 요청" } else { "내 앱 실행 요청" },
+                format!("{client}: {}\n{APP_ID_LABEL}: {bid}\n경로: {path}\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터를 사용합니다.{}", r.name,
+                    if attach { "\n실행 중인 창을 가상 디스플레이로 옮깁니다." } else { "" }),
+            ).await?;
+            self.ask_with(
                 conn,
                 "가상 디스플레이 사용 요청 (실험)",
                 format!(
@@ -904,6 +941,7 @@ impl ControlServer {
                     r.name,
                     if attach { "\n실행 중인 앱을 쓰므로 작업하는 동안 그 앱 창이 가상 모니터로 옮겨집니다." } else { "" }
                 ),
+                true,
             )
             .await?;
             let (width, height) = desk_dims(p);
@@ -984,6 +1022,7 @@ impl ControlServer {
         let name = match tool {
             "computer" => input["action"].as_str().ok_or_else(|| anyhow!("input.action 이 필요합니다"))?.to_string(),
             "browser" => "browser_control".to_string(),
+            "remote" => "remote_control".to_string(),
             "app" => match desk.kind() {
                 DeskKind::Electron => "app_menu".to_string(),
                 _ => "app_control".to_string(),
@@ -1002,6 +1041,11 @@ impl ControlServer {
             let r = agent::exec_computer(&desk, &name, input, &aim).await;
             shared.cursor.lock().record(&name, input, desk.mouse_pos(), false);
             r
+        } else if tool == "remote" {
+            tokio::select! {
+                result = agent::exec_remote_tool(&shared, input) => result,
+                _ = conn.wait_closed() => bail!("Remote operation cancelled: requesting agent disconnected"),
+            }
         } else {
             agent::exec_desk_tool(&desk, &name, input).await
         };
@@ -1116,7 +1160,7 @@ fn done_prefix(lines: &[String]) -> String {
 /// action returned no screen).
 async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot: bool) -> Result<Value> {
     let mut image = image;
-    if image.is_none() && want_shot {
+    if image.is_none() && want_shot && desk.has_screen() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         image = desk.screenshot().await.ok();
     }
@@ -1424,8 +1468,8 @@ fn remote_is_this_computer(host: &str, port: u16) -> bool {
 }
 
 /// desk_open mode names (must match mcp.rs `modes`).
-pub(crate) const MODES: [&str; 9] =
-    ["web", "web_login", "app", "app_login", "app_current_session", "app_running", "app_vdisplay", "session", "remote"];
+pub(crate) const MODES: [&str; 10] =
+    ["web", "web_login", "app", "app_login", "app_current_session", "app_running", "app_vdisplay", "session", "remote", "ssh"];
 
 fn browser_choice<'a>(browsers: &'a [profiles::InstalledBrowser], query: &str) -> Result<&'a profiles::InstalledBrowser> {
     let want = query.trim().to_lowercase();
@@ -1478,6 +1522,7 @@ fn apply_mode(p: &Value) -> Result<Value> {
         "app_vdisplay" => ("app", Some(("virtual_display", json!(true)))),
         "session" => ("session", None),
         "remote" => ("remote", None),
+        "ssh" => ("ssh", None),
         _ => bail!("mode 는 {} 중 하나입니다 (받은 값: {mode})", MODES.join(" / ")),
     };
     let mut q = p.as_object().cloned().unwrap_or_default();
@@ -1509,6 +1554,7 @@ fn kind_name(k: DeskKind) -> &'static str {
     match k {
         DeskKind::Browser => "browser",
         DeskKind::Remote => "remote",
+        DeskKind::Ssh => "ssh",
         DeskKind::Electron => "app(electron)",
         DeskKind::Native => {
             if cfg!(target_os = "macos") {
@@ -1530,6 +1576,7 @@ const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 �
 /// Per-screen usage notes for external agents.
 pub fn guide(k: DeskKind) -> &'static str {
     match k {
+        DeskKind::Ssh => "SSH 명령 실행 및 요청한 결과 파일 수신. 화면은 없습니다. desk_remote 를 사용하세요.",
         DeskKind::Browser => "격리된 headless 브라우저입니다. 스크린샷은 페이지 영역만 보이며 주소창이 없으니 desk_browser(navigate/back/new_tab...)로 이동하세요. 확인·입력 대화상자가 뜨면 desk_browser {action:dialog} 로 읽고 respond_dialog 로 현재 id 에 명시적으로 응답하세요. 좌표는 스크린샷 픽셀입니다.",
         DeskKind::Remote => "별도 원격 데스크톱(VNC)입니다. 좌표는 스크린샷 픽셀입니다. 한글 입력은 서버에 따라 안 될 수 있습니다.",
         DeskKind::Electron => "보이지 않게 띄운 Electron 앱 창입니다. 네이티브 메뉴는 desk_app {action:list|click, path:\"File > ...\"} 로 쓰세요. 확인·입력 대화상자는 desk_app {action:dialog} 로 읽고 respond_dialog 에 현재 source 와 id 를 지정해 응답하세요. 파일 열기·저장 대화상자는 notes 안내를 따르세요. 이 앱은 사용자의 실제 시스템 클립보드를 쓰므로 cmd/ctrl+c·x·v 는 거부됩니다. 글자 입력은 type 을 쓰세요.",
@@ -1891,6 +1938,26 @@ mod win_policy {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn experimental_display_keeps_ordinary_app_permission_separate() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let server = ControlServer::new(events, egui::Context::default());
+        let (_sender, connection) = conn(1);
+        let task = tokio::spawn(async move {
+            server.app_target("/System/Applications/Calculator.app", &json!({"virtual_display":true}), false, "test", "test", &connection).await
+        });
+        let Some(ControlEvent::Approval { experimental, reply, .. }) = tokio::time::timeout(Duration::from_secs(10),receiver.recv()).await.unwrap() else { panic!("Missing ordinary app approval"); };
+        assert!(!experimental);
+        assert!(!approval_allowed(false,true,experimental));
+        reply.send(true).unwrap();
+        let Some(ControlEvent::Approval { experimental, reply, .. }) = tokio::time::timeout(Duration::from_secs(10),receiver.recv()).await.unwrap() else { panic!("Missing display consent"); };
+        assert!(experimental);
+        assert!(approval_allowed(false,true,experimental));
+        reply.send(true).unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), DeskTarget::VDisplay(_)));
+    }
+
     #[test]
     fn requested_browser_and_profile_do_not_silently_use_another_login() {
         let browser = profiles::InstalledBrowser {
@@ -2030,6 +2097,24 @@ mod tests {
     fn conn(id: u64) -> (watch::Sender<bool>, Conn) {
         let (tx, rx) = watch::channel(false);
         (tx, Conn { id, closed: rx })
+    }
+
+    #[tokio::test]
+    async fn team_review_delete_approval_is_bound_to_original_team() {
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let srv = ControlServer::new(tx, egui::Context::default());
+        let (_alive, caller) = conn(1);
+        srv.teams.create("Work", "", "user").unwrap();
+        let requester = srv.clone();
+        let pending = tokio::spawn(async move {
+            requester.team(&json!({"action":"delete","team":"Work"}), &caller).await
+        });
+        let Some(ControlEvent::Approval { reply, .. }) = events.recv().await else { panic!("expected approval") };
+        srv.teams.delete("Work").unwrap();
+        let replacement = srv.teams.create("Work", "replacement", "user").unwrap();
+        reply.send(true).unwrap();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(srv.teams.read_json(replacement, None).unwrap()["goal"], "replacement");
     }
 
     #[tokio::test]
@@ -2320,7 +2405,7 @@ mod tests {
             e = tokio::time::timeout(Duration::from_secs(60), ev_rx.recv()) => e.expect("60초 안에 승인 요청이 오지 않음"),
             r = &mut task => panic!("승인 요청 없이 끝남: {:?}", r.map(|r| r.map(|_| ())).map_err(|e| e.to_string())),
         };
-        let Some(ControlEvent::Approval { title, detail, reply }) = event else { panic!("승인 요청 없음") };
+        let Some(ControlEvent::Approval { title, detail, reply, .. }) = event else { panic!("승인 요청 없음") };
         assert_eq!(title, "현재 계정 로그인 사용 요청");
         assert!(detail.contains("원본 프로필") && detail.contains("실제 계정에 반영"), "{detail}");
         reply.send(true).unwrap();
@@ -2400,7 +2485,7 @@ mod tests {
             let (srv2, c2) = (srv.clone(), c.clone());
             let p = json!({ "kind": "app", "app": exe.to_string_lossy() });
             let task = tokio::spawn(async move { srv2.open(&p, &c2).await });
-            let Some(ControlEvent::Approval { title, detail, reply }) = ev_rx.recv().await else { panic!("승인 요청이 없음") };
+            let Some(ControlEvent::Approval { title, detail, reply, .. }) = ev_rx.recv().await else { panic!("승인 요청이 없음") };
             assert_eq!(title, "내 앱 실행 요청");
             assert!(detail.contains("Windows 앱") && detail.to_lowercase().contains(&format!(r"\{stem}")), "{detail}");
             assert!(!detail.contains("macOS") && !detail.contains("번들"), "{detail}");

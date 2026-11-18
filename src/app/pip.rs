@@ -3,6 +3,24 @@
 use super::*;
 use super::labels::{attention, status_text};
 
+#[derive(Default)]
+pub(super) struct PipState {
+    pub(super) visible: bool,
+    auto_open_eligible: bool,
+}
+
+impl PipState {
+    fn update(&mut self, live_screen: bool, auto_open: bool, auto_close: bool) {
+        let eligible = auto_open && live_screen;
+        if eligible && !self.auto_open_eligible {
+            self.visible = true;
+        } else if auto_close && !live_screen {
+            self.visible = false;
+        }
+        self.auto_open_eligible = eligible;
+    }
+}
+
 impl GhostApp {
     /// Shows agent screens in small always-on-top windows, for keeping an eye on progress while
     /// doing something else. Dragging moves the window, clicking opens that agent in the main
@@ -10,10 +28,21 @@ impl GhostApp {
     pub(super) fn pip_windows(&mut self, ctx: &egui::Context) {
         let mut open = None;
         for (i, a) in self.agents.iter_mut().enumerate() {
-            if !a.pip {
+            if !self.pip_auto_open && !a.pip.visible {
+                a.pip.auto_open_eligible = false;
                 continue;
             }
-            let (sw, sh) = a.shared.workspace().map(|w| w.size()).unwrap_or((1280, 800));
+            let workspace = a.shared.workspace();
+            let live = workspace.as_ref().is_some_and(|desk| desk.has_screen() && !desk.is_closed());
+            a.pip.update(live, self.pip_auto_open, self.pip_auto_close);
+            if !a.pip.visible {
+                continue;
+            }
+            if self.pip_auto_close && live {
+                // A closed workspace can stop producing frames before it requests another repaint.
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+            let (sw, sh) = workspace.map(|w| w.size()).unwrap_or((1280, 800));
             let aspect = sh as f32 / sw.max(1) as f32;
             let tex = a.texture.as_ref().map(|t| t.id());
             let name = a.shared.name.clone();
@@ -24,6 +53,7 @@ impl GhostApp {
                 .with_inner_size([400.0, 400.0 * aspect])
                 .with_min_inner_size([200.0, 120.0])
                 .with_decorations(false)
+                .with_active(false)
                 .with_always_on_top();
             let (mut close, mut clicked) = (false, false);
             ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("pip", a.shared.id)), builder, |ui, _| {
@@ -77,7 +107,7 @@ impl GhostApp {
                 titlebar::resize_edges(&pctx);
             });
             if close {
-                a.pip = false;
+                a.pip.visible = false;
             } else if clicked {
                 open = Some(i);
             }
@@ -88,5 +118,41 @@ impl GhostApp {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pip_opens_once_per_live_screen_and_respects_manual_dismissal() {
+        let mut pip = PipState::default();
+        pip.update(false, true, true);
+        assert!(!pip.visible);
+        pip.update(true, true, true);
+        assert!(pip.visible);
+        pip.visible = false;
+        pip.update(true, true, true);
+        assert!(!pip.visible);
+        pip.update(false, true, true);
+        pip.update(true, true, true);
+        assert!(pip.visible);
+        pip.update(false, true, true);
+        assert!(!pip.visible);
+    }
+
+    #[test]
+    fn pip_settings_act_independently_on_existing_windows() {
+        let mut pip = PipState::default();
+        pip.update(true, false, true);
+        assert!(!pip.visible);
+        pip.update(true, true, false);
+        assert!(pip.visible);
+        pip.update(true, false, false);
+        pip.update(false, false, false);
+        assert!(pip.visible);
+        pip.update(false, false, true);
+        assert!(!pip.visible);
     }
 }

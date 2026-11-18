@@ -23,12 +23,12 @@ impl GhostApp {
     }
 
     /// For each agent id: the team it works in and its role there ("제주 출장 · 조사"), from the
-    /// control connection that opened the screen.
+    /// membership identity of the agent that owns the screen.
     pub(super) fn team_badges(&mut self) -> std::collections::HashMap<u64, (u64, String)> {
         self.teams_ui_active();
         let mut out = std::collections::HashMap::new();
         for a in &self.agents {
-            let conn = a.shared.control_conn.load(Ordering::Relaxed);
+            let conn = a.shared.team_member_id.load(Ordering::Relaxed);
             if conn == 0 {
                 continue;
             }
@@ -152,7 +152,11 @@ impl GhostApp {
         // on the wall of one team, only its members' screens
         let team = if immersive { self.wall_team } else { None };
         let visible: Vec<usize> = (0..self.agents.len())
-            .filter(|&i| team.is_none_or(|t| badges.get(&self.agents[i].shared.id).is_some_and(|(id, _)| *id == t)))
+            .filter(|&i| team.is_none_or(|t| {
+                let agent = &self.agents[i].shared;
+                badges.get(&agent.id).is_some_and(|(id, _)| *id == t)
+                    && agent.workspace().is_some_and(|desk| desk.has_screen() && !desk.is_closed())
+            }))
             .collect();
         let team_name = team.and_then(|t| self.teams_ui.cache().iter().find(|x| x.id == t).map(|x| x.name.clone()));
         if team.is_some() && visible.is_empty() {
@@ -193,6 +197,7 @@ impl GhostApp {
             let asp = ws
                 .as_ref()
                 .map(|w| {
+                    if !w.has_screen() { return aspect; }
                     let (sw, sh) = w.size();
                     sh as f32 / sw.max(1) as f32
                 })
@@ -203,7 +208,14 @@ impl GhostApp {
                 Some(t) => ui.put(rect, egui::Image::new((t.id(), rect.size())).corner_radius(theme::CARD_RADIUS).sense(egui::Sense::click())),
                 None => {
                     let r = ui.allocate_rect(rect, egui::Sense::click());
-                    preparing(ui, rect, tr("준비 중…"));
+                    if ws.as_ref().is_some_and(|w| !w.has_screen()) {
+                        ui.painter().rect_filled(rect, theme::CARD_RADIUS, theme::card());
+                        let recent = a.shared.log.lock().last().map(|entry| crate::llm::short(&entry.text,240)).unwrap_or_default();
+                        let galley = ui.painter().layout(format!("{}\n\n{recent}",tr("SSH 작업 로그")),egui::FontId::proportional(13.0),theme::muted(),(rect.width()-32.0).max(1.0));
+                        ui.painter().with_clip_rect(rect.shrink(8.0)).galley(rect.min+Vec2::splat(16.0),galley,theme::muted());
+                    } else {
+                        preparing(ui, rect, tr("준비 중…"));
+                    }
                     r
                 }
             };
@@ -262,8 +274,9 @@ impl GhostApp {
                 open = Some(i);
             }
             resp.context_menu(|ui| {
-                if ui.button(format!("{}  {}", icon::PICTURE_IN_PICTURE, if a.pip { tr("PiP 닫기") } else { tr("작은 창(PiP)으로 띄우기") })).clicked() {
-                    a.pip = !a.pip;
+                if !a.pip.visible && !a.shared.workspace().is_some_and(|desk| desk.has_screen() && !desk.is_closed()) { return; }
+                if ui.button(format!("{}  {}", icon::PICTURE_IN_PICTURE, if a.pip.visible { tr("PiP 닫기") } else { tr("작은 창(PiP)으로 띄우기") })).clicked() {
+                    a.pip.visible = !a.pip.visible;
                     ui.close();
                 }
             });

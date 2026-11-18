@@ -10,12 +10,11 @@
 //! one screen.
 //!
 //! Teams, notes and tasks are kept in `<data root>/teams.json` and survive a restart. Members are
-//! live connections, so they are not saved: after a restart the members are gone and their claimed
-//! tasks are open again.
+//! live connections. After a restart, file edit claims are gone and claimed tasks are open again.
 
-use std::path::PathBuf;
+use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +29,30 @@ const MAX_TEXT: usize = 4000;
 const MAX_TEAMS: usize = 50;
 /// Author name of things the user writes in the GhostDesk window.
 pub const USER: &str = "사용자";
+
+/// UI selections use stable IDs. MCP callers may still refer to a team by name.
+pub enum TeamKey<'a> {
+    Id(u64),
+    NameOrId(&'a str),
+}
+
+impl From<u64> for TeamKey<'_> {
+    fn from(id: u64) -> Self {
+        Self::Id(id)
+    }
+}
+
+impl<'a> From<&'a str> for TeamKey<'a> {
+    fn from(name: &'a str) -> Self {
+        Self::NameOrId(name)
+    }
+}
+
+impl<'a> From<&'a String> for TeamKey<'a> {
+    fn from(name: &'a String) -> Self {
+        Self::NameOrId(name.as_str())
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Note {
@@ -101,6 +124,8 @@ pub struct Team {
     pub tasks: Vec<Task>,
     #[serde(skip)]
     pub members: Vec<Member>,
+    #[serde(skip)]
+    file_edits: BTreeMap<String, u64>,
 }
 
 impl Team {
@@ -111,9 +136,19 @@ impl Team {
     pub fn open_tasks(&self) -> usize {
         self.tasks.iter().filter(|t| !matches!(t.state, TaskState::Done { .. })).count()
     }
+
+    pub fn file_edits(&self) -> impl Iterator<Item = (&str, &Member)> {
+        self.file_edits.iter().filter_map(|(path, conn)| Some((path.as_str(), self.member(*conn)?)))
+    }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Copy)]
+pub enum FileEditAction {
+    Claim,
+    Release,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct Saved {
     #[serde(default)]
     next_id: u64,
@@ -126,6 +161,7 @@ pub struct TeamStore {
     inner: Mutex<Saved>,
     /// None in tests: nothing is written.
     path: Option<PathBuf>,
+    pub load_error: Option<String>,
     /// Bumped on every change, so the GUI knows when to look again.
     version: std::sync::atomic::AtomicU64,
 }
@@ -145,12 +181,47 @@ fn clean(text: &str, what: &str) -> Result<String> {
     Ok(t.to_string())
 }
 
+fn edit_paths(input: &Value) -> Result<BTreeSet<String>> {
+    let paths = input.as_array().filter(|paths| !paths.is_empty()).ok_or_else(|| anyhow!("paths must be a non-empty list of repository-relative file paths"))?;
+    paths.iter().map(|value| {
+        let path = value.as_str().ok_or_else(|| anyhow!("Each edit path must be a string"))?;
+        let drive_root = matches!(path.as_bytes(), [letter, b':', b'/' | b'\\', ..] if letter.is_ascii_alphabetic());
+        anyhow::ensure!(
+            !path.starts_with('/') && !path.starts_with("\\\\") && !drive_root && !path.chars().any(char::is_control),
+            "Expected a repository-relative file path: {path:?}"
+        );
+        // Git uses '/' as the separator even on Windows. A backslash can be part of a Unix filename.
+        let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+        anyhow::ensure!(!parts.contains(&"..") && parts.iter().any(|part| !part.trim().is_empty()), "Expected a repository-relative file path: {path:?}");
+        Ok(parts.join("/"))
+    }).collect()
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || a.strip_prefix(b).is_some_and(|suffix| suffix.starts_with('/')) || b.strip_prefix(a).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 impl TeamStore {
     /// The store saved in `<data root>/teams.json`.
     pub fn load() -> Self {
-        let path = crate::platform::paths::data_root().join("teams.json");
-        let saved: Saved = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self::from_saved(saved, Some(path))
+        Self::load_path(crate::platform::paths::data_root().join("teams.json"))
+    }
+
+    fn load_path(path: PathBuf) -> Self {
+        let result = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(anyhow::Error::from),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Saved::default()),
+            Err(e) => Err(e.into()),
+        };
+        match result {
+            Ok(saved) => Self::from_saved(saved, Some(path)),
+            Err(err) => {
+                let message = format!("팀 데이터를 불러올 수 없습니다. 파일을 복구한 뒤 다시 실행하세요 ({}): {err}", path.display());
+                let mut store = Self::from_saved(Saved::default(), Some(path));
+                store.load_error = Some(message);
+                store
+            }
+        }
     }
 
     /// A store that is never written to disk (tests).
@@ -169,29 +240,38 @@ impl TeamStore {
         }
         let max = saved.teams.iter().flat_map(|t| std::iter::once(t.id).chain(t.notes.iter().map(|n| n.id)).chain(t.tasks.iter().map(|x| x.id))).max().unwrap_or(0);
         saved.next_id = saved.next_id.max(max + 1);
-        TeamStore { inner: Mutex::new(saved), path, version: Default::default() }
+        TeamStore { inner: Mutex::new(saved), path, load_error: None, version: Default::default() }
     }
 
     pub fn version(&self) -> u64 {
         self.version.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn bump_version(&self) {
+        self.version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Runs `f` on the teams, then saves and bumps the version if it succeeded.
     fn change<R>(&self, f: impl FnOnce(&mut Saved) -> Result<R>) -> Result<R> {
-        let mut s = self.inner.lock();
-        let r = f(&mut s)?;
-        if let Some(p) = &self.path {
-            if let Ok(b) = serde_json::to_vec_pretty(&*s) {
-                if let Some(d) = p.parent() {
-                    let _ = std::fs::create_dir_all(d);
-                }
-                let tmp = p.with_extension("json.tmp");
-                if std::fs::write(&tmp, b).is_ok() {
-                    let _ = std::fs::rename(&tmp, p);
-                }
-            }
-        }
-        self.version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(error) = &self.load_error { bail!("{error}"); }
+        let mut saved = self.inner.lock();
+        let r = if let Some(path) = &self.path {
+            let mut next = saved.clone();
+            let result = f(&mut next)?;
+            let tmp = path.with_extension("json.tmp");
+            let write = || -> Result<()> {
+                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+                std::fs::write(&tmp, serde_json::to_vec_pretty(&next)?)?;
+                std::fs::rename(&tmp, path)?;
+                Ok(())
+            };
+            write().with_context(|| format!("팀 데이터를 저장할 수 없습니다 ({})", path.display()))?;
+            *saved = next;
+            result
+        } else {
+            f(&mut saved)?
+        };
+        self.bump_version();
         Ok(r)
     }
 
@@ -202,17 +282,29 @@ impl TeamStore {
     }
 
     /// Index of the team called `key` (its name, case-insensitive, or its id).
-    fn find(s: &Saved, key: &str) -> Result<usize> {
-        let key = key.trim();
-        s.teams
-            .iter()
-            .position(|t| t.name.eq_ignore_ascii_case(key) || t.id.to_string() == key)
-            .ok_or_else(|| anyhow!("팀 '{key}' 이(가) 없습니다. team(action=list) 로 팀 목록을 확인하세요"))
+    fn find<'a>(s: &Saved, key: impl Into<TeamKey<'a>>) -> Result<usize> {
+        match key.into() {
+            TeamKey::Id(id) => s.teams.iter().position(|team| team.id == id).ok_or_else(|| anyhow!("팀 {id} 이(가) 없습니다")),
+            TeamKey::NameOrId(key) => {
+                let key = key.trim();
+                s.teams
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(key))
+                    .or_else(|| s.teams.iter().position(|t| t.id.to_string() == key))
+                    .ok_or_else(|| anyhow!("팀 '{key}' 이(가) 없습니다. team(action=list) 로 팀 목록을 확인하세요"))
+            }
+        }
     }
 
     /// Copy of every team (for the GUI).
     pub fn snapshot(&self) -> Vec<Team> {
         self.inner.lock().teams.clone()
+    }
+
+    /// Capture the exact team the user is being asked to delete.
+    pub fn team_snapshot(&self, key: &str) -> Result<Team> {
+        let saved = self.inner.lock();
+        Ok(saved.teams[Self::find(&saved, key)?].clone())
     }
 
     pub fn create(&self, name: &str, goal: &str, by: &str) -> Result<u64> {
@@ -237,12 +329,13 @@ impl TeamStore {
                 notes: Vec::new(),
                 tasks: Vec::new(),
                 members: Vec::new(),
+                file_edits: BTreeMap::new(),
             });
             Ok(id)
         })
     }
 
-    pub fn delete(&self, key: &str) -> Result<String> {
+    pub fn delete<'a>(&self, key: impl Into<TeamKey<'a>>) -> Result<String> {
         self.change(|s| {
             let i = Self::find(s, key)?;
             Ok(s.teams.remove(i).name)
@@ -250,7 +343,7 @@ impl TeamStore {
     }
 
     /// Renames a team. Members keep using it under the new name.
-    pub fn rename(&self, key: &str, name: &str) -> Result<()> {
+    pub fn rename<'a>(&self, key: impl Into<TeamKey<'a>>, name: &str) -> Result<()> {
         let name = clean(name, "팀 이름")?;
         if name.chars().count() > 60 {
             bail!("팀 이름은 60자까지입니다");
@@ -265,57 +358,114 @@ impl TeamStore {
         })
     }
 
-    pub fn set_goal(&self, key: &str, goal: &str) -> Result<()> {
+    pub fn set_goal(&self, key: &str, conn: u64, goal: &str) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
+            Self::author(&s.teams[i], Some(conn))?;
             s.teams[i].goal = goal.trim().chars().take(MAX_TEXT).collect();
             Ok(())
         })
     }
 
     /// Joins (or changes role in) a team. One membership per connection per team.
-    pub fn join(&self, key: &str, conn: u64, client: &str, role: &str) -> Result<()> {
+    pub fn join<'a>(&self, key: impl Into<TeamKey<'a>>, conn: u64, client: &str, role: &str) -> Result<u64> {
         let role: String = role.trim().chars().take(40).collect();
-        self.change(|s| {
-            let i = Self::find(s, key)?;
-            let t = &mut s.teams[i];
-            match t.members.iter_mut().find(|m| m.conn == conn) {
-                Some(m) => m.role = role,
-                None => t.members.push(Member { conn, client: client.to_string(), role, joined: now() }),
+        let mut saved = self.inner.lock();
+        let i = Self::find(&saved, key)?;
+        let team = &mut saved.teams[i];
+        match team.members.iter_mut().find(|member| member.conn == conn) {
+            Some(member) => member.role = role,
+            None => {
+                let mut label = client.to_owned();
+                let mut number = 1;
+                while team.members.iter().any(|member| member.client == label) {
+                    number += 1;
+                    label = format!("{client} #{number}");
+                }
+                team.members.push(Member { conn, client: label, role, joined: now() });
             }
-            Ok(())
-        })
+        }
+        self.bump_version();
+        Ok(team.id)
     }
 
     /// Leaves a team; tasks this member claimed are open again.
     pub fn leave(&self, key: &str, conn: u64) -> Result<()> {
-        self.change(|s| {
-            let i = Self::find(s, key)?;
-            Self::drop_member(&mut s.teams[i], conn);
-            Ok(())
-        })
+        let mut saved = self.inner.lock();
+        let i = Self::find(&saved, key)?;
+        Self::drop_member(&mut saved.teams[i], conn);
+        self.bump_version();
+        Ok(())
     }
 
     /// A connection ended: leaves every team it was in.
     pub fn leave_all(&self, conn: u64) {
-        if !self.inner.lock().teams.iter().any(|t| t.member(conn).is_some()) {
-            return;
-        }
-        let _ = self.change(|s| {
-            for t in &mut s.teams {
-                Self::drop_member(t, conn);
+        let mut saved = self.inner.lock();
+        let mut changed = false;
+        for team in &mut saved.teams {
+            if team.member(conn).is_some() {
+                Self::drop_member(team, conn);
+                changed = true;
             }
-            Ok(())
-        });
+        }
+        // Members and file claims are transient. Saved task claims reopen on startup.
+        if changed { self.bump_version(); }
     }
 
     fn drop_member(t: &mut Team, conn: u64) {
         t.members.retain(|m| m.conn != conn);
+        t.file_edits.retain(|_, owner| *owner != conn);
         for task in &mut t.tasks {
             if matches!(task.state, TaskState::Claimed { conn: c, .. } if c == conn) {
                 task.state = TaskState::Open;
             }
         }
+    }
+
+    /// Validate every path and check all owners in the same critical section as the update.
+    pub fn edit_files<'a>(&self, key: impl Into<TeamKey<'a>>, conn: u64, action: FileEditAction, input: &Value) -> Result<Value> {
+        let paths = edit_paths(input)?;
+        let mut saved = self.inner.lock();
+        let i = Self::find(&saved, key)?;
+        let team = &mut saved.teams[i];
+        Self::author(team, Some(conn))?;
+        let status = match action {
+            FileEditAction::Claim => {
+                for (held, owner) in team.file_edits().filter(|(_, owner)| owner.conn != conn) {
+                    if let Some(path) = paths.iter().find(|path| paths_overlap(path, held)) {
+                        bail!("Cannot claim '{path}': {} is editing '{held}'. Choose a different path or coordinate with them.", owner.label());
+                    }
+                }
+                team.file_edits.extend(paths.iter().cloned().map(|path| (path, conn)));
+                "claimed"
+            }
+            FileEditAction::Release => {
+                for path in &paths {
+                    if team.file_edits.get(path).is_some_and(|owner| *owner != conn) {
+                        bail!("Cannot release '{path}': it belongs to another team member");
+                    }
+                }
+                for path in &paths {
+                    team.file_edits.remove(path);
+                }
+                "released"
+            }
+        };
+        self.bump_version();
+        Ok(json!({"status": status, "paths": paths}))
+    }
+
+    /// Releases file claims at the end of an app agent's turn while retaining its membership.
+    pub fn release_file_edits(&self, team_id: u64, conn: u64) -> bool {
+        let mut saved = self.inner.lock();
+        let Some(team) = saved.teams.iter_mut().find(|team| team.id == team_id) else { return false };
+        let before = team.file_edits.len();
+        team.file_edits.retain(|_, owner| *owner != conn);
+        let changed = team.file_edits.len() != before;
+        if changed {
+            self.bump_version();
+        }
+        changed
     }
 
     /// Who is writing: a member's label, or the user when `conn` is None. Agents must join first.
@@ -329,7 +479,7 @@ impl TeamStore {
         }
     }
 
-    pub fn note(&self, key: &str, conn: Option<u64>, text: &str) -> Result<u64> {
+    pub fn note<'a>(&self, key: impl Into<TeamKey<'a>>, conn: Option<u64>, text: &str) -> Result<u64> {
         let text = clean(text, "메모")?;
         self.change(|s| {
             let i = Self::find(s, key)?;
@@ -345,7 +495,7 @@ impl TeamStore {
         })
     }
 
-    pub fn task_add(&self, key: &str, conn: Option<u64>, title: &str, detail: &str) -> Result<u64> {
+    pub fn task_add<'a>(&self, key: impl Into<TeamKey<'a>>, conn: Option<u64>, title: &str, detail: &str) -> Result<u64> {
         let title = clean(title, "할 일 제목")?;
         self.change(|s| {
             let i = Self::find(s, key)?;
@@ -363,7 +513,7 @@ impl TeamStore {
     }
 
     /// Claims an open task. Fails if someone else has it, so two agents never take the same one.
-    pub fn task_claim(&self, key: &str, conn: u64, task: u64) -> Result<()> {
+    pub fn task_claim<'a>(&self, key: impl Into<TeamKey<'a>>, conn: u64, task: u64) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
             let by = Self::author(&s.teams[i], Some(conn))?;
@@ -381,7 +531,7 @@ impl TeamStore {
     }
 
     /// Marks a task done with a short result. Only whoever claimed it (or the user) can.
-    pub fn task_done(&self, key: &str, conn: Option<u64>, task: u64, result: &str) -> Result<()> {
+    pub fn task_done<'a>(&self, key: impl Into<TeamKey<'a>>, conn: Option<u64>, task: u64, result: &str) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
             let by = Self::author(&s.teams[i], conn)?;
@@ -398,7 +548,7 @@ impl TeamStore {
     }
 
     /// Gives a claimed task back (or, for the user, reopens any task).
-    pub fn task_release(&self, key: &str, conn: Option<u64>, task: u64) -> Result<()> {
+    pub fn task_release<'a>(&self, key: impl Into<TeamKey<'a>>, conn: Option<u64>, task: u64) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
             Self::author(&s.teams[i], conn)?;
@@ -416,7 +566,7 @@ impl TeamStore {
         })
     }
 
-    pub fn task_delete(&self, key: &str, task: u64) -> Result<()> {
+    pub fn task_delete<'a>(&self, key: impl Into<TeamKey<'a>>, task: u64) -> Result<()> {
         self.change(|s| {
             let i = Self::find(s, key)?;
             let before = s.teams[i].tasks.len();
@@ -452,7 +602,11 @@ impl TeamStore {
 
     /// What an agent reads: goal, members, every task, and the latest notes (or the ones before
     /// note id `before`, for paging back), oldest first.
-    pub fn read_json(&self, key: &str, before: Option<u64>) -> Result<Value> {
+    pub fn read_json<'a>(&self, key: impl Into<TeamKey<'a>>, before: Option<u64>) -> Result<Value> {
+        self.read_for(key, before, None)
+    }
+
+    pub fn read_for<'a>(&self, key: impl Into<TeamKey<'a>>, before: Option<u64>, viewer: Option<u64>) -> Result<Value> {
         let s = self.inner.lock();
         let t = &s.teams[Self::find(&s, key)?];
         let pool: Vec<&Note> = t.notes.iter().filter(|n| before.is_none_or(|b| n.id < b)).collect();
@@ -462,7 +616,9 @@ impl TeamStore {
             "team": t.name,
             "goal": t.goal,
             "members": t.members.iter().map(Member::label).collect::<Vec<_>>(),
+            "your_member": viewer.and_then(|conn| t.member(conn)).map(Member::label),
             "tasks": t.tasks,
+            "file_edits": t.file_edits().map(|(path, owner)| json!({"path": path, "by": owner.label()})).collect::<Vec<_>>(),
             "notes": notes,
             "older_notes": start,
         }))
@@ -477,6 +633,57 @@ mod tests {
         let s = TeamStore::in_memory();
         s.create("Trip", "Plan a 3-day trip", USER).unwrap();
         s
+    }
+
+    #[test]
+    fn team_review_identical_clients_have_distinct_owners() {
+        let store = store();
+        for (conn, path) in [(1, "a.rs"), (2, "b.rs")] {
+            store.join("Trip", conn, "Codex", "").unwrap();
+            store.edit_files("Trip", conn, FileEditAction::Claim, &json!([path])).unwrap();
+        }
+        let board = store.read_json("Trip", None).unwrap();
+        assert_ne!(board["file_edits"][0]["by"], board["file_edits"][1]["by"]);
+        assert_eq!(board["members"][0], board["file_edits"][0]["by"]);
+        let conflict = store.edit_files("Trip", 2, FileEditAction::Claim, &json!(["a.rs"])).unwrap_err();
+        assert!(conflict.to_string().contains(board["members"][0].as_str().unwrap()));
+    }
+
+    #[test]
+    fn competing_members_have_one_winner_and_can_edit_different_files() {
+        let store = store();
+        store.join("Trip", 1, "First", "").unwrap();
+        store.join("Trip", 2, "Second", "").unwrap();
+        let start = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let claim = |conn| {
+                start.wait();
+                store.edit_files("Trip", conn, FileEditAction::Claim, &json!(["src/shared.rs"]))
+            };
+            let first = scope.spawn(move || claim(1));
+            let second = scope.spawn(move || claim(2));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let (other_conn, owner, rejected) = match (first, second) {
+            (Ok(_), Err(err)) => (2, "First", err),
+            (Err(err), Ok(_)) => (1, "Second", err),
+            outcome => panic!("expected one successful claim, got {outcome:?}"),
+        };
+        assert!(rejected.to_string().contains(owner));
+        store.edit_files("Trip", other_conn, FileEditAction::Claim, &json!(["src/other.rs"])).unwrap();
+        assert_eq!(store.read_json("Trip", None).unwrap()["file_edits"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn numeric_team_selection_uses_the_selected_id_even_if_another_name_matches() {
+        let store = TeamStore::in_memory();
+        store.create("2", "", USER).unwrap();
+        let selected = store.create("Selected team", "", USER).unwrap();
+        assert_eq!(selected, 2);
+        store.join(selected, 100, "Agent", "Research").unwrap();
+        let teams = store.snapshot();
+        assert!(teams[0].members.is_empty());
+        assert_eq!(teams[1].members[0].conn, 100);
     }
 
     #[test]
@@ -566,6 +773,26 @@ mod tests {
         let older = s.read_json("Trip", Some(first)).unwrap();
         assert_eq!(older["notes"].as_array().unwrap().len(), 15);
         assert_eq!(older["older_notes"], 0);
+    }
+
+    #[test]
+    fn failed_save_does_not_publish_a_team_and_corrupt_input_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("gd-team-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("teams.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        let broken = TeamStore::load_path(path.clone());
+        assert!(broken.create("Lost", "", USER).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
+        std::fs::remove_file(&path).unwrap();
+        let store = TeamStore::load_path(path.clone());
+        std::fs::create_dir(&path).unwrap(); // forces the final rename to fail
+        assert!(store.create("Retry", "", USER).is_err());
+        assert!(store.snapshot().is_empty());
+        std::fs::remove_dir(&path).unwrap();
+        store.create("Retry", "", USER).unwrap();
+        assert_eq!(TeamStore::load_path(path).snapshot().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

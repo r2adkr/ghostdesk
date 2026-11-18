@@ -187,6 +187,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
     let shared = AgentShared::new(1, "cli".into(), ws_name.clone(), ctx);
     let cfg = AgentConfig {
         name: "cli".into(),
+        team: None,
         workspace: ws_name.clone(),
         task,
         // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend
@@ -207,6 +208,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
                     username: None,
                     password: None,
                     dedicated_ack: parts.get(2) == Some(&"dedicated"),
+                    ssh: None,
                 })
             }
             None => DeskTarget::Browser {

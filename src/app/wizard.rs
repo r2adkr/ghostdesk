@@ -8,6 +8,8 @@ impl NewAgentForm {
     /// to copy logins from.
     pub(super) fn new(profile_idx: Option<usize>) -> Self {
         NewAgentForm {
+            team_id: None,
+            team_role: String::new(),
             choice: None,
             app_search: String::new(),
             web_use_login: false,
@@ -29,6 +31,12 @@ impl NewAgentForm {
             remote_user: String::new(),
             remote_pass: String::new(),
             remote_dedicated: false,
+            remote_ssh: false,
+            remote_ssh_only: false,
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            ssh_identity: String::new(),
             name: tr("에이전트 1").into(),
             workspace: "ws-1".into(),
             refresh: false,
@@ -266,7 +274,7 @@ impl GhostApp {
                 }
                 // virtual display only where this OS supports it (on Windows the check box isn't even shown)
                 if self.form.native_vdisplay && caps::VDISPLAY {
-                    if !self.form.native_vdisplay_consent {
+                    if !self.allow_experimental && !self.form.native_vdisplay_consent {
                         return self.notify(ctx, tr("가상 디스플레이 사용에 대한 안내를 확인하고 동의 체크를 켜세요"));
                     }
                     let (w, h) = SIZES[self.form.size_idx];
@@ -302,19 +310,34 @@ impl GhostApp {
                 DeskTarget::Session { account: self.form.session_account.trim().to_string() }
             }
             FormKind::Remote => {
-                if self.form.remote_host.trim().is_empty() {
+                if self.form.remote_host.trim().is_empty() && (!self.form.remote_ssh_only || self.form.ssh_host.trim().is_empty()) {
                     return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요"));
                 }
-                DeskTarget::Remote(RemoteTarget {
+                let ssh = (self.form.remote_ssh || self.form.remote_ssh_only).then(|| crate::ssh::SshOptions {
+                    host: if self.form.ssh_host.trim().is_empty() { self.form.remote_host.trim() } else { self.form.ssh_host.trim() }.to_string(),
+                    port: self.form.ssh_port, username: self.form.ssh_user.trim().to_string(), identity_file: self.form.ssh_identity.trim().to_string(),
+                });
+                if let Some(options) = &ssh { if let Err(e) = options.validate() { return self.notify(ctx, format!("{e:#}")); } }
+                if self.form.remote_ssh_only { DeskTarget::Ssh(ssh.expect("SSH-only always configures SSH")) } else { DeskTarget::Remote(RemoteTarget {
                     host: self.form.remote_host.trim().to_string(),
                     port: self.form.remote_port,
                     username: Some(self.form.remote_user.trim().to_string()),
                     password: Some(self.form.remote_pass.clone()),
                     dedicated_ack: self.form.remote_dedicated,
-                })
+                    ssh,
+                }) }
             }
         };
+        let team = self.form.team_id.map(|id| agent::TeamAssignment {
+            store: self.teams.clone(),
+            id,
+            role: self.form.team_role.trim().chars().take(40).collect(),
+        });
+        if team.as_ref().is_some_and(|team| self.teams.read_json(team.id, None).is_err()) {
+            return self.notify(ctx, tr("선택한 팀을 찾을 수 없어요"));
+        }
         let cfg = AgentConfig {
+            team,
             name: self.form.name.clone(),
             workspace: ws_name.clone(),
             task: self.form.task.clone(),
@@ -340,11 +363,40 @@ impl GhostApp {
 
     pub(super) fn open_wizard(&mut self) {
         self.wizard_open = true;
+        self.form.team_id = None;
+        self.form.team_role.clear();
         // auto comes preselected: just write the task and start (the window height is the same from the
         // start, so its position doesn't jump)
         self.form.choice = Some(Choice::Auto);
         self.key_warn = false;
         self.wizard_key_field = self.missing_setup().is_some();
+    }
+
+    fn team_picker(&mut self, ui: &mut egui::Ui) {
+        self.teams_ui_active();
+        let teams = self.teams_ui.cache();
+        if teams.is_empty() && self.form.team_id.is_none() {
+            return;
+        }
+        let selected = self.form.team_id.map_or(tr("팀 없이 시작"), |id| {
+            teams.iter().find(|team| team.id == id).map_or(tr("선택한 팀을 찾을 수 없어요"), |team| team.name.as_str())
+        });
+        ui.horizontal_wrapped(|ui| {
+            theme::section(ui, tr("팀"));
+            egui::ComboBox::from_id_salt("agent_team")
+                .width(200.0)
+                .selected_text(crate::llm::short(selected, 32))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.form.team_id, None, tr("팀 없이 시작"));
+                    for team in teams {
+                        ui.selectable_value(&mut self.form.team_id, Some(team.id), &team.name);
+                    }
+                });
+            if self.form.team_id.is_some() {
+                ui.add(field(&mut self.form.team_role).desired_width(160.0).char_limit(40).hint_text(tr("역할 (선택)")));
+            }
+        });
+        ui.add_space(12.0);
     }
 
     /// Windows child sessions feature state plus an enable (admin approval) button.
@@ -469,6 +521,7 @@ impl GhostApp {
                     Choice::Session => self.form_session(ui),
                 }
                 ui.add_space(18.0);
+                self.team_picker(ui);
                 theme::section(ui, tr("할 일"));
                 ui.add_space(4.0);
                 ui.add(
@@ -714,7 +767,11 @@ impl GhostApp {
                 if self.form.native_vdisplay {
                     theme::tinted(theme::warn()).show(ui, |ui| {
                         ui.label(RichText::new(tr("가상 모니터가 디스플레이 배치의 가장 바깥에 잠시 추가됩니다. 그동안 마우스 커서가 그쪽으로 넘어갈 수 있고, 설정에 따라 Dock·메뉴 막대가 그 화면에도 보일 수 있습니다. 작업이 끝나면 가상 모니터는 제거됩니다.")).small());
-                        ui.add(theme::switch(&mut self.form.native_vdisplay_consent, tr("이해했고 가상 모니터 추가에 동의합니다")));
+                        if self.allow_experimental {
+                            ui.label(theme::hint(tr("설정에서 실험적 기능을 허용했습니다")));
+                        } else {
+                            ui.add(theme::switch(&mut self.form.native_vdisplay_consent, tr("이해했고 가상 모니터 추가에 동의합니다")));
+                        }
                     });
                 } else {
                     self.form.native_vdisplay_consent = false;
@@ -823,32 +880,49 @@ impl GhostApp {
 
     /// Remote computer: address (:port), user, password, plus the dedicated-machine confirmation.
     pub(super) fn form_remote(&mut self, ui: &mut egui::Ui) {
+        ui.add(theme::switch(&mut self.form.remote_ssh_only, tr("SSH만 사용 (화면 없음)")));
         egui::Grid::new("form_remote").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label(tr("주소"));
             ui.horizontal(|ui| {
                 // the port rarely changes, so it's small, next to the address field
                 let w = (ui.available_width() - 76.0).max(160.0);
                 ui.add(field(&mut self.form.remote_host).hint_text(tr("예) 192.168.0.20 또는 vm.local")).desired_width(w));
-                ui.label(":");
-                ui.add(egui::DragValue::new(&mut self.form.remote_port).range(1..=65535)).on_hover_text(tr("포트 (보통 5900)"));
+                if !self.form.remote_ssh_only {
+                    ui.label(":");
+                    ui.add(egui::DragValue::new(&mut self.form.remote_port).range(1..=65535)).on_hover_text(tr("포트 (보통 5900)"));
+                }
             });
             ui.end_row();
+            if !self.form.remote_ssh_only {
             ui.label(tr("사용자"));
             ui.add(field(&mut self.form.remote_user).hint_text(tr("필요할 때만 (macOS 화면 공유는 계정 이름)")));
             ui.end_row();
             ui.label(tr("비밀번호"));
             ui.add(field(&mut self.form.remote_pass).password(true));
             ui.end_row();
+            }
         });
+        ui.add_space(8.0);
+        if !self.form.remote_ssh_only { ui.add(theme::switch(&mut self.form.remote_ssh, tr("SSH 명령 실행·결과 파일 수신"))); }
+        if self.form.remote_ssh || self.form.remote_ssh_only {
+            ui.label(theme::hint(tr("SSH 키 또는 에이전트로 인증해요. 호스트 키를 터미널에서 먼저 확인하세요")));
+            egui::Grid::new("ssh_settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(tr("SSH 주소")); ui.add(field(&mut self.form.ssh_host).hint_text(tr("비워 두면 위 주소 사용"))); ui.end_row();
+                ui.label(tr("SSH 포트")); ui.add(egui::DragValue::new(&mut self.form.ssh_port).range(1..=65535)); ui.end_row();
+                ui.label(tr("SSH 사용자")); ui.add(field(&mut self.form.ssh_user)); ui.end_row();
+                ui.label(tr("개인 키 경로")); ui.add(field(&mut self.form.ssh_identity)); ui.end_row();
+            });
+            ui.label(theme::hint(tr("요청한 결과 파일은 다운로드/GhostDesk 폴더에 저장해요")));
+        }
         ui.add_space(6.0);
-        ui.add(theme::switch(&mut self.form.remote_dedicated, tr("에이전트 전용 머신입니다"))).on_hover_text(pick(
+        if !self.form.remote_ssh_only { ui.add(theme::switch(&mut self.form.remote_dedicated, tr("에이전트 전용 머신입니다"))).on_hover_text(pick(
             tr("macOS 화면 공유에 접속할 때 필요합니다. \
              GhostDesk 는 Apple 의 세션 선택 단계를 구현하지 않아, 대상 Mac 의 콘솔 사용자와 다른 계정으로 접속하면 그 Mac 의 화면이 전환될 수 있습니다. 이 Mac 자신에는 항상 접속을 거부합니다."),
             tr("macOS 화면 공유나 이 PC 의 VNC 서버에 접속할 때 필요합니다. \
              GhostDesk 는 Apple 의 세션 선택 단계를 구현하지 않아, 대상 Mac 의 콘솔 사용자와 다른 계정으로 접속하면 그 Mac 의 화면이 전환될 수 있습니다. \
              또 이 PC 자신에서 실행 중인 VNC 서버는 지금 보고 계신 실제 화면일 수 있어, 확인 없이는 접속하지 않습니다. \
              WSL·Hyper-V 가상 머신처럼 이 PC 주소로 전달되는 별도 데스크톱일 때만 켜세요."),
-        ));
+        )); }
     }
 
     /// Separate account session (macOS: dedicated account name) / child session (Windows: whether the

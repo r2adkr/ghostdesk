@@ -1185,7 +1185,7 @@ fn cli_path_env(cli: &Path) -> OsString {
 /// 1.77+, the CVE-2024-24576 fix; arguments that can't be passed safely, like newlines, error out
 /// instead of running). cmd.exe comes from the system folder, not PATH. No console window is
 /// shown.
-fn cli_command(cli: &Path) -> Command {
+pub(crate) fn cli_command(cli: &Path) -> Command {
     let mut c = Command::new(cli);
     c.env("PATH", cli_path_env(cli));
     #[cfg(windows)]
@@ -1206,7 +1206,7 @@ fn cli_command(cli: &Path) -> Command {
 }
 
 #[cfg(not(windows))]
-fn find_cli(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_cli(name: &str) -> Option<PathBuf> {
     let b = bases();
     let h = b.home.clone();
     let mut cands = vec![
@@ -1215,6 +1215,8 @@ fn find_cli(name: &str) -> Option<PathBuf> {
         h.join(format!(".{name}/bin/{name}")), // opencode install script (~/.opencode/bin)
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
+        PathBuf::from("/Applications/Codex.app/Contents/Resources").join(name),
+        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS").join(name),
     ];
     // launched from a terminal, it may also be on PATH (nvm, ~/.npm-global, bun, …)
     if let Some(cur) = b.var("PATH") {
@@ -1235,7 +1237,7 @@ const CLI_EXTS: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
 
 /// Windows: looks for `name.exe` → `name.cmd` → `name.bat` in common install locations and PATH.
 #[cfg(windows)]
-fn find_cli(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_cli(name: &str) -> Option<PathBuf> {
     let b = bases();
     let pathext = b
         .var("PATHEXT")

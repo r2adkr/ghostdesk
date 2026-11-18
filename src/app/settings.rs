@@ -22,6 +22,8 @@ impl GhostApp {
     pub(super) fn missing_setup(&self) -> Option<String> {
         match self.cur() {
             None => Some(tr("설정에서 쓸 AI 를 추가해 주세요").to_string()),
+            Some(c) if c.provider.is_cli() && !matches!(self.model_fetch.lock().get(&c.id),Some(ModelFetch::Done(Ok(models))) if !models.is_empty()) => Some(tr("설정에서 CLI 연결을 확인해 주세요").to_string()),
+            Some(c) if c.provider.is_cli() && c.model.trim().is_empty() => Some(tr("CLI 모델을 선택해 주세요").to_string()),
             Some(c) => c.missing(),
         }
     }
@@ -29,7 +31,7 @@ impl GhostApp {
     /// Whether a connection is ready enough to show in the home menu. Ollama needs nothing, so it
     /// only shows while in use (many PCs don't have it running).
     fn ready(&self, c: &AiConn) -> bool {
-        if c.provider.needs_key() || c.provider.needs_url() {
+        if c.provider.is_cli() || c.provider.needs_key() || c.provider.needs_url() {
             c.configured()
         } else {
             c.id == self.ai_current
@@ -44,14 +46,19 @@ impl GhostApp {
         if !matches!(state, ModelFetch::Idle) || !c.configured() {
             return state;
         }
-        self.model_fetch.lock().insert(id, ModelFetch::Loading);
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        self.model_fetch.lock().insert(id, ModelFetch::Loading(request));
         let (slot, p, url, key, ctx) = (self.model_fetch.clone(), c.provider, c.base_url(), c.key.clone(), ctx.clone());
         self.rt.spawn(async move {
             let r = crate::llm::list_models(p, &url, &key).await.map_err(|e| format!("{e:#}"));
-            slot.lock().insert(id, ModelFetch::Done(r));
+            let mut slot = slot.lock();
+            if matches!(slot.get(&id), Some(ModelFetch::Loading(active)) if *active == request) {
+                slot.insert(id, ModelFetch::Done(r));
+            }
             ctx.request_repaint();
         });
-        ModelFetch::Loading
+        ModelFetch::Loading(request)
     }
 
     /// The key or URL changed, so refetch that connection's model list next time.
@@ -77,7 +84,7 @@ impl GhostApp {
     /// shows on hover).
     fn fetch_status(&self, ui: &mut egui::Ui, id: u64, state: &ModelFetch) {
         match state {
-            ModelFetch::Loading => {
+            ModelFetch::Loading(_) => {
                 ui.horizontal(|ui| {
                     theme::spinner(ui, 14.0, theme::muted());
                     ui.label(theme::hint(tr("모델 목록을 불러오는 중…")));
@@ -85,7 +92,7 @@ impl GhostApp {
             }
             ModelFetch::Done(Err(e)) => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(tr("모델 목록을 못 불러와서 기본 모델만 보여요")).size(12.0).color(theme::warn()))
+                    ui.label(RichText::new(if self.ai.iter().any(|c| c.id == id && c.provider.is_cli()) { tr("CLI 연결을 확인하지 못했습니다") } else { tr("모델 목록을 못 불러와서 기본 모델만 보여요") }).size(12.0).color(theme::warn()))
                         .on_hover_text(crate::llm::short(e, 300));
                     if ui.link(RichText::new(tr("다시 시도")).size(12.0)).clicked() {
                         self.refetch(id);
@@ -140,6 +147,9 @@ impl GhostApp {
         };
         let mut changed = false;
         ui.label(RichText::new(self.ai[i].title()).strong().color(theme::text()));
+        if self.ai[i].provider.is_cli() {
+            if theme::secondary(ui, tr("설치·로그인 안내")).clicked() { self.open_settings(SettingsTab::Ai); }
+        }
         if self.ai[i].provider.needs_url() {
             changed |= self.url_field(ui, i, width).changed();
         }
@@ -260,7 +270,7 @@ impl GhostApp {
                     let Some(c) = self.ai.iter().find(|c| c.id == id) else { continue };
                     let models: Vec<String> =
                         Self::models_for(c, &state).into_iter().filter(|m| query.is_empty() || m.to_lowercase().contains(&query)).collect();
-                    let busy = matches!(state, ModelFetch::Loading | ModelFetch::Done(Err(_)));
+                    let busy = matches!(state, ModelFetch::Loading(_) | ModelFetch::Done(Err(_)));
                     if models.is_empty() && !busy {
                         continue;
                     }
@@ -281,12 +291,13 @@ impl GhostApp {
                     }
                     ui.add_space(2.0);
                     let selected_model = (id == self.ai_current).then(|| c.model.clone());
+                    let blocked = c.provider.is_cli() && !matches!(&state, ModelFetch::Done(Ok(models)) if !models.is_empty());
                     for m in models {
                         shown += 1;
-                        if first.is_none() {
+                        if !blocked && first.is_none() {
                             first = Some((id, m.clone()));
                         }
-                        if ui.selectable_label(selected_model.as_deref() == Some(m.as_str()), &m).clicked() {
+                        if ui.add_enabled(!blocked, egui::Button::selectable(selected_model.as_deref() == Some(m.as_str()), &m)).clicked() {
                             chosen = Some((id, m));
                         }
                     }
@@ -455,6 +466,9 @@ impl GhostApp {
         ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
             .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
         ui.add_space(6.0);
+        ui.add(theme::switch(&mut self.pip_auto_open, tr("에이전트 화면이 열리면 PiP 자동 표시")));
+        ui.add(theme::switch(&mut self.pip_auto_close, tr("에이전트 화면이 닫히면 PiP 자동 닫기")));
+        ui.add_space(6.0);
         if theme::secondary(ui, tr("사용 설명 다시 보기")).clicked() {
             self.show_settings = false;
             self.save_prefs();
@@ -469,6 +483,12 @@ impl GhostApp {
         ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요")));
 
         ui.add_space(18.0);
+        theme::section(ui, tr("실험적 기능"));
+        ui.add_space(4.0);
+        ui.add(theme::switch(&mut self.allow_experimental, tr("실험적 기능 허용")));
+        ui.label(theme::hint(tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요")));
+
+        ui.add_space(16.0);
         theme::section(ui, tr("승인"));
         ui.add_space(4.0);
         ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기")));
@@ -484,6 +504,15 @@ impl GhostApp {
         ui.add_space(4.0);
         self.conn_cards(ui, width);
         self.add_conn_button(ui);
+        if ui.link(tr("이 컴퓨터의 CLI 찾기")).clicked() {
+            for provider in [Provider::ClaudeCli, Provider::CodexCli] {
+                if !self.ai.iter().any(|c| c.provider == provider) && crate::cli::executable(provider, "").is_some() {
+                    self.ai_next_id += 1;
+                    let c = AiConn::new(self.ai_next_id, provider);
+                    self.ai.push(c);
+                }
+            }
+        }
         ui.add_space(4.0);
         if prefs::CAN_REMEMBER_KEYS {
             ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
@@ -526,18 +555,19 @@ impl GhostApp {
             }
             return;
         }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
-            ui.hyperlink_to(RichText::new(tr("릴리스 노트")).size(12.0), crate::update::RELEASES_PAGE);
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(theme::hint(trf("{} 라이선스 · 오픈소스 패키지 포함", &[&crate::licenses::OWN_NAME])));
+        ui.label(RichText::new(trf("GhostDesk 버전 {}", &[&env!("CARGO_PKG_VERSION")])).color(theme::text()));
+        ui.label(theme::hint(trf("{} 라이선스 · 오픈소스 패키지 포함", &[&crate::licenses::OWN_NAME])));
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if theme::secondary(ui, tr("릴리스 노트")).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE));
+            }
             if theme::secondary(ui, tr("라이선스")).clicked() {
                 self.license_view = Some(LicenseView::new());
             }
         });
         if let crate::update::State::Available(r) | crate::update::State::Failed(r, _) = &*self.update.lock() {
+            ui.add_space(8.0);
             ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
         }
         let (ti, to) = self.agents.iter().fold((0, 0), |acc, a| {
@@ -676,7 +706,26 @@ impl GhostApp {
                 if p.needs_url() {
                     self.url_field(ui, i, inner);
                 }
-                if p.takes_key() {
+                if p.is_cli() {
+                    ui.label(theme::hint(tr("이 CLI의 기존 로그인으로 실행해요. 인증 정보는 앱에 복사하지 않아요")));
+                    if p == Provider::ClaudeCli { ui.label(theme::hint(tr("Claude 모델 별칭을 표시해요. 모델 ID를 직접 입력할 수도 있어요"))); }
+                    let changed = ui.add(egui::TextEdit::singleline(&mut self.ai[i].url).desired_width(inner).hint_text(tr("CLI 실행 파일 경로 (비워 두면 자동 탐지)"))).changed();
+                    let id = self.ai[i].id;
+                    if changed { self.refetch(id); }
+                    let state = self.fetch_models(ui.ctx(), id);
+                    match &state {
+                        ModelFetch::Done(Ok(models)) => {
+                            ui.label(RichText::new(tr("CLI 로그인 확인됨")).size(12.0).color(theme::success()));
+                            if self.ai[i].model.trim().is_empty() { if let Some(model) = models.first() { self.ai[i].model = model.clone(); } }
+                        }
+                        _ => self.fetch_status(ui, id, &state),
+                    }
+                    if let ModelFetch::Done(Err(error)) = &state { ui.label(theme::hint(crate::llm::short(error, 500))); }
+                    ui.horizontal(|ui| {
+                        if ui.link(tr("연결 다시 확인")).clicked() { self.refetch(id); }
+                        ui.hyperlink_to(tr("설치·로그인 안내"), p.key_page());
+                    });
+                } else if p.takes_key() {
                     ui.horizontal(|ui| {
                         let link = p.needs_key() && self.ai[i].key.trim().is_empty() && !p.key_page().is_empty();
                         let w = if link { inner - 72.0 } else { inner };

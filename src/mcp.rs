@@ -157,6 +157,7 @@ fn modes(pl: &Plat) -> Vec<(&'static str, String)> {
             },
         ));
     }
+    m.push(("ssh", "SSH 원격 명령 실행과 요청 시 결과 파일 수신 (키/에이전트 인증, 승인)".to_string()));
     m.push(("remote", "VNC 원격 컴퓨터 (host/port, 승인)".to_string()));
     m
 }
@@ -186,7 +187,10 @@ fn server_instructions_for(pl: &Plat) -> String {
          사용자가 GhostDesk 창에서 실시간으로 지켜봅니다. 메시지 전송·결제·삭제처럼 되돌릴 수 없는 동작은 먼저 확인받으세요. \
          자식 세션·별도 계정 세션(session)은 하나뿐이라 한 번에 한 에이전트만 씁니다. 다른 에이전트가 쓰는 중이라는 오류가 오면 web·app 등 다른 mode 로 할 수 있는지 먼저 보고, 꼭 필요하면 잠시 뒤 다시 desk_open 하세요. \
          사용자가 팀 이름을 주거나 여러 에이전트가 함께 하라고 하면 team(action=join, role=맡을 분야) 으로 들어가 목표·할 일·메모를 읽고, \
-         할 일은 team_task 로 claim → done(결과) 하며, 다른 팀원에게 필요한 발견·결정은 team(action=note) 로 짧게 남기세요. 일을 시작하기 전과 끝낸 뒤에 team(action=read) 로 새 메모를 확인하세요."
+         할 일은 team_task 로 claim → done(결과) 하며, 다른 팀원에게 필요한 발견·결정은 team(action=note) 로 짧게 남기세요. 일을 시작하기 전과 끝낸 뒤에 team(action=read) 로 새 메모를 확인하세요. \
+         팀의 공용 저장소에서 코드를 수정하기 전에 team(action=claim_files, paths=[저장소 루트 기준 상대 경로]) 의 성공을 확인하세요. 다른 팀원이 맡은 경로는 피하거나 담당자와 조율하세요. \
+         예약 후 최신 내용을 읽고, 파일을 추가로 수정하기 전에 경로를 추가하세요. 파일 이름을 바꿀 때는 두 경로를 모두 예약하세요. 파일을 쓰는 명령이 종료되고 수정이 끝나면 team(action=release_files) 로 해제하세요. \
+         수정 범위를 미리 좁히기 어려운 작업은 별도 Git worktree 에서 진행하고 통합을 조율하세요. 팀원이 작업 중인 공용 체크아웃 전체를 바꾸는 명령은 피하세요."
     )
 }
 
@@ -226,6 +230,8 @@ fn tools_for(pl: &Plat) -> Value {
                     "name": { "type": "string", "description": "화면 이름" },
                     "host": { "type": "string" }, "port": { "type": "integer" },
                     "username": { "type": "string" }, "password": { "type": "string" },
+                    "identity_file": { "type": "string", "description":"ssh: optional SSH private key path; otherwise use SSH agent/config" },
+                    "ssh": { "type":"object", "description":"remote: optional SSH connection for commands and result receipt, independent of VNC credentials", "properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"username":{"type":"string"},"identity_file":{"type":"string"}}, "required":["host"] },
                     "dedicated_machine": { "type": "boolean", "description": pl.dedicated_hint },
                     "width": { "type": "integer" }, "height": { "type": "integer" }
                 },
@@ -316,11 +322,12 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "team",
-            "description": "여러 에이전트가 함께 쓰는 팀 작업판 (목표·메모·할 일). action: list | create(name, goal, role) | join(team, role: 맡을 분야) | read(team, before: 이 메모 번호보다 오래된 것) | note(team, text: 알아낸 것·결정·진행 상황) | goal(team, goal) | leave(team) | delete(team, 사용자 승인). join 하면 목표·할 일·최근 메모가 돌아온다. 화면(desk)은 팀원끼리 공유되지 않는다.",
+            "description": "여러 에이전트가 함께 쓰는 팀 작업판. action: list | create(name, goal, role) | join(team, role) | read(team, before: 페이징할 메모 번호) | note(team, text) | goal(team, goal) | leave(team) | delete(team, 사용자 승인) | claim_files(team, paths: 수정 전 예약) | release_files(team, paths: 수정 후 해제). join/read는 목표·할 일·수정 중인 파일과 담당자·최근 메모를 반환한다.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "create", "join", "read", "note", "goal", "leave", "delete"] },
+                    "action": { "type": "string", "enum": ["list", "create", "join", "read", "note", "goal", "leave", "delete", "claim_files", "release_files"] },
+                    "paths": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "공용 저장소의 루트 기준 파일 경로 (예: src/main.rs). 저장소에 있는 표기와 / 구분자를 사용한다. 루트 자체와 절대 경로는 입력할 수 없다." },
                     "team": { "type": "string", "description": "팀 이름" },
                     "name": { "type": "string", "description": "create: 새 팀 이름" },
                     "goal": { "type": "string" },
@@ -348,6 +355,13 @@ fn tools_for(pl: &Plat) -> Value {
             }
         }
     ]);
+    let mut remote = crate::ssh::tool_definition();
+    remote["name"] = json!("desk_remote");
+    remote["inputSchema"] = remote["input_schema"].clone();
+    remote.as_object_mut().unwrap().remove("input_schema");
+    remote["inputSchema"]["properties"]["desk_id"] = json!({"type":"string"});
+    remote["inputSchema"]["required"] = json!(["desk_id","action"]);
+    t.as_array_mut().unwrap().push(remote);
     // don't advertise arguments or tools this OS can't use (so agents don't pick them and then fail
     // at approval)
     if let Some(props) = t[0]["inputSchema"]["properties"].as_object_mut() {
@@ -783,12 +797,12 @@ async fn call_tool(conn: &Conn, name: &str, args: &Value) -> Result<Vec<Value>> 
                 .await?;
             to_content(&r, None)
         }
-        "desk_browser" | "desk_app" => {
+        "desk_browser" | "desk_app" | "desk_remote" => {
             let mut input = args.clone();
             if let Some(o) = input.as_object_mut() {
                 o.remove("desk_id");
             }
-            let tool = if name == "desk_browser" { "browser" } else { "app" };
+            let tool = match name { "desk_browser" => "browser", "desk_remote" => "remote", _ => "app" };
             let r = conn.call("act", json!({ "desk_id": desk_id, "tool": tool, "input": input })).await?;
             to_content(&r, None)
         }
@@ -1634,7 +1648,7 @@ mod tests {
         let r = recv(&mut rx).await;
         assert_eq!(r["id"], 1);
         let names: Vec<&str> = r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["desk_open", "desk_action", "desk_browser", "desk_app", "desk_list", "desk_close", "team", "team_task"]);
+        assert_eq!(names, ["desk_open", "desk_action", "desk_browser", "desk_app", "desk_list", "desk_close", "team", "team_task", "desk_remote"]);
         assert_eq!(r["result"]["tools"], tools());
         send_line(&mut w, r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#).await;
         assert_eq!(recv(&mut rx).await["id"], "p");
@@ -1697,8 +1711,30 @@ mod tests {
             assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("보안상"), "{r}");
         }
         assert!(ev_rx.try_recv().is_err(), "승인 창이 뜨면 안 됨");
+
+        send_line(&mut w, &call(5, "team", json!({"action":"create","name":"Code review","role":"Editor"}))).await;
+        assert_eq!(recv(&mut rx).await["result"]["isError"], false);
+        send_line(&mut w, &call(6, "team", json!({"action":"claim_files","team":"Code review","paths":["./src/lib.rs"]}))).await;
+        let claim = recv(&mut rx).await;
+        assert_eq!(claim["result"]["isError"], false, "{claim}");
+        let store = srv.teams();
+        let board = store.read_json("Code review", None).unwrap();
+        assert_eq!(board["file_edits"][0]["path"], "src/lib.rs");
+        assert_eq!(board["file_edits"][0]["by"], board["members"][0]);
+
+        send_line(&mut w, &call(7, "team", json!({"action":"release_files","team":"Code review","paths":["src/lib.rs"]}))).await;
+        assert_eq!(recv(&mut rx).await["result"]["isError"], false);
+        assert_eq!(store.read_json("Code review", None).unwrap()["file_edits"], json!([]));
+        send_line(&mut w, &call(8, "team", json!({"action":"claim_files","team":"Code review","paths":["src/lib.rs"]}))).await;
+        assert_eq!(recv(&mut rx).await["result"]["isError"], false);
+
         drop(w);
         h.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.read_json("Code review", None).unwrap()["file_edits"] != json!([]) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("disconnected editor's file claim should be released");
         server.abort();
     }
 }

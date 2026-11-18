@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 pub(crate) use anthropic::{CLEAR_TOOL_USES_AT, KEEP_TOOL_USES};
 pub use provider::Provider;
 
+pub(crate) fn cli_tools(tools: &Value) -> Value { openai::to_tools(tools) }
+
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Clone)]
@@ -42,7 +44,7 @@ impl Llm {
     /// Tool definitions for a backend kind, in Claude format. Never changed mid-conversation.
     pub fn tools(kind: crate::desk::DeskKind) -> Value {
         use crate::desk::DeskKind;
-        let mut tools = vec![json!({ "type": "computer_toolset_20260801" })];
+        let mut tools = if kind == DeskKind::Ssh { Vec::new() } else { vec![json!({ "type": "computer_toolset_20260801" })] };
         match kind {
             DeskKind::Browser => tools.push(Self::browser_control_tool()),
             DeskKind::Native => tools.push(crate::native::app_control_tool()),
@@ -52,7 +54,7 @@ impl Llm {
                 #[cfg(windows)]
                 tools.push(Self::session_control_tool());
             }
-            DeskKind::Remote => {}
+            DeskKind::Remote | DeskKind::Ssh => tools.push(crate::ssh::tool_definition()),
         }
         tools.push(Self::ask_user_tool());
         Value::Array(tools)
@@ -120,7 +122,9 @@ impl Llm {
 
     /// Sends one turn and returns the reply in Claude format (`content`, `stop_reason`, `usage`).
     pub async fn send(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
-        if self.provider == Provider::Anthropic {
+        if self.provider.is_cli() {
+            crate::cli::send(self.provider, &self.base_url, &self.model, system, tools, messages).await
+        } else if self.provider == Provider::Anthropic {
             self.send_anthropic(system, tools, messages).await
         } else {
             self.send_openai(system, tools, messages).await
@@ -171,6 +175,7 @@ fn auth(req: reqwest::RequestBuilder, p: Provider, key: &str) -> reqwest::Reques
 /// Model ids the provider actually offers (`GET /models`), minus models that can't do text or
 /// image chat.
 pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<String>> {
+    if p.is_cli() { return crate::cli::models(p, base_url).await; }
     const SKIP: &[&str] = &["embed", "tts", "whisper", "dall-e", "image", "audio", "realtime", "moderation", "transcribe", "veo", "imagen", "aqa"];
     let mut ids: Vec<String> = Vec::new();
     // Anthropic returns at most 100 per page, so follow `after_id` until `has_more` is false

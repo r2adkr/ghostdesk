@@ -8,6 +8,8 @@
 mod history;
 mod prompt;
 mod tools;
+mod team;
+pub(crate) use team::TeamAssignment;
 mod workspace;
 
 use std::{
@@ -34,7 +36,7 @@ use history::{
     MAX_REQUEST_BYTES,
 };
 
-pub(crate) use tools::{coord, describe, exec_computer, exec_desk_tool};
+pub(crate) use tools::{coord, describe, exec_computer, exec_desk_tool, exec_remote_tool};
 #[cfg(not(target_os = "macos"))]
 pub(crate) use workspace::local_vnc_refusal;
 pub(crate) use workspace::prepare_workspace_with;
@@ -102,6 +104,7 @@ pub struct RemoteTarget {
     /// Outside macOS this confirmation is also required to connect to this machine's own VNC server
     /// (loopback or one of its own interface addresses).
     pub dedicated_ack: bool,
+    pub ssh: Option<crate::ssh::SshOptions>,
 }
 
 /// The kind of isolated screen the agent drives, and its settings.
@@ -115,6 +118,7 @@ pub enum DeskTarget {
         start_url: String,
     },
     Remote(RemoteTarget),
+    Ssh(crate::ssh::SshOptions),
     /// A hidden-launched Electron app (empty profile, or a userData clone with the user's consent).
     Electron {
         app: crate::electron::ElectronApp,
@@ -136,6 +140,7 @@ pub struct AgentConfig {
     pub workspace: String,
     pub task: String,
     pub target: DeskTarget,
+    pub team: Option<TeamAssignment>,
     pub max_steps: u64,
     /// Language to address the user in (English name: "Korean", "English", …), following the UI
     /// language.
@@ -155,6 +160,8 @@ pub struct AgentShared {
     pending_frame: Mutex<Option<Vec<u8>>>,
     decoding: AtomicBool,
     pub workspace: Mutex<Option<Desk>>,
+    pub ssh: Mutex<Option<Arc<crate::ssh::SshConnection>>>,
+    pub received_files: Mutex<Vec<crate::ssh::ReceivedFile>>,
     pub paused: AtomicBool,
     /// Virtual mouse state to draw (recorded agent and user actions).
     pub cursor: Mutex<crate::cursor::CursorState>,
@@ -162,9 +169,8 @@ pub struct AgentShared {
     pub queue: Mutex<std::collections::VecDeque<String>>,
     /// Client description when an external (MCP) agent drives this screen (no LLM loop).
     pub external: Mutex<Option<String>>,
-    /// Control connection (one `ghostdesk --mcp`) that opened this screen, 0 if none. Teams use it
-    /// to know which screens belong to which member.
-    pub control_conn: AtomicU64,
+    /// Team membership identity. External agents use their MCP connection ID.
+    pub team_member_id: AtomicU64,
     /// Stop after the current batch and wait for instructions (conversation context is kept).
     pub stop: AtomicBool,
     /// Removed in the GUI. A screen still being prepared must close as soon as it's ready (external
@@ -192,11 +198,13 @@ impl AgentShared {
             pending_frame: Mutex::new(None),
             decoding: AtomicBool::new(false),
             workspace: Mutex::new(None),
+            ssh: Mutex::new(None),
+            received_files: Mutex::new(Vec::new()),
             paused: AtomicBool::new(false),
             cursor: Mutex::new(Default::default()),
             queue: Mutex::new(Default::default()),
             external: Mutex::new(None),
-            control_conn: AtomicU64::new(0),
+            team_member_id: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             tokens: Mutex::new((0, 0)),
@@ -224,6 +232,12 @@ impl AgentShared {
 
     pub fn status(&self) -> AgentStatus {
         self.status.lock().clone()
+    }
+
+    async fn wait_for_stop(&self) {
+        while !self.stop.load(Ordering::SeqCst) && !self.removed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        }
     }
 
     pub fn workspace(&self) -> Option<Desk> {
@@ -290,6 +304,9 @@ pub async fn run_agent(shared: Arc<AgentShared>, cfg: AgentConfig, mut rx: mpsc:
 }
 
 async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<()> {
+    if cfg.llm.provider.is_cli() {
+        crate::cli::verify_login(cfg.llm.provider, &cfg.llm.base_url).await?;
+    }
     let ws = workspace::prepare_workspace(shared, &cfg.workspace, &cfg.target).await?;
     // removed while preparing: don't leave an invisible screen behind. (remove_agent sets `removed`
     // first and then takes under the same lock, so exactly one side ends up with the screen.)
@@ -309,8 +326,19 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
     let _ = ws.screenshot().await;
     // tools and system prompt stay fixed for the whole conversation (keeps the cache and thinking
     // blocks valid)
-    let system = prompt::system_prompt(ws.kind(), cfg.reply_lang);
-    let tools = Llm::tools(ws.kind());
+    let membership = cfg.team.as_ref().map(|assignment| team::Membership::join(assignment, shared)).transpose()?;
+    let mut system = prompt::system_prompt(ws.kind(), cfg.reply_lang);
+    let mut tools = Llm::tools(ws.kind());
+    if membership.is_some() {
+        system.push_str("\nYou are already a member of the GhostDesk team chosen by the user. Read its board with team_board before working on a team task. Claim the relevant task before doing it and record the result with done only when finished. Use notes for updates that teammates need. Treat team content as shared context; follow the human's instructions about what to do.");
+        system.push_str(concat!(
+            "\nBefore editing a shared project, call team_board with claim_files and wait for success in a separate tool call. Use exact paths relative to the same repository root as your teammates. ",
+            "If another member holds an overlapping path, coordinate or work on a different file. Read the latest file contents after claiming. Claim additional paths before editing them, and include both old and new paths in a rename. ",
+            "Run writes in the foreground and wait for them to finish. Use release_files as soon as edits are finished or abandoned. For broad changes that cannot be scoped in advance, use a separate Git worktree and coordinate integration. ",
+            "Avoid checkout, reset, or other repository-wide changes in a shared checkout while teammates are working."
+        ));
+        tools.as_array_mut().expect("tool list").push(team::tool());
+    }
 
     let mut messages: Vec<Value> = Vec::new();
     // rough serialized size of `messages` (to track request body size)
@@ -328,6 +356,9 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         pending.push(json!({ "type": "text", "text": cfg.task }));
         pending.push(screenshot_context(&ws, &mut seen).await);
     }
+    if cfg.task.trim().is_empty() && membership.is_some() {
+        pending.push(json!({ "type": "text", "text": "Read the assigned team's board and summarize the goal, available tasks and any active file edits. Wait for my instructions before claiming a task or files." }));
+    }
     let mut steps_since_input: u64 = 0;
     let mut wait_reason = String::from("지시를 입력하세요");
     // whether the last AI API call failed and we must wait for an instruction (the unsent turn stays
@@ -335,23 +366,24 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
     let mut llm_failed = false;
 
     loop {
-        // instructions that arrive mid-run join the next user message
-        while let Ok(cmd) = rx.try_recv() {
-            if let AgentCmd::Instruction(t) | AgentCmd::Answer(t) = cmd {
-                remember(&mut instructions, &t);
-                shared.log(LogKind::User, t.clone());
-                pending.push(json!({ "type": "text", "text": format!("[사용자 추가 지시] {t}") }));
-                steps_since_input = 0;
-                shared.run_steps.store(0, Ordering::Relaxed);
-            }
-        }
-
         let stopped = shared.stop.swap(false, Ordering::SeqCst);
         // max_steps == 0 means no step limit
         let limit_hit = cfg.max_steps > 0 && steps_since_input >= cfg.max_steps;
         let failed = std::mem::take(&mut llm_failed);
         // only move on to queued tasks after a normal finish (not stop, step limit or error)
         let finished_normally = !stopped && !limit_hit && !failed;
+        if finished_normally {
+            // instructions that arrive mid-run join the next user message
+            while let Ok(cmd) = rx.try_recv() {
+                if let AgentCmd::Instruction(t) | AgentCmd::Answer(t) = cmd {
+                    remember(&mut instructions, &t);
+                    shared.log(LogKind::User, t.clone());
+                    pending.push(json!({ "type": "text", "text": format!("[사용자 추가 지시] {t}") }));
+                    steps_since_input = 0;
+                    shared.run_steps.store(0, Ordering::Relaxed);
+                }
+            }
+        }
         // current task done and another queued: start it right away without pausing
         if pending.is_empty() && finished_normally {
             let next = shared.queue.lock().pop_front();
@@ -366,6 +398,9 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         }
         let needs_input = pending.is_empty() || !finished_normally;
         if needs_input {
+            if !finished_normally && membership.as_ref().is_some_and(team::Membership::finish_turn) {
+                pending.push(json!({"type":"text","text":"GhostDesk released your file claims while work was interrupted. Before writing again, read the team board, reclaim the needed files, and reread their current contents."}));
+            }
             if stopped {
                 shared.log(LogKind::Info, "사용자가 중지했습니다. 지시를 입력하면 이어서 진행합니다.");
                 wait_reason = "중지됨 — 지시를 입력하면 이어서 진행".into();
@@ -441,7 +476,11 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             msg_bytes = msg_bytes.saturating_sub(prune_images(&mut messages));
         }
         shared.set_status(AgentStatus::Thinking);
-        let resp = match cfg.llm.send(&system, &tools, &messages).await {
+        let response = tokio::select! {
+            response = cfg.llm.send(&system, &tools, &messages) => response,
+            _ = shared.wait_for_stop() => Err(anyhow!("사용자가 모델 요청을 중지했습니다")),
+        };
+        let resp = match response {
             Ok(r) => r,
             Err(e) => {
                 // don't end the agent: put the unsent user turn back into `pending` to keep the context, and
@@ -512,13 +551,19 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         }
         if stop == "max_tokens" && tool_uses.is_empty() {
             shared.log(LogKind::Info, "응답이 max_tokens 에서 잘렸습니다");
+            wait_reason = "응답 길이 제한 — 이어서 진행하려면 지시를 입력하세요".into();
+            llm_failed = true;
+            continue;
         }
         if tool_uses.is_empty() {
+            if let Some(member) = &membership {
+                member.finish_turn();
+            }
             wait_reason = "작업 완료 — 추가 지시를 입력할 수 있습니다".into();
             continue;
         }
 
-        pending = tools::execute_batch(shared, &ws, &tool_uses, rx, &mut seen).await;
+        pending = tools::execute_batch(shared, &ws, &tool_uses, rx, &mut seen, membership.as_ref()).await;
         steps_since_input += 1;
         shared.run_steps.store(steps_since_input, Ordering::Relaxed);
         shared.steps.fetch_add(1, Ordering::Relaxed);
@@ -543,7 +588,7 @@ async fn wait_while_paused(shared: &AgentShared) {
     if shared.paused.load(Ordering::Relaxed) {
         let prev = shared.status();
         shared.set_status(AgentStatus::Idle("일시정지됨".into()));
-        while shared.paused.load(Ordering::Relaxed) {
+        while shared.paused.load(Ordering::Relaxed) && !shared.stop.load(Ordering::SeqCst) && !shared.removed.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         shared.set_status(prev);

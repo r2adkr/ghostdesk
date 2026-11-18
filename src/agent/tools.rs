@@ -25,6 +25,31 @@ fn ok(text: impl Into<String>) -> Result<Outcome> {
     Ok(Outcome { text: text.into(), image: None })
 }
 
+pub(crate) async fn exec_remote_tool(shared: &Arc<AgentShared>, input: &Value) -> Result<Outcome> {
+    let ssh = shared.ssh.lock().clone().ok_or_else(|| anyhow!("Configure SSH for this remote workspace first"))?;
+    let result = match input["action"].as_str().unwrap_or_default() {
+        "execute" => {
+            let command = input["command"].as_str().ok_or_else(|| anyhow!("command is required"))?;
+            let seconds = input.get("timeout_seconds").map(|v| v.as_u64().ok_or_else(|| anyhow!("timeout_seconds must be a positive integer"))).transpose()?.unwrap_or(120);
+            let result = ssh.execute(command, seconds, &shared.stop).await?;
+            shared.log(LogKind::Info, format!("SSH exit_code: {}\nstdout:\n{}\nstderr:\n{}", result["exit_code"], short(result["stdout"].as_str().unwrap_or_default(),6000), short(result["stderr"].as_str().unwrap_or_default(),6000)));
+            if result["success"] != true { return Err(anyhow!("Remote command failed: {result}")); }
+            result
+        }
+        "receive" => {
+            let path = input["remote_path"].as_str().ok_or_else(|| anyhow!("remote_path is required"))?;
+            let file = ssh.receive(path, &shared.workspace_name, &shared.stop).await?;
+            let result = json!({"local_path":file.path,"size":file.size,"remote_path":path});
+            shared.log(LogKind::Info, format!("Received: {} ({} bytes)", file.path.display(), file.size));
+            shared.received_files.lock().push(file);
+            shared.ctx.request_repaint();
+            result
+        }
+        _ => return Err(anyhow!("action must be execute or receive")),
+    };
+    ok(serde_json::to_string(&result)?)
+}
+
 /// Runs one turn's tool calls in order and returns their `tool_result`s.
 ///
 /// The last result gets the current screenshot and window/tab list attached, unless the model
@@ -35,6 +60,7 @@ pub(super) async fn execute_batch(
     tool_uses: &[Value],
     rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
     seen: &mut Seen,
+    membership: Option<&super::team::Membership>,
 ) -> Vec<Value> {
     let mut results: Vec<Value> = Vec::new();
     let mut failed = false;
@@ -51,10 +77,13 @@ pub(super) async fn execute_batch(
             result["toolset_name"] = json!(ts);
         }
 
-        if failed || shared.stop.load(Ordering::SeqCst) {
+        if !failed {
+            wait_while_paused(shared).await;
+        }
+        if failed || shared.stop.load(Ordering::SeqCst) || shared.removed.load(Ordering::SeqCst) {
             result["is_error"] = json!(true);
             result["content"] = json!(if failed {
-                "Not executed: an earlier computer action in this turn failed."
+                "Not executed: an earlier action in this turn failed."
             } else {
                 "Not executed: the human operator stopped the agent."
             });
@@ -63,7 +92,6 @@ pub(super) async fn execute_batch(
             continue;
         }
 
-        wait_while_paused(shared).await;
         let desc = describe(&name, input);
         shared.set_status(AgentStatus::Acting(short(&desc, 60)));
         shared.log(LogKind::Action, desc);
@@ -77,7 +105,7 @@ pub(super) async fn execute_batch(
         let out = if toolset.is_some() {
             exec_computer(ws, &name, input, &aim).await
         } else {
-            exec_custom(shared, ws, &name, input, rx).await
+            exec_custom(shared, ws, &name, input, rx, membership).await
         };
         if toolset.is_some() {
             shared.cursor.lock().record(&name, input, ws.mouse_pos(), false);
@@ -97,7 +125,8 @@ pub(super) async fn execute_batch(
                 shared.log(LogKind::Error, format!("{name} 실패: {e:#}"));
                 result["is_error"] = json!(true);
                 result["content"] = json!(format!("Error: {e:#}"));
-                failed = toolset.is_some();
+                // A losing claim must not be followed by work from the same batch.
+                failed = toolset.is_some() || (name == "team_board" && matches!(input["action"].as_str(), Some("claim" | "claim_files")));
                 last_has_image = false;
             }
         }
@@ -106,6 +135,7 @@ pub(super) async fn execute_batch(
     }
 
     // if the batch didn't end with a screenshot, attach the latest screen and tabs to the last result
+    if !ws.has_screen() { return results; }
     settle(ws).await;
     let uses = tool_uses.len();
     let mut extra = Vec::new();
@@ -248,6 +278,7 @@ async fn exec_custom(
     name: &str,
     input: &Value,
     rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    membership: Option<&super::team::Membership>,
 ) -> Result<Outcome> {
     match name {
         "ask_user" => {
@@ -255,7 +286,12 @@ async fn exec_custom(
             shared.log(LogKind::Assistant, format!("{} {q}", crate::icon::CIRCLE_HELP));
             shared.set_status(AgentStatus::WaitingUser(q));
             let ans = loop {
-                match rx.recv().await {
+                let command = tokio::select! {
+                    biased;
+                    _ = shared.wait_for_stop() => return Err(anyhow!("질문 대기 중지")),
+                    command = rx.recv() => command,
+                };
+                match command {
                     Some(AgentCmd::Answer(a)) | Some(AgentCmd::Instruction(a)) => break a,
                     // a queue notification is not an answer, keep waiting
                     Some(AgentCmd::Wake) => continue,
@@ -266,6 +302,13 @@ async fn exec_custom(
             shared.set_status(AgentStatus::Thinking);
             ok(format!("Human answered: {ans}"))
         }
+        "team_board" => {
+            let member = membership.ok_or_else(|| anyhow!("No team was selected for this agent"))?;
+            let result = member.execute(input)?;
+            shared.ctx.request_repaint();
+            ok(result.to_string())
+        }
+        "remote_control" => exec_remote_tool(shared, input).await,
         other => exec_desk_tool(desk, other, input).await,
     }
 }
@@ -391,6 +434,7 @@ pub(crate) fn describe(name: &str, input: &Value) -> String {
             input["url"].as_str().map(String::from).or(input["index"].as_u64().map(|i| i.to_string())).unwrap_or_default()
         ),
         "ask_user" => "ask_user".into(),
+        "team_board" => format!("team_board {}", input["action"].as_str().unwrap_or_default()),
         "app_control" | "app_menu" => format!(
             "{name} {} {}",
             input["action"].as_str().unwrap_or(""),

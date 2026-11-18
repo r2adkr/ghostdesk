@@ -59,7 +59,7 @@ enum ChildEnable {
 enum ModelFetch {
     #[default]
     Idle,
-    Loading,
+    Loading(u64),
     Done(Result<Vec<String>, String>),
 }
 
@@ -90,7 +90,7 @@ struct AgentHandle {
     /// Text the IME is composing during takeover (shows Korean input on Windows; cleared on commit).
     preedit: String,
     /// Whether this agent's screen is shown in a small always-on-top window (PiP).
-    pip: bool,
+    pip: pip::PipState,
     /// Maximum steps allowed without my confirmation (0 = unlimited / external agent); the end of the
     /// progress bar.
     max_steps: u64,
@@ -112,7 +112,7 @@ impl AgentHandle {
             url_input: String::new(),
             takeover: false,
             preedit: String::new(),
-            pip: false,
+            pip: Default::default(),
             max_steps: 0,
         }
     }
@@ -152,6 +152,8 @@ enum Choice {
 }
 
 struct NewAgentForm {
+    team_id: Option<u64>,
+    team_role: String,
     choice: Option<Choice>,
     app_search: String,
     /// Web: use my browser's login state (which profile is `profile_idx`, picked in advanced
@@ -178,6 +180,12 @@ struct NewAgentForm {
     remote_user: String,
     remote_pass: String,
     remote_dedicated: bool,
+    remote_ssh: bool,
+    remote_ssh_only: bool,
+    ssh_host: String,
+    ssh_port: u16,
+    ssh_user: String,
+    ssh_identity: String,
     name: String,
     workspace: String,
     refresh: bool,
@@ -223,9 +231,13 @@ pub struct GhostApp {
     prefs_other: serde_json::Map<String, serde_json::Value>,
     /// Keeps the Mac/PC from sleeping while agents work, even with the screen locked (display off).
     keep_awake: bool,
+    pip_auto_open: bool,
+    pip_auto_close: bool,
     /// Permission bypass: approve external agents' sensitive requests (login cloning, running apps,
     /// remote access, …) without asking. Hard refusals in `control.rs` still apply.
     auto_approve: bool,
+    /// Consent once to experimental features, independently of ordinary permissions.
+    allow_experimental: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
     awake: Option<crate::platform::awake::KeepAwake>,
     browsers: Vec<InstalledBrowser>,
@@ -346,7 +358,10 @@ impl GhostApp {
             lang: Lang::Ko,
             effort_idx: 1,
             keep_awake: true,
+            pip_auto_open: false,
+            pip_auto_close: true,
             auto_approve: false,
+            allow_experimental: false,
             tour: None,
             tour_seen: false,
             tour_capture: tour::Capture::from_env(),
@@ -448,6 +463,7 @@ impl GhostApp {
     }
 
     fn remove_agent(&mut self, idx: usize) {
+        if let Some(ssh) = self.agents[idx].shared.ssh.lock().as_ref() { ssh.close(); }
         let h = self.agents.remove(idx);
         // mark screens still being prepared (internal or external) to close as soon as they're ready
         h.shared.removed.store(true, Ordering::SeqCst);
@@ -526,12 +542,13 @@ impl eframe::App for GhostApp {
                     let task = self.rt.spawn(async {});
                     self.agents.push(AgentHandle::new(&self.rt, shared, tx, task));
                 }
-                crate::control::ControlEvent::Approval { title, reply, .. } if self.auto_approve => {
+                crate::control::ControlEvent::Approval { title, reply, experimental, .. }
+                    if crate::control::approval_allowed(self.auto_approve, self.allow_experimental, experimental) => {
                     // permission bypass: answer at once, and say what was allowed so it never happens unseen
                     let _ = reply.send(true);
                     self.notify(&ctx, trf("자동 허용됨: {}", &[&title]));
                 }
-                crate::control::ControlEvent::Approval { title, detail, reply } => {
+                crate::control::ControlEvent::Approval { title, detail, reply, .. } => {
                     self.approvals.push((title, detail, Some(reply)));
                     #[cfg(windows)]
                     show_approval_window();
@@ -706,6 +723,7 @@ impl Drop for GhostApp {
         let mut desks = Vec::new();
         for a in self.agents.drain(..) {
             a.shared.removed.store(true, Ordering::SeqCst);
+            if let Some(ssh) = a.shared.ssh.lock().as_ref() { ssh.close(); }
             a.task.abort();
             let ws = a.shared.workspace.lock().take();
             if let Some(ws) = ws {
