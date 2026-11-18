@@ -48,14 +48,43 @@ pub(crate) async fn prepare_workspace_with(
             Ok(Desk::VDisplay(ws))
         }
         DeskTarget::Session { account } => {
+            // one agent at a time on this session screen: wait for the turn (turns.rs)
+            let turn = take_session_turn(shared, account).await?;
             shared.set_status(AgentStatus::Preparing(format!("'{account}' 세션에 연결 중")));
             let sh = shared.clone();
             let d = crate::session::SessionDesk::connect(account, Arc::new(move |b: &[u8]| sh.push_frame(b))).await?;
+            d.hold(turn);
             let (w, h) = d.size();
             shared.log(LogKind::Info, format!("전용 계정 '{account}' 의 별도 세션에 연결했습니다 ({w}x{h})"));
             Ok(Desk::Session(d))
         }
     }
+}
+
+/// Waits for this agent's turn on the session screen (the Windows child session, or a macOS
+/// dedicated account's session), showing who it waits for. Agents inside GhostDesk wait until
+/// stopped; external agents give up after 40 s (their MCP call would time out) with who has it.
+async fn take_session_turn(shared: &Arc<AgentShared>, account: &str) -> Result<crate::turns::Turn> {
+    use std::sync::atomic::Ordering;
+    let (key, what) = if cfg!(windows) {
+        (crate::turns::CHILD_SESSION.to_string(), "자식 세션".to_string())
+    } else {
+        (crate::turns::account_key(account), format!("'{account}' 세션"))
+    };
+    let external = shared.external.lock().clone();
+    let who = match &external {
+        Some(client) => format!("{client} ({})", shared.name),
+        None => shared.name.clone(),
+    };
+    let max_wait = external.is_some().then(|| Duration::from_secs(40));
+    let sh = shared.clone();
+    let on_wait = move |owner: &str, place: usize| {
+        sh.set_status(AgentStatus::Preparing(format!("{what} 차례를 기다리는 중 · 지금 {owner} 사용 중 · 대기 {place}번째")));
+        sh.log(LogKind::Info, format!("{what} 은(는) 한 번에 한 에이전트만 쓸 수 있어 {owner} 이(가) 끝나기를 기다립니다"));
+    };
+    let sh = shared.clone();
+    let cancelled = move || sh.stop.load(Ordering::SeqCst) || sh.removed.load(Ordering::SeqCst);
+    crate::turns::global().take(&key, &who, max_wait, on_wait, cancelled).await
 }
 
 async fn prepare_electron(

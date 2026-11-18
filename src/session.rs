@@ -1221,6 +1221,9 @@ pub struct SessionDesk {
     canary_ok: AtomicBool,
     /// Reads the cursor position in the user's (client) session (swapped out by the self-test).
     local_cursor: Mutex<LocalCursorFn>,
+    /// This agent's turn on the one session screen (turns.rs); released when the screen closes so
+    /// the next agent in line gets it.
+    turn: Mutex<Option<crate::turns::Turn>>,
 }
 
 /// Reads the current cursor position in the user's (client) session, for input leak detection.
@@ -1350,6 +1353,7 @@ impl SessionDesk {
             poller: Mutex::new(None),
             canary_ok: AtomicBool::new(false),
             local_cursor: Mutex::new(Arc::new(real_local_cursor)),
+            turn: Mutex::new(None),
         });
         let (c, hello) = me.open().await?;
         me.apply_hello(&hello, true);
@@ -1858,9 +1862,16 @@ impl SessionDesk {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Keeps `turn` until this screen closes.
+    pub fn hold(&self, turn: crate::turns::Turn) {
+        *self.turn.lock() = Some(turn);
+    }
+
     /// Only closes the connection (the agent session and helper keep running).
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // the next agent in line may use the session now
+        self.turn.lock().take();
         if let Some(h) = self.poller.lock().take() {
             h.abort();
         }

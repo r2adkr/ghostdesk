@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.6.2-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.2/GhostDesk-Setup-0.6.2-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.7.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.0/GhostDesk-Setup-0.7.0-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.6.2-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.6.2/GhostDesk-0.6.2-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.7.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.7.0/GhostDesk-0.7.0-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
@@ -337,7 +337,11 @@ macOS.
 - **Child session (PiP):** drives a whole separate Windows session on the same
   PC and account. Pick it under New agent; the first time, **Enable child
   sessions** asks for administrator approval (UAC). Only one child session can
-  be connected system-wide. Installed apps and files are shared, but using the
+  be connected system-wide, so agents take turns on it: the first one keeps it
+  until its screen closes, and the others wait in line (their status shows who
+  they wait for). External agents wait up to 40 seconds, then are told who has
+  it so they can pick another mode or try again. The same applies on macOS to
+  each dedicated account's separate session. Installed apps and files are shared, but using the
   same browser profile concurrently or staying signed in to every app is not
   guaranteed. Use this mode for Microsoft Store apps such as the new Windows
   Notepad, Calculator and Paint, which cannot run in hidden app mode. External
