@@ -50,7 +50,16 @@ pub(crate) async fn prepare_workspace_with(
         DeskTarget::Session { account } => {
             // one agent at a time on this session screen: wait for the turn (turns.rs)
             let turn = take_session_turn(shared, account).await?;
-            shared.set_status(AgentStatus::Preparing(format!("'{account}' 세션에 연결 중")));
+            if cfg!(windows) {
+                // the child session signs in as this account again; Windows may ask for the password
+                shared.set_status(AgentStatus::Preparing("자식 세션에 로그인하는 중 · 'Windows 보안' 창이 뜨면 계정 암호를 넣으세요".into()));
+                shared.log(
+                    LogKind::Info,
+                    "자식 세션은 지금 계정으로 한 번 더 로그인합니다. 'Windows 보안' 창이 뜨면 PIN 이 아니라 계정 암호를 넣고, '내 자격 증명 기억' 을 체크하면 다음부터 묻지 않습니다",
+                );
+            } else {
+                shared.set_status(AgentStatus::Preparing(format!("'{account}' 세션에 연결 중")));
+            }
             let sh = shared.clone();
             let d = crate::session::SessionDesk::connect(account, Arc::new(move |b: &[u8]| sh.push_frame(b))).await?;
             d.hold(turn);

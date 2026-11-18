@@ -346,7 +346,17 @@ macOS.
   until its screen closes, and the others wait in line (their status shows who
   they wait for). External agents wait up to 40 seconds, then are told who has
   it so they can pick another mode or try again. The same applies on macOS to
-  each dedicated account's separate session. Installed apps and files are shared, but using the
+  each dedicated account's separate session.
+- **Signing in to the child session:** it signs in to this PC as you once more,
+  so Windows may show a **Windows Security** prompt when it connects. Enter your
+  account's **password** (for a Microsoft account, the Microsoft account
+  password, user name `MicrosoftAccount\you@example.com`); a PIN, fingerprint
+  or face (Windows Hello) doesn't work there. Check **Remember me** so it
+  doesn't ask again. If *Settings → Accounts → Sign-in options → For improved
+  security, only allow Windows Hello sign-in for Microsoft accounts on this
+  device* is on, turn it off first. Smart-card-only accounts can't use child
+  sessions. The full guide is under **New agent → Child session → How to set it
+  up**. Installed apps and files are shared, but using the
   same browser profile concurrently or staying signed in to every app is not
   guaranteed. Use this mode for Microsoft Store apps such as the new Windows
   Notepad, Calculator and Paint, which cannot run in hidden app mode. External

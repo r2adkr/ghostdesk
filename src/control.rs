@@ -2293,7 +2293,7 @@ mod tests {
         let task = tokio::spawn(async move {
             srv.app_target(&exe.to_string_lossy(), &json!({"attach_running":true}), false, "test", "test", &c).await
         });
-        let event = tokio::time::timeout(Duration::from_secs(10), ev_rx.recv()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(60), ev_rx.recv()).await.unwrap();
         let Some(ControlEvent::Approval { title, reply, .. }) = event else { panic!("실행 중인 앱 승인 요청 없음") };
         assert_eq!(title, "실행 중인 내 앱 사용 요청");
         reply.send(true).unwrap();
@@ -2312,10 +2312,14 @@ mod tests {
         let srv = ControlServer::new(ev_tx, egui::Context::default());
         let (_t, c) = conn(1);
         let app = exe.display().to_string();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             srv.app_target(&app, &json!({"app_host":"current_session"}), false, "test", "test", &c).await
         });
-        let event = tokio::time::timeout(Duration::from_secs(10), ev_rx.recv()).await.unwrap();
+        // resolving the app can be slow on a busy CI runner; if it ends without asking, show why
+        let event = tokio::select! {
+            e = tokio::time::timeout(Duration::from_secs(60), ev_rx.recv()) => e.expect("60초 안에 승인 요청이 오지 않음"),
+            r = &mut task => panic!("승인 요청 없이 끝남: {:?}", r.map(|r| r.map(|_| ())).map_err(|e| e.to_string())),
+        };
         let Some(ControlEvent::Approval { title, detail, reply }) = event else { panic!("승인 요청 없음") };
         assert_eq!(title, "현재 계정 로그인 사용 요청");
         assert!(detail.contains("원본 프로필") && detail.contains("실제 계정에 반영"), "{detail}");

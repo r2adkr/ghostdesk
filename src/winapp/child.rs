@@ -56,7 +56,8 @@ const DESK_W: i32 = 1280;
 const DESK_H: i32 = 800;
 /// How long to wait for the child session to log on and the helper to start.
 pub const HELPER_WAIT: Duration = Duration::from_secs(90);
-const CONNECT_WAIT: Duration = Duration::from_secs(60);
+/// Includes the time the user may need to type a password into the Windows Security prompt.
+const CONNECT_WAIT: Duration = Duration::from_secs(180);
 const RUNONCE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\RunOnce";
 const RUNONCE_VALUE: &str = "GhostDeskChildHelper";
 
@@ -72,10 +73,30 @@ Windows 의 공식 기능인 '자식 세션'으로, 지금 계정 그대로 **�
 1. 아래 '자식 세션 켜기' 를 누르고 관리자 승인(UAC)을 허락합니다. (`WTSEnableChildSessions` — 시스템 설정 하나를 켭니다)
 2. 그 뒤 에이전트를 시작하면 자식 세션이 로그온되고(처음엔 수십 초) GhostDesk 헬퍼가 그 안에서 자동으로 실행됩니다.
 
+### 로그인 창이 뜨면 (Windows 보안)
+자식 세션은 지금 계정으로 이 PC 에 **한 번 더 로그인**하는 방식이라, 연결할 때 'Windows 보안 — 자격 증명 입력' 창이 뜰 수 있습니다
+(최신 Windows 11 은 이 연결에 네트워크 수준 인증을 씁니다). GhostDesk 는 암호를 대신 넣거나 저장하지 않으니 직접 입력하세요.
+1. **사용자 이름**: 지금 계정이 채워져 있으면 그대로 둡니다. 비어 있거나 다르면 이 PC 에 로그인하는 계정을 넣습니다.
+   Microsoft 계정이면 `MicrosoftAccount\메일주소`, 로컬 계정이면 계정 이름입니다.
+2. **암호**: 계정의 **암호**를 넣습니다. PIN·지문·얼굴 인식(Windows Hello)은 이 창에서 쓸 수 없습니다.
+   Microsoft 계정이면 Microsoft 계정 암호입니다.
+3. **'내 자격 증명 기억'** 을 체크하면 다음부터는 묻지 않습니다 (Windows 자격 증명 관리자에 저장).
+4. 3분 안에 입력하면 됩니다. 시간이 지나거나 창을 닫으면 에이전트를 다시 시작하세요.
+
+### 암호를 모르거나 PIN 으로만 로그인해 왔다면
+- 설정 → 계정 → 로그인 옵션의 **'보안 향상을 위해 이 장치에서 Microsoft 계정에 Windows Hello 로그인만 허용'** 이 켜져 있으면
+  암호 로그인이 막혀 자식 세션 로그인이 실패할 수 있습니다. 이 옵션을 끈 뒤 다시 시도하세요.
+- Microsoft 계정 암호를 잊었다면 account.microsoft.com 에서 다시 정한 뒤, PC 에 한 번 암호로 로그인해 두세요.
+- 스마트카드로만 로그인하는 계정(회사 PC 등)은 자식 세션을 쓸 수 없습니다. 웹사이트·Windows 앱 모드나 원격 컴퓨터(VM)를 쓰세요.
+
+### 연결이 안 될 때
+- '자식 세션 켜기' 를 했는지(관리자 승인) 확인하세요.
+- 로그인 창을 닫았거나 암호가 틀리면 "자식 세션에 연결하지 못했습니다" 가 뜹니다. 에이전트를 다시 시작하면 창이 다시 뜹니다.
+- 저장한 암호가 바뀌었다면: 제어판 → 자격 증명 관리자 → Windows 자격 증명에서 localhost(TERMSRV) 항목을 지운 뒤 다시 시도하세요.
+
 ### 알아 둘 점
 - 같은 Windows 계정이라 설치된 앱·파일을 그대로 씁니다. 단, 이미 내 화면에서 쓰는 앱·브라우저 프로필은 동시에 열지 못할 수 있습니다.
 - 자식 세션은 PC 전체에서 하나만 연결됩니다. 내가 로그아웃하면 자식 세션도 끝납니다.
-- 스마트카드·Windows Hello 전용 로그인 등 일부 인증 방식에서는 자식 세션 자동 로그온이 되지 않을 수 있습니다.
 - 끄려면 관리자 PowerShell 에서: `Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyChildConnections 1`"#;
 
 // ---- session info ----
@@ -884,7 +905,10 @@ mod rdp {
                         bail!("자식 세션 연결이 끊겼습니다");
                     }
                     if !was_up && (c == 0 && start.elapsed() > Duration::from_secs(5) || start.elapsed() > CONNECT_WAIT) {
-                        bail!("자식 세션에 연결하지 못했습니다 (상태 {c}). 자식 세션 기능이 켜져 있는지, 이 계정의 로그인 방식이 자식 세션 자동 로그온을 지원하는지 확인하세요.");
+                        bail!(
+                            "자식 세션에 연결하지 못했습니다 (상태 {c}). 'Windows 보안' 로그인 창을 닫았거나 암호가 틀렸다면 다시 시도하세요 — \
+                             PIN 이 아니라 계정 암호를 넣어야 합니다. 새 에이전트 → 자식 세션 → '처음 설정 방법 보기' 의 '로그인 창이 뜨면' 을 참고하세요."
+                        );
                     }
                 }
                 std::thread::sleep(Duration::from_millis(30));
