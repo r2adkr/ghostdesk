@@ -163,3 +163,149 @@ impl GhostApp {
         }
     }
 }
+
+// ---- importing a browser login into the agent account ----
+
+enum ImportStep {
+    Ask,
+    Working(Slot),
+    Done(String),
+    Failed(String),
+}
+
+/// The dialog that copies one browser profile's login into an agent account (macOS). Browser logins are
+/// copied; native apps are logged in once inside the agent account by the person.
+pub(super) struct ImportPrompt {
+    account: String,
+    browser: usize,
+    profile: usize,
+    step: ImportStep,
+}
+
+impl ImportPrompt {
+    pub(super) fn new(account: &str) -> Self {
+        ImportPrompt { account: account.to_string(), browser: 0, profile: 0, step: ImportStep::Ask }
+    }
+}
+
+impl GhostApp {
+    pub(super) fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.import_prompt.take() else { return };
+        let mut keep = true;
+        let mut start = false;
+        if let ImportStep::Working(slot) = &prompt.step {
+            let done = slot.lock().take();
+            match done {
+                Some(Ok(msg)) => prompt.step = ImportStep::Done(msg),
+                Some(Err(e)) => prompt.step = ImportStep::Failed(e),
+                None => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+            }
+        }
+        prompt.browser = prompt.browser.min(self.browsers.len().saturating_sub(1));
+        let account = prompt.account.clone();
+        let modal = egui::Modal::new(egui::Id::new("agent_import")).frame(theme::modal_frame()).show(ctx, |ui| {
+            ui.set_width(520.0);
+            keep &= !theme::modal_header(ui, tr("브라우저 로그인 가져오기"));
+            ui.spacing_mut().item_spacing.y = 8.0;
+            match &prompt.step {
+                ImportStep::Ask => {
+                    if self.browsers.is_empty() {
+                        ui.label(RichText::new(tr("Chromium 계열 브라우저를 찾지 못했어요")).color(theme::danger()));
+                    } else {
+                        ui.label(trf("내 브라우저의 로그인(쿠키)을 '{}' 계정의 같은 브라우저로 복사해요.", &[&account]));
+                        ui.horizontal(|ui| {
+                            ui.label(tr("브라우저"));
+                            let names: Vec<String> = self.browsers.iter().map(|b| b.name.clone()).collect();
+                            egui::ComboBox::from_id_salt("import_browser").icon(theme::combo_icon).selected_text(names[prompt.browser].clone()).show_ui(ui, |ui| {
+                                for (i, n) in names.iter().enumerate() {
+                                    if ui.selectable_value(&mut prompt.browser, i, n).clicked() {
+                                        prompt.profile = 0;
+                                    }
+                                }
+                            });
+                        });
+                        let profiles = self.browsers[prompt.browser].profiles.clone();
+                        prompt.profile = prompt.profile.min(profiles.len().saturating_sub(1));
+                        if !profiles.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(tr("프로필"));
+                                let shown = super::labels::profile_short(&profiles[prompt.profile].name);
+                                egui::ComboBox::from_id_salt("import_profile").icon(theme::combo_icon).selected_text(shown).show_ui(ui, |ui| {
+                                    for (i, p) in profiles.iter().enumerate() {
+                                        ui.selectable_value(&mut prompt.profile, i, &p.name);
+                                    }
+                                });
+                            });
+                        }
+                        ui.label(theme::hint(tr("macOS 가 두 번 물어봐요. 먼저 내 로그인 암호(브라우저의 로그인 키를 읽을 때), 다음에 관리자 암호(그 계정에 쓸 때)예요. GhostDesk 는 두 암호를 보지 못해요.")));
+                        ui.label(theme::hint(tr("그 계정에 로그인되어 있어야 하고, 그 계정의 같은 브라우저는 꺼져 있어야 해요. 그 계정에 이미 있던 이 브라우저의 데이터는 덮어써요.")));
+                        ui.label(RichText::new(tr("에이전트가 이 사이트들에 내 로그인 그대로 들어갈 수 있게 돼요. 믿는 에이전트에게만 쓰세요.")).small().color(theme::warn()));
+                        ui.label(theme::hint(tr("네이티브 앱은 가져올 수 없어요. 그 계정으로 로그인해서 앱에 한 번 직접 로그인해 두세요.")));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled_ui(!self.browsers.is_empty(), |ui| theme::primary(ui, tr("가져오기"))).inner.clicked() {
+                                start = true;
+                            }
+                            if theme::secondary(ui, tr("취소")).clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
+                }
+                ImportStep::Working(_) => {
+                    ui.horizontal(|ui| {
+                        theme::spinner(ui, 14.0, theme::muted());
+                        ui.label(tr("macOS 의 암호 창을 확인하세요…"));
+                    });
+                }
+                ImportStep::Done(msg) => {
+                    ui.label(RichText::new(msg).color(theme::success()));
+                    ui.label(theme::hint(tr("그 계정의 세션에서 브라우저를 열면 로그인되어 있어요.")));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::primary(ui, tr("닫기")).clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
+                }
+                ImportStep::Failed(e) => {
+                    ui.label(RichText::new(e).color(theme::danger()));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::primary(ui, tr("다시 시도")).clicked() {
+                                prompt.step = ImportStep::Ask;
+                            }
+                            if theme::secondary(ui, tr("닫기")).clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
+                }
+            }
+        });
+        if modal.should_close() && !matches!(prompt.step, ImportStep::Working(_)) {
+            keep = false;
+        }
+        if start {
+            if let Some(b) = self.browsers.get(prompt.browser).cloned() {
+                let pdir = b.profiles.get(prompt.profile).map(|p| p.dir.clone()).unwrap_or_else(|| "Default".into());
+                let slot: Slot = Arc::new(Mutex::new(None));
+                let (s2, ctx2, acc) = (slot.clone(), ctx.clone(), prompt.account.clone());
+                self.rt.spawn(async move {
+                    let r = crate::agent_account::import_browser_login(&acc, &b, &pdir).await.map_err(|e| format!("{e:#}"));
+                    *s2.lock() = Some(r);
+                    ctx2.request_repaint();
+                });
+                prompt.step = ImportStep::Working(slot);
+            }
+        }
+        if keep {
+            self.import_prompt = Some(prompt);
+        }
+    }
+}

@@ -265,6 +265,7 @@ pub struct GhostApp {
     usage_ui: usage::UsageUi,
     palette: Option<palette::Palette>,
     account_prompt: Option<account::AccountPrompt>,
+    import_prompt: Option<account::ImportPrompt>,
     routing: Option<route::Routing>,
     usage_saved: Instant,
     sidebar_open: bool,
@@ -404,6 +405,7 @@ impl GhostApp {
             usage_ui: Default::default(),
             palette: None,
             account_prompt: None,
+            import_prompt: None,
             routing: None,
             usage_saved: Instant::now(),
             sidebar_open: true,
@@ -838,6 +840,7 @@ impl GhostApp {
             self.connect_window(&ctx);
             self.palette_window(&ctx);
             self.account_window(&ctx);
+            self.import_window(&ctx);
             self.new_agent_window(&ctx);
             self.tour_window(&ctx);
             // separate session guide (macOS: LaunchAgent; Windows: enabling child sessions)

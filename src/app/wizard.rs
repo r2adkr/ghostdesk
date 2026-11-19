@@ -1084,6 +1084,9 @@ impl GhostApp {
                     None => self.toast = Some((tr("저장된 암호가 없어요").to_string(), ui.input(|i| i.time) + TOAST_SECS)),
                 }
             }
+            if !chosen.is_empty() && cfg!(target_os = "macos") && theme::secondary(ui, tr("브라우저 로그인 가져오기")).clicked() {
+                self.import_prompt = Some(account::ImportPrompt::new(&chosen));
+            }
             if theme::secondary(ui, tr("새 계정 만들기")).clicked() {
                 let name = crate::agent_account::next_name();
                 self.account_prompt = Some(account::AccountPrompt::ask(&name));

@@ -236,6 +236,139 @@ pub async fn create(_name: &str) -> Result<String> {
     bail!("전용 에이전트 계정은 macOS 에서만 만들 수 있어요")
 }
 
+// ---- browser login import (macOS) ----
+
+/// `(keychain service, keychain account)` that a Chromium browser keeps its cookie key under. A profile copied to
+/// another account only keeps its logins if that account's keychain holds the same key.
+pub fn safe_storage(browser: &str) -> Option<(&'static str, &'static str)> {
+    Some(match browser {
+        "Google Chrome" | "Chrome Beta" => ("Chrome Safe Storage", "Chrome"),
+        "Microsoft Edge" => ("Microsoft Edge Safe Storage", "Microsoft Edge"),
+        "Brave" => ("Brave Safe Storage", "Brave"),
+        "Naver Whale" => ("Whale Safe Storage", "Whale"),
+        "Vivaldi" => ("Vivaldi Safe Storage", "Vivaldi"),
+        "Chromium" => ("Chromium Safe Storage", "Chromium"),
+        _ => return None,
+    })
+}
+
+/// A path that can sit inside a double-quoted shell word and an AppleScript string as it is.
+fn plain_path(p: &std::path::Path) -> bool {
+    p.to_str().is_some_and(|s| !s.is_empty() && !s.contains(['"', '\\', '$', '`', '\n', '\'']))
+}
+
+/// The shell script run as administrator: puts the staged profile into the account's home, owned by that account,
+/// and adds the cookie key to that account's login keychain (inside its own session), trusting the browser app.
+pub fn import_script(account: &str, rel: &str, staged: &str, keyfile: &str, service: &str, kc_account: &str, app: &str) -> Result<String> {
+    if !valid_name(account) {
+        bail!("invalid account name");
+    }
+    for v in [rel, staged, keyfile, service, kc_account, app] {
+        if v.is_empty() || v.contains(['"', '\\', '$', '`', '\n', '\'']) {
+            bail!("unsafe value in import script");
+        }
+    }
+    Ok(format!(
+        "set -e\n\
+         ACC={account}\n\
+         D=\"/Users/$ACC/Library/Application Support/{rel}\"\n\
+         UIDN=$(/usr/bin/id -u $ACC)\n\
+         /usr/bin/sudo -u $ACC /bin/mkdir -p \"$D\"\n\
+         /usr/bin/ditto \"{staged}\" \"$D\"\n\
+         /usr/sbin/chown -R $ACC \"$D\"\n\
+         KEY=$(/bin/cat \"{keyfile}\")\n\
+         /bin/launchctl asuser $UIDN /usr/bin/sudo -u $ACC /usr/bin/security add-generic-password -U -a \"{kc_account}\" -s \"{service}\" -w \"$KEY\" -T \"{app}\" > /dev/null\n"
+    ))
+}
+
+/// Copies one profile of the person's browser (cookies, logins) into the agent account's copy of that browser, and the
+/// key that decrypts them into that account's keychain. macOS asks for the person's login (to read the key) and for the
+/// administrator password (to write into the other account); GhostDesk sees neither.
+#[cfg(target_os = "macos")]
+pub async fn import_browser_login(account: &str, browser: &crate::profiles::InstalledBrowser, profile_dir: &str) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    if !valid_name(account) || !exists(account) {
+        bail!("'{account}' 계정이 없습니다");
+    }
+    if !has_session(account) {
+        bail!("'{account}' 계정이 로그인되어 있지 않습니다. 빠른 사용자 전환으로 그 계정에 한 번 로그인해 둔 채로 다시 시도하세요 (그 계정의 키체인은 로그인해야 열려요)");
+    }
+    let (service, kc_account) = safe_storage(&browser.name).ok_or_else(|| anyhow::anyhow!("{} 은(는) 로그인 가져오기를 지원하지 않습니다", browser.name))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("홈 폴더를 알 수 없습니다"))?;
+    let sup = home.join("Library/Application Support");
+    let rel = browser.data_dir.strip_prefix(&sup).map_err(|_| anyhow::anyhow!("브라우저 데이터 위치가 예상과 다릅니다"))?.to_path_buf();
+    let app_bundle = browser.exe.ancestors().nth(3).map(|p| p.to_path_buf()).filter(|p| p.extension().is_some_and(|e| e == "app"))
+        .ok_or_else(|| anyhow::anyhow!("브라우저 앱 위치를 알 수 없습니다"))?;
+
+    // the key: the person's keychain asks them to allow it
+    let out = tokio::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-w", "-s", service, "-a", kc_account])
+        .output()
+        .await?;
+    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || key.is_empty() || key.len() > 128 || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')) {
+        bail!("{} 의 로그인 키를 읽지 못했어요 (키체인 접근을 허용하지 않았거나, 이 브라우저를 한 번도 쓰지 않았어요)", browser.name);
+    }
+
+    // stage the copy where only this person can read it; the administrator step moves it
+    let stage = std::env::temp_dir().join(format!("ghostdesk-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage)?;
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o755))?;
+    let cleanup = |stage: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(stage);
+    };
+    let (data_dir, pdir, staged) = (browser.data_dir.clone(), profile_dir.to_string(), stage.join("data"));
+    let copied = tokio::task::spawn_blocking({
+        let staged = staged.clone();
+        move || crate::profiles::clone_profile(&data_dir, &pdir, &staged, &|_, _| {})
+    })
+    .await?;
+    if let Err(e) = copied {
+        cleanup(&stage);
+        bail!("프로필을 복사하지 못했어요: {e:#}");
+    }
+    // the administrator step runs as root and reads the key from a file only this person (and root) can open
+    let keyfile = stage.join("key");
+    std::fs::write(&keyfile, &key)?;
+    std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o600))?;
+    let script_path = stage.join("run.sh");
+    let rel_s = rel.to_string_lossy().to_string();
+    let script = match (plain_path(&staged), plain_path(&keyfile), plain_path(&app_bundle)) {
+        (true, true, true) => import_script(account, &rel_s, &staged.to_string_lossy(), &keyfile.to_string_lossy(), service, kc_account, &app_bundle.to_string_lossy()),
+        _ => Err(anyhow::anyhow!("경로에 쓸 수 없는 문자가 있어요")),
+    };
+    let script = match script {
+        Ok(s) => s,
+        Err(e) => {
+            cleanup(&stage);
+            return Err(e);
+        }
+    };
+    std::fs::write(&script_path, script)?;
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))?;
+    let osa = format!(
+        "do shell script \"/bin/sh {}\" with administrator privileges with prompt \"GhostDesk 가 브라우저 로그인을 '{account}' 계정으로 복사합니다\"",
+        script_path.display()
+    );
+    let res = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(osa).output().await;
+    cleanup(&stage);
+    let res = res?;
+    if !res.status.success() {
+        let err = String::from_utf8_lossy(&res.stderr);
+        if err.contains("-128") {
+            bail!("관리자 암호 입력을 취소해서 가져오지 않았어요");
+        }
+        bail!("로그인을 가져오지 못했어요: {}", err.trim().lines().last().unwrap_or("알 수 없는 오류"));
+    }
+    Ok(format!("{} 의 로그인을 '{account}' 계정으로 가져왔어요", browser.name))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn import_browser_login(_account: &str, _browser: &crate::profiles::InstalledBrowser, _profile_dir: &str) -> Result<String> {
+    bail!("macOS 에서만 쓸 수 있어요")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +379,20 @@ mod tests {
         for bad in ["", "-x", ".x", "A", "a b", "a;b", "a/b", "a'b", "$(x)", &"a".repeat(65)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn import_script_is_plain_and_refuses_odd_values() {
+        let s = import_script("ghostdesk-agent", "Google/Chrome", "/tmp/x/data", "/tmp/x/key", "Chrome Safe Storage", "Chrome", "/Applications/Google Chrome.app").unwrap();
+        assert!(s.contains("sudo -u $ACC /bin/mkdir") && s.contains("chown -R $ACC") && s.contains("-T \"/Applications/Google Chrome.app\""));
+        assert!(s.contains("asuser $UIDN"), "the key goes in through the account's own session");
+        assert!(!s.contains("Abc"), "no secret value in the script itself");
+        for bad in ["a\"b", "a$b", "a`b", "a\\b", "a'b", "a\nb", ""] {
+            assert!(import_script("ghostdesk-agent", bad, "/tmp/x", "/tmp/k", "s", "a", "/Applications/A.app").is_err(), "{bad:?}");
+        }
+        assert!(import_script("x; rm", "r", "/tmp/x", "/tmp/k", "s", "a", "/Applications/A.app").is_err());
+        assert_eq!(safe_storage("Google Chrome"), Some(("Chrome Safe Storage", "Chrome")));
+        assert_eq!(safe_storage("Firefox"), None);
     }
 
     #[test]
