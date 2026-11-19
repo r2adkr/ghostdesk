@@ -325,7 +325,7 @@ pub fn spawn_suspended(
         let e = unsafe { GetLastError() };
         if e == ERROR_ELEVATION_REQUIRED {
             bail!(
-                "{} 은(는) 관리자 권한이 필요한 앱이라 실행하지 않았습니다 — UAC 확인 창이 사용자 화면에 뜨고, \
+                "{ELEVATION_NEEDED} {} 은(는) 관리자 권한이 필요한 앱이라 실행하지 않았습니다 — UAC 확인 창이 사용자 화면에 뜨고, \
                  권한이 높은 앱의 창은 GhostDesk 가 메시지로 조작할 수 없습니다 (UIPI). {ELEVATED_HINT}",
                 exe.display()
             );
@@ -470,9 +470,44 @@ fn is_selftest_target(exe: &Path) -> bool {
         && std::env::current_exe().map(|c| paths::same_path(&c, exe)).unwrap_or(false)
 }
 
+/// Marks an error as "this needs administrator rights": the control server answers it by asking the
+/// person to restart GhostDesk as administrator (see `ControlServer::request_elevated_restart`).
+pub const ELEVATION_NEEDED: &str = "[관리자 권한 필요]";
+
 /// Windows blocks a process from driving windows of higher integrity (UIPI), so the way in is to
 /// start GhostDesk itself elevated; a child it launches then inherits that.
-const ELEVATED_HINT: &str = "관리자 권한 앱을 조작하려면 사용자가 GhostDesk 를 관리자 권한으로 실행(우클릭 → 관리자 권한으로 실행)해야 합니다.";
+const ELEVATED_HINT: &str = "관리자 권한 앱을 조작하려면 GhostDesk 를 관리자 권한으로 다시 시작해야 합니다.";
+
+/// Whether this process runs elevated (administrator).
+pub fn self_elevated() -> bool {
+    is_elevated(std::process::id()) == Some(true)
+}
+
+/// Whether an executable's manifest asks for administrator rights (`requireAdministrator`): started
+/// from a normal process it would raise an elevation prompt, which the agent could never answer.
+/// Reads the file as text: the manifest sits uncompressed in the resources.
+pub fn requires_admin(exe: &Path) -> bool {
+    const MARK: &[u8] = b"requireAdministrator";
+    let Some(bytes) = read_head(exe, 16 << 20) else { return false };
+    bytes.windows(MARK.len()).any(|w| w.eq_ignore_ascii_case(MARK))
+}
+
+/// Starts a new elevated copy of GhostDesk (the elevation prompt shows on the user's screen) and
+/// returns once it was accepted and the process exists. Blocks while the prompt is open.
+pub fn relaunch_self_elevated() -> Result<()> {
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
+    let exe = std::env::current_exe()?;
+    let (verb, file) = (pw::wide("runas"), pw::wide(&exe));
+    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    sei.lpVerb = verb.as_ptr();
+    sei.lpFile = file.as_ptr();
+    sei.nShow = 1; // SW_SHOWNORMAL
+    if unsafe { ShellExecuteExW(&mut sei) } == 0 {
+        bail!("{}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 const CHILD_SESSION_HINT: &str = "Windows 자식 세션을 사용하세요. 자식 세션 기능을 켜고 GhostDesk 창에서 승인해야 합니다. MCP: desk_open(mode=\"session\") 후 desk_app {action:\"launch\", app:\"<앱 이름·경로>\"} 로 그 안에서 앱을 여세요.";
 
@@ -573,7 +608,7 @@ pub fn check_attachable(pid: u32) -> Result<()> {
         );
     }
     if is_elevated(pid) == Some(true) && is_elevated(std::process::id()) != Some(true) {
-        bail!("pid {pid} 는 관리자 권한으로 실행 중이라 조작할 수 없습니다 (권한이 높은 창에는 메시지·UI Automation 이 막힘). {ELEVATED_HINT}");
+        bail!("{ELEVATION_NEEDED} pid {pid} 는 관리자 권한으로 실행 중이라 조작할 수 없습니다 (권한이 높은 창에는 메시지·UI Automation 이 막힘). {ELEVATED_HINT}");
     }
     Ok(())
 }

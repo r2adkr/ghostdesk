@@ -48,6 +48,20 @@ pub(crate) fn approval_allowed(all: bool, allow_experimental: bool, experimental
     all || (allow_experimental && experimental)
 }
 
+/// The "allow shells, terminals and system tools" setting (Windows). On: such apps start after a
+/// person approves (at once with the permission bypass). Off: they are refused. Tests start with it
+/// off, since they check the refusals.
+static SHELL_TOOLS_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(test));
+
+pub fn set_shell_tools_allowed(on: bool) {
+    SHELL_TOOLS_ALLOWED.store(on, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn shell_tools_allowed() -> bool {
+    SHELL_TOOLS_ALLOWED.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod experimental_policy_tests {
     #[test]
@@ -145,7 +159,11 @@ pub enum ControlEvent {
     Register(Arc<AgentShared>),
     /// User approval is needed. If the requester gives up (timeout, disconnect), the receiving side
     /// of `reply` is dropped (the GUI clears items whose `reply.is_closed()`).
-    Approval { title: String, detail: String, experimental: bool, reply: oneshot::Sender<bool> },
+    /// `manual`: only a person's click answers it, never the permission bypass.
+    Approval { title: String, detail: String, experimental: bool, manual: bool, reply: oneshot::Sender<bool> },
+    /// Windows: restart this window as administrator (an app needs it). Answered once the elevation
+    /// prompt (UAC) was accepted and the new window started, or with why it didn't.
+    RestartElevated { reply: oneshot::Sender<std::result::Result<(), String>> },
     /// The dedicated agent account was just created (an agent asked for the session and the person allowed it):
     /// the window shows its one-time password and the steps left.
     AccountCreated { name: String, password: String },
@@ -551,12 +569,22 @@ impl ControlServer {
     }
 
     async fn ask_with(&self, conn: &Conn, title: &str, detail: String, experimental: bool) -> Result<()> {
+        self.ask_inner(conn, title, detail, experimental, false).await
+    }
+
+    /// Like `ask`, but the permission bypass doesn't answer it (restarting the window as administrator).
+    #[cfg(windows)]
+    async fn ask_manual(&self, conn: &Conn, title: &str, detail: String) -> Result<()> {
+        self.ask_inner(conn, title, detail, false, true).await
+    }
+
+    async fn ask_inner(&self, conn: &Conn, title: &str, detail: String, experimental: bool, manual: bool) -> Result<()> {
         if conn.is_closed() {
             bail!("요청한 에이전트의 연결이 끊겨 승인 요청을 취소했습니다");
         }
         let (tx, rx) = oneshot::channel();
         self.events
-            .send(ControlEvent::Approval { title: title.to_string(), detail, experimental, reply: tx })
+            .send(ControlEvent::Approval { title: title.to_string(), detail, experimental, manual, reply: tx })
             .map_err(|_| anyhow!("GhostDesk 창이 닫혀 있습니다"))?;
         self.ctx.request_repaint();
         let res = tokio::select! {
@@ -679,7 +707,7 @@ impl ControlServer {
                 }
                 #[cfg(windows)]
                 if let Some(app) = p["app"].as_str().filter(|a| !a.trim().is_empty()) {
-                    session_launch_policy(app).await?;
+                    self.vet_session_app(app, &client, conn).await?;
                 }
                 // a Windows child session is the user's own account and reaches real data, so ask a person
                 // macOS: no such account yet. Offer to make it; the person allows it here and gives their administrator
@@ -818,6 +846,13 @@ impl ControlServer {
             Err(e) => {
                 shared.log(LogKind::Error, format!("{e:#}"));
                 shared.set_status(AgentStatus::Error(short(&format!("{e}"), 80)));
+                // the app turned out to need administrator rights (a running one, or one that only says so
+                // when started): ask for the restart instead of just failing
+                #[cfg(windows)]
+                if format!("{e:#}").contains(crate::winapp::ELEVATION_NEEDED) && !crate::winapp::self_elevated() {
+                    let app = p["app"].as_str().unwrap_or("앱").to_string();
+                    return Err(self.request_elevated_restart(conn, &app, &client).await);
+                }
                 return Err(e);
             }
         };
@@ -927,10 +962,12 @@ impl ControlServer {
 
         // shells, scripts, credentials and security settings apps aren't opened for external agents
         if is_denied(&r) {
-            bail!(
-                "보안상 외부 에이전트는 '{}' ({bid}) 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.",
-                r.name
-            );
+            bail!("보안상 외부 에이전트는 '{}' ({bid}) 을(를) 열 수 없습니다. {DENIED_WHY}", r.name);
+        }
+        // a shell or system tool that the setting allows still needs a person's yes (the permission bypass gives it)
+        #[cfg(windows)]
+        if win_policy::is_tool(&r) {
+            self.ask(conn, "셸·시스템 도구 실행 요청", tool_request_text(client, &r.name, &r.path.display().to_string())).await?;
         }
         // GhostDesk itself: driving the current window could click its own approval dialogs or change
         // settings, keys and connections, so it's only opened as a freshly launched test instance with
@@ -1012,6 +1049,10 @@ impl ControlServer {
         // for a request that would fail even if approved)
         #[cfg(windows)]
         {
+            // an app that insists on administrator rights can't be driven from a normal window (UIPI)
+            if !attach && crate::winapp::requires_admin(&r.path) && !crate::winapp::self_elevated() {
+                return Err(self.request_elevated_restart(conn, &r.name, client).await);
+            }
             let exe = r.path.clone();
             tokio::task::spawn_blocking(move || crate::native::preflight_app(&exe))
                 .await
@@ -1117,7 +1158,7 @@ impl ControlServer {
         // on screen return one (see `default_shot`).
         let want_shot = p["screenshot"].as_bool().unwrap_or_else(|| default_shot(tool, input));
         if input.get("actions").is_some() && matches!(tool, "computer" | "browser" | "app") {
-            let reply = self.act_sequence(&shared, &desk, tool, input, want_shot).await?;
+            let reply = self.act_sequence(&shared, &desk, tool, input, want_shot, conn).await?;
             note_usage(&shared, &reply, p["screenshot"].is_null() && !want_shot);
             return Ok(reply);
         }
@@ -1131,6 +1172,8 @@ impl ControlServer {
             },
             other => bail!("tool 은 computer / browser / app 중 하나여야 합니다 (받은 값: {other})"),
         };
+        #[cfg(windows)]
+        self.vet_launch(&shared, &desk, tool, input, conn).await?;
         let desc = agent::describe(&name, input);
         shared.log(LogKind::Action, desc.clone());
         shared.set_status(AgentStatus::Acting(short(&desc, 60)));
@@ -1172,7 +1215,7 @@ impl ControlServer {
     ///
     /// Stops at the first failure or when the user stops/pauses, reporting how far it got. The screen
     /// is captured only once, at the end.
-    async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, tool: &str, input: &Value, want_shot: bool) -> Result<Value> {
+    async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, tool: &str, input: &Value, want_shot: bool, conn: &Conn) -> Result<Value> {
         let steps = input["actions"].as_array().ok_or_else(|| anyhow!("actions 는 동작 객체의 배열이어야 합니다"))?;
         anyhow::ensure!(!steps.is_empty(), "actions 가 비어 있습니다");
         anyhow::ensure!(steps.len() <= MAX_SEQUENCE, "actions 는 한 번에 {MAX_SEQUENCE}개까지입니다 (받은 수: {})", steps.len());
@@ -1205,6 +1248,10 @@ impl ControlServer {
                 "app" => if desk.kind() == DeskKind::Electron { "app_menu" } else { "app_control" },
                 _ => name.as_str(),
             };
+            #[cfg(windows)]
+            if let Err(e) = self.vet_launch(shared, desk, step_tool, step, conn).await {
+                bail!("{}{n}번째 동작({name})을 실행하지 않았습니다: {e:#}", done_prefix(&lines));
+            }
             let desc = agent::describe(tool_name, step);
             shared.log(LogKind::Action, desc.clone());
             shared.set_status(AgentStatus::Acting(short(&format!("{n}/{} {desc}", steps.len()), 60)));
@@ -1565,13 +1612,6 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     Ok(ResolvedApp { path, bundle_id, name, electron })
 }
 
-/// Windows: app name, executable name, .exe/.lnk path or Electron install folder → the real
-/// executable (.exe only).
-///
-/// Order: (block by name first) → a path is used as is / a folder as an Electron install folder /
-/// anything else (.lnk, …) is resolved by the local app backend; a name goes to the Electron app
-/// list (name, executable name) → the local app backend (Start menu, App Paths, …).
-#[cfg(windows)]
 /// Whether a `desk_open mode=app` request is for an app only a Windows child session can run (see
 /// `winapp::needs_child_session`). Requests that name a mode of their own (attach, current session, a
 /// virtual display, a login clone) and Electron apps keep their own path.
@@ -1596,27 +1636,116 @@ async fn wants_child_session(p: &Value) -> bool {
     .unwrap_or(false)
 }
 
-/// What an agent may start inside a Windows child session: the same refusals as the hidden app mode
-/// (shells, scripts, credential and security settings apps, network and device paths). An app that
-/// doesn't resolve, like a Store app's display name, passes: the session is the approved screen and
-/// the Start menu would open it the same way.
+/// Why an app is refused, when it is (the always-blocked list or a shell/system tool while the setting is off).
 #[cfg(windows)]
-pub(crate) async fn session_launch_policy(app: &str) -> Result<()> {
+const DENIED_WHY: &str = "암호 관리자와 GhostDesk 자신은 항상 차단되고, 터미널·스크립트·시스템 설정 계열 앱은 설정의 '셸·터미널·시스템 도구 허용'을 켜야 열 수 있습니다.";
+#[cfg(not(windows))]
+const DENIED_WHY: &str = "터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.";
+
+/// The approval text for a shell or system tool.
+#[cfg(windows)]
+fn tool_request_text(client: &str, name: &str, path: &str) -> String {
+    format!(
+        "{client} 이(가) 셸·터미널·시스템 도구 '{name}' 을(를) 열려고 합니다.\n경로: {path}\n이런 도구는 명령을 실행하거나 시스템 설정을 바꿀 수 있어 \
+         컴퓨터를 직접 조작하는 것과 같습니다. 믿을 수 있는 작업일 때만 허용하세요."
+    )
+}
+
+/// What a request to start an app inside a Windows child session turned out to be.
+#[cfg(windows)]
+pub(crate) struct LaunchCheck {
+    /// Display name, if it is a shell or system tool (needs a person's yes).
+    tool: Option<String>,
+    /// The app insists on administrator rights.
+    admin: bool,
+}
+
+/// Checks an app an agent wants to start inside a Windows child session, with the same refusals as the
+/// hidden app mode: network and device paths, password managers and GhostDesk itself always, shells
+/// and system tools while the setting is off. An app that doesn't resolve, like a Store app's display
+/// name, has nothing more to check: the session is the approved screen and the Start menu would open
+/// it the same way.
+#[cfg(windows)]
+pub(crate) async fn session_launch_policy(app: &str) -> Result<LaunchCheck> {
     let raw = app.trim().trim_matches('"').trim().to_string();
     if win_policy::network_or_device(&raw) || win_policy::network_or_device(&win_policy::expand_path(&raw).to_string_lossy()) {
         bail!("보안상 외부 에이전트는 네트워크 공유·장치 경로의 앱을 열 수 없습니다: {raw}");
     }
     if win_policy::denied_query(&raw) {
-        bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.");
+        bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. {DENIED_WHY}");
     }
+    let mut check = LaunchCheck { tool: win_policy::tool_query(&raw).then(|| raw.clone()), admin: false };
     if let Ok(Ok(r)) = tokio::task::spawn_blocking(move || resolve_external_app(&raw)).await {
         if is_denied(&r) {
-            bail!("보안상 외부 에이전트는 '{}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.", r.name);
+            bail!("보안상 외부 에이전트는 '{}' 을(를) 열 수 없습니다. {DENIED_WHY}", r.name);
         }
+        if win_policy::is_tool(&r) {
+            check.tool = Some(r.name.clone());
+        }
+        check.admin = crate::winapp::requires_admin(&r.path);
     }
-    Ok(())
+    Ok(check)
 }
 
+#[cfg(windows)]
+impl ControlServer {
+    /// Everything between an agent and an app starting inside a child session: the refusals, a person's
+    /// yes for a shell or system tool, and the administrator restart for an app that needs it.
+    async fn vet_session_app(&self, app: &str, client: &str, conn: &Conn) -> Result<()> {
+        let check = session_launch_policy(app).await?;
+        if let Some(name) = &check.tool {
+            self.ask(conn, "셸·시스템 도구 실행 요청", tool_request_text(client, name, app)).await?;
+        }
+        if check.admin && !crate::winapp::self_elevated() {
+            return Err(self.request_elevated_restart(conn, app, client).await);
+        }
+        Ok(())
+    }
+
+    /// `desk_app launch` (alone or inside a bundle) on a child session goes through the same checks.
+    async fn vet_launch(&self, shared: &Arc<AgentShared>, desk: &Desk, tool: &str, step: &Value, conn: &Conn) -> Result<()> {
+        if tool != "app" || step["action"].as_str() != Some("launch") || desk.as_session().is_none() {
+            return Ok(());
+        }
+        let client = shared.external.lock().clone().unwrap_or_else(|| "외부 에이전트".to_string());
+        self.vet_session_app(step["app"].as_str().unwrap_or(""), &client, conn).await
+    }
+
+    /// An app needs administrator rights, which a normal window can't drive (UIPI). Asks the person
+    /// (a window, a taskbar flash and a notice, never answered by the permission bypass) to restart
+    /// GhostDesk as administrator; if they agree and accept Windows' prompt (UAC), the window restarts
+    /// and the agent retries. The error returned says how it went.
+    async fn request_elevated_restart(&self, conn: &Conn, app: &str, client: &str) -> anyhow::Error {
+        let detail = format!(
+            "{client} 이(가) 열려는 '{app}' 은(는) 관리자 권한이 필요한 앱입니다. 일반 권한의 GhostDesk 는 이런 앱을 조작할 수 없습니다.\n\
+             허용하면 GhostDesk 를 관리자 권한으로 다시 시작합니다. Windows 의 사용자 계정 컨트롤(UAC) 창이 뜨면 '예' 를 누르세요. \
+             다시 시작하면 지금 열려 있는 화면이 모두 닫히고, 에이전트가 처음부터 다시 연결해야 합니다."
+        );
+        if let Err(e) = self.ask_manual(conn, "관리자 권한으로 다시 시작 요청", detail).await {
+            return e;
+        }
+        let (tx, rx) = oneshot::channel();
+        if self.events.send(ControlEvent::RestartElevated { reply: tx }).is_err() {
+            return anyhow!("GhostDesk 창이 닫혀 있습니다");
+        }
+        self.ctx.request_repaint();
+        match tokio::time::timeout(Duration::from_secs(120), rx).await {
+            Ok(Ok(Ok(()))) => anyhow!(
+                "사용자가 허용해 GhostDesk 를 관리자 권한으로 다시 시작하는 중입니다. 몇 초 뒤 desk_open 부터 다시 시작하세요 (열려 있던 화면은 닫힙니다)."
+            ),
+            Ok(Ok(Err(why))) => anyhow!("관리자 권한으로 다시 시작하지 못했습니다 (UAC 를 취소했거나 실패): {why}"),
+            _ => anyhow!("관리자 권한 승인(UAC) 대기 시간이 지났습니다. 사용자에게 GhostDesk 창과 UAC 창을 확인해 달라고 요청하세요"),
+        }
+    }
+}
+
+/// Windows: app name, executable name, .exe/.lnk path or Electron install folder → the real
+/// executable (.exe only).
+///
+/// Order: (block by name first) → a path is used as is / a folder as an Electron install folder /
+/// anything else (.lnk, …) is resolved by the local app backend; a name goes to the Electron app
+/// list (name, executable name) → the local app backend (Start menu, App Paths, …).
+#[cfg(windows)]
 fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     use crate::platform::paths;
     let raw = input.trim().trim_matches('"').trim();
@@ -1633,7 +1762,7 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     // shells and system tools are refused by name alone, before resolving a path (App Execution
     // Aliases like wt.exe can't be opened as real files, so they'd never reach the path check)
     if win_policy::denied_query(raw) {
-        bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱과 GhostDesk 자신은 차단됩니다.");
+        bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. {DENIED_WHY}");
     }
     let electrons = crate::electron::detect_apps();
     let q = win_policy::norm_query(raw);
@@ -1953,8 +2082,6 @@ mod win_policy {
         "php-cgi", "php-win", "java", "javaw", "lua", "tclsh", "wish", "code-tunnel", "code-insiders-tunnel",
         // automation
         "pad.console.host", "pad.designer", "pad.robot",
-        // credentials
-        "keeper", "keeperpasswordmanager", "credwiz", "proton pass",
         // system and security settings (the counterparts of System Settings, Disk Utility, Installer)
         "systemsettings", "control", "mmc", "regedit", "reg", "msconfig", "useraccountcontrolsettings", "netplwiz",
         "optionalfeatures", "eventvwr", "perfmon", "resmon", "diskpart", "dfrgui", "bcdedit", "dism", "rstrui",
@@ -1971,13 +2098,21 @@ mod win_policy {
     ];
 
     /// Blocked when starting with these prefixes (variants like powershell_ise, pwsh-preview,
-    /// ubuntu2204, keepassxc, regedt32, …).
+    /// ubuntu2204, regedt32, …).
     const DENY_EXE_PREFIX: &[&str] = &[
         "powershell", "pwsh", "windowsterminal", "wezterm", "mobaxterm", "conemu", "wsl", "ubuntu", "debian", "kali",
-        "opensuse", "sles", "oraclelinux", "archlinux", "python", "autohotkey", "autoit3", "keepass", "1password",
-        "bitwarden", "lastpass", "dashlane", "enpass", "roboform", "nordpass", "regedt", "systemproperties", "procexp",
-        "procmon", "autoruns", "processhacker", "systeminformer", "ghostdesk",
+        "opensuse", "sles", "oraclelinux", "archlinux", "python", "autohotkey", "autoit3", "regedt", "systemproperties",
+        "procexp", "procmon", "autoruns", "processhacker", "systeminformer",
     ];
+
+    // Always blocked, whatever the "shells and system tools" setting says: password managers and
+    // credential stores, and GhostDesk itself (driving its own window could answer its own approvals).
+    const HARD_EXE: &[&str] = &["keeper", "keeperpasswordmanager", "credwiz", "proton pass"];
+    const HARD_PREFIX: &[&str] = &[
+        "keepass", "1password", "bitwarden", "lastpass", "dashlane", "enpass", "roboform", "nordpass", "ghostdesk",
+    ];
+    const HARD_DISPLAY: &[&str] = &["credential manager", "자격 증명 관리자"];
+    const HARD_PACKAGES: &[&str] = &["8bitsolutionsllc.bitwardendesktop", "agilebits."];
 
     /// Blocked by display name (lowercase): Start menu name, FileDescription.
     const DENY_DISPLAY: &[&str] = &[
@@ -1988,7 +2123,7 @@ mod win_policy {
         "windows control panel", "settings", "설정", "windows settings", "windows security", "windows 보안",
         "services", "서비스", "computer management", "컴퓨터 관리", "event viewer", "이벤트 뷰어", "resource monitor",
         "리소스 모니터", "performance monitor", "성능 모니터", "system configuration", "시스템 구성",
-        "microsoft management console", "credential manager", "자격 증명 관리자", "remote desktop connection",
+        "microsoft management console", "remote desktop connection",
         "원격 데스크톱 연결", "quick assist", "빠른 지원", "on-screen keyboard", "화상 키보드", "narrator", "내레이터",
         "magnifier", "돋보기", "task scheduler", "작업 스케줄러", "windows script host", "microsoft (r) html application host",
     ];
@@ -2009,8 +2144,6 @@ mod win_policy {
         "microsoft.desktopappinstaller",
         "microsoftcorporationii.quickassist",
         "microsoft.powerautomatedesktop",
-        "8bitsolutionsllc.bitwardendesktop",
-        "agilebits.",
     ];
 
     /// Harmless built-in tools allowed as exceptions directly under %SystemRoot%, System32 and
@@ -2035,21 +2168,32 @@ mod win_policy {
         p.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext))
     }
 
-    /// Whether the executable name (lowercase, no extension) is on the deny list.
-    pub(super) fn denied_stem(stem: &str) -> bool {
+    /// Whether the executable name (lowercase, no extension) is on the deny list. `tools`: the shell and
+    /// system-tool lists count too (the "always" lists do whatever it says).
+    fn denied_stem(stem: &str, tools: bool) -> bool {
         let s = stem.trim();
-        !s.is_empty() && (DENY_EXE.contains(&s) || DENY_EXE_PREFIX.iter().any(|p| s.starts_with(p)))
+        !s.is_empty()
+            && (HARD_EXE.contains(&s)
+                || HARD_PREFIX.iter().any(|p| s.starts_with(p))
+                || (tools && (DENY_EXE.contains(&s) || DENY_EXE_PREFIX.iter().any(|p| s.starts_with(p)))))
     }
 
-    fn denied_name(name: &str) -> bool {
+    fn denied_name(name: &str, tools: bool) -> bool {
         let n = name.trim().to_lowercase();
-        !n.is_empty() && (DENY_DISPLAY.contains(&n.as_str()) || denied_stem(&n))
+        !n.is_empty()
+            && (HARD_DISPLAY.contains(&n.as_str()) || (tools && DENY_DISPLAY.contains(&n.as_str())) || denied_stem(&n, tools))
     }
 
     /// Whether to refuse based on the request string alone, before finding the app (name, executable
     /// name, file name of a path).
     pub(super) fn denied_query(raw: &str) -> bool {
-        denied_name(&norm_query(raw))
+        denied_name(&norm_query(raw), !super::shell_tools_allowed())
+    }
+
+    /// Whether the request string names a shell or system tool (the class the setting governs).
+    pub(super) fn tool_query(raw: &str) -> bool {
+        let n = norm_query(raw);
+        denied_name(&n, true) && !denied_name(&n, false)
     }
 
     /// Whether an Electron app list entry matches the request (id, name, executable name, install
@@ -2163,12 +2307,12 @@ mod win_policy {
 
     /// Whether it's an executable inside a blocked package (Windows Terminal, PowerShell, WSL,
     /// Settings, Windows Security, …).
-    fn denied_package(s: &str) -> bool {
+    fn denied_package(s: &str, tools: bool) -> bool {
         let parts: Vec<&str> = s.split('\\').collect();
         parts.windows(2).any(|w| {
             w[0] == "windowsapps" && {
                 let name = w[1].split('_').next().unwrap_or("");
-                DENY_PACKAGES.iter().any(|d| name.starts_with(d))
+                HARD_PACKAGES.iter().any(|d| name.starts_with(d)) || (tools && DENY_PACKAGES.iter().any(|d| name.starts_with(d)))
             }
         })
     }
@@ -2191,39 +2335,50 @@ mod win_policy {
     }
 
     /// Verdict for a single executable path (name, location, GhostDesk itself).
-    fn denied_exe(p: &Path) -> bool {
+    fn denied_exe(p: &Path, tools: bool) -> bool {
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if denied_stem(&stem) {
+        if denied_stem(&stem, tools) {
             return true;
         }
         // network shares (\\server\…, \\localhost\C$\Windows\…) and device paths can't be located, so
         // they're blocked
         let Some(s) = local_form(p) else { return true };
-        system_dir_denied(&s) || denied_package(&s) || is_own(p, &s)
+        is_own(p, &s) || denied_package(&s, tools) || (tools && system_dir_denied(&s))
     }
 
-    fn denied_original_name(o: Option<&str>) -> bool {
+    fn denied_original_name(o: Option<&str>, tools: bool) -> bool {
         o.is_some_and(|o| {
             let n = o.trim().to_lowercase();
             // strip every stacked extension, like pwsh.dll or PowerShell.EXE.MUI
             let stem = n.split('.').next().unwrap_or("");
-            denied_stem(stem) || denied_stem(&norm_query(&n))
+            denied_stem(stem, tools) || denied_stem(&norm_query(&n), tools)
         })
     }
 
-    pub(super) fn denied(r: &ResolvedApp) -> bool {
-        if denied_exe(&r.path) || denied_original_name(r.original_filename.as_deref()) || denied_name(&r.name) {
+    pub(super) fn verdict(r: &ResolvedApp, tools: bool) -> bool {
+        if denied_exe(&r.path, tools) || denied_original_name(r.original_filename.as_deref(), tools) || denied_name(&r.name, tools) {
             return true;
         }
         if let Some(e) = &r.electron {
-            if denied_exe(&e.exe) || denied_name(&e.name) {
+            if denied_exe(&e.exe, tools) || denied_name(&e.name, tools) {
                 return true;
             }
-            if denied_original_name(win::version_info(&e.exe).and_then(|v| v.original_filename).as_deref()) {
+            if denied_original_name(win::version_info(&e.exe).and_then(|v| v.original_filename).as_deref(), tools) {
                 return true;
             }
         }
         false
+    }
+
+    /// Whether the app must be refused now: the always-blocked list, plus the shell and system tools
+    /// while the setting keeps them blocked.
+    pub(super) fn denied(r: &ResolvedApp) -> bool {
+        verdict(r, !super::shell_tools_allowed())
+    }
+
+    /// Whether the app is a shell or system tool (allowed only with a person's approval).
+    pub(super) fn is_tool(r: &ResolvedApp) -> bool {
+        verdict(r, true) && !verdict(r, false)
     }
 
     #[cfg(test)]
@@ -2786,6 +2941,69 @@ mod tests {
             assert!(error.contains("app_host") || error.contains("current_session"), "{error}");
             assert!(ev_rx.try_recv().is_err());
         }
+    }
+
+    /// The setting splits the old deny list: password managers and GhostDesk stay refused either way,
+    /// shells and system tools are refused only while the setting is off (and ask when it is on).
+    #[cfg(windows)]
+    #[test]
+    fn shell_tools_setting_splits_the_deny_list() {
+        // tests start with the setting off: everything refused, as before
+        for q in ["cmd", "powershell.exe", "regedit", "keepass", "ghostdesk"] {
+            assert!(win_policy::denied_query(q), "{q}");
+        }
+        // what the setting governs is the shell/system-tool class, not the always-blocked one
+        for q in ["cmd", "powershell.exe", "Windows Terminal", "regedit", "taskmgr", r"C:\Windows\System32\cmd.exe"] {
+            assert!(win_policy::tool_query(q), "{q}");
+        }
+        for q in ["keepass", "1password", "ghostdesk", "자격 증명 관리자", "notepad", "charmap"] {
+            assert!(!win_policy::tool_query(q), "{q}");
+        }
+        let app = |name: &str, path: &str| ResolvedApp { path: PathBuf::from(path), bundle_id: None, name: name.into(), electron: None, original_filename: None, publisher: None };
+        let (cmd, vault) = (app("Windows Command Processor", r"C:\Windows\System32\cmd.exe"), app("KeePassXC", r"C:\Program Files\KeePassXC\KeePassXC.exe"));
+        assert!(win_policy::verdict(&cmd, true) && !win_policy::verdict(&cmd, false), "a shell is refused only with the tool list");
+        assert!(win_policy::verdict(&vault, true) && win_policy::verdict(&vault, false), "a password manager is refused always");
+    }
+
+    /// An app that insists on administrator rights asks for a restart as administrator, and only a
+    /// person's click answers that (the permission bypass can't).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn app_needing_administrator_asks_for_a_restart() {
+        if crate::winapp::self_elevated() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ghostdesk-needs-admin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("needs-admin.exe");
+        std::fs::write(&exe, b"MZ....<requestedExecutionLevel level=\"requireAdministrator\"/>....").unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let srv = ControlServer::new(ev_tx, egui::Context::default());
+        let (_t, c) = conn(1);
+        let p = json!({ "kind": "app", "app": exe.to_string_lossy() });
+        let task = tokio::spawn(async move { srv.open(&p, &c).await });
+        let Some(ControlEvent::Approval { title, manual, reply, .. }) = ev_rx.recv().await else { panic!("재시작 승인 요청이 없음") };
+        assert!(manual && title.contains("관리자"), "{title}");
+        assert!(!approval_allowed(false, true, false), "the window must not auto-answer a manual request");
+        reply.send(false).unwrap();
+        let e = task.await.unwrap().unwrap_err().to_string();
+        assert!(e.contains("거부"), "{e}");
+        assert!(ev_rx.try_recv().is_err(), "after a no there is no restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manifest_asking_for_administrator_is_found() {
+        let dir = std::env::temp_dir().join(format!("ghostdesk-admin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (admin, plain) = (dir.join("admin.exe"), dir.join("plain.exe"));
+        std::fs::write(&admin, b"MZ....<requestedExecutionLevel level=\"requireAdministrator\" uiAccess=\"false\"/>....").unwrap();
+        std::fs::write(&plain, b"MZ....<requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>....").unwrap();
+        assert!(crate::winapp::requires_admin(&admin));
+        assert!(!crate::winapp::requires_admin(&plain));
+        assert!(!crate::winapp::requires_admin(&dir.join("missing.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

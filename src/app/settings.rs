@@ -518,6 +518,21 @@ impl GhostApp {
         // the warning stays visible while it's on, not only on hover
         let warn = tr("외부 에이전트가 로그인 복제, 실행 중인 앱, 원격 접속을 묻지 않고 바로 시작해요. 믿는 에이전트만 연결했을 때 켜세요");
         ui.label(if self.auto_approve { RichText::new(warn).size(12.0).color(theme::warn()) } else { theme::hint(warn) });
+
+        // Windows: the shell and system-tool refusals of the app modes
+        #[cfg(windows)]
+        {
+            ui.add_space(8.0);
+            ui.add(theme::switch(&mut self.allow_shell_tools, tr("셸·터미널·시스템 도구 허용")));
+            let note = if !self.allow_shell_tools {
+                tr("끄면 터미널, PowerShell, 레지스트리 편집기 같은 도구는 외부 에이전트가 열 수 없어요")
+            } else if self.auto_approve {
+                tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
+            } else {
+                tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
+            };
+            ui.label(if self.allow_shell_tools && self.auto_approve { RichText::new(note).size(12.0).color(theme::warn()) } else { theme::hint(note) });
+        }
     }
 
     /// AI tab: connections (keys) and the AI/model in use.

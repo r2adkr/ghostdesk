@@ -278,6 +278,10 @@ pub struct GhostApp {
     /// Permission bypass: approve external agents' sensitive requests (login cloning, running apps,
     /// remote access, …) without asking. Hard refusals in `control.rs` still apply.
     auto_approve: bool,
+    /// Windows: let external agents open shells, terminals and system tools (after a person's yes, or at
+    /// once with the permission bypass). Off refuses them. The password managers and GhostDesk itself
+    /// stay refused either way.
+    allow_shell_tools: bool,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
@@ -416,6 +420,7 @@ impl GhostApp {
             pip_auto_open: false,
             pip_auto_close: true,
             auto_approve: false,
+            allow_shell_tools: true,
             allow_experimental: false,
             tour: None,
             tour_seen: false,
@@ -645,11 +650,31 @@ impl eframe::App for GhostApp {
                     let task = self.rt.spawn(async {});
                     self.agents.push(AgentHandle::new(&self.rt, shared, tx, task));
                 }
-                crate::control::ControlEvent::Approval { title, reply, experimental, .. }
-                    if crate::control::approval_allowed(self.auto_approve, self.allow_experimental, experimental) => {
+                crate::control::ControlEvent::Approval { title, reply, experimental, manual, .. }
+                    if !manual && crate::control::approval_allowed(self.auto_approve, self.allow_experimental, experimental) => {
                     // permission bypass: answer at once, and say what was allowed so it never happens unseen
                     let _ = reply.send(true);
                     self.notify(&ctx, trf("자동 허용됨: {}", &[&title]));
+                }
+                crate::control::ControlEvent::RestartElevated { reply } => {
+                    // the elevation prompt blocks until answered, so keep it off the UI thread
+                    #[cfg(windows)]
+                    {
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || match crate::winapp::relaunch_self_elevated() {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                                // let the answer reach the agent, then make room for the elevated window
+                                std::thread::sleep(Duration::from_millis(1500));
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("{e:#}")));
+                            }
+                        });
+                    }
+                    #[cfg(not(windows))]
+                    let _ = reply.send(Err("only supported on Windows".to_string()));
                 }
                 crate::control::ControlEvent::AccountCreated { name, password } => {
                     self.account_prompt = Some(account::AccountPrompt::created(name, password));
@@ -667,6 +692,7 @@ impl eframe::App for GhostApp {
                 }
             }
         }
+        crate::control::set_shell_tools_allowed(self.allow_shell_tools);
         self.poll_route(&ctx);
         self.approval_window(&ctx);
         self.spawn_demos(&ctx);

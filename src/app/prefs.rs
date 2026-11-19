@@ -41,6 +41,8 @@ pub(super) struct Prefs {
     pip_auto_close: Option<bool>,
     /// Permission bypass (approve external agents' requests without asking).
     auto_approve: Option<bool>,
+    /// Windows: external agents may open shells, terminals and system tools (default on: each one asks).
+    allow_shell_tools: Option<bool>,
     allow_experimental: Option<bool>,
     /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
@@ -181,6 +183,7 @@ impl GhostApp {
         self.pip_auto_close = p.pip_auto_close.unwrap_or(true);
         self.ssh_profiles = p.ssh_profiles;
         self.auto_approve = p.auto_approve.unwrap_or(false);
+        self.allow_shell_tools = p.allow_shell_tools.unwrap_or(true);
         self.allow_experimental = p.allow_experimental.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
@@ -216,6 +219,7 @@ impl GhostApp {
             pip_auto_open: Some(self.pip_auto_open),
             pip_auto_close: Some(self.pip_auto_close),
             auto_approve: Some(self.auto_approve),
+            allow_shell_tools: Some(self.allow_shell_tools),
             allow_experimental: Some(self.allow_experimental),
             tour_seen: Some(self.tour_seen),
             other: self.prefs_other.clone(),

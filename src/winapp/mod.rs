@@ -38,7 +38,7 @@ mod w32;
 mod workspace;
 
 pub use apps::{installed_apps, resolve_app_query};
-pub use launch::needs_child_session;
+pub use launch::{needs_child_session, relaunch_self_elevated, requires_admin, self_elevated, ELEVATION_NEEDED};
 pub use launch::preflight;
 pub use recovery::recover as recover_parked_windows;
 pub use selftest::selftest;
