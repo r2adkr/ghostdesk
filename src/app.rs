@@ -206,6 +206,8 @@ struct NewAgentForm {
     remote_user: String,
     remote_pass: String,
     remote_dedicated: bool,
+    /// Pairing code of a host computer (kept instead of an address when one was pasted).
+    host_code: Option<String>,
     remote_mode: RemoteMode,
     card_input: String,
     card_invalid: bool,

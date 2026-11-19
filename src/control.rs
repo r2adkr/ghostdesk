@@ -748,6 +748,17 @@ impl ControlServer {
                 .await?;
                 DeskTarget::Session { account }
             }
+            "remote" if p["host_code"].is_string() => {
+                let code = p["host_code"].as_str().unwrap_or_default().trim().to_string();
+                crate::host::parse_code(&code)?;
+                self.ask(
+                    conn,
+                    "호스트 컴퓨터 접속 요청",
+                    format!("{client} 이(가) 접속 코드로 다른 컴퓨터(호스트)의 화면과 마우스·키보드를 조작하려고 합니다. 호스트 컴퓨터의 실제 화면이므로, 그 컴퓨터를 쓰는 사람이 있다면 방해가 됩니다. 내가 준 코드가 맞을 때만 허용하세요."),
+                )
+                .await?;
+                DeskTarget::Host { code }
+            }
             "remote" => {
                 let host = p["host"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("host 가 필요합니다"))?.to_owned();
                 let port = match p.get("port") {

@@ -1277,6 +1277,7 @@ pub struct SessionDesk {
     /// This agent's turn on the one session screen (turns.rs); released when the screen closes so
     /// the next agent in line gets it.
     turn: Mutex<Option<crate::turns::Turn>>,
+    guard: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 /// Reads the current cursor position in the user's (client) session, for input leak detection.
@@ -1424,6 +1425,7 @@ impl SessionDesk {
             canary_ok: AtomicBool::new(false),
             local_cursor: Mutex::new(Arc::new(real_local_cursor)),
             turn: Mutex::new(None),
+            guard: Mutex::new(None),
         });
         let (c, hello) = me.open().await?;
         me.apply_hello(&hello, true);
@@ -1933,6 +1935,11 @@ impl SessionDesk {
     }
 
     /// Keeps `turn` until this screen closes.
+    /// Keeps something alive for as long as this connection (the host bridge: closing it ends the link).
+    pub fn keep_alive(&self, guard: Box<dyn std::any::Any + Send>) {
+        *self.guard.lock() = Some(guard);
+    }
+
     pub fn hold(&self, turn: crate::turns::Turn) {
         *self.turn.lock() = Some(turn);
     }

@@ -110,6 +110,8 @@ pub struct RemoteTarget {
 /// The kind of isolated screen the agent drives, and its settings.
 #[derive(Clone)]
 pub enum DeskTarget {
+    /// Another computer running GhostDesk host mode, reached with its pairing code over the internet.
+    Host { code: String },
     Browser {
         source: ProfileSource,
         headless: bool,

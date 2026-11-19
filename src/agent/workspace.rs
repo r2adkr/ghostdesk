@@ -59,6 +59,16 @@ pub(crate) async fn prepare_workspace_with(
             }
             Ok(Desk::VDisplay(ws))
         }
+        DeskTarget::Host { code } => {
+            shared.set_status(AgentStatus::Preparing("호스트 컴퓨터에 연결 중".into()));
+            let bridge = crate::host::connect(code).await?;
+            let sh = shared.clone();
+            let d = crate::session::SessionDesk::connect_target(bridge.target.clone(), None, "호스트 컴퓨터", Arc::new(move |b: &[u8]| sh.push_frame(b)), Default::default()).await?;
+            d.keep_alive(Box::new(bridge));
+            let (w, h) = d.size();
+            shared.log(LogKind::Info, format!("호스트 컴퓨터에 연결했습니다 ({w}x{h})"));
+            Ok(Desk::Session(d))
+        }
         DeskTarget::Session { account } => {
             // one agent at a time on this session screen: wait for the turn (turns.rs)
             let turn = take_session_turn(shared, account).await?;

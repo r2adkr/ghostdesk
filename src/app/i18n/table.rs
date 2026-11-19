@@ -28,6 +28,8 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["지금까지 준 코드는 모두 쓸 수 없게 돼요. 호스트가 다시 시작돼요.", "Every code given out so far stops working. The host restarts.", "これまでに渡したコードはすべて使えなくなります。ホストが再起動します。", "之前给出的连接码都将失效。主机会重新启动。"],
     ["코드를 가진 사람은 이 컴퓨터를 조작할 수 있어요. 비밀번호처럼 다루세요.", "Anyone with the code can control this computer. Treat it like a password.", "コードを持つ人はこのコンピューターを操作できます。パスワードのように扱ってください。", "拥有连接码的人可以操作这台电脑。请像密码一样保管。"],
     ["접속 코드를 복사했어요", "Pairing code copied", "接続コードをコピーしました", "已复制连接码"],
+    ["호스트 컴퓨터 (접속 코드)", "Host computer (pairing code)", "ホストコンピューター（接続コード）", "主机电脑（连接码）"],
+    ["인터넷으로 연결해요. VPN 이나 포트 설정은 필요 없어요.", "Connects over the internet. No VPN or port setup is needed.", "インターネット経由で接続します。VPNやポート設定は不要です。", "通过互联网连接。无需 VPN 或端口设置。"],
     ["암호 보기", "Show password", "パスワードを表示", "查看密码"],
     ["저장된 암호가 없어요", "No password is saved", "保存されたパスワードがありません", "没有已保存的密码"],
     ["이 계정 만들기", "Create this account", "このアカウントを作成", "创建此账户"],

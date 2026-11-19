@@ -292,6 +292,17 @@ impl GhostApp {
 
 impl NewAgentForm {
     pub(super) fn show_connection_summary(&mut self, ui: &mut egui::Ui) {
+        if self.host_code.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(RichText::new(tr("호스트 컴퓨터 (접속 코드)")).strong()).wrap());
+                if ui.link(tr("연결 정보 수정")).clicked() {
+                    self.host_code = None;
+                    self.remote_entry = RemoteEntry::Paste;
+                }
+            });
+            ui.label(theme::hint(tr("인터넷으로 연결해요. VPN 이나 포트 설정은 필요 없어요.")));
+            return;
+        }
         let has_vnc = self.remote_mode != RemoteMode::Ssh;
         let host = if has_vnc { &self.remote_host } else { &self.ssh.host };
         let user = if has_vnc { &self.remote_user } else { &self.ssh.username };
@@ -335,7 +346,16 @@ impl NewAgentForm {
             apply |= ui.add_enabled(!self.card_input.trim().is_empty(), egui::Button::new(tr("적용"))).clicked();
         });
         if apply {
+            if crate::host::parse_code(&self.card_input).is_ok() {
+                // a host computer's pairing code: no address, port or password to fill in
+                self.host_code = Some(self.card_input.trim().to_string());
+                self.remote_entry = RemoteEntry::Imported;
+                self.card_input.clear();
+                self.card_invalid = false;
+                return true;
+            }
             if let Some(card) = Card::decode(&self.card_input) {
+                self.host_code = None;
                 card.apply(self);
                 self.card_input.clear();
                 self.card_invalid = false;

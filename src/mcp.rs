@@ -229,6 +229,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "workspace": { "type": "string", "description": "workspace to reuse (keeps cloned login/app data; opens under a new name if busy)" },
                     "refresh_login": { "type": "boolean", "description": "web_login/app_login: 원본에서 새로 복사해 복제 데이터를 교체 (replace the clone; its own changes may be lost)" },
                     "name": { "type": "string", "description": "screen name" },
+                    "host_code": { "type": "string", "description": "remote: pairing code (ghostdesk:host:v1:…) of a computer running GhostDesk host mode; use instead of host/port" },
                     "host": { "type": "string" }, "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                     "username": { "type": "string" }, "password": { "type": "string" },
                     "identity_file": { "type": "string", "description":"ssh: private key path (default: ssh agent/config)" },

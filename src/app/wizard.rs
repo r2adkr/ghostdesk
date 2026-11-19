@@ -48,6 +48,7 @@ impl NewAgentForm {
             remote_user: String::new(),
             remote_pass: String::new(),
             remote_dedicated: false,
+            host_code: None,
             remote_mode: RemoteMode::Vnc,
             card_input: String::new(),
             card_invalid: false,
@@ -343,6 +344,9 @@ impl GhostApp {
                 }
                 DeskTarget::Session { account: chosen }
             }
+            FormKind::Remote if self.form.host_code.is_some() => {
+                DeskTarget::Host { code: self.form.host_code.clone().unwrap_or_default() }
+            }
             FormKind::Remote => {
                 if self.form.remote_mode != RemoteMode::Ssh && self.form.remote_host.trim().is_empty() {
                     return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요"));
@@ -406,6 +410,7 @@ impl GhostApp {
         self.form.card_input.clear();
         self.form.card_invalid = false;
         self.form.remote_entry = RemoteEntry::Paste;
+        self.form.host_code = None;
         self.form.team_id = None;
         self.form.team_role.clear();
         // auto comes preselected: just write the task and start (the window height is the same from the
