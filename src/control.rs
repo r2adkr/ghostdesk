@@ -611,6 +611,19 @@ impl ControlServer {
         let workspace = reservation.name.clone();
         let ws_dir = profiles::workspaces_root().join(profiles::slug(&workspace));
 
+        // Windows: an app the hidden app mode can't hide (Store app, console program, …) runs in a child
+        // session instead of failing, so mode=app works for any app
+        #[cfg(windows)]
+        let mut kind = kind;
+        #[cfg(windows)]
+        let routed_to_session = kind == "app" && wants_child_session(p).await;
+        #[cfg(windows)]
+        if routed_to_session {
+            kind = "session";
+        }
+        #[cfg(not(windows))]
+        let routed_to_session = false;
+
         // kinds this OS can't use are refused before asking the user anything
         if let Some(why) = unsupported_kind(kind) {
             bail!("{why}");
@@ -664,6 +677,10 @@ impl ControlServer {
                 if !valid_account_name(&account) {
                     bail!("account 는 계정 이름(영문 소문자·숫자·'.'·'_'·'-', 64자 이하)이어야 합니다 (받은 값: {account})");
                 }
+                #[cfg(windows)]
+                if let Some(app) = p["app"].as_str().filter(|a| !a.trim().is_empty()) {
+                    session_launch_policy(app).await?;
+                }
                 // a Windows child session is the user's own account and reaches real data, so ask a person
                 // macOS: no such account yet. Offer to make it; the person allows it here and gives their administrator
                 // password to macOS itself. The session still needs one login to start, so this call ends with that.
@@ -692,7 +709,12 @@ impl ControlServer {
                     "자식 세션(PiP) 사용 요청",
                     format!(
                         "{client} 이(가) 이 PC 의 Windows 자식 세션(같은 계정의 별도 화면)을 열어 조작하려고 합니다.
-                         내 마우스·키보드와는 분리되지만, 같은 Windows 계정이라 사용자의 파일·앱·로그인을 그대로 사용합니다."
+                         내 마우스·키보드와는 분리되지만, 같은 Windows 계정이라 사용자의 파일·앱·로그인을 그대로 사용합니다.{}",
+                        match (routed_to_session, p["app"].as_str()) {
+                            (true, Some(app)) => format!("\n'{app}' 은(는) 숨김 앱 모드로 열 수 없는 앱(Store 앱·콘솔 프로그램 등)이라 이 세션 안에서 엽니다."),
+                            (false, Some(app)) if !app.trim().is_empty() => format!("\n세션 안에서 '{app}' 을(를) 엽니다."),
+                            _ => String::new(),
+                        }
                     ),
                 )
                 .await?;
@@ -835,7 +857,18 @@ impl ControlServer {
         let reservation = reservation.keep();
         self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation, named: p["workspace"].is_string(), params: p.clone() });
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Windows child session: `app` opens inside the session, so Store apps, console programs and
+        // other things the hidden app mode refuses are one call away. A failure doesn't close the screen:
+        // the agent can still start the app from the Start menu.
+        let mut launch_note = None;
+        #[cfg(windows)]
+        if let (DeskKind::Session, Some(app)) = (desk.kind(), p["app"].as_str().map(str::trim).filter(|a| !a.is_empty())) {
+            launch_note = Some(match self.launch_in_session(&desk, app).await {
+                Ok(msg) => msg,
+                Err(e) => format!("앱 '{app}' 을(를) 열지 못했습니다: {e:#}. 시작 메뉴에서 직접 여세요."),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(if launch_note.is_some() { 2000 } else { 300 })).await;
         // a web page is read as text, so no picture unless asked for (it costs the agent over a thousand tokens)
         let want_png = p["screenshot"].as_bool().unwrap_or(kind != "browser");
         let png = if want_png { desk.screenshot().await.ok() } else { None };
@@ -846,10 +879,21 @@ impl ControlServer {
             "kind": kind_name(desk.kind()),
             "size": [w, h],
             "shared": shared_access,
-            "notes": guide(desk.kind()),
+            "notes": match &launch_note {
+                Some(n) => format!("{n}\n{}", guide(desk.kind())),
+                None => guide(desk.kind()).to_string(),
+            },
             "views": desk.views_text(),
             "screenshot_png": png.map(|b| B64.encode(b)),
         }))
+    }
+
+    /// Opens `app` inside a Windows child session (see [`session_launch_policy`]).
+    #[cfg(windows)]
+    async fn launch_in_session(&self, desk: &Desk, app: &str) -> Result<String> {
+        session_launch_policy(app).await?;
+        let session = desk.as_session().ok_or_else(|| anyhow!("자식 세션이 아닙니다"))?;
+        session.app_control(&json!({"action": "launch", "app": app})).await
     }
 
     /// App name/bundle id/path → Electron (hidden clone) or macOS/Windows app (hidden window) target.
@@ -1528,6 +1572,51 @@ fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
 /// anything else (.lnk, …) is resolved by the local app backend; a name goes to the Electron app
 /// list (name, executable name) → the local app backend (Start menu, App Paths, …).
 #[cfg(windows)]
+/// Whether a `desk_open mode=app` request is for an app only a Windows child session can run (see
+/// `winapp::needs_child_session`). Requests that name a mode of their own (attach, current session, a
+/// virtual display, a login clone) and Electron apps keep their own path.
+#[cfg(windows)]
+async fn wants_child_session(p: &Value) -> bool {
+    let plain = !p["attach_running"].as_bool().unwrap_or(false)
+        && !p["use_my_login"].as_bool().unwrap_or(false)
+        && !p["virtual_display"].as_bool().unwrap_or(false)
+        && p["app_host"].as_str().is_none_or(|h| h == "auto");
+    let Some(app) = p["app"].as_str().filter(|_| plain) else { return false };
+    let input = app.to_string();
+    tokio::task::spawn_blocking(move || match resolve_external_app(&input) {
+        Ok(r) => r.electron.is_none() && !is_denied(&r) && !is_ghostdesk(&r) && crate::winapp::needs_child_session(&r.path),
+        // a Store app has no .exe to resolve: it's a packaged app if exactly one Start-menu name matches
+        Err(_) if !win_policy::denied_query(&input) && !win_policy::network_or_device(&input) && !input.contains(['\\', '/']) => {
+            let apps = crate::winapp::child::packaged_apps();
+            crate::winapp::child::packaged_matches(&apps, &input).len() == 1
+        }
+        Err(_) => false,
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// What an agent may start inside a Windows child session: the same refusals as the hidden app mode
+/// (shells, scripts, credential and security settings apps, network and device paths). An app that
+/// doesn't resolve, like a Store app's display name, passes: the session is the approved screen and
+/// the Start menu would open it the same way.
+#[cfg(windows)]
+pub(crate) async fn session_launch_policy(app: &str) -> Result<()> {
+    let raw = app.trim().trim_matches('"').trim().to_string();
+    if win_policy::network_or_device(&raw) || win_policy::network_or_device(&win_policy::expand_path(&raw).to_string_lossy()) {
+        bail!("보안상 외부 에이전트는 네트워크 공유·장치 경로의 앱을 열 수 없습니다: {raw}");
+    }
+    if win_policy::denied_query(&raw) {
+        bail!("보안상 외부 에이전트는 '{raw}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.");
+    }
+    if let Ok(Ok(r)) = tokio::task::spawn_blocking(move || resolve_external_app(&raw)).await {
+        if is_denied(&r) {
+            bail!("보안상 외부 에이전트는 '{}' 을(를) 열 수 없습니다. 터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.", r.name);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_external_app(input: &str) -> Result<ResolvedApp> {
     use crate::platform::paths;
     let raw = input.trim().trim_matches('"').trim();
@@ -1789,7 +1878,7 @@ pub fn guide(k: DeskKind) -> &'static str {
         DeskKind::Browser => "격리된 headless 브라우저입니다. 스크린샷은 페이지 영역만 보이며 주소창이 없으니 desk_browser(navigate/back/new_tab...)로 이동하세요. 확인·입력 대화상자가 뜨면 desk_browser {action:dialog} 로 읽고 respond_dialog 로 현재 id 에 명시적으로 응답하세요. 좌표는 스크린샷 픽셀입니다.",
         DeskKind::Remote => "별도 원격 데스크톱(VNC)입니다. 좌표는 스크린샷 픽셀입니다. 한글 입력은 서버에 따라 안 될 수 있습니다.",
         DeskKind::Electron => "보이지 않게 띄운 Electron 앱 창입니다. 네이티브 메뉴는 desk_app {action:list|click, path:\"File > ...\"} 로 쓰세요. 확인·입력 대화상자는 desk_app {action:dialog} 로 읽고 respond_dialog 에 현재 source 와 id 를 지정해 응답하세요. 파일 열기·저장 대화상자는 notes 안내를 따르세요. 이 앱은 사용자의 실제 시스템 클립보드를 쓰므로 cmd/ctrl+c·x·v 는 거부됩니다. 글자 입력은 type 을 쓰세요.",
-        DeskKind::Session if cfg!(windows) => "같은 Windows 계정의 자식 세션 화면 전체입니다. 시작 메뉴·작업 표시줄·alt+tab 을 사용할 수 있습니다. 정확한 클릭·입력은 desk_app {action:list_windows|switch_window|ui_tree|press|set_value|read|focus|select|choose} 를 쓰세요. id 는 다음 ui_tree 전까지 유효합니다. menus/menu 는 지원하지 않으므로 메뉴는 스크린샷과 키보드 단축키로 조작하세요. helper 재시작 안내가 나오면 업데이트된 GhostDesk 로 자식 세션을 다시 연결하세요. 사용자의 파일·로그인은 실제 계정의 것입니다.",
+        DeskKind::Session if cfg!(windows) => "같은 Windows 계정의 자식 세션 화면 전체입니다. 시작 메뉴·작업 표시줄·alt+tab 을 사용할 수 있습니다. 정확한 클릭·입력은 desk_app {action:launch|list_windows|switch_window|ui_tree|press|set_value|read|focus|select|choose} 를 쓰세요. 앱은 desk_app {action:launch, app:이름·경로·AppUserModelID} 로 이 세션 안에서 여세요 (Store 앱·콘솔 프로그램도 열립니다). id 는 다음 ui_tree 전까지 유효합니다. menus/menu 는 지원하지 않으므로 메뉴는 스크린샷과 키보드 단축키로 조작하세요. helper 재시작 안내가 나오면 업데이트된 GhostDesk 로 자식 세션을 다시 연결하세요. 사용자의 파일·로그인은 실제 계정의 것입니다.",
         DeskKind::Session => "전용 에이전트 계정의 별도 로그인 세션 전체 화면입니다. 사용자 화면이 아니므로 Dock·메뉴 막대·cmd+tab 을 자유롭게 써도 됩니다. 사용자의 로그인은 공유되지 않습니다.",
         DeskKind::VDisplay => crate::vdisplay::CONTROL_HINT,
         DeskKind::Native => {
@@ -2730,12 +2819,11 @@ mod tests {
                 continue;
             }
             let canonical = crate::platform::paths::canonicalize(&exe).unwrap();
-            let Err(why) = crate::native::preflight_app(&canonical) else { continue };
+            let Err(_) = crate::native::preflight_app(&canonical) else { continue };
+            // a plain request moves to a child session instead of failing (it only asks for approval there)
             let p = json!({ "kind": "app", "app": exe.to_string_lossy() });
-            let e = srv.open(&p, &c).await.unwrap_err().to_string();
-            // compare with the same canonical path as the control server (TEMP may be an 8.3 short path)
-            assert_eq!(e.to_lowercase(), why.to_string().to_lowercase(), "{p}");
-            assert!(ev_rx.try_recv().is_err(), "승인 창을 띄우기 전에 거절해야 함: {p}");
+            assert!(wants_child_session(&p).await, "{p}");
+            // the modes that name their own way of running keep it, and the refusal
             let p = json!({ "kind": "app", "app": exe.to_string_lossy(), "attach_running": true });
             assert!(srv.open(&p, &c).await.is_err());
             assert!(ev_rx.try_recv().is_err(), "승인 창을 띄우기 전에 거절해야 함: {p}");

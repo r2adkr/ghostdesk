@@ -326,7 +326,7 @@ pub fn spawn_suspended(
         if e == ERROR_ELEVATION_REQUIRED {
             bail!(
                 "{} 은(는) 관리자 권한이 필요한 앱이라 실행하지 않았습니다 — UAC 확인 창이 사용자 화면에 뜨고, \
-                 권한이 높은 앱의 창은 GhostDesk 가 메시지로 조작할 수 없습니다 (UIPI).",
+                 권한이 높은 앱의 창은 GhostDesk 가 메시지로 조작할 수 없습니다 (UIPI). {ELEVATED_HINT}",
                 exe.display()
             );
         }
@@ -470,7 +470,17 @@ fn is_selftest_target(exe: &Path) -> bool {
         && std::env::current_exe().map(|c| paths::same_path(&c, exe)).unwrap_or(false)
 }
 
-const CHILD_SESSION_HINT: &str = "Windows 자식 세션을 사용하세요. 자식 세션 기능을 켜고 GhostDesk 창에서 승인해야 합니다. MCP: desk_open(mode=\"session\").";
+/// Windows blocks a process from driving windows of higher integrity (UIPI), so the way in is to
+/// start GhostDesk itself elevated; a child it launches then inherits that.
+const ELEVATED_HINT: &str = "관리자 권한 앱을 조작하려면 사용자가 GhostDesk 를 관리자 권한으로 실행(우클릭 → 관리자 권한으로 실행)해야 합니다.";
+
+const CHILD_SESSION_HINT: &str = "Windows 자식 세션을 사용하세요. 자식 세션 기능을 켜고 GhostDesk 창에서 승인해야 합니다. MCP: desk_open(mode=\"session\") 후 desk_app {action:\"launch\", app:\"<앱 이름·경로>\"} 로 그 안에서 앱을 여세요.";
+
+/// Whether `exe` is refused by the hidden app mode only because it can't be hidden (Store apps,
+/// execution aliases, console programs): a Windows child session runs it as is.
+pub fn needs_child_session(exe: &Path) -> bool {
+    preflight(exe).err().is_some_and(|e| e.to_string().contains(CHILD_SESSION_HINT))
+}
 
 /// Errors with a user-facing reason if the target must not be launched.
 pub fn preflight(exe: &Path) -> Result<()> {
@@ -515,7 +525,7 @@ pub fn preflight(exe: &Path) -> Result<()> {
     if let Some(sub) = read_head(exe, 4096).as_deref().and_then(pe_subsystem) {
         if sub == 3 && !is_selftest_target(exe) {
             bail!(
-                "{} 은(는) 명령줄(콘솔) 프로그램입니다. 콘솔 창은 터미널 앱이 사용자 화면에 띄울 수 있어 지원하지 않습니다.",
+                "{} 은(는) 명령줄(콘솔) 프로그램입니다. 콘솔 창은 터미널 앱이 사용자 화면에 띄울 수 있어 이 숨김 앱 모드에서는 지원하지 않습니다. {CHILD_SESSION_HINT}",
                 exe.display()
             );
         }
@@ -563,7 +573,7 @@ pub fn check_attachable(pid: u32) -> Result<()> {
         );
     }
     if is_elevated(pid) == Some(true) && is_elevated(std::process::id()) != Some(true) {
-        bail!("pid {pid} 는 관리자 권한으로 실행 중이라 조작할 수 없습니다 (권한이 높은 창에는 메시지·UI Automation 이 막힘)");
+        bail!("pid {pid} 는 관리자 권한으로 실행 중이라 조작할 수 없습니다 (권한이 높은 창에는 메시지·UI Automation 이 막힘). {ELEVATED_HINT}");
     }
     Ok(())
 }

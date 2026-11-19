@@ -411,7 +411,12 @@ async fn app_with_names(desk: &Desk, input: &Value) -> Result<Outcome> {
 /// The app tool of whatever kind of screen this is.
 async fn app_dispatch(desk: &Desk, input: &Value) -> Result<Outcome> {
     if cfg!(windows) {
-        if let Some(session) = desk.as_session() { return ok(session.app_control(input).await?); }
+        if let Some(session) = desk.as_session() {
+            if input["action"].as_str() == Some("launch") {
+                crate::control::session_launch_policy(input["app"].as_str().unwrap_or("")).await?;
+            }
+            return ok(session.app_control(input).await?);
+        }
     }
     if let Some(v) = desk.as_vdisplay() {
         return ok(v.app_control(input).await?);

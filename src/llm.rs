@@ -63,8 +63,9 @@ impl Llm {
     #[cfg(windows)]
     fn session_control_tool() -> Value {
         let mut tool = crate::native::app_control_tool();
-        tool["description"] = json!("Inspect and operate windows and UI Automation elements inside the Windows child session. Actions: list_windows, switch_window(index), ui_tree(max_depth optional), press(id), set_value(id,text), focus(id), select(id), choose(id,option), read(id). Use set_value for exact long-text replacement and read to verify it. Element IDs belong to the last ui_tree and observed foreground window; refresh the tree after switching windows or changing focus. Operate application menus using screenshots and keyboard shortcuts.");
-        tool["input_schema"]["properties"]["action"]["enum"] = json!(["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]);
+        tool["description"] = json!("Inspect and operate windows and UI Automation elements inside the Windows child session. Actions: launch(app: name, .exe path or AppUserModelID; opens Store apps, console programs and anything else inside the session), list_windows, switch_window(index), ui_tree(max_depth optional), press(id), set_value(id,text), focus(id), select(id), choose(id,option), read(id). Use set_value for exact long-text replacement and read to verify it. Element IDs belong to the last ui_tree and observed foreground window; refresh the tree after switching windows or changing focus. Operate application menus using screenshots and keyboard shortcuts.");
+        tool["input_schema"]["properties"]["action"]["enum"] = json!(["launch", "list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]);
+        tool["input_schema"]["properties"]["app"] = json!({ "type": "string", "description": "launch: app name, .exe path or AppUserModelID" });
         tool["input_schema"]["properties"].as_object_mut().unwrap().remove("path");
         tool
     }
@@ -258,7 +259,7 @@ mod tool_contract_tests {
         assert_eq!(control.is_some(), cfg!(windows));
         if let Some(control) = control {
             assert_eq!(control["input_schema"]["properties"]["action"]["enum"],
-                json!(["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]));
+                json!(["launch", "list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "read"]));
             assert!(control["input_schema"]["properties"].get("path").is_none());
         }
     }

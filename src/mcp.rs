@@ -210,7 +210,7 @@ fn tools_for(pl: &Plat) -> Value {
          Dialogs: dialog lists them; respond_dialog(source, id, native: response=button index, javascript: accept+prompt_text). Confirm irreversible answers are allowed first."
     );
     let app_desc = if pl.child_session {
-        format!("{app_desc} Windows child sessions support the same actions except menus. Look up again after changing windows or focus; for long text set_value then read to check. Operate app menus by screen or keyboard.")
+        format!("{app_desc} Windows child sessions support the same actions except menus, plus action=launch(app: name, .exe path or AppUserModelID) which opens any app inside the session (Store apps, console programs, anything desk_open mode=app refuses). Look up again after changing windows or focus; for long text set_value then read to check. Operate app menus by screen or keyboard.")
     } else { app_desc };
     let mut t = json!([
         {
@@ -325,6 +325,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "id": { "type": "integer" }, "index": { "type": "integer" },
                     "label": { "type": "string", "description": "instead of id: element name" },
                     "query": { "type": "string", "description": "find: 찾을 글자" },
+                    "app": { "type": "string", "description": "launch (Windows child session): app name, .exe path or AppUserModelID" },
                     "text": { "type": "string" }, "option": { "type": "string" },
                     "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context", "javascript", "native"], "description": "menu: app|context. respond_dialog: javascript|native from dialog" },
                     "max_depth": { "type": "integer" },

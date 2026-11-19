@@ -209,6 +209,59 @@ fn process_in_session(pid: u32, session: u32) -> bool {
     unsafe { ProcessIdToSessionId(pid, &mut found) != 0 && found == session }
 }
 
+/// Start-menu apps that have no .exe shortcut (Store/packaged apps) as `(name, AppUserModelID)`.
+pub fn packaged_apps() -> Vec<(String, String)> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-StartApps | ForEach-Object { $_.Name + \"`t\" + $_.AppID }";
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().split_once('\t').map(|(n, id)| (n.trim().to_string(), id.trim().to_string())))
+        .filter(|(n, id)| !n.is_empty() && !id.is_empty())
+        .collect()
+}
+
+/// The packaged apps a typed name means: the exact name if there is one, else every name containing it.
+pub fn packaged_matches<'a>(apps: &'a [(String, String)], q: &str) -> Vec<&'a (String, String)> {
+    let lq = q.trim().to_lowercase();
+    let exact: Vec<_> = apps.iter().filter(|(n, _)| n.to_lowercase() == lq).collect();
+    if exact.is_empty() { apps.iter().filter(|(n, _)| !lq.is_empty() && n.to_lowercase().contains(&lq)).collect() } else { exact }
+}
+
+/// Opens an app inside this (child) session the way the Start menu would, so Store apps, aliases,
+/// console programs and anything else the app mode refuses start normally. `app` is an .exe/.lnk
+/// path, an installed app's name, or an AppUserModelID.
+fn launch_app(app: &str) -> Result<String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let q = app.trim().trim_matches('"').trim();
+    if q.is_empty() {
+        bail!("app 이 필요합니다 (앱 이름, 경로 또는 AppUserModelID)");
+    }
+    let (target, shown) = if let Some(p) = super::apps::resolve_app_query(q) {
+        (p.display().to_string(), q.to_string())
+    } else if q.contains('!') && !q.contains(' ') {
+        (format!("shell:AppsFolder\\{q}"), q.to_string())
+    } else {
+        let apps = packaged_apps();
+        match packaged_matches(&apps, q).as_slice() {
+            [(name, id)] => (format!("shell:AppsFolder\\{id}"), name.clone()),
+            [] => bail!("'{q}' 앱을 찾지 못했습니다. 정확한 이름이나 .exe 경로를 쓰거나, 자식 세션 화면에서 시작 메뉴로 여세요"),
+            many => bail!("'{q}' 와 맞는 앱이 여럿입니다: {}", many.iter().take(8).map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")),
+        }
+    };
+    let (verb, file) = (wide("open"), wide(&target));
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) } as usize;
+    if r <= 32 {
+        bail!("'{shown}' 을(를) 열지 못했습니다 (ShellExecute 오류 {r})");
+    }
+    Ok(format!("'{shown}' 을(를) 자식 세션에서 열었습니다. 창이 뜨기까지 잠시 걸릴 수 있으니 list_windows 로 확인하세요"))
+}
+
 fn app_rect_to_frame(r: (i32, i32, i32, i32), screen: (i32, i32), frame: (u32, u32)) -> [i64; 4] {
     [r.0 as i64 * frame.0 as i64 / screen.0 as i64, r.1 as i64 * frame.1 as i64 / screen.1 as i64,
         (r.2 - r.0) as i64 * frame.0 as i64 / screen.0 as i64, (r.3 - r.1) as i64 * frame.1 as i64 / screen.1 as i64]
@@ -222,8 +275,12 @@ impl AppControl {
         if session != my_session_id() { bail!("앱 요소 조작 대상 세션이 헬퍼와 다릅니다"); }
         uia::com_init();
         let action = input["action"].as_str().unwrap_or("");
-        if !matches!(action, "list_windows" | "switch_window" | "ui_tree" | "press" | "set_value" | "read" | "focus" | "select" | "choose") {
+        if !matches!(action, "launch" | "list_windows" | "switch_window" | "ui_tree" | "press" | "set_value" | "read" | "focus" | "select" | "choose") {
             bail!("지원하지 않는 app_control 동작입니다: {action}");
+        }
+        if action == "launch" {
+            check()?;
+            return launch_app(input["app"].as_str().unwrap_or(""));
         }
         if action == "list_windows" {
             self.windows = crate::platform::win::top_level_hwnds().into_iter().filter_map(|h| {
