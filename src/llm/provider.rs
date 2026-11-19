@@ -154,7 +154,7 @@ impl Provider {
     /// Models to show before the real list is fetched from the API (when the model field opens).
     pub fn default_models(self) -> &'static [&'static str] {
         match self {
-            Provider::ClaudeCli => &["sonnet", "opus", "haiku"],
+            Provider::ClaudeCli => &["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
             Provider::CodexCli => &[],
             Provider::Anthropic => &["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-haiku-5-5"],
             Provider::OpenAi => &["gpt-5.5", "gpt-5.5-mini"],

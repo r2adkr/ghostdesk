@@ -34,8 +34,23 @@ fn command(provider: Provider, explicit: &str) -> Result<Command> {
 pub async fn models(provider: Provider, explicit: &str) -> Result<Vec<String>> {
     verify_login(provider, explicit).await?;
     if provider == Provider::ClaudeCli {
-        // Aliases are resolved by the installed CLI; not an exhaustive account catalog.
-        Ok(vec!["sonnet".into(), "opus".into(), "haiku".into()])
+        // The CLI only has aliases, so ask it which exact model each one means right now. Anything it
+        // can't resolve stays as the alias (the CLI still understands that).
+        let aliases = ["opus", "sonnet", "haiku"];
+        let resolved = futures_util::future::join_all(aliases.iter().map(|a| {
+            let explicit = explicit.to_string();
+            let alias = a.to_string();
+            async move { tokio::task::spawn_blocking(move || claude_alias_model(&explicit, &alias)).await.ok().flatten() }
+        }))
+        .await;
+        let mut out: Vec<String> = Vec::new();
+        for (alias, id) in aliases.iter().zip(resolved) {
+            let name = id.unwrap_or_else(|| alias.to_string());
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        Ok(out)
     } else {
         let models = codex_models(explicit).await?;
         if models.is_empty() {
@@ -43,6 +58,45 @@ pub async fn models(provider: Provider, explicit: &str) -> Result<Vec<String>> {
         }
         Ok(models)
     }
+}
+
+/// The exact model id a Claude CLI alias (opus/sonnet/haiku) points to. The CLI prints it in its first
+/// `init` event, before any model request is made, so the process is stopped right after that line and
+/// nothing is billed.
+fn claude_alias_model(explicit: &str, alias: &str) -> Option<String> {
+    let mut c = command(Provider::ClaudeCli, explicit).ok()?;
+    c.args(["-p", ".", "--model", alias, "--output-format", "stream-json", "--verbose"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = crate::ssh::ProcessGuard(crate::platform::proc::spawn_group(&mut c).ok()?);
+    let stdout = child.0.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match std::io::Read::take(&mut reader, 4 * 1024 * 1024).read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Some(m) = init_model(&line) {
+                        let _ = tx.send(m);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let model = rx.recv_timeout(Duration::from_secs(20)).ok();
+    drop(child); // stops the CLI
+    model
+}
+
+/// The `model` of a stream-json `system`/`init` line.
+fn init_model(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    (v["type"] == "system" && v["subtype"] == "init").then(|| v["model"].as_str().map(str::to_string)).flatten().filter(|m| !m.is_empty())
 }
 
 pub async fn verify_login(provider: Provider, explicit: &str) -> Result<()> {
@@ -414,6 +468,24 @@ impl Drop for Scratch {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn init_line_gives_the_exact_model() {
+        let l = r#"{"type":"system","subtype":"init","model":"claude-opus-5-5","tools":[]}"#;
+        assert_eq!(super::init_model(l).as_deref(), Some("claude-opus-5-5"));
+        assert!(super::init_model(r#"{"type":"assistant","model":"x"}"#).is_none());
+        assert!(super::init_model("not json").is_none());
+    }
+
+    /// Needs an installed, signed-in Claude Code: `GHOSTDESK_CLAUDE_PATH=/path/to/claude cargo test live_claude_aliases -- --ignored`.
+    #[test]
+    #[ignore = "Explicit opt-in: starts the installed Claude CLI three times (stopped before any model call)"]
+    fn live_claude_aliases_resolve_to_exact_models() {
+        for a in ["opus", "sonnet", "haiku"] {
+            let explicit = std::env::var("GHOSTDESK_CLAUDE_PATH").unwrap_or_default();
+            let m = super::claude_alias_model(&explicit, a).expect("alias resolves");
+            assert!(m.starts_with("claude-") && m.contains(a), "{a} -> {m}");
+        }
+    }
     use super::*;
     use serde_json::json;
 

@@ -113,6 +113,36 @@ pub(super) struct Share {
     with_pass: bool,
     pass: String,
     detected: bool,
+    /// Other addresses this computer can be reached at: `(label, address)`. The first is the home-network
+    /// address, which only works from the same network.
+    choices: Vec<(String, String)>,
+}
+
+/// This computer's VPN address (Tailscale), which works from any network. Empty when it isn't installed.
+fn tailscale_ip() -> Option<String> {
+    let exe = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", r"C:\Program Files\Tailscale\tailscale.exe"]
+        .into_iter()
+        .find(|c| std::process::Command::new(c).arg("version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false))?;
+    let out = std::process::Command::new(exe).args(["ip", "-4"]).stderr(std::process::Stdio::null()).output().ok()?;
+    let ip = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    ip.parse::<Ipv4Addr>().ok().map(|_| ip)
+}
+
+/// A public address looked up once from a plain-text echo service, only when the person asks.
+async fn public_ip() -> Result<String, String> {
+    let text = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get("https://api.ipify.org")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let ip = text.trim().to_string();
+    ip.parse::<IpAddr>().map(|_| ip).map_err(|_| "unexpected reply".to_string())
 }
 
 // Both protocols announce themselves before authentication. A different listener on the
@@ -135,8 +165,17 @@ impl Share {
         // Check only this computer's advertised interface, never other machines on the network.
         let ssh = ip.is_some_and(|ip| service_at(SocketAddr::new(ip, 22), b"SSH-"));
         let vnc = ip.is_some_and(|ip| service_at(SocketAddr::new(ip, 5900), b"RFB "));
+        let lan = ip.map(|ip| ip.to_string()).unwrap_or_default();
+        let mut choices = Vec::new();
+        if !lan.is_empty() {
+            choices.push((tr("같은 네트워크").to_string(), lan.clone()));
+        }
+        if let Some(vpn) = tailscale_ip() {
+            choices.push((tr("VPN (Tailscale)").to_string(), vpn));
+        }
         Self {
-            host: ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            choices,
+            host: lan,
             user: std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default(),
             ssh,
             ssh_port: 22,
@@ -198,6 +237,33 @@ impl GhostApp {
                 ui.label(theme::hint(tr("비밀번호는 암호화되지 않은 텍스트로 들어가요. 믿을 수 있는 사람에게만 보내세요.")));
             }
         }
+        // which address to hand out: the home-network one only works from the same network
+        ui.horizontal_wrapped(|ui| {
+            let mut choices = share.choices.clone();
+            if let Some(Ok(ip)) = self.public_ip.as_ref().and_then(|s| s.lock().clone()) {
+                if !choices.iter().any(|(_, a)| *a == ip) {
+                    choices.push((tr("공인 IP").to_string(), ip));
+                }
+            }
+            for (label, addr) in &choices {
+                if ui.selectable_label(share.host == *addr, format!("{label}  {addr}")).clicked() {
+                    share.host = addr.clone();
+                }
+            }
+            if self.public_ip.is_none() && theme::secondary(ui, tr("공인 IP 찾기")).on_hover_text(tr("다른 네트워크에서 접속할 때 필요해요. 공인 주소를 알려 주는 서비스에 한 번 물어봐요.")).clicked() {
+                let slot = std::sync::Arc::new(parking_lot::Mutex::new(None));
+                let (s2, ctx) = (slot.clone(), ui.ctx().clone());
+                self.rt.spawn(async move {
+                    *s2.lock() = Some(public_ip().await);
+                    ctx.request_repaint();
+                });
+                self.public_ip = Some(slot);
+            }
+        });
+        if let Some(Err(_)) = self.public_ip.as_ref().and_then(|s| s.lock().clone()) {
+            ui.label(theme::hint(tr("공인 IP를 찾지 못했어요. 주소를 직접 입력하세요.")));
+        }
+        ui.label(theme::hint(tr("다른 네트워크에서 접속하려면 VPN(Tailscale 등) 주소를 쓰거나, 공인 IP로 공유기에서 포트를 이 컴퓨터로 전달해야 해요.")));
         let encoded = share.card().encode();
         let mut copied = false;
         let mut close = false;
@@ -216,6 +282,7 @@ impl GhostApp {
         drop(state);
         if close || copied {
             self.share_connection = None;
+            self.public_ip = None;
         }
         if copied {
             self.notify(ui.ctx(), tr("연결 정보를 복사했어요"));

@@ -258,6 +258,8 @@ pub struct GhostApp {
     ssh_profiles: ssh_profiles::Profiles,
     ssh_editor: Option<ssh_profiles::Editor>,
     share_connection: Option<Slot<remote_info::Share>>,
+    /// Public address lookup started from the share card.
+    public_ip: Option<Slot<Result<String, String>>>,
     /// Keeps the Mac/PC from sleeping while agents work, even with the screen locked (display off).
     keep_awake: bool,
     /// Tidy up finished screens by themselves (`cleanup`).
@@ -408,6 +410,7 @@ impl GhostApp {
             ssh_profiles: Default::default(),
             ssh_editor: None,
             share_connection: None,
+            public_ip: None,
             keep_awake: true,
             auto_clean: true,
             usage_ui: Default::default(),
