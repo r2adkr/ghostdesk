@@ -168,10 +168,12 @@ impl Setup {
                 *progress.lock() = Some(s.to_string());
                 ctx.request_repaint();
             };
-            let r = match mode {
+            // a panic in the worker must end as an error, not leave the window spinning forever
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
                 Mode::Install => do_install(desktop, &step),
                 Mode::Uninstall => do_uninstall(remove_data, &step),
-            };
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("setup stopped unexpectedly")));
             *result.lock() = Some(r.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
@@ -329,7 +331,7 @@ fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 fn do_install(desktop: bool, step: &dyn Fn(&str)) -> Result<()> {
     step(tr("실행 중인 GhostDesk 를 닫는 중"));
-    install::close_gui_windows(std::time::Duration::from_secs(8));
+    install::stop_running_gui();
     step(tr("파일을 복사하는 중"));
     let exe = install::install_app()?;
     step(tr("바로 가기를 만드는 중"));
@@ -422,7 +424,7 @@ fn relaunch_from_temp() -> Result<bool> {
 fn do_uninstall(remove_data: bool, step: &dyn Fn(&str)) -> Result<()> {
     let dir = install::stable_app();
     step(tr("실행 중인 GhostDesk 를 닫는 중"));
-    install::close_gui_windows(std::time::Duration::from_secs(8));
+    install::stop_running_gui();
     // MCP servers started by AI apps run from the install folder and would keep their files locked
     kill_processes_in(&dir);
     step(tr("AI 앱 연결을 지우는 중"));

@@ -684,7 +684,7 @@ mod imp {
             if b == MouseButton::Right || mods & MOD_CTRL != 0 {
                 bail!(
                     "숨김 모드에서는 오른쪽 클릭(컨텍스트 메뉴)을 할 수 없습니다 — 메뉴가 사용자 화면에 그려지기 때문입니다. \
-                     메뉴 막대 항목은 app_control menu, 요소 동작은 app_control press 를 쓰세요."
+                     메뉴 막대 항목은 app_control menu, 요소 동작은 app_control press 를 쓰세요. 꼭 필요하면 desk_close 후 desk_open mode=app_vdisplay 로 다시 여세요 (실제 마우스·키 입력, 승인 필요)."
                 );
             }
             if b == MouseButton::Middle {
@@ -804,7 +804,7 @@ mod imp {
     }
 
     const DRAG_ERR: &str = "숨김 모드에서는 드래그와 픽셀 단위 마우스 조작을 할 수 없습니다 (숨겨진 창에는 마우스 이벤트가 전달되지 않음). \
-        스크롤은 scroll, 값 변경은 app_control set_value, 선택은 app_control select 를 쓰세요.";
+        스크롤은 scroll, 값 변경은 app_control set_value, 선택은 app_control select 를 쓰세요. 꼭 실제 드래그가 필요하면 desk_close 후 desk_open mode=app_vdisplay 로 다시 여세요 (실제 마우스·키 입력, 승인 필요).";
 
     // ---- launch / attach ----
 
@@ -1599,7 +1599,7 @@ mod imp {
             }
             let r = self.raw_key(combo)?;
             Ok(Some(format!(
-                "{r}. 숨김 상태로 시작한 앱은 단축키를 무시하는 경우가 많습니다 — 효과가 없으면 app_control menu / press 를 쓰세요."
+                "{r}. 숨김 상태로 시작한 앱은 단축키를 무시하는 경우가 많습니다 — 효과가 없으면 app_control menu / press 를 쓰거나, desk_close 후 desk_open mode=app_vdisplay 로 다시 열어 실제 키 입력을 쓰세요."
             )))
         }
 

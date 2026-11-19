@@ -8,6 +8,7 @@
 //! right away.
 
 mod agent;
+mod agent_account;
 mod app;
 mod browser;
 mod browser_dom;

@@ -126,17 +126,17 @@ pub(super) const LOCAL_APP_CARD: bool = caps::ELECTRON || caps::NATIVE_APPS;
 /// One entry in the local app list (Mac apps / Windows apps).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct AppListItem {
-    label: String,
-    path: String,
+    pub(super) label: String,
+    pub(super) path: String,
     /// Index if this is an Electron app that can be launched hidden.
-    electron: Option<usize>,
+    pub(super) electron: Option<usize>,
     /// Why the entry can't be picked, if so (Electron apps that can't be launched hidden).
-    disabled: Option<String>,
+    pub(super) disabled: Option<String>,
 }
 
 /// Where auto mode decided to work.
 #[derive(Debug, Clone, PartialEq)]
-enum AutoPick {
+pub(super) enum AutoPick {
     Web,
     App { label: String, path: String, electron: Option<usize> },
     /// An app that needs a full Windows screen instead of hidden-window control.
@@ -323,6 +323,18 @@ impl GhostApp {
                 // Windows child sessions use the same account, so no account name is needed
                 if cfg!(target_os = "macos") && self.form.session_account.trim().is_empty() {
                     return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요"));
+                }
+                // macOS: the account does not exist yet, so offer to make it instead of failing later
+                #[cfg(target_os = "macos")]
+                {
+                    let name = self.form.session_account.trim();
+                    if !crate::agent_account::valid_name(name) {
+                        return self.notify(ctx, tr("계정 이름은 영문 소문자·숫자·'.'·'_'·'-' 만 쓸 수 있어요"));
+                    }
+                    if !crate::agent_account::exists(name) {
+                        self.account_prompt = Some(account::AccountPrompt::ask(name));
+                        return;
+                    }
                 }
                 DeskTarget::Session { account: self.form.session_account.trim().to_string() }
             }
@@ -616,7 +628,13 @@ impl GhostApp {
         // clicking outside doesn't close it (so typed text isn't lost by accident); Esc, ✕ and Cancel do
         let esc = m.is_top_modal && !m.any_popup_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if start {
-            self.start_from_wizard(ctx);
+            // auto: the AI reads the task and picks where to work (the keyword guess is the fallback)
+            if self.form.choice == Some(Choice::Auto) && self.begin_route(ctx) {
+                self.wizard_open = false;
+                self.notify(ctx, tr("어디서 일할지 정하는 중…"));
+            } else {
+                self.start_from_wizard(ctx);
+            }
         }
         if close || esc {
             self.wizard_open = false;
@@ -640,7 +658,7 @@ impl GhostApp {
     }
 
     /// Auto mode's decision: the app if the task names an app on this computer, otherwise the web.
-    fn auto_pick(&self) -> AutoPick {
+    pub(super) fn auto_pick(&self) -> AutoPick {
         if !LOCAL_APP_CARD {
             return AutoPick::Web;
         }
@@ -839,17 +857,23 @@ impl GhostApp {
         }
     }
 
+    /// Turns a decision of auto mode into the form's choice.
+    pub(super) fn apply_pick(&mut self, pick: AutoPick) {
+        match pick {
+            AutoPick::App { path, electron, .. } => {
+                self.form.choice = Some(Choice::App);
+                self.form.native_app = path;
+                self.form.electron_idx = electron;
+            }
+            AutoPick::ChildSession { .. } => self.form.choice = Some(Choice::Session),
+            AutoPick::Web => self.form.choice = Some(Choice::Web),
+        }
+    }
+
     pub(super) fn start_from_wizard(&mut self, ctx: &egui::Context) {
         if self.form.choice == Some(Choice::Auto) {
-            match self.auto_pick() {
-                AutoPick::App { path, electron, .. } => {
-                    self.form.choice = Some(Choice::App);
-                    self.form.native_app = path;
-                    self.form.electron_idx = electron;
-                }
-                AutoPick::ChildSession { .. } => self.form.choice = Some(Choice::Session),
-                AutoPick::Web => self.form.choice = Some(Choice::Web),
-            }
+            let pick = self.auto_pick();
+            self.apply_pick(pick);
         }
         match self.form.choice {
             Some(Choice::Web) => {
@@ -1022,6 +1046,7 @@ impl GhostApp {
                 ui.add(field(&mut self.form.session_account));
                 ui.end_row();
             });
+            self.account_tools(ui);
         }
         #[cfg(windows)]
         self.child_session_status(ui);
@@ -1029,6 +1054,36 @@ impl GhostApp {
         if ui.link(trf("{}  처음 설정 방법 보기", &[&icon::BOOK_OPEN])).clicked() {
             self.show_session_guide = true;
         }
+    }
+
+    /// Known dedicated accounts to pick from, plus "show password" / "make another account".
+    fn account_tools(&mut self, ui: &mut egui::Ui) {
+        let known = crate::agent_account::known();
+        let current = self.form.session_account.trim().to_string();
+        if !known.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for n in &known {
+                    if ui.selectable_label(*n == current, n).clicked() {
+                        self.form.session_account = n.clone();
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            if crate::agent_account::valid_name(&current) && crate::agent_account::exists(&current) {
+                if theme::secondary(ui, tr("암호 보기")).clicked() {
+                    match account::AccountPrompt::show(&current) {
+                        Some(p) => self.account_prompt = Some(p),
+                        None => {
+                            self.toast = Some((tr("저장된 암호가 없어요").to_string(), ui.input(|i| i.time) + TOAST_SECS))
+                        }
+                    }
+                }
+            } else if crate::agent_account::valid_name(&current) && theme::secondary(ui, tr("이 계정 만들기")).clicked() {
+                self.account_prompt = Some(account::AccountPrompt::ask(&current));
+            }
+        });
+        ui.label(theme::hint(tr("다른 계정을 쓰려면 새 이름을 적고 '이 계정 만들기'를 눌러요")));
     }
 
     /// Advanced settings: name, workspace, max steps, plus details for the chosen kind (in one grid

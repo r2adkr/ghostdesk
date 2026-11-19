@@ -841,6 +841,54 @@ pub(crate) fn close_gui_windows(wait: Duration) -> bool {
     false
 }
 
+/// Closes this user's other GhostDesk windows for an install or uninstall, and never waits longer than a
+/// fixed time: a window that does not answer (or a Win32 call that blocks on a hung one) must not stall the
+/// installer on "closing GhostDesk". After the polite close, windows that are still there are ended.
+#[cfg(windows)]
+pub(crate) fn stop_running_gui() {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let polite = close_gui_windows(Duration::from_secs(4));
+        let _ = tx.send(polite);
+        if !polite {
+            end_gui_processes();
+        }
+    });
+    // 4 s polite wait + the forced end; give up after 12 s whatever happens in the helper thread
+    let _ = rx.recv_timeout(Duration::from_secs(12));
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Ends the other GhostDesk processes that still own a "GhostDesk" window.
+#[cfg(windows)]
+fn end_gui_processes() {
+    use crate::platform::win;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    let me = std::process::id();
+    let pids: std::collections::BTreeSet<u32> = win::top_level_hwnds()
+        .into_iter()
+        .map(win::window_info)
+        .filter(|w| w.pid != me && w.title == "GhostDesk")
+        .filter(|w| {
+            win::process_path(w.pid)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+                .is_some_and(|n| n.starts_with("ghostdesk") && n.ends_with(".exe"))
+        })
+        .map(|w| w.pid)
+        .collect();
+    for pid in pids {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
 /// Whether `me` is an old installed copy moved aside in the install folder (ghostdesk.exe.old-*).
 #[cfg(windows)]
 fn is_displaced_copy(me: &Path, dir: &Path) -> bool {

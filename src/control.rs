@@ -146,6 +146,9 @@ pub enum ControlEvent {
     /// User approval is needed. If the requester gives up (timeout, disconnect), the receiving side
     /// of `reply` is dropped (the GUI clears items whose `reply.is_closed()`).
     Approval { title: String, detail: String, experimental: bool, reply: oneshot::Sender<bool> },
+    /// The dedicated agent account was just created (an agent asked for the session and the person allowed it):
+    /// the window shows its one-time password and the steps left.
+    AccountCreated { name: String, password: String },
 }
 
 /// This OS's word for regular apps in approval dialogs and errors ("macOS 앱" / "Windows 앱").
@@ -654,6 +657,27 @@ impl ControlServer {
                     bail!("account 는 계정 이름(영문 소문자·숫자·'.'·'_'·'-', 64자 이하)이어야 합니다 (받은 값: {account})");
                 }
                 // a Windows child session is the user's own account and reaches real data, so ask a person
+                // macOS: no such account yet. Offer to make it; the person allows it here and gives their administrator
+                // password to macOS itself. The session still needs one login to start, so this call ends with that.
+                #[cfg(target_os = "macos")]
+                if !crate::agent_account::exists(&account) {
+                    self.ask(
+                        conn,
+                        "에이전트 전용 계정 만들기",
+                        format!(
+                            "{client} 이(가) 별도 계정 세션을 쓰려는데 '{account}' 계정이 없습니다.\n허용하면 이 Mac 에 표준(관리자 아님) 사용자 '{account}' 를 만듭니다. \
+                             macOS 가 관리자 암호를 물어보고, GhostDesk 는 그 암호를 보지 못합니다. 새 계정의 암호는 만든 직후 한 번만 보여 드려요."
+                        ),
+                    )
+                    .await?;
+                    let password = crate::agent_account::create(&account).await?;
+                    let _ = self.events.send(ControlEvent::AccountCreated { name: account.clone(), password });
+                    self.ctx.request_repaint();
+                    bail!(
+                        "전용 계정 '{account}' 를 만들었습니다. 사용자가 GhostDesk 창의 안내에 따라 이 계정으로 한 번 로그인해 세션을 준비해야 합니다. \
+                         준비되면 다시 desk_open 하세요. 그 전에 다른 mode(web, app 등)로 할 수 있는 일이면 그것으로 진행하세요."
+                    );
+                }
                 #[cfg(windows)]
                 self.ask(
                     conn,
@@ -1290,11 +1314,7 @@ fn desk_dims(p: &Value) -> (u32, u32) {
 /// Session accounts in external requests must be plain account names (nothing that could be read
 /// as a path or option).
 fn valid_account_name(a: &str) -> bool {
-    !a.is_empty()
-        && a.len() <= 64
-        && !a.starts_with('-')
-        && !a.starts_with('.')
-        && a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    crate::agent_account::valid_name(a)
 }
 
 /// Checks a workspace folder to be opened with an empty profile: it must be empty or created

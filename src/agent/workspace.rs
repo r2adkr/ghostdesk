@@ -196,6 +196,10 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
     #[cfg(target_os = "macos")]
     let _ = local_ok;
     use crate::rfb::{self, RfbDesk, RfbOptions};
+    // `vnc://host:5901` and `host:5901` typed into the address field mean what they say
+    let mut cleaned = t.clone();
+    (cleaned.host, cleaned.port) = rfb::normalize_endpoint(&t.host, t.port);
+    let t = &cleaned;
     shared.set_status(AgentStatus::Preparing("원격 데스크톱 확인 중".into()));
     let g = rfb::probe(&t.host, t.port, rfb::ReplyVersion::Auto, Duration::from_secs(6)).await?;
     let types: Vec<&str> = g.security_types.iter().map(|x| rfb::security_type_name(*x)).collect();

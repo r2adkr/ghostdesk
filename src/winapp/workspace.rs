@@ -1204,7 +1204,7 @@ impl Inner {
                     std::thread::sleep(Duration::from_millis(80));
                     let after = w32::control_text(target).unwrap_or_default();
                     if after == before {
-                        bail!("글자 입력이 반영되지 않았습니다 ({} 에 WM_CHAR·EM_REPLACESEL 모두 실패)", w32::class_name(target));
+                        bail!("글자 입력이 반영되지 않았습니다 ({} 에 WM_CHAR·EM_REPLACESEL 모두 실패). 이 앱은 창 메시지 입력을 받지 않는 것 같습니다 — desk_close 후 desk_open mode=session (같은 PC 의 별도 Windows 세션, 실제 키보드·마우스 입력)으로 다시 여세요", w32::class_name(target));
                     }
                     notes.push("글자 메시지가 반영되지 않아 EM_REPLACESEL 로 넣었습니다".into());
                 }

@@ -18,6 +18,7 @@ use crate::{
     profiles::{self, InstalledBrowser},
 };
 
+mod account;
 mod connect;
 mod detail;
 mod fonts;
@@ -27,6 +28,7 @@ mod labels;
 mod palette;
 mod pip;
 mod prefs;
+mod route;
 #[cfg(windows)]
 pub mod setup;
 mod screens;
@@ -262,6 +264,8 @@ pub struct GhostApp {
     auto_clean: bool,
     usage_ui: usage::UsageUi,
     palette: Option<palette::Palette>,
+    account_prompt: Option<account::AccountPrompt>,
+    routing: Option<route::Routing>,
     usage_saved: Instant,
     sidebar_open: bool,
     /// When each outside agent's screen was first seen closed (for the list grace period).
@@ -399,6 +403,8 @@ impl GhostApp {
             auto_clean: true,
             usage_ui: Default::default(),
             palette: None,
+            account_prompt: None,
+            routing: None,
             usage_saved: Instant::now(),
             sidebar_open: true,
             closed_since: HashMap::new(),
@@ -640,6 +646,10 @@ impl eframe::App for GhostApp {
                     let _ = reply.send(true);
                     self.notify(&ctx, trf("자동 허용됨: {}", &[&title]));
                 }
+                crate::control::ControlEvent::AccountCreated { name, password } => {
+                    self.account_prompt = Some(account::AccountPrompt::created(name, password));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                }
                 crate::control::ControlEvent::Approval { title, detail, reply, .. } => {
                     self.approvals.push((title, detail, Some(reply)));
                     #[cfg(windows)]
@@ -652,6 +662,7 @@ impl eframe::App for GhostApp {
                 }
             }
         }
+        self.poll_route(&ctx);
         self.approval_window(&ctx);
         self.spawn_demos(&ctx);
         self.update_textures(&ctx);
@@ -826,6 +837,7 @@ impl GhostApp {
             self.settings_window(&ctx);
             self.connect_window(&ctx);
             self.palette_window(&ctx);
+            self.account_window(&ctx);
             self.new_agent_window(&ctx);
             self.tour_window(&ctx);
             // separate session guide (macOS: LaunchAgent; Windows: enabling child sessions)
@@ -1032,3 +1044,4 @@ mod icon_tests {
         }
     }
 }
+

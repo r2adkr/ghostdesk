@@ -67,7 +67,12 @@ impl GhostApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                next |= theme::primary(ui, tr("다음")).on_hover_text("Enter").clicked();
+                                if self.routing_active() {
+                                    theme::spinner(ui, 14.0, theme::muted());
+                                    ui.label(theme::hint(tr("어디서 일할지 정하는 중…")));
+                                } else {
+                                    next |= theme::primary(ui, tr("시작하기")).on_hover_text("Enter").clicked();
+                                }
                                 // quiet hint while typing; fades with focus so it doesn't crowd the idle card
                                 if focus > 0.01 {
                                     ui.add_space(4.0);
@@ -77,7 +82,13 @@ impl GhostApp {
                             });
                         });
                     });
-                    if next { self.open_wizard(); }
+                    if next && !self.routing_active() {
+                        // the AI picks where to work from the request; the dialog only opens when that isn't possible
+                        self.open_wizard();
+                        if self.begin_route(ui.ctx()) {
+                            self.wizard_open = false;
+                        }
+                    }
                     ui.add_space(24.0);
                     theme::section(ui, tr("작업 장소로 시작"));
                     ui.add_space(6.0);

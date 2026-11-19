@@ -304,6 +304,74 @@ pub struct RfbDesk {
     last_request: Mutex<Instant>,
 }
 
+/// Cleans up what people type as a VNC address: `vnc://host:5901/`, `host:5901`, `[fe80::1]:5900`, spaces.
+/// A port written in the address wins over the separate port field.
+pub fn normalize_endpoint(host: &str, port: u16) -> (String, u16) {
+    let mut h = host.trim();
+    for scheme in ["vnc://", "rfb://", "tcp://", "http://", "https://"] {
+        if h.len() >= scheme.len() && h[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            h = &h[scheme.len()..];
+        }
+    }
+    let h = h.split(['/', '?', '#']).next().unwrap_or(h).trim();
+    let h = h.rsplit_once('@').map_or(h, |(_, rest)| rest); // user@host
+    if let Some(rest) = h.strip_prefix('[') {
+        // [v6]:port
+        if let Some((addr, tail)) = rest.split_once(']') {
+            let p = tail.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(port);
+            return (addr.to_string(), p);
+        }
+    }
+    // exactly one ':' means host:port (more means a bare IPv6 address)
+    if h.matches(':').count() == 1 {
+        if let Some((a, p)) = h.split_once(':') {
+            if let Ok(p) = p.parse::<u16>() {
+                return (a.to_string(), p);
+            }
+            return (a.to_string(), port);
+        }
+    }
+    (h.to_string(), port)
+}
+
+/// Opens the TCP connection: every address the name resolves to is tried in turn (IPv4 first, since many VNC
+/// servers listen on IPv4 only), each with its own time limit, and a failure says what likely went wrong.
+pub async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    let (host, port) = normalize_endpoint(host, port);
+    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow!("'{host}' 주소를 찾지 못했어요 ({e}). 이름이나 IP 를 확인하세요"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("'{host}' 주소를 찾지 못했어요");
+    }
+    addrs.sort_by_key(|a| a.is_ipv6());
+    let mut last = String::new();
+    let mut hint = "";
+    for a in addrs {
+        match tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(a)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => {
+                hint = match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => {
+                        "상대 컴퓨터는 응답했지만 그 포트에서 VNC 서버가 듣고 있지 않아요. VNC(화면 공유) 서버가 켜져 있는지, 포트(보통 5900)가 맞는지 확인하세요"
+                    }
+                    _ if cfg!(target_os = "macos") && e.raw_os_error() == Some(65) => {
+                        "macOS 의 '로컬 네트워크' 권한이 막혀 있을 수 있어요. 시스템 설정 > 개인정보 보호 및 보안 > 로컬 네트워크에서 GhostDesk 를 허용하세요"
+                    }
+                    _ => "상대 컴퓨터가 켜져 있고 같은 네트워크(또는 VPN)에 있는지, 방화벽이 포트를 막지 않는지 확인하세요",
+                };
+                last = format!("{a}: {e}");
+            }
+            Err(_) => {
+                hint = "응답이 없어요. 주소가 맞는지, 상대 컴퓨터가 켜져 있는지, 방화벽이 막고 있지 않은지 확인하세요";
+                last = format!("{a}: 시간 초과");
+            }
+        }
+    }
+    bail!("{host}:{port} TCP 접속 실패 ({last}). {hint}")
+}
+
 /// Connects with default options.
 pub async fn connect(
     host: &str,
@@ -322,7 +390,7 @@ pub async fn connect(
 /// attempt, no input sent).
 pub async fn probe(host: &str, port: u16, reply: ReplyVersion, timeout: Duration) -> Result<Greeting> {
     let fut = async {
-        let mut s = TcpStream::connect((host, port)).await.context("TCP 접속 실패")?;
+        let mut s = connect_tcp(host, port).await?;
         let peer = s.peer_addr().ok();
         let (server_version, minor, reply_str) = read_version(&mut s, reply).await?;
         s.write_all(reply_str.as_bytes()).await?;
@@ -362,8 +430,10 @@ pub async fn probe(host: &str, port: u16, reply: ReplyVersion, timeout: Duration
 /// Connecting to this computer's own VNC server would let the agent drive the user's real screen,
 /// so callers block it.
 pub async fn is_local_host(host: &str, port: u16) -> bool {
-    let Ok(addrs) = tokio::net::lookup_host((host, port)).await else { return false };
-    addrs.into_iter().any(is_local_addr)
+    let (host, port) = normalize_endpoint(host, port);
+    let Ok(addrs) = tokio::net::lookup_host((host.as_str(), port)).await else { return false };
+    let local = addrs.into_iter().any(is_local_addr);
+    local
 }
 
 /// With `refuse_local`, refuses with that reason when the connected socket's peer is this
@@ -408,7 +478,9 @@ pub fn is_local_addr(addr: std::net::SocketAddr) -> bool {
 }
 
 impl RfbDesk {
-    pub async fn connect_with(opts: RfbOptions, on_frame: FrameCallback) -> Result<Arc<RfbDesk>> {
+    pub async fn connect_with(mut opts: RfbOptions, on_frame: FrameCallback) -> Result<Arc<RfbDesk>> {
+        let (h, p) = normalize_endpoint(&opts.host, opts.port);
+        (opts.host, opts.port) = (h, p);
         let timeout = opts.connect_timeout;
         let desk = tokio::time::timeout(timeout, Self::connect_inner(opts, on_frame))
             .await
@@ -421,9 +493,7 @@ impl RfbDesk {
     }
 
     async fn connect_inner(opts: RfbOptions, on_frame: FrameCallback) -> Result<Arc<RfbDesk>> {
-        let mut s = TcpStream::connect((opts.host.as_str(), opts.port))
-            .await
-            .with_context(|| format!("{}:{} TCP 접속 실패", opts.host, opts.port))?;
+        let mut s = connect_tcp(&opts.host, opts.port).await?;
         check_peer(&s, opts.refuse_local.as_deref())?;
         let _ = s.set_nodelay(true);
 
@@ -2307,5 +2377,21 @@ mod tests {
         assert_eq!(parse_version(b"RFB 003.889\n").unwrap(), (3, 889));
         assert_eq!(parse_version(b"RFB 003.008\n").unwrap(), (3, 8));
         assert!(parse_version(b"HTTP/1.1 200").is_err());
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::normalize_endpoint as n;
+
+    #[test]
+    fn typed_addresses_are_cleaned_up() {
+        assert_eq!(n(" 192.168.0.20 ", 5900), ("192.168.0.20".into(), 5900));
+        assert_eq!(n("192.168.0.20:5901", 5900), ("192.168.0.20".into(), 5901));
+        assert_eq!(n("vnc://vm.local:5902/", 5900), ("vm.local".into(), 5902));
+        assert_eq!(n("[fe80::1]:5905", 5900), ("fe80::1".into(), 5905));
+        assert_eq!(n("fe80::1", 5900), ("fe80::1".into(), 5900));
+        assert_eq!(n("me@host", 5900), ("host".into(), 5900));
+        assert_eq!(n("host:", 5900), ("host".into(), 5900));
     }
 }
