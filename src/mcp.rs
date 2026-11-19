@@ -1873,7 +1873,9 @@ mod tests {
         };
         let (tools, ins) = (estimate(&tools().to_string()), estimate(&server_instructions()));
         eprintln!("tool definitions ~{tools} tokens, instructions ~{ins}");
-        assert!(tools < 3_300, "tool definitions grew to ~{tools} tokens");
+        // Windows describes more (child sessions, Win32 app names, the dedicated-machine warning)
+        let cap = if cfg!(windows) { 3_700 } else { 3_300 };
+        assert!(tools < cap, "tool definitions grew to ~{tools} tokens");
         assert!(ins < 700, "instructions grew to ~{ins} tokens");
     }
 }
