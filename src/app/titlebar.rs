@@ -42,8 +42,10 @@ pub struct Columns {
     pub right: f32,
 }
 
-/// Draws the title bar. Call inside `Panel::top`.
-pub fn bar(ui: &mut egui::Ui, cols: Columns) {
+/// Draws the title bar. Call inside `Panel::top`. Returns true when the sidebar button was clicked
+/// (`sidebar_open` only picks its tooltip).
+pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool) -> bool {
+    let mut toggled = false;
     let ctx = ui.ctx().clone();
     let rect = ui.max_rect();
     let p = ui.painter().clone();
@@ -76,7 +78,9 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
     let x0 = rect.left() + if mac { MAC_TRAFFIC_W - 10.0 } else { 0.0 };
     let (icon_size, text_size) = if mac { (15.0, 13.0) } else { (17.0, 14.0) };
     p.text(pos2(x0 + 28.0, cy), egui::Align2::CENTER_CENTER, crate::icon::GHOST, FontId::proportional(icon_size), fg);
-    p.text(pos2(x0 + 46.0, cy), egui::Align2::LEFT_CENTER, "GhostDesk", FontId::proportional(text_size), fg);
+    let name = p.layout_no_wrap("GhostDesk".into(), FontId::proportional(text_size), fg);
+    let name_right = x0 + 46.0 + name.size().x;
+    p.galley(pos2(x0 + 46.0, cy - name.size().y / 2.0), name, fg);
 
     // empty space: drag to move, double-click to maximize/restore. Created before the buttons so
     // the buttons win clicks on top.
@@ -93,9 +97,28 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
+    // sidebar button right after the name: the same spot whether the sidebar is shown or hidden
+    {
+        let held = ctx.input(|i| i.modifiers.command);
+        let r = Rect::from_center_size(pos2(name_right + 28.0, cy), vec2(36.0, 24.0));
+        let resp = ui.interact(r, ui.scope_id().with("titlebar_sidebar"), Sense::click());
+        if resp.hovered() || resp.has_focus() {
+            p.rect_filled(r, theme::RADIUS, theme::overlay_hover());
+        }
+        let color = if resp.hovered() { theme::text() } else { theme::body() };
+        if held {
+            p.text(r.center(), egui::Align2::CENTER_CENTER, super::palette::cmd_key("B"), FontId::monospace(12.0), theme::muted());
+        } else {
+            p.text(r.center(), egui::Align2::CENTER_CENTER, crate::icon::PANEL_LEFT, FontId::proportional(17.0), color);
+        }
+        let tip = format!("{} ({})", if sidebar_open { tr("사이드바 접기") } else { tr("사이드바 열기") }, super::palette::cmd_key("B"));
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip.clone()));
+        toggled = resp.on_hover_text(tip).clicked();
+    }
+
     // macOS draws the window buttons natively
     if mac {
-        return;
+        return toggled;
     }
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
     let mut x = rect.right() - BUTTON_W;
@@ -111,6 +134,7 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns) {
         }
         x -= BUTTON_W;
     }
+    toggled
 }
 
 /// Title bar of a small fixed-size window (the installer): app name, drag to move, minimize and

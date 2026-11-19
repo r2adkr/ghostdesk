@@ -200,7 +200,7 @@ pub(crate) async fn exec_computer(
     let mods = mods_from(&input["text"]);
     if let (Some(p), true) = (
         pos,
-        matches!(name, "left_click" | "right_click" | "middle_click" | "double_click" | "triple_click" | "mouse_move" | "scroll"),
+        matches!(name, "left_click" | "right_click" | "middle_click" | "double_click" | "triple_click" | "mouse_move" | "scroll" | "fill_at"),
     ) {
         glide(ws, p, aim).await?;
     }
@@ -268,6 +268,44 @@ pub(crate) async fn exec_computer(
             tokio::time::sleep(Duration::from_secs_f64(d)).await;
             ok("")
         }
+        // wait until the picture changes (a page or app finishing what it was doing), instead of guessing a delay
+        "wait_change" => {
+            let limit = Duration::from_secs_f64(input["duration"].as_f64().unwrap_or(5.0).clamp(0.5, 60.0));
+            let started = std::time::Instant::now();
+            let digest = |b: &[u8]| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                b.hash(&mut h);
+                h.finish()
+            };
+            let before = digest(&ws.screenshot().await?);
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if digest(&ws.screenshot().await?) != before {
+                    // let an animation settle before the agent looks
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    return ok(format!("화면이 바뀌었어요 ({:.1}초)", started.elapsed().as_secs_f64()));
+                }
+                if started.elapsed() >= limit {
+                    return ok(format!("{:.0}초 동안 화면이 바뀌지 않았어요", limit.as_secs_f64()));
+                }
+            }
+        }
+        // click a field, replace its content, type, optionally press Enter (three clicks select the line)
+        "fill_at" => {
+            let text = input["text"].as_str().ok_or_else(|| anyhow!("text 누락"))?;
+            ws.click(pos, MouseButton::Left, 3, 0).await?;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if text.is_empty() {
+                ws.key("Delete", 1).await?;
+            } else {
+                ws.type_text(text).await?;
+            }
+            if input["submit"].as_bool().unwrap_or(false) {
+                ws.key("Return", 1).await?;
+            }
+            ok("")
+        }
         other => Err(anyhow!("지원하지 않는 동작: {other}")),
     }
 }
@@ -315,21 +353,79 @@ async fn exec_custom(
 
 /// Per-screen helper tools (`browser_control`, `app_control`, `app_menu`). Shared with
 /// external (MCP) agents.
+/// `find` and name-based targets for app elements: both read the element list (`ui_tree`) and pick
+/// the line, so an agent can say `press label="저장"` instead of reading the whole tree for an id.
+async fn app_with_names(desk: &Desk, input: &Value) -> Result<Outcome> {
+    let action = input["action"].as_str().unwrap_or_default();
+    let plain = |s: &str| -> String {
+        // drop the pixel rectangle: it is the costliest part of a line and the agent has ids
+        match s.rfind(" [") {
+            Some(i) if s[i..].ends_with(']') && s[i..].matches(',').count() == 3 => s[..i].to_string(),
+            _ => s.to_string(),
+        }
+    };
+    let lines_matching = |tree: &str, q: &str| -> Vec<(usize, String)> {
+        let q = q.to_lowercase();
+        tree.lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                let id: usize = t.split_whitespace().next()?.parse().ok()?;
+                t.to_lowercase().contains(&q).then(|| (id, plain(t)))
+            })
+            .collect()
+    };
+    let tree_of = |depth: u64| async move {
+        let mut i = json!({ "action": "ui_tree" });
+        i["max_depth"] = json!(depth);
+        app_dispatch(desk, &i).await
+    };
+    if action == "find" {
+        let q = input["query"].as_str().filter(|q| !q.trim().is_empty()).ok_or_else(|| anyhow!("query 가 필요합니다"))?;
+        let hits = lines_matching(&tree_of(30).await?.text, q);
+        return ok(if hits.is_empty() {
+            format!("'{q}' 가 들어간 요소를 못 찾았어요 (창을 바꿨다면 switch_window 뒤에 다시)")
+        } else {
+            hits.iter().take(15).map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+        });
+    }
+    let mut input = input.clone();
+    if input["action"] == "click" {
+        input["action"] = json!("press");
+    }
+    if let (Some(label), true) = (input["label"].as_str().map(String::from), input.get("id").is_none_or(Value::is_null)) {
+        let hits = lines_matching(&tree_of(30).await?.text, &label);
+        // exact quoted name first, then the first that contains it
+        let quoted = format!("\"{}\"", label.to_lowercase());
+        let pick = hits.iter().find(|(_, l)| l.to_lowercase().contains(&quoted)).or(hits.first());
+        let (id, _) = pick.ok_or_else(|| anyhow!("'{label}' 라는 이름의 요소를 못 찾았어요 (find 로 찾아 보세요)"))?;
+        input["id"] = json!(id);
+        if hits.len() > 1 {
+            let mut out = app_dispatch(desk, &input).await?;
+            out.text.push_str(&format!(" (같은 이름이 {}개 있어 {}번을 골랐어요)", hits.len(), id));
+            return Ok(out);
+        }
+    }
+    app_dispatch(desk, &input).await
+}
+
+/// The app tool of whatever kind of screen this is.
+async fn app_dispatch(desk: &Desk, input: &Value) -> Result<Outcome> {
+    if cfg!(windows) {
+        if let Some(session) = desk.as_session() { return ok(session.app_control(input).await?); }
+    }
+    if let Some(v) = desk.as_vdisplay() {
+        return ok(v.app_control(input).await?);
+    }
+    let apps = if cfg!(target_os = "macos") { "macOS 앱" } else { crate::platform::text::LOCAL_APPS };
+    let ws = desk
+        .as_native()
+        .ok_or_else(|| anyhow!("app_control 은 {apps} 작업공간에서만 쓸 수 있습니다"))?;
+    ok(ws.app_control(input).await?)
+}
+
 pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Result<Outcome> {
     match name {
-        "app_control" => {
-            if cfg!(windows) {
-                if let Some(session) = desk.as_session() { return ok(session.app_control(input).await?); }
-            }
-            if let Some(v) = desk.as_vdisplay() {
-                return ok(v.app_control(input).await?);
-            }
-            let apps = if cfg!(target_os = "macos") { "macOS 앱" } else { crate::platform::text::LOCAL_APPS };
-            let ws = desk
-                .as_native()
-                .ok_or_else(|| anyhow!("app_control 은 {apps} 작업공간에서만 쓸 수 있습니다"))?;
-            ok(ws.app_control(input).await?)
-        }
+        "app_control" => app_with_names(desk, input).await,
         "app_menu" => {
             let ws = desk
                 .as_electron()
@@ -369,9 +465,15 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
             }
         }
         "browser_control" => {
-            let ws = desk
-                .as_browser()
-                .ok_or_else(|| anyhow!("browser_control 은 브라우저 작업공간에서만 쓸 수 있습니다"))?;
+            let action = input["action"].as_str().unwrap_or_default();
+            // an Electron app's window is a page too: elements can be read and driven, but it must not be navigated
+            // away or given tabs
+            let ws = match (desk.as_browser(), desk.as_electron()) {
+                (Some(b), _) => b,
+                (None, Some(e)) if matches!(action, "read" | "text" | "find" | "links" | "click" | "double_click" | "fill" | "select" | "scroll_to" | "wait_for") => e.page(),
+                (None, Some(_)) => return Err(anyhow!("Electron 앱에서는 read/text/find/links/click/fill/select/scroll_to/wait_for 만 쓸 수 있습니다 (메뉴는 desk_app)")),
+                _ => return Err(anyhow!("browser_control 은 브라우저·Electron 작업공간에서만 쓸 수 있습니다")),
+            };
             let url = input["url"].as_str().unwrap_or_default();
             let idx = input["index"].as_u64().unwrap_or(0) as usize;
             match input["action"].as_str().unwrap_or_default() {
@@ -383,6 +485,38 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                 "switch_tab" => ws.switch_tab(idx).await?,
                 "close_tab" => ws.close_tab(idx).await?,
                 "list_tabs" => return ok(ws.tabs_text()),
+                // reading and acting by page elements (a few lines of text instead of a screenshot)
+                "read" => {
+                    let all = input["scope"].as_str() == Some("page");
+                    let max = input["max_items"].as_u64().unwrap_or(if all { 120 } else { 60 }).clamp(5, 300) as usize;
+                    return ok(ws.dom_read(all, max).await?);
+                }
+                "text" => {
+                    let max = input["max_chars"].as_u64().unwrap_or(4000).clamp(200, 40_000) as usize;
+                    return ok(ws.dom_text(input["selector"].as_str(), max).await?);
+                }
+                "find" => {
+                    let q = input["query"].as_str().filter(|q| !q.trim().is_empty()).ok_or_else(|| anyhow!("query 가 필요합니다"))?;
+                    return ok(ws.dom_find(q).await?);
+                }
+                "links" => return ok(ws.dom_links(input["max_items"].as_u64().unwrap_or(40).clamp(5, 200) as usize).await?),
+                "click" | "double_click" => {
+                    let (r, l) = (&input["ref"], input["label"].as_str());
+                    return ok(ws.dom_click(r, l, input["action"] == "double_click").await?);
+                }
+                "fill" => {
+                    let value = input["value"].as_str().ok_or_else(|| anyhow!("value 가 필요합니다"))?;
+                    return ok(ws.dom_fill(&input["ref"], input["label"].as_str(), value, input["submit"].as_bool().unwrap_or(false)).await?);
+                }
+                "select" => {
+                    let option = input["option"].as_str().ok_or_else(|| anyhow!("option 이 필요합니다"))?;
+                    return ok(ws.dom_select(&input["ref"], input["label"].as_str(), option).await?);
+                }
+                "scroll_to" => return ok(ws.dom_scroll_to(&input["ref"], input["label"].as_str()).await?),
+                "wait_for" => {
+                    let t = input["text"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("text 가 필요합니다"))?;
+                    return ok(ws.dom_wait_for(t, input["gone"].as_bool().unwrap_or(false), input["timeout"].as_f64().unwrap_or(10.0)).await?);
+                }
                 "dialog" => return ok(ws.dialog().unwrap_or(Value::Null).to_string()),
                 "respond_dialog" => {
                     let accept = input["accept"].as_bool().ok_or_else(|| anyhow!("accept (true/false)를 명시해야 합니다"))?;

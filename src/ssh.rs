@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SshOptions {
     pub host: String,
@@ -26,25 +26,71 @@ impl Default for SshOptions {
     }
 }
 
+#[derive(Debug)]
+pub enum InvalidSshOption {
+    Host,
+    Port,
+    Username,
+    KeyPath,
+}
+
+impl std::fmt::Display for InvalidSshOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Host => "Enter a hostname, IP address or OpenSSH alias without a port",
+            Self::Port => "SSH port must be between 1 and 65535",
+            Self::Username => "Invalid SSH username",
+            Self::KeyPath => "Invalid SSH identity file path",
+        })
+    }
+}
+
+impl std::error::Error for InvalidSshOption {}
+
 impl SshOptions {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), InvalidSshOption> {
+        let host = self.plain_host();
+        let is_ipv6 = host.contains(':');
+        if is_ipv6 {
+            let (address, scope) = host.split_once('%').map_or((host, None), |(ip, scope)| (ip, Some(scope)));
+            if address.parse::<std::net::Ipv6Addr>().is_err()
+                || scope.is_some_and(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
+            {
+                return Err(InvalidSshOption::Host);
+            }
+        }
         if self.host.is_empty()
+            || (!is_ipv6 && self.host.contains(['[', ']']))
             || self.host.starts_with('-')
             || self.host.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '/' | '\\' | '"' | '\''))
         {
-            bail!("SSH host must be a hostname, IP address or OpenSSH host alias");
+            return Err(InvalidSshOption::Host);
         }
         if self.port == 0 {
-            bail!("SSH port must be between 1 and 65535");
+            return Err(InvalidSshOption::Port);
         }
         if self.username.starts_with('-') || self.username.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '"' | '\'' | '='))
         {
-            bail!("Invalid SSH username");
+            return Err(InvalidSshOption::Username);
         }
         if self.identity_file.chars().any(|c| c.is_control()) {
-            bail!("Invalid SSH identity file path");
+            return Err(InvalidSshOption::KeyPath);
         }
         Ok(())
+    }
+
+    fn plain_host(&self) -> &str {
+        self.host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(&self.host)
+    }
+
+    fn destination(&self, brackets: bool) -> String {
+        let host = self.plain_host();
+        if brackets && host.contains(':') { format!("[{host}]") } else { host.to_owned() }
+    }
+
+    pub fn endpoint(&self) -> String {
+        let host = self.destination(true);
+        if self.username.is_empty() { format!("{host}:{}", self.port) } else { format!("{}@{host}:{}", self.username, self.port) }
     }
 
     fn command(&self, sftp: bool) -> Result<Command> {
@@ -64,7 +110,7 @@ impl SshOptions {
         } else {
             c.arg("-T");
         }
-        c.arg("--").arg(if sftp && self.host.contains(':') && !self.host.starts_with('[') { format!("[{}]", self.host) } else { self.host.clone() });
+        c.arg("--").arg(self.destination(sftp));
         Ok(c)
     }
 }
@@ -319,6 +365,22 @@ mod tests {
         assert!(SshOptions { host: "build-server".into(), port: 0, ..Default::default() }.validate().is_err());
         assert!(SshOptions { host: "build-server".into(), username: "-root".into(), ..Default::default() }.validate().is_err());
         assert!(SshOptions { host: "2001:db8::1".into(), username: "worker".into(), ..Default::default() }.validate().is_ok());
+    }
+
+    #[test]
+    fn ssh_and_sftp_use_the_same_ipv6_host_and_reject_ambiguous_addresses() {
+        for host in ["dev:2222", "[::1]:2222", "[::1", "[dev]", "::zzz", "fe80::1%"] {
+            let options = SshOptions { host: host.into(), ..Default::default() };
+            assert!(options.validate().is_err(), "{host}");
+        }
+        for host in ["::1", "[::1]", "fe80::1%en0", "[fe80::1%en0]"] {
+            let options = SshOptions { host: host.into(), ..Default::default() };
+            let plain = host.trim_matches(['[', ']']);
+            for (sftp, expected) in [(false, plain.to_owned()), (true, format!("[{plain}]"))] {
+                let cmd = options.command(sftp).unwrap();
+                assert_eq!(cmd.get_args().last().unwrap().to_str(), Some(expected.as_str()));
+            }
+        }
     }
 
     #[test]

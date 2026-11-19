@@ -4,6 +4,23 @@ use super::*;
 use super::labels::profile_short;
 
 impl NewAgentForm {
+    pub(super) fn clear_vnc_authorization(&mut self) {
+        self.remote_pass.clear();
+        self.remote_dedicated = false;
+    }
+
+    pub(super) fn ssh_options(&self) -> Option<crate::ssh::SshOptions> {
+        if self.remote_mode == RemoteMode::Vnc {
+            return None;
+        }
+        let mut options = self.ssh.clone();
+        if self.remote_mode == RemoteMode::Both && options.host.trim().is_empty() {
+            options.host = self.remote_host.clone();
+        }
+        ssh_profiles::trim_options(&mut options);
+        Some(options)
+    }
+
     /// Defaults for a freshly opened new-agent window. `profile_idx` is the default browser profile
     /// to copy logins from.
     pub(super) fn new(profile_idx: Option<usize>) -> Self {
@@ -31,12 +48,12 @@ impl NewAgentForm {
             remote_user: String::new(),
             remote_pass: String::new(),
             remote_dedicated: false,
-            remote_ssh: false,
-            remote_ssh_only: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_identity: String::new(),
+            remote_mode: RemoteMode::Vnc,
+            card_input: String::new(),
+            card_invalid: false,
+            remote_entry: RemoteEntry::Paste,
+            ssh_profile: None,
+            ssh: Default::default(),
             name: tr("에이전트 1").into(),
             workspace: "ws-1".into(),
             refresh: false,
@@ -310,22 +327,27 @@ impl GhostApp {
                 DeskTarget::Session { account: self.form.session_account.trim().to_string() }
             }
             FormKind::Remote => {
-                if self.form.remote_host.trim().is_empty() && (!self.form.remote_ssh_only || self.form.ssh_host.trim().is_empty()) {
+                if self.form.remote_mode != RemoteMode::Ssh && self.form.remote_host.trim().is_empty() {
                     return self.notify(ctx, tr("원격 데스크톱 주소를 입력하세요"));
                 }
-                let ssh = (self.form.remote_ssh || self.form.remote_ssh_only).then(|| crate::ssh::SshOptions {
-                    host: if self.form.ssh_host.trim().is_empty() { self.form.remote_host.trim() } else { self.form.ssh_host.trim() }.to_string(),
-                    port: self.form.ssh_port, username: self.form.ssh_user.trim().to_string(), identity_file: self.form.ssh_identity.trim().to_string(),
-                });
-                if let Some(options) = &ssh { if let Err(e) = options.validate() { return self.notify(ctx, format!("{e:#}")); } }
-                if self.form.remote_ssh_only { DeskTarget::Ssh(ssh.expect("SSH-only always configures SSH")) } else { DeskTarget::Remote(RemoteTarget {
-                    host: self.form.remote_host.trim().to_string(),
-                    port: self.form.remote_port,
-                    username: Some(self.form.remote_user.trim().to_string()),
-                    password: Some(self.form.remote_pass.clone()),
-                    dedicated_ack: self.form.remote_dedicated,
-                    ssh,
-                }) }
+                let ssh = self.form.ssh_options();
+                if let Some(options) = &ssh {
+                    if let Err(error) = options.validate() {
+                        return self.notify(ctx, ssh_profiles::validation_message(error));
+                    }
+                }
+                if self.form.remote_mode == RemoteMode::Ssh {
+                    DeskTarget::Ssh(ssh.expect("SSH-only always configures SSH"))
+                } else {
+                    DeskTarget::Remote(RemoteTarget {
+                        host: self.form.remote_host.trim().to_string(),
+                        port: self.form.remote_port,
+                        username: Some(self.form.remote_user.trim().to_string()),
+                        password: Some(self.form.remote_pass.clone()),
+                        dedicated_ack: self.form.remote_dedicated,
+                        ssh,
+                    })
+                }
             }
         };
         let team = self.form.team_id.map(|id| agent::TeamAssignment {
@@ -363,6 +385,10 @@ impl GhostApp {
 
     pub(super) fn open_wizard(&mut self) {
         self.wizard_open = true;
+        self.form.clear_vnc_authorization();
+        self.form.card_input.clear();
+        self.form.card_invalid = false;
+        self.form.remote_entry = RemoteEntry::Paste;
         self.form.team_id = None;
         self.form.team_role.clear();
         // auto comes preselected: just write the task and start (the window height is the same from the
@@ -490,19 +516,41 @@ impl GhostApp {
             close |= theme::modal_header(ui, tr("새 에이전트"));
             theme::modal_scroll(ui, max_h, |ui| {
                 ui.set_width(W);
+                theme::section(ui, tr("할 일"));
+                ui.add_space(4.0);
+                let task_hint = if self.form.choice == Some(Choice::Remote) && self.form.remote_mode == RemoteMode::Ssh {
+                    tr("예) 서버에서 테스트를 실행하고 결과 파일을 받아줘")
+                } else {
+                    tr("예) 네이버에서 오늘 날씨를 찾아 요약해줘  (비워 두면 나중에 지시)")
+                };
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.form.task)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(10, 8))
+                        .hint_text(task_hint),
+                );
+                ui.add_space(16.0);
                 theme::section(ui, tr("어디서 일할까요"));
                 ui.add_space(4.0);
                 let gap = 8.0;
-                let n = kinds.len() as f32;
-                let tw = ((W - gap * (n - 1.0)) / n).floor();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    for k in &kinds {
-                        if theme::tile(ui, self.form.choice == Some(k.choice), k.icon, k.title, Vec2::new(tw, 52.0)).clicked() {
-                            self.form.choice = Some(k.choice);
+                let widest = kinds.iter().map(|k| ui.painter().layout_no_wrap(
+                    k.title.to_owned(), egui::FontId::proportional(14.0), theme::text(),
+                ).size().x).fold(0.0f32, f32::max);
+                let fit = (((W + gap) / (widest + 36.0 + gap)).floor() as usize).clamp(1, kinds.len());
+                // spread over the rows it needs (3 + 2, not 4 + 1)
+                let cols = kinds.len().div_ceil(kinds.len().div_ceil(fit));
+                let tw = ((W - gap * (cols - 1) as f32) / cols as f32).floor();
+                for row in kinds.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for k in row {
+                            if theme::tile(ui, self.form.choice == Some(k.choice), k.icon, k.title, Vec2::new(tw, 42.0)).clicked() {
+                                self.form.choice = Some(k.choice);
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 ui.add_space(6.0);
                 // a single line describing the chosen place (not one per card)
                 let Some(choice) = self.form.choice else {
@@ -522,15 +570,6 @@ impl GhostApp {
                 }
                 ui.add_space(18.0);
                 self.team_picker(ui);
-                theme::section(ui, tr("할 일"));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.form.task)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .margin(Margin::symmetric(10, 8))
-                        .hint_text(tr("예) 네이버에서 오늘 날씨를 찾아 요약해줘  (비워 두면 나중에 지시)")),
-                );
                 ui.add_space(10.0);
                 egui::CollapsingHeader::new(tr("고급 설정")).default_open(false).show(ui, |ui| self.advanced(ui, choice));
                 if self.wizard_key_field {
@@ -565,7 +604,7 @@ impl GhostApp {
             });
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ready = self.form.choice.is_some();
+                let ready = self.form.choice.is_some() && (self.form.choice != Some(Choice::Remote) || self.form.remote_entry != RemoteEntry::Paste);
                 if ui.add_enabled_ui(ready, |ui| theme::primary(ui, tr("에이전트 시작"))).inner.clicked() {
                     start = true;
                 }
@@ -880,42 +919,29 @@ impl GhostApp {
 
     /// Remote computer: address (:port), user, password, plus the dedicated-machine confirmation.
     pub(super) fn form_remote(&mut self, ui: &mut egui::Ui) {
-        ui.add(theme::switch(&mut self.form.remote_ssh_only, tr("SSH만 사용 (화면 없음)")));
-        egui::Grid::new("form_remote").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label(tr("주소"));
+        if self.form.remote_entry != RemoteEntry::Imported {
             ui.horizontal(|ui| {
-                // the port rarely changes, so it's small, next to the address field
-                let w = (ui.available_width() - 76.0).max(160.0);
-                ui.add(field(&mut self.form.remote_host).hint_text(tr("예) 192.168.0.20 또는 vm.local")).desired_width(w));
-                if !self.form.remote_ssh_only {
-                    ui.label(":");
-                    ui.add(egui::DragValue::new(&mut self.form.remote_port).range(1..=65535)).on_hover_text(tr("포트 (보통 5900)"));
+                if theme::tab(ui, self.form.remote_entry == RemoteEntry::Paste, tr("받은 연결 정보")).clicked() {
+                    self.form.remote_entry = RemoteEntry::Paste;
+                }
+                if theme::tab(ui, self.form.remote_entry == RemoteEntry::Manual, tr("직접 설정")).clicked() {
+                    self.form.remote_entry = RemoteEntry::Manual;
                 }
             });
-            ui.end_row();
-            if !self.form.remote_ssh_only {
-            ui.label(tr("사용자"));
-            ui.add(field(&mut self.form.remote_user).hint_text(tr("필요할 때만 (macOS 화면 공유는 계정 이름)")));
-            ui.end_row();
-            ui.label(tr("비밀번호"));
-            ui.add(field(&mut self.form.remote_pass).password(true));
-            ui.end_row();
+            ui.separator();
+            ui.add_space(6.0);
+        }
+        match self.form.remote_entry {
+            RemoteEntry::Paste => {
+                ui.label(theme::hint(tr("상대방의 설정 → 원격 연결에서 복사한 정보를 붙여넣으세요.")));
+                if !self.form.import_connection_info(ui) { return; }
+                self.form.show_connection_summary(ui);
             }
-        });
-        ui.add_space(8.0);
-        if !self.form.remote_ssh_only { ui.add(theme::switch(&mut self.form.remote_ssh, tr("SSH 명령 실행·결과 파일 수신"))); }
-        if self.form.remote_ssh || self.form.remote_ssh_only {
-            ui.label(theme::hint(tr("SSH 키 또는 에이전트로 인증해요. 호스트 키를 터미널에서 먼저 확인하세요")));
-            egui::Grid::new("ssh_settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label(tr("SSH 주소")); ui.add(field(&mut self.form.ssh_host).hint_text(tr("비워 두면 위 주소 사용"))); ui.end_row();
-                ui.label(tr("SSH 포트")); ui.add(egui::DragValue::new(&mut self.form.ssh_port).range(1..=65535)); ui.end_row();
-                ui.label(tr("SSH 사용자")); ui.add(field(&mut self.form.ssh_user)); ui.end_row();
-                ui.label(tr("개인 키 경로")); ui.add(field(&mut self.form.ssh_identity)); ui.end_row();
-            });
-            ui.label(theme::hint(tr("요청한 결과 파일은 다운로드/GhostDesk 폴더에 저장해요")));
+            RemoteEntry::Manual => self.manual_connection_fields(ui),
+            RemoteEntry::Imported => self.form.show_connection_summary(ui),
         }
         ui.add_space(6.0);
-        if !self.form.remote_ssh_only { ui.add(theme::switch(&mut self.form.remote_dedicated, tr("에이전트 전용 머신입니다"))).on_hover_text(pick(
+        if self.form.remote_mode != RemoteMode::Ssh { ui.add(theme::switch(&mut self.form.remote_dedicated, tr("에이전트 전용 머신입니다"))).on_hover_text(pick(
             tr("macOS 화면 공유에 접속할 때 필요합니다. \
              GhostDesk 는 Apple 의 세션 선택 단계를 구현하지 않아, 대상 Mac 의 콘솔 사용자와 다른 계정으로 접속하면 그 Mac 의 화면이 전환될 수 있습니다. 이 Mac 자신에는 항상 접속을 거부합니다."),
             tr("macOS 화면 공유나 이 PC 의 VNC 서버에 접속할 때 필요합니다. \
@@ -923,6 +949,68 @@ impl GhostApp {
              또 이 PC 자신에서 실행 중인 VNC 서버는 지금 보고 계신 실제 화면일 수 있어, 확인 없이는 접속하지 않습니다. \
              WSL·Hyper-V 가상 머신처럼 이 PC 주소로 전달되는 별도 데스크톱일 때만 켜세요."),
         )); }
+    }
+
+    fn manual_connection_fields(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr("접속 방식"));
+            ui.selectable_value(&mut self.form.remote_mode, RemoteMode::Vnc, tr("화면 (VNC)"));
+            ui.selectable_value(&mut self.form.remote_mode, RemoteMode::Ssh, tr("명령·파일 (SSH)"));
+            ui.selectable_value(&mut self.form.remote_mode, RemoteMode::Both, "VNC + SSH");
+        });
+        ui.add_space(6.0);
+        if self.form.remote_mode != RemoteMode::Ssh {
+            egui::Grid::new("form_remote").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(tr("VNC 주소"));
+                let endpoint_changed = ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 76.0).max(160.0);
+                    let host = ui.add(field(&mut self.form.remote_host).hint_text(tr("예) 192.168.0.20 또는 vm.local")).desired_width(w));
+                    ui.label(":");
+                    let port = ui.add(egui::DragValue::new(&mut self.form.remote_port).range(1..=65535)).on_hover_text(tr("포트 (보통 5900)"));
+                    host.changed() || port.changed()
+                }).inner;
+                ui.end_row();
+                ui.label(tr("사용자"));
+                let user = ui.add(field(&mut self.form.remote_user).hint_text(tr("필요할 때만 (macOS 화면 공유는 계정 이름)")));
+                if endpoint_changed || user.changed() {
+                    self.form.clear_vnc_authorization();
+                }
+                ui.end_row();
+                ui.label(tr("비밀번호"));
+                ui.add(field(&mut self.form.remote_pass).password(true));
+                ui.end_row();
+            });
+            ui.add_space(8.0);
+        }
+        if self.form.remote_mode != RemoteMode::Vnc {
+            ui.label(theme::hint(tr("SSH 키 또는 에이전트로 인증해요. 호스트 키를 터미널에서 먼저 확인하세요")));
+            if self.ssh_profiles.is_empty() {
+                ui.label(theme::hint(tr("설정 → 원격 연결에서 자주 쓰는 연결을 저장할 수 있어요")));
+            } else {
+                if self.form.ssh_profile.as_ref().and_then(|name| self.ssh_profiles.get(name)) != Some(&self.form.ssh) {
+                    self.form.ssh_profile = None;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(tr("저장된 SSH 연결"));
+                    let selected = self.form.ssh_profile.as_deref().unwrap_or(tr("직접 입력"));
+                    egui::ComboBox::from_id_salt("remote_ssh_profile").width(208.0).truncate().selected_text(selected).show_ui(ui, |ui| {
+                        if ui.selectable_label(self.form.ssh_profile.is_none(), tr("직접 입력")).clicked() {
+                            self.form.ssh_profile = None;
+                        }
+                        for (name, options) in &self.ssh_profiles {
+                            let choice = egui::Button::selectable(self.form.ssh_profile.as_ref() == Some(name), name).truncate();
+                            if ui.add(choice).on_hover_text(format!("{name}\n{}", options.endpoint())).clicked() {
+                                self.form.ssh_profile = Some(name.clone());
+                                self.form.ssh = options.clone();
+                            }
+                        }
+                    });
+                });
+            }
+            let hint = if self.form.remote_mode == RemoteMode::Ssh { tr("예) 192.168.0.20 또는 vm.local") } else { tr("비워 두면 위 주소 사용") };
+            ssh_profiles::fields(ui, &mut self.form.ssh, hint);
+            ui.label(theme::hint(tr("요청한 결과 파일은 다운로드/GhostDesk 폴더에 저장해요")));
+        }
     }
 
     /// Separate account session (macOS: dedicated account name) / child session (Windows: whether the
@@ -1045,16 +1133,16 @@ fn field(s: &mut String) -> egui::TextEdit<'_> {
 }
 
 /// One card under "Where should it work?".
-struct Kind {
-    choice: Choice,
-    icon: &'static str,
-    title: &'static str,
+pub(super) struct Kind {
+    pub(super) choice: Choice,
+    pub(super) icon: &'static str,
+    pub(super) title: &'static str,
     /// One-line description shown below when picked.
-    about: &'static str,
+    pub(super) about: &'static str,
 }
 
 /// Only places available on this OS (unsupported kinds are hidden; see `platform::caps`).
-fn kinds() -> Vec<Kind> {
+pub(super) fn kinds() -> Vec<Kind> {
     let mut v = vec![Kind {
         choice: Choice::Auto,
         icon: icon::STAR,
@@ -1081,7 +1169,7 @@ fn kinds() -> Vec<Kind> {
             ),
         });
     }
-    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터나 가상 머신에 VNC 로 접속해서 일해요") });
+    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터에서 VNC로 화면을 조작하거나 SSH로 명령을 실행하고 파일을 받아요") });
     v
 }
 
@@ -1182,6 +1270,22 @@ pub(super) fn list_mac_apps() -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn switching_remote_modes_resolves_only_the_current_vnc_host() {
+        let mut form = NewAgentForm::new(None);
+        form.remote_host = "old".into();
+        assert!(form.ssh_options().is_none());
+        form.remote_mode = RemoteMode::Both;
+        assert_eq!(form.ssh_options().unwrap().host, "old");
+        form.remote_mode = RemoteMode::Ssh;
+        assert!(form.ssh_options().unwrap().validate().is_err());
+        form.remote_host = "new".into();
+        form.remote_mode = RemoteMode::Both;
+        assert_eq!(form.ssh_options().unwrap().host, "new");
+        form.ssh.host = "explicit".into();
+        assert_eq!(form.ssh_options().unwrap().host, "explicit");
+    }
 
     fn electron(name: &str, hideable: bool, reason: Option<&str>) -> crate::electron::ElectronApp {
         crate::electron::ElectronApp {

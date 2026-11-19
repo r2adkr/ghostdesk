@@ -148,6 +148,11 @@ pub struct AgentConfig {
     pub llm: Llm,
 }
 
+/// Name an agent's usage is counted under in the Usage tab: the AI and its model.
+fn usage_source(llm: &Llm) -> String {
+    format!("{} · {}", llm.provider.short_name(), llm.model)
+}
+
 pub struct AgentShared {
     pub id: u64,
     pub name: String,
@@ -499,11 +504,13 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         };
         let u = &resp["usage"];
         let input = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter().map(|k| u[*k].as_u64().unwrap_or(0)).sum::<u64>();
+        let output = u["output_tokens"].as_u64().unwrap_or(0);
         {
             let mut t = shared.tokens.lock();
             t.0 += input;
-            t.1 += u["output_tokens"].as_u64().unwrap_or(0);
+            t.1 += output;
         }
+        crate::usage::global().tokens(&usage_source(&cfg.llm), input, output);
         too_long = input > MAX_CONTEXT_TOKENS;
         // Claude's server clears old tool results; for other providers clear them here at the same
         // threshold (applies from the next request)
@@ -567,6 +574,7 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         steps_since_input += 1;
         shared.run_steps.store(steps_since_input, Ordering::Relaxed);
         shared.steps.fetch_add(1, Ordering::Relaxed);
+        crate::usage::global().step(&usage_source(&cfg.llm));
     }
 }
 

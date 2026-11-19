@@ -261,6 +261,28 @@ impl GhostApp {
         remove
     }
 
+    pub(super) fn compact_detail(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let agent = &self.agents[idx];
+        let key = ui.make_persistent_id(("detail_controls", agent.shared.id));
+        let waiting = matches!(agent.shared.status(), AgentStatus::WaitingUser(_));
+        let no_screen = agent.shared.workspace().is_some_and(|desk| !desk.has_screen());
+        let mut controls = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(waiting || no_screen);
+        ui.horizontal(|ui| {
+            let label = if no_screen { tr("SSH 작업 로그") } else { tr("작업 화면") };
+            if theme::tab(ui, !controls, label).clicked() { controls = false; }
+            if theme::tab(ui, controls, tr("지시와 기록")).clicked() { controls = true; }
+            if waiting { theme::chip(ui, theme::warn(), tr("질문")); }
+        });
+        ui.data_mut(|d| d.insert_temp(key, controls));
+        ui.separator();
+        ui.add_space(6.0);
+        if controls {
+            if self.detail_side(ui, idx) { self.remove_agent(idx); }
+        } else {
+            self.detail_view(ui, idx);
+        }
+    }
+
     pub(super) fn detail_view(&mut self, ui: &mut egui::Ui, idx: usize) {
         let rt = self.rt.clone();
         let ws_opt = self.agents[idx].shared.workspace();

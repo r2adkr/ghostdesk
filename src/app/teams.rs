@@ -25,6 +25,7 @@ pub(super) struct TeamsUi {
 
 #[derive(Default)]
 struct BoardDraft {
+    show_notes: bool,
     task: String,
     note: String,
     task_error: Option<String>,
@@ -103,6 +104,14 @@ impl GhostApp {
         ui.label(theme::hint(tr("팀에서 에이전트와 목표·할 일·메모를 공유해요")));
         ui.add_space(16.0);
 
+        if ts.cache.is_empty() {
+            egui::ScrollArea::vertical().id_salt("team_create").show(ui, |ui| {
+                ui.set_max_width(ui.available_width().min(480.0));
+                if !ts.creating { ui.label(tr("아직 팀이 없어요")); }
+                team_list(ui, ts, &store, true);
+            });
+            return;
+        }
         let full = ui.available_rect_before_wrap();
         let mut action = None;
         let mut show_board = |ui: &mut egui::Ui, ts: &mut TeamsUi| match ts.cache.iter().find(|t| Some(t.id) == ts.selected).cloned() {
@@ -111,14 +120,14 @@ impl GhostApp {
                     action = board(ui, ts, &store, &team, screens.get(&team.id).copied().unwrap_or(0)).map(|action| (team.id, action));
                 });
             }
-            None => empty_board(ui),
+            None => {},
         };
         if full.width() < LIST_W + COLUMN_GAP + BOARD_MIN_W {
-            egui::ScrollArea::vertical().id_salt("teams_compact").auto_shrink([false, false]).show(ui, |ui| {
-                team_list(ui, ts, &store, 128.0);
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
+            team_list(ui, ts, &store, true);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().id_salt(("compact_board", ts.selected)).auto_shrink([false, false]).show(ui, |ui| {
                 show_board(ui, ts);
             });
         } else {
@@ -127,7 +136,7 @@ impl GhostApp {
             let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             // The list and its creation form must both remain reachable in a short window.
             egui::ScrollArea::vertical().id_salt("teams_list").auto_shrink([false, false]).show(&mut list_ui, |ui| {
-                team_list(ui, ts, &store, f32::INFINITY);
+                team_list(ui, ts, &store, false);
             });
             let mut board_ui = ui.new_child(egui::UiBuilder::new().max_rect(board_rect).layout(egui::Layout::top_down(egui::Align::Min)));
             egui::ScrollArea::vertical().id_salt(("teams_board", ts.selected)).auto_shrink([false, false]).show(&mut board_ui, |ui| {
@@ -151,12 +160,26 @@ impl GhostApp {
 }
 
 /// Left column: the teams, and a form to create one.
-fn team_list(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, max_list_height: f32) {
-    if !ts.creating && theme::primary(ui, format!("{}  {}", icon::PLUS, tr("새 팀"))).clicked() {
-        ts.creating = true;
-        ts.focus_new_name = true;
-        ts.error = None;
-    }
+fn team_list(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, compact: bool) {
+    ui.horizontal_wrapped(|ui| {
+        if compact && !ts.cache.is_empty() {
+            let selected = ts.cache.iter().find(|t| Some(t.id) == ts.selected).map_or("", |t| t.name.as_str());
+            egui::ComboBox::from_id_salt("compact_team").width(224.0).truncate().selected_text(selected).show_ui(ui, |ui| {
+                for team in &ts.cache {
+                    let item = egui::Button::selectable(ts.selected == Some(team.id), &team.name).truncate();
+                    if ui.add(item).on_hover_text(&team.name).clicked() {
+                        ts.selected = Some(team.id);
+                        ts.error = None;
+                    }
+                }
+            });
+        }
+        if !ts.creating && theme::secondary(ui, format!("{}  {}", icon::PLUS, tr("새 팀"))).clicked() {
+            ts.creating = true;
+            ts.focus_new_name = true;
+            ts.error = None;
+        }
+    });
     if ts.creating {
         ui.spacing_mut().item_spacing.y = 6.0;
         let name = ui.add(
@@ -199,45 +222,29 @@ fn team_list(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore
     if let Some(e) = &ts.error {
         ui.label(RichText::new(e).size(12.0).color(theme::danger()));
     }
-    if !ts.cache.is_empty() {
+    if !compact && !ts.cache.is_empty() {
         ui.add_space(8.0);
-        let mut show_rows = |ui: &mut egui::Ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for t in &ts.cache {
-                let selected = ts.selected == Some(t.id);
-                let r = theme::nav_item(ui, selected, icon::LIST_TODO, &t.name, (!t.members.is_empty()).then(theme::success));
-                if r.clicked() {
-                    ts.selected = Some(t.id);
-                    ts.error = None;
-                }
-                // right click: rename or delete
-                r.context_menu(|ui| {
-                    if ui.button(tr("이름 바꾸기")).clicked() {
-                        ts.dialog = Some(Dialog::rename(t));
-                        ui.close();
-                    }
-                    if ui.button(RichText::new(tr("팀 삭제")).color(theme::danger())).clicked() {
-                        ts.dialog = Some(Dialog::delete(t));
-                        ui.close();
-                    }
-                });
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for t in &ts.cache {
+            let selected = ts.selected == Some(t.id);
+            let r = theme::nav_item(ui, selected, icon::LIST_TODO, &t.name, (!t.members.is_empty()).then(theme::success));
+            if r.clicked() {
+                ts.selected = Some(t.id);
+                ts.error = None;
             }
-        };
-        if max_list_height.is_finite() {
-            egui::ScrollArea::vertical().id_salt("compact_team_list").max_height(max_list_height).show(ui, show_rows);
-        } else {
-            show_rows(ui);
+            // right click: rename or delete
+            r.context_menu(|ui| {
+                if ui.button(tr("이름 바꾸기")).clicked() {
+                    ts.dialog = Some(Dialog::rename(t));
+                    ui.close();
+                }
+                if ui.button(RichText::new(tr("팀 삭제")).color(theme::danger())).clicked() {
+                    ts.dialog = Some(Dialog::delete(t));
+                    ui.close();
+                }
+            });
         }
     }
-}
-
-fn empty_board(ui: &mut egui::Ui) {
-    ui.vertical_centered(|ui| {
-        ui.add_space((ui.available_height() * 0.25).max(24.0));
-        ui.label(RichText::new(tr("아직 팀이 없어요")).size(20.0).color(theme::text()));
-        ui.add_space(8.0);
-        ui.label(theme::hint(tr("'새 팀'을 누르거나 AI 앱에 팀을 만들어 달라고 하세요")));
-    });
 }
 
 enum BoardAction {
@@ -324,17 +331,18 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
     ui.add_space(12.0);
 
     let draft = ts.drafts.entry(team.id).or_default();
-    if ui.available_width() < BOARD_MIN_W {
-        tasks_column(ui, draft, store, team);
-        ui.add_space(16.0);
+    if ui.available_width() < 680.0 {
+        ui.horizontal(|ui| {
+            if theme::tab(ui, !draft.show_notes, &format!("{}  {}", tr("할 일"), team.open_tasks())).clicked() { draft.show_notes = false; }
+            if theme::tab(ui, draft.show_notes, &format!("{}  {}", tr("메모"), team.notes.len())).clicked() { draft.show_notes = true; }
+        });
         ui.separator();
-        ui.add_space(16.0);
-        notes_column(ui, draft, store, team);
+        if draft.show_notes { notes_column(ui, draft, store, team, false); } else { tasks_column(ui, draft, store, team, false); }
     } else {
         ui.spacing_mut().item_spacing.x = COLUMN_GAP;
         ui.columns(2, |columns| {
-            tasks_column(&mut columns[0], draft, store, team);
-            notes_column(&mut columns[1], draft, store, team);
+            tasks_column(&mut columns[0], draft, store, team, true);
+            notes_column(&mut columns[1], draft, store, team, true);
         });
     }
     action
@@ -342,12 +350,18 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
 
 fn composer(ui: &mut egui::Ui, text: &mut String, hint: &str, button: &str) -> bool {
     let mut submit = false;
-    ui.horizontal(|ui| {
+    // button on the right at its own width, the field takes everything left of it
+    // a right-to-left layout would take the whole remaining height, so give it one row
+    let row = egui::vec2(ui.available_width(), 34.0);
+    ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let clicked = ui.add_enabled_ui(!text.trim().is_empty(), |ui| theme::secondary(ui, button)).inner.clicked();
         let edit = ui.add(
-            egui::TextEdit::singleline(text).desired_width((ui.available_width() - 88.0).max(48.0)).margin(Margin::symmetric(10, 6)).hint_text(hint),
+            egui::TextEdit::singleline(text)
+                .desired_width(ui.available_width().max(48.0))
+                .margin(Margin::symmetric(10, 8))
+                .hint_text(hint),
         );
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let clicked = ui.add_enabled_ui(!text.trim().is_empty(), |ui| theme::secondary(ui, button)).inner.clicked();
         submit = (enter || clicked) && !text.trim().is_empty();
         if submit {
             edit.request_focus();
@@ -356,11 +370,13 @@ fn composer(ui: &mut egui::Ui, text: &mut String, hint: &str, button: &str) -> b
     submit
 }
 
-fn tasks_column(ui: &mut egui::Ui, draft: &mut BoardDraft, store: &crate::team::TeamStore, team: &Team) {
-    ui.horizontal(|ui| {
-        theme::section(ui, tr("할 일"));
-        ui.label(theme::hint(trf("남은 일 {}개", &[&team.open_tasks()])));
-    });
+fn tasks_column(ui: &mut egui::Ui, draft: &mut BoardDraft, store: &crate::team::TeamStore, team: &Team, heading: bool) {
+    if heading {
+        ui.horizontal(|ui| {
+            theme::section(ui, tr("할 일"));
+            ui.label(theme::hint(trf("남은 일 {}개", &[&team.open_tasks()])));
+        });
+    }
     if composer(ui, &mut draft.task, tr("할 일 추가 (Enter)"), tr("추가")) {
         match store.task_add(team.id, None, &draft.task, "") {
             Ok(_) => {
@@ -429,11 +445,13 @@ fn task_row(ui: &mut egui::Ui, store: &crate::team::TeamStore, team: &Team, t: &
     ui.add_space(4.0);
 }
 
-fn notes_column(ui: &mut egui::Ui, draft: &mut BoardDraft, store: &crate::team::TeamStore, team: &Team) {
-    ui.horizontal(|ui| {
-        theme::section(ui, tr("메모"));
-        theme::count_badge(ui, &team.notes.len().to_string());
-    });
+fn notes_column(ui: &mut egui::Ui, draft: &mut BoardDraft, store: &crate::team::TeamStore, team: &Team, heading: bool) {
+    if heading {
+        ui.horizontal(|ui| {
+            theme::section(ui, tr("메모"));
+            theme::count_badge(ui, &team.notes.len().to_string());
+        });
+    }
     if composer(ui, &mut draft.note, tr("팀에 메모 남기기 (Enter)"), tr("보내기")) {
         match store.note(team.id, None, &draft.note) {
             Ok(_) => {

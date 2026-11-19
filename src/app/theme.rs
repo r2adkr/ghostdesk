@@ -382,8 +382,9 @@ fn filled_with(ui: &mut egui::Ui, label: RichText, size: Vec2, radius: u8, base:
 
 /// Button for an action that deletes something (danger color), used in confirm dialogs.
 pub fn destructive(ui: &mut egui::Ui, text: impl Into<String>) -> Response {
-    let d = danger();
-    filled_with(ui, RichText::new(text.into()), Vec2::new(BUTTON_MIN_W, 32.0), RADIUS, d, d.gamma_multiply(0.85), Color32::WHITE)
+    let colors = pal();
+    let hover = colors.danger.lerp_to_gamma(colors.accent, 0.12);
+    filled_with(ui, RichText::new(text.into()), Vec2::new(BUTTON_MIN_W, 32.0), RADIUS, colors.danger, hover, colors.on_accent)
 }
 
 /// Primary action button (accent color).
@@ -418,6 +419,47 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> Response {
     focus_outline(ui, &resp, RADIUS);
     resp.on_hover_text(tip)
 }
+
+/// An icon button that shows `keys` (small, in place of the icon) while the shortcut hints are on.
+pub fn icon_button_keys(ui: &mut egui::Ui, icon: &str, keys: Option<&str>, tip: &str) -> Response {
+    let Some(k) = keys else { return icon_button(ui, icon, tip) };
+    // a fixed size, whatever the text: a button that grows with its label makes a row wider than its panel, and
+    // the panel then widens a little more on every frame the hint is shown
+    let resp = ui.add_sized(
+        Vec2::new(KEY_BUTTON_W, 32.0),
+        egui::Button::new(RichText::new(k).monospace().size(13.0).color(muted()))
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .frame_when_inactive(false),
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, resp.enabled(), tip));
+    focus_outline(ui, &resp, RADIUS);
+    resp.on_hover_text(tip)
+}
+
+/// A big icon button for the collapsed sidebar's rail (shows `keys` instead of the icon while hints are on).
+pub fn rail_button(ui: &mut egui::Ui, icon: &str, keys: Option<&str>, tip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, resp.enabled(), tip));
+    if ui.is_rect_visible(rect) {
+        let h = hover_t(ui.ctx(), &resp);
+        let p = ui.painter();
+        if resp.is_pointer_button_down_on() {
+            p.rect_filled(rect, RADIUS, over(pal().neutral, pal().overlay_pressed));
+        } else if h > 0.0 {
+            p.rect_filled(rect, RADIUS, overlay_hover().gamma_multiply(h));
+        }
+        let fg = body().lerp_to_gamma(text(), h);
+        match keys {
+            Some(k) => { p.text(rect.center(), egui::Align2::CENTER_CENTER, k, FontId::monospace(13.0), muted()); }
+            None => { p.text(rect.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(22.0), fg); }
+        }
+    }
+    focus_outline(ui, &resp, RADIUS);
+    resp.on_hover_text(tip)
+}
+
+/// Width of the shortcut-hint button (the icon button it replaces is 32 wide).
+pub const KEY_BUTTON_W: f32 = 54.0;
 
 /// One tab in a tab row: plain text, with an accent underline when selected.
 pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> Response {
@@ -519,6 +561,11 @@ pub fn focus_outline(ui: &egui::Ui, resp: &Response, radius: u8) {
 /// One sidebar row: icon · text · (status dot on the right). A light background when selected, a
 /// lighter one on hover.
 pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badge: Option<Color32>) -> Response {
+    nav_item_keys(ui, selected, icon, label, badge, None)
+}
+
+/// A nav row that can show its keyboard shortcut at the right (`keys`, shown while ⌘/Ctrl is held).
+pub fn nav_item_keys(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badge: Option<Color32>, keys: Option<&str>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, resp.enabled(), selected, label));
     let mut elided = false;
@@ -534,7 +581,8 @@ pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badg
         let fg = if selected { text() } else { body().lerp_to_gamma(text(), h) };
         p.text(egui::pos2(rect.left() + 18.0, rect.center().y), egui::Align2::CENTER_CENTER, icon, FontId::proportional(16.0), fg);
         let text_left = rect.left() + 36.0;
-        let right_padding = if badge.is_some() { 26.0 } else { 8.0 };
+        let key_w = if keys.is_some() { 50.0 } else { 0.0 };
+        let right_padding = if badge.is_some() { 26.0 } else { 8.0 } + key_w;
         let mut job = egui::text::LayoutJob::simple(label.to_owned(), FontId::proportional(14.0), fg, (rect.right() - text_left - right_padding).max(1.0));
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
@@ -542,27 +590,14 @@ pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str, badg
         elided = galley.elided;
         p.with_clip_rect(rect).galley(egui::pos2(text_left, rect.center().y - galley.size().y / 2.0), galley, fg);
         if let Some(c) = badge {
-            p.circle_filled(egui::pos2(rect.right() - 14.0, rect.center().y), 3.5, c);
+            p.circle_filled(egui::pos2(rect.right() - 14.0 - key_w, rect.center().y), 3.5, c);
+        }
+        if let Some(k) = keys {
+            p.text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, k, FontId::monospace(13.0), muted());
         }
     }
     focus_outline(ui, &resp, RADIUS);
     if elided { resp.on_hover_text(label) } else { resp }
-}
-
-/// Send button: an Enter icon (Lucide corner-down-left) in an accent-colored circle.
-pub fn enter_button(ui: &mut egui::Ui, tip: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, resp.enabled(), tip));
-    if ui.is_rect_visible(rect) {
-        let h = hover_t(ui.ctx(), &resp);
-        let p = ui.painter();
-        let fill = accent().lerp_to_gamma(pal().accent_hover, h);
-        let r = if resp.is_pointer_button_down_on() { 16.0 } else { 17.0 };
-        p.circle_filled(rect.center(), r, fill);
-        p.text(rect.center(), egui::Align2::CENTER_CENTER, crate::icon::CORNER_DOWN_LEFT, FontId::proportional(17.0), on_accent());
-    }
-    focus_outline(ui, &resp, RADIUS);
-    resp.on_hover_text(tip)
 }
 
 /// Frame of the large input box (the task box on the home screen). `focus` goes 0 (idle) to 1
@@ -605,19 +640,6 @@ pub fn chip(ui: &mut egui::Ui, color: Color32, text: &str) -> Response {
 /// not a pill.
 pub fn count_badge(ui: &mut egui::Ui, text: &str) -> Response {
     ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0).color(muted())).selectable(false))
-}
-
-/// A key on the keyboard drawn as a small keycap (shortcut hints like Enter, Shift).
-pub fn keycap(ui: &mut egui::Ui, key: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(key.to_string(), FontId::proportional(11.0), body());
-    let size = Vec2::new((galley.size().x + 12.0).max(20.0), 20.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let p = ui.painter();
-    p.rect(rect, 4, card(), Stroke::new(1.0, border()), StrokeKind::Inside);
-    // a slightly heavier bottom edge, like a real key
-    p.line_segment([rect.left_bottom() + Vec2::new(3.0, -0.5), rect.right_bottom() + Vec2::new(-3.0, -0.5)], Stroke::new(1.0, border_hover()));
-    p.galley(rect.center() - galley.size() / 2.0, galley, body());
-    resp
 }
 
 /// A low, selectable tile (icon + title centered on one line). Clicked when pressed.
@@ -798,6 +820,8 @@ mod tests {
             }
             assert!(contrast(p.on_accent, p.accent) >= 4.5);
             assert!(contrast(p.on_accent, p.accent_hover) >= 4.5);
+            assert!(contrast(p.on_accent, p.danger) >= 4.5);
+            assert!(contrast(p.on_accent, p.danger.lerp_to_gamma(p.accent, 0.12)) >= 4.5);
             assert!(contrast(p.text, p.accent_tint) >= 4.5);
         }
     }

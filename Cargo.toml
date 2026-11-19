@@ -1,6 +1,6 @@
 [package]
 name = "ghostdesk"
-version = "0.8.0"
+version = "0.9.0"
 license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.95"
@@ -14,6 +14,7 @@ futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
 toml_edit = "0.25"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

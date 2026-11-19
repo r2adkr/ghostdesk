@@ -228,7 +228,7 @@ impl GhostApp {
             None => label.append(tr("AI 를 추가해 주세요"), 0.0, part(13.0, theme::muted())),
         }
         label.append(icon::CHEVRON_DOWN, 6.0, part(12.0, theme::muted()));
-        let button = egui::Button::new(label).frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
+        let button = egui::Button::new(label).truncate().frame_when_inactive(false).min_size(Vec2::new(0.0, 28.0));
         let hover = self.cur().map(|c| tr(c.provider.label()).to_string()).unwrap_or_default();
         let (r, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
             // fixed width, otherwise the search field grabs all remaining width and the menu grows as wide
@@ -390,51 +390,66 @@ impl GhostApp {
         if !self.show_settings {
             return;
         }
-        const W: f32 = 520.0;
+        let width = (ctx.content_rect().width() - 96.0).clamp(540.0, 760.0);
+        const NAV: f32 = 172.0;
         const LABEL: f32 = 96.0;
-        let field = W - LABEL - 14.0;
-        let max_h = (ctx.content_rect().height() - 200.0).max(260.0);
-        // every tab gets the same height so the window doesn't jump around when switching
-        let body_h = max_h.min(440.0);
+        let body_h = (ctx.content_rect().height() - 184.0).clamp(240.0, 504.0);
         let mut close = false;
         let mut lang = self.lang;
         let perm_ok = self.permissions_ok(ctx);
-        let mut tabs = vec![SettingsTab::General, SettingsTab::Ai];
+        let mut tabs = vec![SettingsTab::General, SettingsTab::Ai, SettingsTab::Ssh];
         if cfg!(target_os = "macos") {
             tabs.push(SettingsTab::Permissions);
         }
         tabs.push(SettingsTab::About);
         let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
-            ui.set_width(W);
+            ui.set_width(width);
             close |= theme::modal_header(ui, tr("설정"));
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for &t in &tabs {
-                    // a missing permission is flagged on its tab so it's findable from any tab
-                    let label = match t {
-                        SettingsTab::Permissions if !perm_ok => format!("{} {}", tr(t.label()), icon::SHIELD_ALERT),
-                        _ => tr(t.label()).to_string(),
-                    };
-                    if theme::tab(ui, self.settings_tab == t, &label).clicked() {
-                        self.settings_tab = t;
-                        self.license_view = None;
-                    }
-                }
-            });
+            if let Some(error) = &self.prefs_error {
+                ui.colored_label(theme::danger(), trf("설정 파일을 읽거나 저장하지 못했어요 ({})", &[error]));
+            }
             ui.separator();
-            ui.add_space(10.0);
-            theme::modal_scroll(ui, body_h, |ui| {
-                ui.set_width(W);
-                ui.set_min_height(body_h);
-                match self.settings_tab {
-                    SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
-                    SettingsTab::Ai => self.settings_ai(ui, W, LABEL, field),
-                    SettingsTab::Permissions => {
-                        #[cfg(target_os = "macos")]
-                        self.permission_rows(ui);
+            ui.add_space(8.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.allocate_ui_with_layout(Vec2::new(NAV, body_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(NAV);
+                    for &tab in &tabs {
+                        let glyph = match tab {
+                            SettingsTab::General => icon::SETTINGS,
+                            SettingsTab::Ai => icon::PLUG,
+                            SettingsTab::Ssh => icon::MONITOR,
+                            SettingsTab::Permissions => icon::SHIELD_ALERT,
+                            SettingsTab::About => icon::BOOK_OPEN,
+                        };
+                        let badge = (tab == SettingsTab::Permissions && !perm_ok).then(theme::warn);
+                        if theme::nav_item(ui, self.settings_tab == tab, glyph, tr(tab.label()), badge).clicked() {
+                            self.settings_tab = tab;
+                            self.license_view = None;
+                        }
                     }
-                    SettingsTab::About => self.settings_about(ui),
-                }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    let body_w = ui.available_width();
+                    let field = body_w - LABEL - 14.0;
+                    ui.push_id(("settings_body", self.settings_tab as u8), |ui| {
+                        theme::modal_scroll(ui, body_h, |ui| {
+                            ui.set_width(body_w);
+                            ui.set_min_height(body_h);
+                            match self.settings_tab {
+                                SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
+                                SettingsTab::Ssh => self.settings_ssh(ui),
+                                SettingsTab::Ai => self.settings_ai(ui, body_w, LABEL, field),
+                                SettingsTab::Permissions => {
+                                    #[cfg(target_os = "macos")]
+                                    self.permission_rows(ui);
+                                }
+                                SettingsTab::About => self.settings_about(ui),
+                            }
+                        });
+                    });
+                });
             });
         });
         if lang != self.lang {
@@ -444,6 +459,9 @@ impl GhostApp {
             self.show_settings = false;
             self.license_view = None;
             self.save_prefs();
+            if let Some(error) = &self.prefs_error {
+                self.notify(ctx, trf("설정 파일을 읽거나 저장하지 못했어요 ({})", &[error]));
+            }
         }
     }
 
@@ -482,6 +500,11 @@ impl GhostApp {
             .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
         ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요")));
 
+        ui.add_space(8.0);
+        ui.add(theme::switch(&mut self.auto_clean, tr("끝난 화면 자동 정리")))
+            .on_hover_text(tr("외부 에이전트가 닫은 화면을 목록에서 지우고, 이름 없이 열린 임시 작업공간 폴더도 삭제해요. 이름을 정해 둔 작업공간과 로그인 복제본은 그대로 둬요."));
+        ui.label(theme::hint(tr("닫힌 지 1분 반쯤 지나면 목록에서 사라져요")));
+
         ui.add_space(18.0);
         theme::section(ui, tr("실험적 기능"));
         ui.add_space(4.0);
@@ -504,6 +527,7 @@ impl GhostApp {
         ui.add_space(4.0);
         self.conn_cards(ui, width);
         self.add_conn_button(ui);
+        ui.add_space(6.0);
         if ui.link(tr("이 컴퓨터의 CLI 찾기")).clicked() {
             for provider in [Provider::ClaudeCli, Provider::CodexCli] {
                 if !self.ai.iter().any(|c| c.provider == provider) && crate::cli::executable(provider, "").is_some() {
@@ -693,7 +717,10 @@ impl GhostApp {
                     } else {
                         ui.label(RichText::new(self.ai[i].title()).strong().color(theme::text()));
                     }
-                    ui.label(theme::hint(tr(p.label())));
+                    // the kind next to the name only when it adds something ("Codex CLI  Codex CLI" doesn't)
+                    if self.ai[i].title() != tr(p.label()) {
+                        ui.label(theme::hint(tr(p.label())));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::icon_button(ui, icon::X, tr("이 AI 연결 지우기")).clicked() {
                             remove = Some(i);
@@ -882,6 +909,7 @@ pub(super) enum SettingsTab {
     #[default]
     General,
     Ai,
+    Ssh,
     /// macOS only (permissions needed to drive Mac apps).
     Permissions,
     About,
@@ -892,6 +920,7 @@ impl SettingsTab {
         match self {
             Self::General => "일반",
             Self::Ai => "AI",
+            Self::Ssh => "원격 연결",
             Self::Permissions => "권한",
             Self::About => "정보",
         }

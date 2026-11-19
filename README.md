@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.8.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.8.0/GhostDesk-Setup-0.8.0-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.9.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.9.0/GhostDesk-Setup-0.9.0-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.8.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.8.0/GhostDesk-0.8.0-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.9.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.9.0/GhostDesk-0.9.0-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
@@ -73,9 +73,10 @@ Claude shows the CLI's `sonnet`, `opus`, and `haiku` aliases and accepts a model
 ID entered by hand. CLI versions must support the required non-interactive and
 structured-output options; unsupported versions show an error.
 
-**New agent** lets you choose where the agent works: a website, a specific
-app, or a remote computer. The default, **Auto**, uses an app if the task names
-one and starts on the web otherwise.
+To start, enter a task on **Home** or choose **New agent** on the **All agents**
+screen. Then choose where the agent works: a website, a specific app, or a
+remote computer. **Auto** uses an app if the task names one and starts on the
+web otherwise.
 
 <p><img src="assets/tour/1-home.jpg" width="49%" alt="Home screen"> <img src="assets/tour/2-new-agent.jpg" width="49%" alt="New agent dialog"></p>
 
@@ -88,6 +89,17 @@ not on that list (Cursor, Gemini CLI, Windsurf, …) can be connected from
 connection kit.
 
 <p><img src="assets/tour/5-connect.jpg" width="49%" alt="Connections dialog"> <img src="assets/tour/4-settings.jpg" width="49%" alt="AI connections in Settings"></p>
+
+**Keyboard.** Press Cmd+K (Ctrl+K on Windows) to jump to a screen, an agent or an
+action. Cmd+1 to 4 switch between Home, All agents, Teams and Usage, Cmd+N
+starts an agent, Cmd+B hides or shows the sidebar and Cmd+, opens Settings.
+Hold Cmd to see each shortcut next to its menu item.
+
+**Usage tab.** Shows what agents used over the last 7, 30 or 90 days, by day and
+by agent. Agents inside GhostDesk report real token counts. Outside agents
+(Claude Code, Codex, …) use their own AI service, so GhostDesk counts what it
+can see: screens opened, actions, and screenshots sent or left out, with a rough
+estimate of the tokens that saved.
 
 The UI is available in Korean, English, Japanese and Chinese.
 
@@ -183,21 +195,46 @@ puts the command, as an array, under `mcp`:
 
 The tools are `desk_open`, `desk_action` (click, type, scroll; returns a
 screenshot. Pass several steps in `actions` to run them in order with a single
-screenshot at the end), `desk_browser` (navigation and tabs), `desk_app` (app
-menus and accessibility elements), `desk_list`, `desk_close`, and `team` and
+screenshot at the end; `wait_change` waits for the screen to change and
+`fill_at` replaces a field's content), `desk_browser` (reads a page as a short numbered list of
+what can be clicked or typed into, then `click`, `fill` and `select` by number
+or by name, plus `text`, `find`, `links`, `wait_for`, navigation and tabs; it
+returns text, not screenshots, which is far cheaper), `desk_app` (app
+menus and accessibility elements; `find` and `label` pick elements by name
+without reading the whole tree), `desk_list`, `desk_close`, and `team` and
 `team_task` for [teams](#teams). The
 `desk_open` `mode` is one of `web`, `web_login`, `app`, `app_login`,
 `app_running`, `app_vdisplay`, `session` or `remote` (`app_current_session`
 instead of `app_vdisplay` on Windows); agents pick the one that fits the task.
+
+To keep token use low, only actions that change the picture return a
+screenshot, a screenshot identical to the last one is left out, and tab lists
+are sent only when they change. Pass `screenshot: true` to see the screen.
 Screens opened by external agents are marked with a plug icon and show the
 virtual cursor. The control socket is
 `~/Library/Application Support/GhostDesk/control.sock` with mode 0600.
 
 ### SSH work and requested result files
 
-Under **New agent → Remote computer**, choose **SSH only (no screen)** for
-command work, or keep VNC and enable **SSH commands and result files**. Set the
-SSH host, port, user and optional private key path separately from VNC login.
+If both computers have GhostDesk, open **Settings → Remote connections → Share
+this computer’s connection info** on the computer doing the work. Check the
+suggested address and services, then choose **Copy connection info**. On the
+requesting computer, paste it into **Home → Remote computer**. Review the
+destination and start the agent. The card contains the address, username and
+selected ports. Enter a VNC password on the requesting computer when required.
+SSH uses that computer’s verified host keys and SSH key or agent. The two
+computers need a network route to each other and the selected services must
+be enabled. You can edit the address for a VPN or a forwarded port.
+
+Under **Home → Remote computer → Manual setup**, choose **Commands & files (SSH)** to
+work over SSH, or **VNC + SSH** to also control the screen. In combined mode,
+an empty SSH host uses the VNC host. Enter the port in its own field.
+
+In **Settings → Remote connections**, save a named connection with a host, port and optional
+username and private key path. Use **Edit** to change or delete a connection.
+In the new-agent window, pick its name under **Saved SSH connections**.
+Editing the loaded fields applies those changes to this run.
+
 System OpenSSH `ssh` and `sftp` must be installed. SSH keys, the SSH agent and
 OpenSSH host aliases are supported. Verify the host key and working key login
 in a terminal first: unknown or changed keys are never accepted automatically.
@@ -331,7 +368,11 @@ hand over to it when opened.
 
 - Workspaces, including cloned cookies and app data, live in
   `~/Library/Application Support/GhostDesk/workspaces/<name>`. Delete them
-  whenever you like.
+  whenever you like. With **Settings → General → Tidy up finished screens**
+  on (the default), a screen an outside agent closed leaves the lists after
+  about 90 seconds and its scratch workspace (one opened without a name) is
+  deleted; workspaces an agent named and cloned logins are kept.
+- Usage history is kept per day for 120 days in `usage.json`.
 - On macOS, API keys are never written to disk. Enter them in Settings each
   launch or pass them through environment variables such as `ANTHROPIC_API_KEY`,
   `OPENAI_API_KEY` or `GEMINI_API_KEY`. Everything else (providers, models,

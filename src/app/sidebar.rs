@@ -5,9 +5,12 @@ use super::detail::is_working;
 use super::labels::{attention, display_status};
 
 impl GhostApp {
-    /// The left sidebar: name, new agent, views and the agent list, with Connections and Settings
+    /// The left sidebar: views and the agent list, with Connections and Settings
     /// pinned to the bottom.
     pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
+        // holding ⌘ (Ctrl) shows each row's shortcut, like a menu
+        let held = ui.input(|i| i.modifiers.command);
+        let key = |k: &'static str| -> Option<String> { held.then(|| palette::cmd_key(k)) };
         ui.spacing_mut().item_spacing.y = 2.0;
         // when the app draws its own title bar, the name lives there (right above the sidebar)
         if !titlebar::visible(ui.ctx()) {
@@ -18,39 +21,54 @@ impl GhostApp {
             });
             ui.add_space(16.0);
         }
-        if theme::nav_item(ui, self.view == View::Home, icon::GHOST, tr("홈"), None).clicked() {
+        // quick actions first: start something, find something
+        if titlebar::visible(ui.ctx()) {
+            if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
+                self.open_wizard();
+            }
+        } else {
+            // no title bar (full screen, Linux): the sidebar button sits here. It is wider than its 32pt minimum, so
+            // leave it room (a row wider than the panel would make the panel grow on every frame)
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let w = ui.available_width() - theme::KEY_BUTTON_W - 6.0;
+                ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
+                        self.open_wizard();
+                    }
+                });
+                if theme::icon_button_keys(ui, icon::PANEL_LEFT, key("B").as_deref(), &format!("{} ({})", tr("사이드바 접기"), palette::cmd_key("B"))).clicked() {
+                    self.sidebar_open = false;
+                }
+            });
+        }
+        if theme::nav_item_keys(ui, false, icon::SEARCH, tr("찾기"), None, key("K").as_deref()).on_hover_text(palette::cmd_key("K")).clicked() {
+            self.open_palette();
+        }
+        ui.add_space(6.0);
+        if theme::nav_item_keys(ui, self.view == View::Home, icon::GHOST, tr("홈"), None, key("1").as_deref()).clicked() {
             self.view = View::Home;
         }
-        if theme::nav_item(ui, false, icon::PLUS, tr("새 에이전트"), None)
-            .on_hover_text(trf("에이전트가 일할 곳(웹사이트·{}·원격 컴퓨터)을 고르고 할 일을 맡겨요", &[&tr(text::LOCAL_APPS)]))
-            .clicked()
-        {
-            self.open_wizard();
-        }
-        if theme::nav_item(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None).clicked() {
+        if theme::nav_item_keys(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None, key("2").as_deref()).clicked() {
             self.view = View::Grid;
         }
         // green dot while any agent is in a team
         let active = self.teams_ui_active();
-        if theme::nav_item(ui, self.view == View::Teams, icon::LIST_TODO, tr("팀"), active.then(theme::success))
+        if theme::nav_item_keys(ui, self.view == View::Teams, icon::LIST_TODO, tr("팀"), active.then(theme::success), key("3").as_deref())
             .on_hover_text(tr("여러 에이전트가 같은 목표·메모·할 일을 보며 함께 일해요"))
             .clicked()
         {
             self.view = View::Teams;
         }
-        if !self.agents.is_empty()
-            && theme::nav_item(ui, false, icon::LAYOUT_DASHBOARD, tr("화면 모아보기"), None)
-                .on_hover_text(pick(
-                    tr("모든 에이전트 화면을 한곳에 크게 봐요 (⌃⌘F 전체 화면 · Esc 닫기)"),
-                    tr("모든 에이전트 화면을 한곳에 크게 봐요 (F11 전체 화면 · Esc 닫기)"),
-                ))
-                .clicked()
+        if theme::nav_item_keys(ui, self.view == View::Usage, icon::CHART_COLUMN, tr("사용량"), None, key("4").as_deref())
+            .on_hover_text(tr("에이전트가 쓴 토큰·동작·화면을 날짜별로 봐요"))
+            .clicked()
         {
-            self.enter_wall(ui.ctx());
+            self.view = View::Usage;
         }
         // lay out the pinned bottom rows first; the agent list gets whatever height is left
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            if theme::nav_item(ui, false, icon::SETTINGS, tr("설정"), None)
+            if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref())
                 .on_hover_text(tr("AI 회사 · API 키 · 모델 고르기"))
                 .clicked()
             {
@@ -71,15 +89,18 @@ impl GhostApp {
                 self.open_connect(ui.ctx());
             }
             ui.add_space(4.0);
-            // right below the menu: notice cards, then the agent list. Notices go in this top-down layout
+            // Right below the menu: agent list and notices. Notices go in this top-down layout
             // because in the bottom-up one the card border would stretch to fill the remaining height.
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                self.update_notice(ui);
-                self.permission_notice(ui);
-                if !self.agents.is_empty() {
-                    ui.add_space(20.0);
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.agent_list(ui));
-                }
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("sidebar_activity").auto_shrink([false, false]).show(ui, |ui| {
+                    if !self.agents.is_empty() {
+                        ui.add_space(12.0);
+                        self.agent_list(ui);
+                    }
+                    self.permission_notice(ui);
+                    self.update_notice(ui);
+                });
             });
         });
     }

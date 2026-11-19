@@ -9,7 +9,8 @@
 //! The old format (one key and model per provider, a single OpenAI-compatible URL) is still read
 //! and migrated to the connection list (`migrate`).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
+use anyhow::Context;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,7 @@ pub(super) struct Prefs {
     lang: String,
     /// AI connections (`None` for an old-format file).
     conns: Option<Vec<SavedConn>>,
+    ssh_profiles: ssh_profiles::Profiles,
     /// Index of the current connection in `conns`.
     current: Option<usize>,
     effort: Option<usize>,
@@ -34,6 +36,7 @@ pub(super) struct Prefs {
     remember_keys: Option<bool>,
     /// Keep working while the screen is locked (prevents sleep during work).
     keep_awake: Option<bool>,
+    auto_clean: Option<bool>,
     pip_auto_open: Option<bool>,
     pip_auto_close: Option<bool>,
     /// Permission bypass (approve external agents' requests without asking).
@@ -119,9 +122,14 @@ fn migrate(p: &Prefs) -> (Vec<SavedConn>, Option<usize>) {
 impl GhostApp {
     /// Applies saved preferences once at startup (defaults stay if missing or broken).
     pub(super) fn load_prefs(&mut self) {
-        let Ok(bytes) = std::fs::read(path()) else { return };
-        let Ok(p) = serde_json::from_slice::<Prefs>(&bytes) else { return };
-        self.apply_prefs(p);
+        match read_document(&path()) {
+            Ok(Some(doc)) => match serde_json::from_value(doc) {
+                Ok(prefs) => self.apply_prefs(prefs),
+                Err(e) => self.prefs_error = Some(e.to_string()),
+            },
+            Ok(None) => {}
+            Err(e) => self.prefs_error = Some(format!("{e:#}")),
+        }
     }
 
     fn apply_prefs(&mut self, p: Prefs) {
@@ -163,8 +171,15 @@ impl GhostApp {
         if let Some(k) = p.keep_awake {
             self.keep_awake = k;
         }
+        self.auto_clean = p.auto_clean.unwrap_or(true);
+        cleanup::set_enabled(self.auto_clean);
+        // leftovers from earlier runs, off the UI thread (deleting folders can take a while)
+        std::thread::spawn(|| {
+            cleanup::sweep_leftovers();
+        });
         self.pip_auto_open = p.pip_auto_open.unwrap_or(false);
         self.pip_auto_close = p.pip_auto_close.unwrap_or(true);
+        self.ssh_profiles = p.ssh_profiles;
         self.auto_approve = p.auto_approve.unwrap_or(false);
         self.allow_experimental = p.allow_experimental.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
@@ -190,12 +205,14 @@ impl GhostApp {
             .collect();
         Prefs {
             lang: self.lang.code().into(),
+            ssh_profiles: self.ssh_profiles.clone(),
             conns: Some(conns),
             current: self.ai.iter().position(|c| c.id == self.ai_current),
             effort: Some(self.effort_idx),
             show_cursor: Some(self.show_cursor),
             remember_keys: Some(self.remember_keys),
             keep_awake: Some(self.keep_awake),
+            auto_clean: Some(self.auto_clean),
             pip_auto_open: Some(self.pip_auto_open),
             pip_auto_close: Some(self.pip_auto_close),
             auto_approve: Some(self.auto_approve),
@@ -208,21 +225,61 @@ impl GhostApp {
 
     /// Writes the current preferences. Called when Settings closes, a model is picked, the language
     /// changes, and on quit.
-    pub(super) fn save_prefs(&self) {
-        let p = path();
-        let json = match serde_json::to_vec_pretty(&self.to_prefs()) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
-        // write next to it and swap in, so quitting mid-write never leaves half a file
-        let tmp = p.with_extension("json.tmp");
-        let ok = p.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-            && std::fs::write(&tmp, json).is_ok()
-            && std::fs::rename(&tmp, &p).is_ok();
-        if !ok {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    pub(super) fn save_prefs(&mut self) {
+        let result = write_document(&path(), |existing| {
+            let mut prefs = self.to_prefs();
+            if let Some(existing) = existing {
+                // Profiles are saved immediately by their editor. An older window closing must
+                // not roll a newer profile edit back.
+                prefs.ssh_profiles = serde_json::from_value::<Prefs>(existing)?.ssh_profiles;
+            }
+            Ok(serde_json::to_value(prefs)?)
+        });
+        self.prefs_error = result.err().map(|e| format!("{e:#}"));
     }
+
+    pub(super) fn save_ssh_profiles(&mut self, profiles: ssh_profiles::Profiles) -> anyhow::Result<()> {
+        write_document(&path(), |existing| {
+            update_profiles(existing, &self.ssh_profiles, &profiles)
+        })?;
+        self.ssh_profiles = profiles;
+        Ok(())
+    }
+}
+
+type Document = serde_json::Value;
+
+fn read_document(path: &Path) -> anyhow::Result<Option<Document>> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let doc: Document = serde_json::from_slice(&bytes).context("prefs.json")?;
+            anyhow::ensure!(doc.is_object(), "prefs.json must contain a JSON object");
+            Ok(Some(doc))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("prefs.json"),
+    }
+}
+
+fn update_profiles(existing: Option<Document>, expected: &ssh_profiles::Profiles, profiles: &ssh_profiles::Profiles) -> anyhow::Result<Document> {
+    let mut doc = existing.unwrap_or_else(|| serde_json::json!({}));
+    let saved: Prefs = serde_json::from_value(doc.clone()).context("prefs.json")?;
+    anyhow::ensure!(saved.ssh_profiles == *expected, "{}", tr("저장된 연결이 변경됐어요. 앱을 다시 열어 최신 목록을 확인하세요"));
+    doc["ssh_profiles"] = serde_json::to_value(profiles)?;
+    Ok(doc)
+}
+
+fn write_document(path: &Path, update: impl FnOnce(Option<Document>) -> anyhow::Result<Document>) -> anyhow::Result<()> {
+    let directory = path.parent().expect("preferences have a parent directory");
+    fs::create_dir_all(directory)?;
+    let lock = fs::File::options().create(true).truncate(false).read(true).write(true).open(path.with_extension("lock"))?;
+    lock.try_lock().context("prefs.json is busy")?;
+    let doc = update(read_document(path)?)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer_pretty(tmp.as_file_mut(), &doc)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(())
 }
 
 /// API key sealing: DPAPI on Windows (only that user account can decrypt); not stored on other
@@ -276,6 +333,43 @@ mod secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_ssh_profiles_round_trip_and_old_preferences_still_load() {
+        let mut prefs: Prefs = serde_json::from_str(r#"{"lang":"en"}"#).unwrap();
+        assert!(prefs.ssh_profiles.is_empty());
+        for (name, host, port) in [("개발", "dev.internal", 2222), ("Build", "build-alias", 22)] {
+            prefs.ssh_profiles.insert(name.into(), crate::ssh::SshOptions {
+                host: host.into(), port, username: "worker".into(), identity_file: "/keys/work key".into(),
+            });
+        }
+        let bytes = serde_json::to_vec(&prefs).unwrap();
+        let loaded: Prefs = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.ssh_profiles, prefs.ssh_profiles);
+        assert_eq!(loaded.lang, "en");
+    }
+
+    #[test]
+    fn profile_edits_preserve_other_settings_and_reject_stale_or_damaged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let original = serde_json::json!({"keys":{"Claude":"sealed"}, "future": [1,2], "conns":[{"future_key":42}]});
+        fs::write(&path, original.to_string()).unwrap();
+        let empty = ssh_profiles::Profiles::new();
+        let profiles = BTreeMap::from([("build".into(), crate::ssh::SshOptions { host: "vm".into(), ..Default::default() })]);
+        write_document(&path, |doc| update_profiles(doc, &empty, &profiles)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut result: Document = serde_json::from_slice(&before).unwrap();
+        result.as_object_mut().unwrap().remove("ssh_profiles");
+        assert_eq!(result, original);
+        assert!(write_document(&path, |doc| update_profiles(doc, &empty, &empty)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        for damaged in ["{", "null", "[]", r#"{"ssh_profiles":[]}"#] {
+            fs::write(&path, damaged).unwrap();
+            assert!(write_document(&path, |doc| update_profiles(doc, &profiles, &empty)).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), damaged);
+        }
+    }
 
     #[test]
     fn experimental_permission_is_explicit_and_persisted() {

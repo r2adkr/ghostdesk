@@ -65,7 +65,7 @@ const PAUSE_WAIT: Duration = Duration::from_secs(120);
 const APPROVAL_WAIT: Duration = Duration::from_secs(180);
 /// Marker for MCP workspaces created without login (empty profile). Folders with content but
 /// without this marker are never opened as an empty profile.
-const BLANK_MARKER: &str = "ghostdesk-mcp-blank";
+const BLANK_MARKER: &str = crate::cleanup::SCRATCH_MARKER;
 
 /// Apps external agents can never open (shells, scripts, credentials, security settings).
 ///
@@ -192,6 +192,8 @@ struct DeskEntry {
     shared_access: bool,
     /// Workspace reservation key (released on close).
     reservation: String,
+    /// The agent chose this screen's workspace name itself (so it may come back to it).
+    named: bool,
 }
 
 /// Workspace reservation. Released automatically on drop if opening fails.
@@ -340,6 +342,7 @@ impl ControlServer {
             "open" => self.open(p, conn).await,
             "act" => self.act(p, conn).await,
             "close" => self.close(p, conn).await,
+            "usage" => self.usage_note(p, conn),
             "team" => {
                 let r = self.team(p, conn).await;
                 self.ctx.request_repaint();
@@ -369,8 +372,16 @@ impl ControlServer {
         if let Some(ssh) = e.shared.ssh.lock().as_ref() { ssh.close(); }
         self.reserved.lock().remove(&e.reservation);
         let left = e.shared.workspace.lock().take();
-        if let Some(d) = left {
-            tokio::spawn(async move { d.shutdown().await });
+        let (name, named) = (e.shared.workspace_name.clone(), e.named);
+        match left {
+            // delete the scratch workspace only once the program using it has shut down
+            Some(d) => {
+                tokio::spawn(async move {
+                    d.shutdown().await;
+                    crate::cleanup::forget_workspace(&name, named);
+                });
+            }
+            None => crate::cleanup::forget_workspace(&name, named),
         }
     }
 
@@ -382,6 +393,7 @@ impl ControlServer {
             d.shutdown().await;
         }
         self.reserved.lock().remove(&e.reservation);
+        crate::cleanup::forget_workspace(&e.shared.workspace_name, e.named);
         e.shared.log(LogKind::Info, why.to_string());
         e.shared.set_status(AgentStatus::Idle("닫힘".into()));
         self.ctx.request_repaint();
@@ -655,13 +667,17 @@ impl ControlServer {
                 DeskTarget::Session { account }
             }
             "remote" => {
-                let host = p["host"].as_str().ok_or_else(|| anyhow!("host 가 필요합니다"))?.to_string();
-                let port = p["port"].as_u64().unwrap_or(5900) as u16;
+                let host = p["host"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("host 가 필요합니다"))?.to_owned();
+                let port = match p.get("port") {
+                    None => 5900,
+                    Some(value) => value.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|&n| n > 0)
+                        .ok_or_else(|| anyhow!("VNC port must be an integer between 1 and 65535"))?,
+                };
                 let dedicated = p["dedicated_machine"].as_bool().unwrap_or(false);
                 let ssh = p.get("ssh").filter(|v| !v.is_null()).map(|v| serde_json::from_value::<crate::ssh::SshOptions>(v.clone())).transpose()?;
                 if let Some(options) = &ssh { options.validate()?; }
                 let mut detail = format!("{client} 이(가) {host}:{port} 원격 데스크톱(VNC)에 접속하려고 합니다.");
-                if let Some(options) = &ssh { detail.push_str(&format!("\nSSH: {}:{} — remote commands and requested file receipt", options.host, options.port)); }
+                if let Some(options) = &ssh { detail.push_str(&format!("\nSSH: {} — remote commands and requested file receipt", options.endpoint())); }
                 #[cfg(target_os = "macos")]
                 if dedicated {
                     detail.push_str(
@@ -714,7 +730,7 @@ impl ControlServer {
             "ssh" => {
                 let options: crate::ssh::SshOptions = serde_json::from_value(p.clone())?;
                 options.validate()?;
-                self.ask(conn, "SSH 원격 작업 접속 요청", format!("{client}: {}:{}\nRemote command execution and requested result file receipt using SSH key/agent authentication", options.host, options.port)).await?;
+                self.ask(conn, "SSH 원격 작업 접속 요청", format!("{client}: {}\nRemote command execution and requested result file receipt using SSH key/agent authentication", options.endpoint())).await?;
                 DeskTarget::Ssh(options)
             }
             other => bail!("kind 는 browser / app / session / remote / ssh 중 하나여야 합니다 (받은 값: {other})"),
@@ -781,11 +797,14 @@ impl ControlServer {
             bail!("요청한 에이전트의 연결이 끊겨 화면을 닫았습니다");
         }
         shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+        crate::usage::global().screen(&client);
         let reservation = reservation.keep();
-        self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation });
+        self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation, named: p["workspace"].is_string() });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let png = desk.screenshot().await.ok();
+        // a web page is read as text, so no picture unless asked for (it costs the agent over a thousand tokens)
+        let want_png = p["screenshot"].as_bool().unwrap_or(kind != "browser");
+        let png = if want_png { desk.screenshot().await.ok() } else { None };
         let (w, h) = desk.size();
         Ok(json!({
             "desk_id": desk_id,
@@ -1016,8 +1035,13 @@ impl ControlServer {
         }
         let tool = p["tool"].as_str().unwrap_or("computer");
         let input = &p["input"];
-        if tool == "computer" && input.get("actions").is_some() {
-            return self.act_sequence(&shared, &desk, input, p["screenshot"].as_bool().unwrap_or(true)).await;
+        // Screenshots cost an agent a lot, so unless it says otherwise only actions that change what is
+        // on screen return one (see `default_shot`).
+        let want_shot = p["screenshot"].as_bool().unwrap_or_else(|| default_shot(tool, input));
+        if input.get("actions").is_some() && matches!(tool, "computer" | "browser" | "app") {
+            let reply = self.act_sequence(&shared, &desk, tool, input, want_shot).await?;
+            note_usage(&shared, &reply, p["screenshot"].is_null() && !want_shot);
+            return Ok(reply);
         }
         let name = match tool {
             "computer" => input["action"].as_str().ok_or_else(|| anyhow!("input.action 이 필요합니다"))?.to_string(),
@@ -1060,7 +1084,9 @@ impl ControlServer {
             }
         };
         let text = if out.text.is_empty() { "OK".to_string() } else { out.text };
-        act_reply(&desk, text, out.image, p["screenshot"].as_bool().unwrap_or(true)).await
+        let reply = act_reply(&desk, text, out.image, want_shot).await?;
+        note_usage(&shared, &reply, p["screenshot"].is_null() && !want_shot);
+        Ok(reply)
     }
 
     /// `input.actions`: runs several computer actions in order (a bundle like click → type → Enter in
@@ -1068,7 +1094,7 @@ impl ControlServer {
     ///
     /// Stops at the first failure or when the user stops/pauses, reporting how far it got. The screen
     /// is captured only once, at the end.
-    async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, input: &Value, want_shot: bool) -> Result<Value> {
+    async fn act_sequence(&self, shared: &Arc<AgentShared>, desk: &Desk, tool: &str, input: &Value, want_shot: bool) -> Result<Value> {
         let steps = input["actions"].as_array().ok_or_else(|| anyhow!("actions 는 동작 객체의 배열이어야 합니다"))?;
         anyhow::ensure!(!steps.is_empty(), "actions 가 비어 있습니다");
         anyhow::ensure!(steps.len() <= MAX_SEQUENCE, "actions 는 한 번에 {MAX_SEQUENCE}개까지입니다 (받은 수: {})", steps.len());
@@ -1087,15 +1113,34 @@ impl ControlServer {
             if shared.paused.load(Ordering::SeqCst) {
                 bail!("{}사용자가 직접 조작을 시작해 {n}번째 동작부터 실행하지 않았습니다. 잠시 후 화면을 확인하고 이어서 하세요.", done_prefix(&lines));
             }
-            let desc = agent::describe(&name, step);
+            // which tool this step belongs to: page-element and navigation actions go to the browser, the
+            // rest to the tool the call was made for (so one bundle can mix clicks by number with pixels)
+            let step_tool = if tool != "app" && is_browser_action(&name, step) {
+                "browser"
+            } else if tool == "browser" {
+                "computer"
+            } else {
+                tool
+            };
+            let tool_name = match step_tool {
+                "browser" => "browser_control",
+                "app" => if desk.kind() == DeskKind::Electron { "app_menu" } else { "app_control" },
+                _ => name.as_str(),
+            };
+            let desc = agent::describe(tool_name, step);
             shared.log(LogKind::Action, desc.clone());
             shared.set_status(AgentStatus::Acting(short(&format!("{n}/{} {desc}", steps.len()), 60)));
             let aim = |pt: (f64, f64)| {
                 shared.cursor.lock().aim(pt, desk.mouse_pos());
                 shared.ctx.request_repaint();
             };
-            let r = agent::exec_computer(desk, &name, step, &aim).await;
-            shared.cursor.lock().record(&name, step, desk.mouse_pos(), false);
+            let r = if step_tool == "computer" {
+                let r = agent::exec_computer(desk, &name, step, &aim).await;
+                shared.cursor.lock().record(&name, step, desk.mouse_pos(), false);
+                r
+            } else {
+                agent::exec_desk_tool(desk, tool_name, step).await
+            };
             shared.ctx.request_repaint();
             match r {
                 Ok(o) => {
@@ -1129,6 +1174,16 @@ impl ControlServer {
         act_reply(desk, lines.join("\n"), image, want_shot).await
     }
 
+    /// An MCP connection says it left a repeated screenshot out (see mcp.rs `trim_repeats`).
+    fn usage_note(&self, p: &Value, conn: &Conn) -> Result<Value> {
+        let id = p["desk_id"].as_str().unwrap_or_default();
+        let client = self.desks.lock().get(id).filter(|e| e.conn == conn.id || e.shared_access).and_then(|e| e.shared.external.lock().clone());
+        if let Some(client) = client {
+            crate::usage::global().shot(&client, false);
+        }
+        Ok(json!({}))
+    }
+
     async fn close(&self, p: &Value, conn: &Conn) -> Result<Value> {
         let id = p["desk_id"].as_str().ok_or_else(|| anyhow!("desk_id 가 필요합니다"))?;
         let e = {
@@ -1141,6 +1196,50 @@ impl ControlServer {
         };
         self.shutdown_entry(e, "외부 에이전트가 화면을 닫았습니다").await;
         Ok(json!({ "closed": id }))
+    }
+}
+
+/// Actions that read or drive a page by its elements, or navigate it (everything `browser_control`
+/// does apart from dialogs), so a bundle can use them next to pixel actions.
+fn is_browser_action(name: &str, step: &Value) -> bool {
+    match name {
+        "navigate" | "back" | "forward" | "reload" | "new_tab" | "switch_tab" | "close_tab" | "list_tabs" | "read" | "text" | "find"
+        | "links" | "click" | "fill" | "select" | "scroll_to" | "wait_for" | "dialog" | "respond_dialog" => true,
+        // `double_click` with coordinates is the pixel action
+        "double_click" => step.get("ref").is_some() || step.get("label").is_some(),
+        _ => false,
+    }
+}
+
+/// Whether a call returns a screenshot when the agent didn't say. Pixel actions do (the agent works
+/// from the picture); page-element, navigation and read-only actions don't (they answer in text, and
+/// the agent asks with `screenshot: true` when it wants to see).
+fn default_shot(tool: &str, input: &Value) -> bool {
+    let one = |tool: &str, step: &Value| -> bool {
+        let name = step["action"].as_str().unwrap_or_default();
+        match tool {
+            "browser" => false,
+            "app" => !matches!(name, "list" | "list_windows" | "ui_tree" | "menus" | "read" | "dialog" | "find"),
+            "computer" => !is_browser_action(name, step),
+            _ => true,
+        }
+    };
+    match input["actions"].as_array() {
+        Some(steps) => steps.iter().any(|s| one(tool, s)),
+        None => one(tool, input),
+    }
+}
+
+/// Counts one call of an outside agent (and the screenshot it got, if any) for the Usage tab.
+/// `skipped`: the screenshot was left out by default (it would have been sent before).
+fn note_usage(shared: &AgentShared, reply: &Value, skipped: bool) {
+    let client = shared.external.lock().clone().unwrap_or_else(|| "외부 에이전트".into());
+    let u = crate::usage::global();
+    u.action(&client);
+    if reply["screenshot_png"].is_string() {
+        u.shot(&client, true);
+    } else if skipped {
+        u.shot(&client, false);
     }
 }
 
@@ -1935,6 +2034,21 @@ mod win_policy {
 }
 
 #[cfg(test)]
+    #[test]
+    fn screenshots_are_returned_only_when_the_screen_is_what_changed() {
+        let step = |a: &str| json!({ "action": a });
+        // pixel actions: yes; reading and element actions: no
+        assert!(default_shot("computer", &step("left_click")));
+        assert!(!default_shot("computer", &step("read")));
+        assert!(!default_shot("browser", &step("click")));
+        assert!(!default_shot("browser", &json!({ "actions": [step("navigate"), step("read")] })));
+        // a bundle that also uses the mouse ends with a picture
+        assert!(default_shot("computer", &json!({ "actions": [step("click"), step("left_click")] })));
+        assert!(!default_shot("app", &step("ui_tree")) && default_shot("app", &step("press")));
+        // `double_click` is a page element action only when it names one
+        assert!(is_browser_action("double_click", &json!({ "ref": 3 })) && !is_browser_action("double_click", &json!({ "coordinate": [1, 2] })));
+    }
+
 mod tests {
     use super::*;
 
@@ -2118,6 +2232,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_vnc_ports_are_rejected_before_approval() {
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let srv = ControlServer::new(tx, egui::Context::default());
+        let (_alive, caller) = conn(1);
+        for port in [json!(0), json!(65536), json!(-1), json!("5900"), Value::Null] {
+            let params = json!({"kind": "remote", "host": "test.invalid", "port": port});
+            let error = tokio::time::timeout(Duration::from_secs(1), srv.open(&params, &caller)).await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("port"), "{error}");
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn approval_cancelled_when_requester_disconnects() {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let srv = ControlServer::new(ev_tx, egui::Context::default());
@@ -2148,7 +2275,7 @@ mod tests {
             srv.reserved.lock().insert(reservation_key(&format!("mcp_{id}")));
             srv.desks.lock().insert(
                 id.into(),
-                DeskEntry { shared: sh, conn: owner, shared_access: shared, reservation: reservation_key(&format!("mcp_{id}")) },
+                DeskEntry { shared: sh, conn: owner, shared_access: shared, reservation: reservation_key(&format!("mcp_{id}")), named: false },
             );
         }
         // other connections can't drive or close it, shared ones can

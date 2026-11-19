@@ -131,42 +131,40 @@ pub(crate) fn current_modes() -> Vec<(&'static str, String)> {
 fn modes(pl: &Plat) -> Vec<(&'static str, String)> {
     let apps = pl.local_apps;
     let mut m = vec![
-        ("web", "숨겨진 빈 브라우저".to_string()),
-        ("web_login", "내 브라우저 로그인을 복제한 숨겨진 브라우저 (승인)".to_string()),
+        ("web", "빈 숨김 브라우저".to_string()),
+        ("web_login", "내 브라우저 로그인 복제 (승인)".to_string()),
     ];
     if pl.app_kind {
-        m.push(("app", format!("{apps}을 숨겨서 새로 실행 (Electron 앱은 빈 복제본)")));
-        m.push(("app_login", format!("{apps}을 숨겨서 실행, Electron 앱은 내 로그인 복제 (승인)")));
+        m.push(("app", format!("{apps}을 숨겨 실행 (Electron 은 빈 복제본)")));
+        m.push(("app_login", format!("{apps}을 숨겨 실행, Electron 은 내 로그인 복제 (승인)")));
         if pl.app_host {
-            m.push(("app_current_session", "현재 Windows 계정의 원본 로그인·프로필로 숨겨서 실행, 같은 앱은 먼저 완전히 종료 (승인)".to_string()));
+            m.push(("app_current_session", "현재 Windows 계정의 원본 로그인·프로필로 숨겨 실행, 같은 앱은 먼저 종료 (승인)".to_string()));
         }
         if pl.attach {
-            m.push(("app_running", "지금 실행 중인 내 앱을 숨기고 조작 (승인)".to_string()));
+            m.push(("app_running", "실행 중인 내 앱을 숨기고 조작 (승인)".to_string()));
         }
         if pl.vdisplay {
-            m.push(("app_vdisplay", "가상 모니터 위에서 실행, 실제 픽셀 클릭·드래그 (실험, 승인)".to_string()));
+            m.push(("app_vdisplay", "가상 모니터에서 실행, 실제 픽셀 클릭·드래그 (실험, 승인)".to_string()));
         }
     }
     if pl.session {
         m.push((
             "session",
             if pl.child_session {
-                "같은 PC·같은 계정의 Windows 자식 세션 화면 전체 (승인, 사용자가 기능을 켜야 함)".to_string()
+                "같은 PC·계정의 Windows 자식 세션 전체 화면 (승인, 사용자가 기능을 켜야 함)".to_string()
             } else {
-                "전용 macOS 계정의 별도 로그인 세션 화면 전체 (account)".to_string()
+                "전용 macOS 계정의 별도 세션 전체 화면 (account)".to_string()
             },
         ));
     }
-    m.push(("ssh", "SSH 원격 명령 실행과 요청 시 결과 파일 수신 (키/에이전트 인증, 승인)".to_string()));
+    m.push(("ssh", "SSH 원격 명령과 결과 파일 수신 (승인)".to_string()));
     m.push(("remote", "VNC 원격 컴퓨터 (host/port, 승인)".to_string()));
     m
 }
 
 fn server_instructions_for(pl: &Plat) -> String {
-    let apps = pl.local_apps;
-    let app_tools = if pl.app_kind { format!(", {apps}은 desk_app 으로 메뉴·접근성 요소를") } else { String::new() };
     let child_session_hint = if pl.child_session {
-        " Windows 의 새 메모장·계산기 같은 Microsoft Store 앱은 session 으로 여세요 (자식 세션 기능 켜기·GhostDesk 창에서 승인 필요)."
+        " On Windows, new Microsoft Store apps (Notepad, Calculator) open with session (needs the child-session feature on and approval in the GhostDesk window)."
     } else {
         ""
     };
@@ -174,23 +172,22 @@ fn server_instructions_for(pl: &Plat) -> String {
     // modes are guarded by the approval dialog in the GhostDesk window. If the user didn't mention
     // GhostDesk but it suits the task, ask once whether to use it. The mode list lives only in
     // desk_open's mode description.
+    let app_cost = if pl.app_kind { " In apps use desk_app find/press(label) first; pixel clicks are the last resort." } else { "" };
     format!(
-        "사용자가 GhostDesk 를 말하지 않았더라도, 웹사이트나 앱 화면을 직접 눌러 보고 입력해야 하는 일(사이트에서 찾기·양식 채우기·화면 확인, 앱 조작 등)이고 \
-         GhostDesk 로 하면 사용자의 화면·마우스를 빼앗지 않아 더 낫다고 판단되면, 시작하기 전에 \"GhostDesk 로 할까요?\" 처럼 한 문장으로 쓸지 물어보세요. \
-         파일·명령어·API 로 끝낼 수 있는 일에는 묻지 마세요. 같은 대화에서 이미 답을 들었으면 다시 묻지 말고 그 답을 따르세요. \
-         사용자가 'GhostDesk 로', '고스트데스크에서', '내 화면 건드리지 말고' 같은 말로 작업을 맡기면, 사용자에게 모드를 묻지 말고 desk_open 의 mode 목록에서 할 일에 가장 알맞은 것을 스스로 골라 바로 desk_open 하세요. \
-         고르는 기준: 웹사이트에서 할 일이면 web, 그중 내 로그인(메일·쇼핑·SNS 계정 등)이 필요하면 web_login, 이 컴퓨터의 특정 앱에서 할 일이면 app, \
-         그 앱에 이미 로그인된 상태가 필요하면 app_login.{child_session_hint} 사용자가 모드를 말했으면 그것을 쓰세요. 로그인 복제·실행 중인 앱·원격 접속 같은 모드는 \
-         GhostDesk 창에서 사용자가 승인하므로 따로 묻지 않아도 됩니다. desk_open(mode) → desk_action/desk_browser/desk_app 반복 → 결과 보고 → desk_close 로 끝까지 진행하세요. \
-         고른 모드가 실패하거나 승인이 거절되면 이유를 짧게 알리고, 더 알맞은 다른 모드가 있으면 그것으로 다시 시도하세요 (같은 승인을 되풀이해 요청하지는 마세요). \
-         화면은 사용자의 화면·마우스·키보드와 분리되어 있고, 동작마다 스크린샷이 돌아옵니다. 좌표는 최신 스크린샷의 픽셀입니다. 브라우저는 desk_browser 로 URL·탭을{app_tools} 다룹니다. \
-         사용자가 GhostDesk 창에서 실시간으로 지켜봅니다. 메시지 전송·결제·삭제처럼 되돌릴 수 없는 동작은 먼저 확인받으세요. \
-         자식 세션·별도 계정 세션(session)은 하나뿐이라 한 번에 한 에이전트만 씁니다. 다른 에이전트가 쓰는 중이라는 오류가 오면 web·app 등 다른 mode 로 할 수 있는지 먼저 보고, 꼭 필요하면 잠시 뒤 다시 desk_open 하세요. \
-         사용자가 팀 이름을 주거나 여러 에이전트가 함께 하라고 하면 team(action=join, role=맡을 분야) 으로 들어가 목표·할 일·메모를 읽고, \
-         할 일은 team_task 로 claim → done(결과) 하며, 다른 팀원에게 필요한 발견·결정은 team(action=note) 로 짧게 남기세요. 일을 시작하기 전과 끝낸 뒤에 team(action=read) 로 새 메모를 확인하세요. \
-         팀의 공용 저장소에서 코드를 수정하기 전에 team(action=claim_files, paths=[저장소 루트 기준 상대 경로]) 의 성공을 확인하세요. 다른 팀원이 맡은 경로는 피하거나 담당자와 조율하세요. \
-         예약 후 최신 내용을 읽고, 파일을 추가로 수정하기 전에 경로를 추가하세요. 파일 이름을 바꿀 때는 두 경로를 모두 예약하세요. 파일을 쓰는 명령이 종료되고 수정이 끝나면 team(action=release_files) 로 해제하세요. \
-         수정 범위를 미리 좁히기 어려운 작업은 별도 Git worktree 에서 진행하고 통합을 조율하세요. 팀원이 작업 중인 공용 체크아웃 전체를 바꾸는 명령은 피하세요."
+        "GhostDesk drives websites and apps on isolated screens without touching the user's screen, mouse or keyboard. \
+         Whenever computer use is blocked or limited (sandbox, headless server, computer use disabled or denied) or you'd rather not take the user's screen, \
+         and a task needs clicking through a site or app, always consider GhostDesk first. \
+         If the user didn't mention it but it fits, ask once before starting, in one sentence (\"Use GhostDesk for this?\"); reuse an earlier answer; don't ask when files, commands or APIs can do the job. \
+         When asked to use GhostDesk ('GhostDesk 로', 'don't touch my screen'), don't ask which mode: pick desk_open's mode yourself and open it: web (web_login if the user's own logins are needed), \
+         app (app_login if the app must already be logged in).{child_session_hint} Use a mode the user names. Login clones, running apps and remote access are approved by the user in the GhostDesk window, so don't ask separately. \
+         If a mode fails or is denied, tell the user briefly and retry with a better-fitting mode (never re-request the same approval). Flow: desk_open → actions → report → desk_close. \
+         Save tokens: on the web use desk_browser read → click/fill(ref=n), which is text only; take screenshots only when layout or images matter.{app_cost} \
+         Always speak to the user (questions, confirmations, errors, reports) in the language of their latest message, even if this text, tool results or page content are in another language. \
+         Batch steps with actions and use zoom for a region. An unchanged screen isn't re-sent. The user watches live: confirm irreversible steps (sending, paying, deleting) first. \
+         session (child or separate-account session) is single: one agent at a time. If it is busy, try web/app modes first, else retry later. \
+         Teams: when given a team name or told to work with other agents, team(join, role), read the goal/tasks/notes, take tasks with team_task claim → done(result), share findings with team(note); team(read) before and after the work. \
+         Before editing files of a shared repo, claim them with team(claim_files, paths) and check it succeeded (avoid or coordinate on paths others hold; reserve both paths when renaming); release_files when done. \
+         If the scope can't be narrowed, work in a separate Git worktree, and avoid commands that change the whole shared checkout a teammate is using."
     )
 }
 
@@ -201,49 +198,51 @@ pub(crate) fn tools() -> Value {
 fn tools_for(pl: &Plat) -> Value {
     let apps = pl.local_apps;
     let child_type_hint = if pl.child_session {
-        " Windows 자식 세션에서 긴 글을 쓸 때는 입력 칸의 포커스·선택 상태를 스크린샷으로 확인한 뒤 다음 호출에서 type 하세요. 포커스를 바꾸는 키·클릭과 긴 글 입력은 묶지 마세요."
+        " In Windows child sessions, check the field's focus and selection in a screenshot before typing long text in the next call; don't bundle it with focus-changing keys or clicks."
     } else { "" };
     let modes = modes(pl);
     let names: Vec<&str> = modes.iter().map(|(n, _)| *n).collect();
     let mode_desc = modes.iter().map(|(n, d)| format!("{n}={d}")).collect::<Vec<_>>().join("; ");
     let app_desc = format!(
-        "앱 화면의 보조 조작. Electron 앱: action=list|click (source=app|context, path='File > New Text File') 로 네이티브 메뉴 사용. dialog 로 대기 중인 대화상자를 조회하고 respond_dialog 에 반환된 source·id 를 지정한다. source=native 는 response (0부터 시작하는 버튼 번호), source=javascript 는 accept (true/false)와 prompt_text 로 응답한다. 삭제·결제 등 되돌릴 수 없는 응답은 작업에서 허용한 범위인지 먼저 확인한다. {apps}: action=list_windows | switch_window{{index}} | ui_tree{{max_depth}} | press{{id}} | set_value{{id,text}} | focus{{id}} | select{{id}} | choose{{id,option}} | menus | menu{{path:'파일 > 신규'}} | read{{id}}. ui_tree 의 id 는 다음 ui_tree 전까지 유효하다."
+        "Drive app elements. {apps}: action=find(query) | press|click(id|label) | set_value(id|label,text) | focus | select | choose(option) | read | ui_tree(max_depth) | list_windows | switch_window(index) | menus | menu(path:'File > New'). \
+         label (the element's name) works without an id; ids come from ui_tree/find and last until the next lookup. \
+         Electron apps: menus via action=list|click(source=app|context, path='File > New'); elements inside the window via desk_browser. \
+         Dialogs: dialog lists them; respond_dialog(source, id, native: response=button index, javascript: accept+prompt_text). Confirm irreversible answers are allowed first."
     );
     let app_desc = if pl.child_session {
-        format!("{app_desc} Windows 자식 세션에서도 list_windows, switch_window, ui_tree, press, set_value, focus, select, choose, read 를 사용할 수 있다. 창·포커스를 바꾼 뒤 ui_tree 를 다시 조회한다. 긴 글은 set_value 후 read 로 확인한다. 이 세션의 앱 메뉴는 화면이나 키보드로 조작한다.")
+        format!("{app_desc} Windows child sessions support the same actions except menus. Look up again after changing windows or focus; for long text set_value then read to check. Operate app menus by screen or keyboard.")
     } else { app_desc };
     let mut t = json!([
         {
             "name": "desk_open",
-            "description": "격리된 화면을 연다 (할 일에 맞는 mode). 결과로 desk_id 와 첫 스크린샷을 돌려준다.",
+            "description": "Open an isolated screen; returns desk_id. Pick mode to fit the task.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": { "type": "string", "enum": names, "description": mode_desc },
                     "app": { "type": "string", "description": pl.app_hint },
-                    "url": { "type": "string", "description": "web: 처음 열 URL" },
-                    "account": { "type": "string", "description": "session: 전용 에이전트 macOS 계정 이름 (기본 ghostdesk-agent)" },
-                    "browser": { "type": "string", "description": "web: Chrome / Edge / Whale 등 (기본: 처음 찾은 것)" },
-                    "browser_profile": { "type": "string", "description": "web_login: 탐지된 브라우저 프로필 ID (Default, Profile 1 등) 또는 표시 이름. 생략하면 첫 프로필" },
-                    "workspace": { "type": "string", "description": "재사용할 작업공간 이름. 이전 복제 로그인·앱 데이터를 유지한다. 로그인 사용 여부별로 분리되며 동시에 사용 중이면 별도 이름으로 열린다" },
-                    "refresh_login": { "type": "boolean", "description": "web_login/app_login 전용: 기존 작업공간의 복제 데이터를 원본에서 새로 복사한 데이터로 교체한다. 이전 복제본에서 변경한 데이터는 사라질 수 있다" },
-                    "name": { "type": "string", "description": "화면 이름" },
-                    "host": { "type": "string" }, "port": { "type": "integer" },
+                    "url": { "type": "string", "description": "web: start URL" },
+                    "account": { "type": "string", "description": "session: dedicated macOS account (default ghostdesk-agent)" },
+                    "browser": { "type": "string", "description": "web: Chrome, Edge, Whale…" },
+                    "browser_profile": { "type": "string", "description": "web_login: profile id (Default, Profile 1…) or name (default: first)" },
+                    "workspace": { "type": "string", "description": "workspace to reuse (keeps cloned login/app data; opens under a new name if busy)" },
+                    "refresh_login": { "type": "boolean", "description": "web_login/app_login: 원본에서 새로 복사해 복제 데이터를 교체 (replace the clone; its own changes may be lost)" },
+                    "name": { "type": "string", "description": "screen name" },
+                    "host": { "type": "string" }, "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                     "username": { "type": "string" }, "password": { "type": "string" },
-                    "identity_file": { "type": "string", "description":"ssh: optional SSH private key path; otherwise use SSH agent/config" },
-                    "ssh": { "type":"object", "description":"remote: optional SSH connection for commands and result receipt, independent of VNC credentials", "properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"username":{"type":"string"},"identity_file":{"type":"string"}}, "required":["host"] },
+                    "identity_file": { "type": "string", "description":"ssh: private key path (default: ssh agent/config)" },
+                    "ssh": { "type":"object", "description":"remote: SSH for commands/results, separate from VNC", "properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"username":{"type":"string"},"identity_file":{"type":"string"}}, "required":["host"] },
                     "dedicated_machine": { "type": "boolean", "description": pl.dedicated_hint },
-                    "width": { "type": "integer" }, "height": { "type": "integer" }
+                    "width": { "type": "integer" }, "height": { "type": "integer" },
+                    "screenshot": { "type": "boolean", "description": "first screenshot (web: default false)" }
                 },
                 "required": ["mode"]
             }
         },
         {
             "name": "desk_action",
-            "description": format!("화면에서 마우스/키보드 동작을 한다 (Claude computer-use 와 같은 동작 이름). action: screenshot, left_click, right_click, middle_click, double_click, triple_click, left_click_drag(start_coordinate→coordinate), mouse_move, left_mouse_down, left_mouse_up, scroll(scroll_direction up/down/left/right, scroll_amount), type(text, 한글 가능), key(text: 'Return', '{}+a', 'ctrl+shift+t'; repeat), hold_key(text, duration), wait(duration), zoom(region [x0,y0,x1,y1]), cursor_position. 동작 뒤 스크린샷을 돌려준다. \
-                 여러 동작을 한 번에: action 대신 actions 에 동작 객체 배열을 넣으면 순서대로 실행하고 끝에 스크린샷 한 장만 돌려준다 \
-                 (예: [{{\"action\":\"left_click\",\"coordinate\":[400,300]}},{{\"action\":\"type\",\"text\":\"서울 날씨\"}},{{\"action\":\"key\",\"text\":\"Return\"}}]). \
-                 결과를 보고 판단해야 하는 지점에서는 묶음을 끊으세요.{child_type_hint} 하나가 실패하면 거기서 멈추고 몇 번째까지 했는지 알려 준다 (최대 50개).", pl.primary_mod),
+            "description": format!("Pixel actions (computer-use style). action: screenshot | left_click|right_click|middle_click|double_click|triple_click(coordinate) | left_click_drag(start_coordinate→coordinate) | mouse_move | left_mouse_down|left_mouse_up | scroll(scroll_direction, scroll_amount) | type(text) | key(text:'{}+a'|'ctrl+shift+t', repeat) | hold_key(text,duration) | wait(duration) | wait_change(duration: until the screen changes) | fill_at(coordinate, text, submit: replace a field's content) | zoom(region:[x0,y0,x1,y1]) | cursor_position. \
+                 actions=[{{\"action\":\"left_click\",\"coordinate\":[400,300]}},{{\"action\":\"type\",\"text\":\"hello\"}}] runs up to 50 steps in order and returns one screenshot at the end (stops at a failure). Split the bundle where you must look before deciding.{child_type_hint}", pl.primary_mod),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -251,7 +250,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "action": { "type": "string" },
                     "actions": {
                         "type": "array",
-                        "description": "action 대신: 순서대로 실행할 동작들. 각 항목은 action 과 그 동작의 인자(coordinate, text, …)를 가진 객체",
+                        "description": "instead of action: steps run in order (max 50)",
                         "items": { "type": "object", "properties": { "action": { "type": "string" } }, "required": ["action"] },
                         "minItems": 1, "maxItems": 50
                     },
@@ -263,26 +262,49 @@ fn tools_for(pl: &Plat) -> Value {
                     "duration": { "type": "number" },
                     "repeat": { "type": "integer" },
                     "region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
-                    "screenshot": { "type": "boolean", "description": "동작 뒤 스크린샷을 받을지 (기본 true)" }
+                    "screenshot": { "type": "boolean", "description": "return a screenshot (pixel actions: true, element actions: false)" }
                 },
                 "required": ["desk_id"]
             }
         },
         {
             "name": "desk_browser",
-            "description": "브라우저 화면의 주소 이동·탭 관리·대화상자 응답. action: navigate(url), back, forward, reload, new_tab(url), switch_tab(index), close_tab(index), list_tabs, dialog, respond_dialog(id,accept,prompt_text). confirm/prompt 는 자동 수락하지 않는다. dialog 에서 받은 현재 id 와 명시적인 accept=true/false 로 응답한다. 입력 중 대화상자가 열렸다면 같은 입력을 반복하지 말고 먼저 조회한다. 삭제·결제 같은 응답은 작업에서 허용한 범위인지 확인한다.",
+            "description": "Read and drive web pages by element number, without screenshots (far cheaper than images). read returns a numbered list [n]; click/fill/select take ref=n or label=name. Numbers stay valid until the next read/find. \
+                 action: read(scope=page) | text(selector, max_chars) | find(query) | links | click | double_click | fill(value, submit) | select(option) | scroll_to | wait_for(text, gone, timeout) | navigate(url) | back | forward | reload | new_tab(url) | switch_tab(index) | close_tab(index) | list_tabs | dialog | respond_dialog. \
+                 No screenshot unless screenshot=true. actions=[{action:'navigate',url},{action:'wait_for',text:'Search'},{action:'read'}] runs a bundle (pixel actions may be mixed in). Also reads/drives elements inside Electron apps. \
+                 Dialogs are never auto-accepted: read the id with dialog, then respond_dialog with explicit accept. If one interrupted typing, don't repeat the input; confirm irreversible answers (delete, pay) are allowed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "desk_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
+                    "action": { "type": "string", "enum": ["read", "text", "find", "links", "click", "double_click", "fill", "select", "scroll_to", "wait_for", "navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
+                    "actions": {
+                        "type": "array",
+                        "description": "instead of action: steps run in order (stops at a failure, max 50)",
+                        "items": { "type": "object", "properties": { "action": { "type": "string" } }, "required": ["action"] },
+                        "minItems": 1, "maxItems": 50
+                    },
                     "url": { "type": "string" },
                     "index": { "type": "integer" },
-                    "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: dialog 에서 받은 현재 id" },
-                    "accept": { "type": "boolean", "description": "respond_dialog: 수락 true / 취소 false 를 반드시 명시" },
-                    "prompt_text": { "type": "string", "description": "respond_dialog: prompt 에 넣을 답변" }
+                    "ref": { "type": "integer", "minimum": 1, "description": "element number from read/find" },
+                    "label": { "type": "string", "description": "instead of ref: the element's name (button text, placeholder)" },
+                    "value": { "type": "string", "description": "fill: text (replaces content)" },
+                    "submit": { "type": "boolean", "description": "press Enter after fill" },
+                    "option": { "type": "string", "description": "select: option text or value" },
+                    "query": { "type": "string", "description": "find: text to look for" },
+                    "selector": { "type": "string", "description": "text: CSS selector (default: whole page)" },
+                    "max_chars": { "type": "integer", "description": "text: max chars (4000)" },
+                    "max_items": { "type": "integer", "description": "read/links: max items" },
+                    "scope": { "type": "string", "enum": ["viewport", "page"], "description": "read: viewport (default) | page" },
+                    "text": { "type": "string", "description": "wait_for: text to wait for" },
+                    "gone": { "type": "boolean", "description": "wait_for: wait until it is gone" },
+                    "timeout": { "type": "number", "description": "wait_for: max seconds (10)" },
+                    "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: id from dialog" },
+                    "accept": { "type": "boolean", "description": "respond_dialog: true=accept, false=cancel (required)" },
+                    "prompt_text": { "type": "string", "description": "respond_dialog: prompt answer" },
+                    "screenshot": { "type": "boolean", "description": "return a screenshot (default false)" }
                 },
-                "required": ["desk_id", "action"]
+                "required": ["desk_id"]
             }
         },
         {
@@ -300,38 +322,41 @@ fn tools_for(pl: &Plat) -> Value {
                         "minItems": 1, "maxItems": 50
                     },
                     "id": { "type": "integer" }, "index": { "type": "integer" },
+                    "label": { "type": "string", "description": "instead of id: element name" },
+                    "query": { "type": "string", "description": "find: 찾을 글자" },
                     "text": { "type": "string" }, "option": { "type": "string" },
-                    "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context", "javascript", "native"], "description": "메뉴 list/click: app|context. respond_dialog: dialog 가 반환한 javascript|native" },
+                    "path": { "type": "string" }, "source": { "type": "string", "enum": ["app", "context", "javascript", "native"], "description": "menu: app|context. respond_dialog: javascript|native from dialog" },
                     "max_depth": { "type": "integer" },
-                    "response": { "type": "integer", "minimum": 0, "description": "native respond_dialog: 0부터 시작하는 버튼 번호" },
-                    "accept": { "type": "boolean", "description": "javascript respond_dialog: 명시적 수락 또는 취소" },
-                    "prompt_text": { "type": "string", "description": "javascript respond_dialog: prompt 답변" }
+                    "response": { "type": "integer", "minimum": 0, "description": "native dialog: button index (from 0)" },
+                    "accept": { "type": "boolean", "description": "javascript dialog: accept/cancel" },
+                    "prompt_text": { "type": "string", "description": "javascript dialog: prompt answer" },
+                    "screenshot": { "type": "boolean", "description": "return a screenshot (reads: false, press/type: true)" }
                 },
                 "required": ["desk_id", "action"]
             }
         },
         {
             "name": "desk_list",
-            "description": "열려 있는 GhostDesk 화면 목록 (desk_id, 종류, 크기, 탭/창).",
+            "description": "List open screens (desk_id, kind, size, tabs/windows).",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "desk_close",
-            "description": "화면을 닫고 그 프로그램을 종료한다 (작업공간 데이터는 남는다).",
+            "description": "Close a screen and quit its program (workspace data stays).",
             "inputSchema": { "type": "object", "properties": { "desk_id": { "type": "string" } }, "required": ["desk_id"] }
         },
         {
             "name": "team",
-            "description": "여러 에이전트가 함께 쓰는 팀 작업판. action: list | create(name, goal, role) | join(team, role) | read(team, before: 페이징할 메모 번호) | note(team, text) | goal(team, goal) | leave(team) | delete(team, 사용자 승인) | claim_files(team, paths: 수정 전 예약) | release_files(team, paths: 수정 후 해제). join/read는 목표·할 일·수정 중인 파일과 담당자·최근 메모를 반환한다.",
+            "description": "Shared board for several agents. action: list | create(name, goal, role) | join(team, role) | read(team, before) | note(team, text) | goal(team, goal) | leave | delete(needs user approval) | claim_files(team, paths: before editing) | release_files(team, paths: after). join/read return the goal, tasks, files being edited and recent notes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["list", "create", "join", "read", "note", "goal", "leave", "delete", "claim_files", "release_files"] },
-                    "paths": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "공용 저장소의 루트 기준 파일 경로 (예: src/main.rs). 저장소에 있는 표기와 / 구분자를 사용한다. 루트 자체와 절대 경로는 입력할 수 없다." },
-                    "team": { "type": "string", "description": "팀 이름" },
-                    "name": { "type": "string", "description": "create: 새 팀 이름" },
+                    "paths": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "repo-root-relative paths (src/main.rs)" },
+                    "team": { "type": "string", "description": "team name" },
+                    "name": { "type": "string", "description": "create: new team name" },
                     "goal": { "type": "string" },
-                    "role": { "type": "string", "description": "이 팀에서 맡는 분야 (예: 조사, 구현, 검증)" },
+                    "role": { "type": "string", "description": "your area (research, build, verify)" },
                     "text": { "type": "string" },
                     "before": { "type": "integer" }
                 },
@@ -340,7 +365,7 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "team_task",
-            "description": "팀의 할 일. action: add(team, title, detail) | claim(team, task: 번호, 한 할 일은 한 에이전트만) | done(team, task, result: 결과 요약) | release(team, task: 맡은 것 내려놓기). 먼저 team(action=join) 해야 한다.",
+            "description": "Team tasks. add(team, title, detail) | claim(team, task) | done(team, task, result) | release(team, task). join the team first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -747,6 +772,56 @@ fn image(b64: &str) -> Value {
     json!({ "type": "image", "data": b64, "mimeType": "image/png" })
 }
 
+/// What the agent was last shown for each screen, so what hasn't changed isn't sent again.
+static SEEN: std::sync::LazyLock<PMutex<HashMap<String, Seen>>> = std::sync::LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct Seen {
+    shot: u64,
+    views: u64,
+    size: Vec<u64>,
+}
+
+fn hash_of(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Drops what the agent already has from a reply: a screenshot identical to the last one it got
+/// (unless `keep_shot`), a tab/window list and screen size that haven't changed. Every repeated
+/// image is over a thousand tokens of nothing new.
+fn trim_repeats(desk_id: &str, r: &mut Value, keep_shot: bool) -> bool {
+    let mut dropped = false;
+    let mut seen = SEEN.lock();
+    let e = seen.entry(desk_id.to_string()).or_default();
+    if let Some(img) = r["screenshot_png"].as_str() {
+        let h = hash_of(img);
+        if h == e.shot && !keep_shot {
+            r["screenshot_png"] = Value::Null;
+            dropped = true;
+            let t = r["text"].as_str().unwrap_or_default();
+            r["text"] = json!(format!("{t}{}(화면이 직전과 같아서 이미지는 생략했어요)", if t.is_empty() { "" } else { "\n" }));
+        }
+        e.shot = h;
+    }
+    if let Some(v) = r["views"].as_str() {
+        let h = hash_of(v);
+        if h == e.views {
+            r["views"] = Value::Null;
+        }
+        e.views = h;
+    }
+    let size: Vec<u64> = r["size"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
+    if size == e.size {
+        r["size"] = Value::Null;
+    } else {
+        e.size = size;
+    }
+    dropped
+}
+
 /// Control server response → MCP content blocks.
 fn to_content(r: &Value, head: Option<String>) -> Vec<Value> {
     let mut c = Vec::new();
@@ -766,7 +841,7 @@ fn to_content(r: &Value, head: Option<String>) -> Vec<Value> {
     if let Some(v) = r["views"].as_str().filter(|v| !v.trim().is_empty()) {
         lines.push(format!("Views (▶ = current):\n{v}"));
     }
-    if let Some(s) = r["size"].as_array() {
+    if let (Some(s), true) = (r["size"].as_array(), r["screenshot_png"].is_string()) {
         lines.push(format!("Screenshot size: {}x{}", s.first().and_then(|x| x.as_u64()).unwrap_or(0), s.get(1).and_then(|x| x.as_u64()).unwrap_or(0)));
     }
     c.push(text(lines.join("\n")));
@@ -783,27 +858,34 @@ async fn call_tool(conn: &Conn, name: &str, args: &Value) -> Result<Vec<Value>> 
         "desk_open" => {
             let mut p = args.clone();
             p["client"] = json!(std::env::var("GHOSTDESK_CLIENT_NAME").unwrap_or_else(|_| "외부 에이전트".into()));
-            let r = conn.call("open", p).await?;
+            let mut r = conn.call("open", p).await?;
+            if let Some(id) = r["desk_id"].as_str().map(String::from) {
+                let _ = trim_repeats(&id, &mut r, true);
+            }
             to_content(&r, Some(format!("desk_id: {} ({})", r["desk_id"].as_str().unwrap_or(""), r["kind"].as_str().unwrap_or(""))))
         }
-        "desk_action" => {
+        "desk_action" | "desk_browser" | "desk_app" | "desk_remote" => {
             let mut input = args.clone();
             if let Some(o) = input.as_object_mut() {
                 o.remove("desk_id");
                 o.remove("screenshot");
             }
-            let r = conn
-                .call("act", json!({ "desk_id": desk_id, "tool": "computer", "input": input, "screenshot": args["screenshot"].as_bool().unwrap_or(true) }))
-                .await?;
-            to_content(&r, None)
-        }
-        "desk_browser" | "desk_app" | "desk_remote" => {
-            let mut input = args.clone();
-            if let Some(o) = input.as_object_mut() {
-                o.remove("desk_id");
+            let tool = match name { "desk_action" => "computer", "desk_browser" => "browser", "desk_remote" => "remote", _ => "app" };
+            let mut call = json!({ "desk_id": desk_id, "tool": tool, "input": input });
+            // only said when the agent said it; otherwise the screen decides (control.rs `default_shot`)
+            let asked = args["screenshot"].as_bool();
+            if let (Some(shot), true) = (asked, name != "desk_remote") {
+                call["screenshot"] = json!(shot);
             }
-            let tool = match name { "desk_browser" => "browser", "desk_remote" => "remote", _ => "app" };
-            let r = conn.call("act", json!({ "desk_id": desk_id, "tool": tool, "input": input })).await?;
+            let mut r = conn.call("act", call).await?;
+            // an explicit screenshot / zoom is always shown
+            let looks_at_screen = asked == Some(true) || matches!(args["action"].as_str(), Some("screenshot" | "zoom"));
+            if let Some(id) = desk_id.as_str() {
+                if trim_repeats(id, &mut r, looks_at_screen) {
+                    // told to the GUI only for its Usage tab; a failure here changes nothing
+                    let _ = conn.call("usage", json!({ "desk_id": id })).await;
+                }
+            }
             to_content(&r, None)
         }
         "desk_list" => {
@@ -812,6 +894,9 @@ async fn call_tool(conn: &Conn, name: &str, args: &Value) -> Result<Vec<Value>> 
         }
         "desk_close" => {
             let r = conn.call("close", json!({ "desk_id": desk_id })).await?;
+            if let Some(id) = desk_id.as_str() {
+                SEEN.lock().remove(id);
+            }
             vec![text(format!("닫음: {}", r["closed"]))]
         }
         "team" | "team_task" => {
@@ -1151,9 +1236,9 @@ mod tests {
         assert!(mac.contains(&"app_vdisplay".into()) && !mac.contains(&"app_current_session".into()));
         let ins = server_instructions();
         // tells agents to pick the mode themselves without asking
-        assert!(ins.contains("스스로 골라") && !ins.contains("어떤 모드로 할지") && ins.contains("mode"), "{ins}");
+        assert!(ins.contains("pick desk_open's mode yourself") && ins.contains("mode"), "{ins}");
         // if GhostDesk wasn't mentioned but fits the task, ask first whether to use it
-        assert!(ins.contains("GhostDesk 로 할까요?") && ins.contains("묻지 마세요"), "{ins}");
+        assert!(ins.contains("Use GhostDesk for this?") && ins.contains("don't ask when files") && ins.contains("in the language of their latest message"), "{ins}");
         if cfg!(windows) {
             assert!(modes.contains(&"app_current_session".into()) && modes.contains(&"app_running".into()));
             let desc = props["mode"]["description"].as_str().unwrap();
@@ -1165,7 +1250,7 @@ mod tests {
             // example app names must be findable by their Start menu shortcut (.lnk) names
             assert!(app.contains(".exe") && app.contains("'Character Map'") && !app.contains("문자표"), "{app}");
             assert!(app.contains("자식 세션") && app.contains("session"), "{app}");
-            assert!(ins.contains("메모장") && ins.contains("session"), "{ins}");
+            assert!(ins.contains("Notepad") && ins.contains("session"), "{ins}");
         }
         if !cfg!(target_os = "macos") {
             // it also lifts the protection for this computer's own VNC server, so it says to set it only when
@@ -1736,5 +1821,59 @@ mod tests {
             }
         }).await.expect("disconnected editor's file claim should be released");
         server.abort();
+    }
+
+    #[test]
+    fn repeated_screens_and_lists_are_not_sent_twice() {
+        let id = "t-repeat";
+        let reply = || json!({"text": "OK", "views": "▶ [0] a", "size": [10, 20], "screenshot_png": "AAAA"});
+        let mut first = reply();
+        trim_repeats(id, &mut first, false);
+        assert!(first["screenshot_png"].is_string() && first["views"].is_string() && first["size"].is_array());
+        let mut again = reply();
+        trim_repeats(id, &mut again, false);
+        assert!(again["screenshot_png"].is_null() && again["views"].is_null() && again["size"].is_null());
+        assert!(again["text"].as_str().unwrap().contains("생략"));
+        // asking to look is always answered with the picture
+        let mut asked = reply();
+        trim_repeats(id, &mut asked, true);
+        assert!(asked["screenshot_png"].is_string());
+        // a changed screen comes through
+        let mut changed = json!({"text": "OK", "screenshot_png": "BBBB", "size": [10, 20]});
+        trim_repeats(id, &mut changed, false);
+        assert!(changed["screenshot_png"].is_string());
+        // without an image there is no size line either
+        let c = to_content(&json!({"text": "t", "size": [10, 20]}), None);
+        assert!(!c[0]["text"].as_str().unwrap().contains("Screenshot size"));
+    }
+
+    #[test]
+    fn browser_tool_reads_by_elements_and_instructions_say_how_to_save_tokens() {
+        let t = tools();
+        let b = t.as_array().unwrap().iter().find(|x| x["name"] == "desk_browser").unwrap();
+        let props = &b["inputSchema"]["properties"];
+        for k in ["ref", "label", "value", "query", "actions", "screenshot", "scope"] {
+            assert!(props.get(k).is_some(), "{k}");
+        }
+        let acts: Vec<&str> = props["action"]["enum"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        for a in ["read", "click", "fill", "select", "find", "text", "wait_for", "navigate"] {
+            assert!(acts.contains(&a), "{a}");
+        }
+        let ins = server_instructions();
+        assert!(ins.contains("always consider GhostDesk first") && ins.contains("read") && ins.contains("actions"), "{ins}");
+    }
+
+    #[test]
+    fn descriptions_stay_short() {
+        // what an agent pays for in every conversation. Rough token estimate: ~4 bytes of ASCII per
+        // token, ~1.5 tokens per Hangul syllable
+        let estimate = |text: &str| {
+            let ko = text.chars().filter(|c| ('\u{ac00}'..='\u{d7a3}').contains(c)).count();
+            (text.len() - ko * 3) / 4 + ko * 3 / 2
+        };
+        let (tools, ins) = (estimate(&tools().to_string()), estimate(&server_instructions()));
+        eprintln!("tool definitions ~{tools} tokens, instructions ~{ins}");
+        assert!(tools < 3_300, "tool definitions grew to ~{tools} tokens");
+        assert!(ins < 700, "instructions grew to ~{ins} tokens");
     }
 }

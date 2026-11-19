@@ -1,7 +1,9 @@
 //! The egui UI: creating agents, the live multi-agent grid, and the detail view (log,
 //! instructions, takeover).
 
+use std::collections::HashMap;
 use std::sync::{atomic::Ordering, Arc};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Margin, RichText, Stroke, StrokeKind, Vec2};
 use tokio::{runtime::Handle, sync::mpsc};
@@ -10,6 +12,7 @@ use crate::{
     icon,
     agent::{self, AgentCmd, AgentConfig, AgentShared, AgentStatus, DeskTarget, LogKind, ProfileSource, RemoteTarget},
     browser::MouseButton,
+    cleanup,
     llm::{Provider, EFFORTS},
     platform::{caps, text},
     profiles::{self, InstalledBrowser},
@@ -21,13 +24,17 @@ mod fonts;
 mod ai;
 mod i18n;
 mod labels;
+mod palette;
 mod pip;
 mod prefs;
 #[cfg(windows)]
 pub mod setup;
 mod screens;
 mod settings;
+mod remote_info;
+mod ssh_profiles;
 mod teams;
+mod usage;
 mod sidebar;
 mod theme;
 mod titlebar;
@@ -118,7 +125,7 @@ impl AgentHandle {
     }
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Clone, Copy)]
 enum View {
     #[default]
     Home,
@@ -128,6 +135,8 @@ enum View {
     Wall,
     /// Teams: shared work boards for agents working together.
     Teams,
+    /// What agents used, by day and by agent.
+    Usage,
 }
 
 /// Kind of isolated screen a new agent uses.
@@ -149,6 +158,20 @@ enum Choice {
     App,
     Session,
     Remote,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteMode {
+    Vnc,
+    Ssh,
+    Both,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteEntry {
+    Paste,
+    Manual,
+    Imported,
 }
 
 struct NewAgentForm {
@@ -180,12 +203,12 @@ struct NewAgentForm {
     remote_user: String,
     remote_pass: String,
     remote_dedicated: bool,
-    remote_ssh: bool,
-    remote_ssh_only: bool,
-    ssh_host: String,
-    ssh_port: u16,
-    ssh_user: String,
-    ssh_identity: String,
+    remote_mode: RemoteMode,
+    card_input: String,
+    card_invalid: bool,
+    remote_entry: RemoteEntry,
+    ssh_profile: Option<String>,
+    ssh: crate::ssh::SshOptions,
     name: String,
     workspace: String,
     refresh: bool,
@@ -228,9 +251,21 @@ pub struct GhostApp {
     /// Whether the sidebar permission notice was dismissed for this run.
     perm_notice_hidden: bool,
     /// Fields in prefs.json this version doesn't know (written back unchanged on save).
+    prefs_error: Option<String>,
     prefs_other: serde_json::Map<String, serde_json::Value>,
+    ssh_profiles: ssh_profiles::Profiles,
+    ssh_editor: Option<ssh_profiles::Editor>,
+    share_connection: Option<Slot<remote_info::Share>>,
     /// Keeps the Mac/PC from sleeping while agents work, even with the screen locked (display off).
     keep_awake: bool,
+    /// Tidy up finished screens by themselves (`cleanup`).
+    auto_clean: bool,
+    usage_ui: usage::UsageUi,
+    palette: Option<palette::Palette>,
+    usage_saved: Instant,
+    sidebar_open: bool,
+    /// When each outside agent's screen was first seen closed (for the list grace period).
+    closed_since: HashMap<u64, Instant>,
     pip_auto_open: bool,
     pip_auto_close: bool,
     /// Permission bypass: approve external agents' sensitive requests (login cloning, running apps,
@@ -357,7 +392,16 @@ impl GhostApp {
             remember_keys: prefs::CAN_REMEMBER_KEYS,
             lang: Lang::Ko,
             effort_idx: 1,
+            ssh_profiles: Default::default(),
+            ssh_editor: None,
+            share_connection: None,
             keep_awake: true,
+            auto_clean: true,
+            usage_ui: Default::default(),
+            palette: None,
+            usage_saved: Instant::now(),
+            sidebar_open: true,
+            closed_since: HashMap::new(),
             pip_auto_open: false,
             pip_auto_close: true,
             auto_approve: false,
@@ -369,6 +413,7 @@ impl GhostApp {
             perm_cache: None,
             perm_notice_hidden: false,
             prefs_other: Default::default(),
+            prefs_error: None,
             awake: None,
             browsers,
             form: NewAgentForm::new(profile_idx),
@@ -462,6 +507,44 @@ impl GhostApp {
         self.toast = Some((msg.into(), ctx.input(|i| i.time) + TOAST_SECS));
     }
 
+    /// Removes outside agents' screens from the lists a little while after they closed (the agent
+    /// called desk_close, disconnected, or the program exited). The screen on display stays.
+    fn tidy_finished(&mut self, ctx: &egui::Context) {
+        cleanup::set_enabled(self.auto_clean);
+        if !self.auto_clean {
+            self.closed_since.clear();
+            return;
+        }
+        let now = Instant::now();
+        let shown = if self.view == View::Detail { self.selected } else { None };
+        let mut gone = Vec::new();
+        for (idx, a) in self.agents.iter().enumerate() {
+            let finished = a.shared.external.lock().is_some() && a.shared.workspace().map_or(true, |w| w.is_closed());
+            let id = a.shared.id;
+            if !finished || Some(idx) == shown || matches!(a.shared.status(), AgentStatus::Preparing(_)) {
+                self.closed_since.remove(&id);
+            } else if now.duration_since(*self.closed_since.entry(id).or_insert(now)) >= cleanup::LIST_GRACE {
+                gone.push(idx);
+            }
+        }
+        if !self.agents.is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(10));
+        }
+        for idx in gone.into_iter().rev() {
+            self.closed_since.remove(&self.agents[idx].shared.id);
+            self.remove_agent(idx);
+        }
+    }
+
+    /// Writes the usage history now and then (and when the window closes, see `on_exit`).
+    fn save_usage(&mut self, ctx: &egui::Context) {
+        if self.usage_saved.elapsed() >= Duration::from_secs(15) {
+            self.usage_saved = Instant::now();
+            save_usage_file();
+        }
+        ctx.request_repaint_after(Duration::from_secs(15));
+    }
+
     fn remove_agent(&mut self, idx: usize) {
         if let Some(ssh) = self.agents[idx].shared.ssh.lock().as_ref() { ssh.close(); }
         let h = self.agents.remove(idx);
@@ -522,7 +605,16 @@ impl GhostApp {
     }
 }
 
+/// The file is small, so the write happens on the spot.
+fn save_usage_file() {
+    crate::usage::global().save_if_dirty();
+}
+
 impl eframe::App for GhostApp {
+    fn on_exit(&mut self) {
+        crate::usage::global().save_if_dirty();
+    }
+
     /// Window clear color. The default (translucent black) shows through the 1 px gaps and
     /// separators between panels as black lines in the light theme.
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -564,7 +656,10 @@ impl eframe::App for GhostApp {
         self.spawn_demos(&ctx);
         self.update_textures(&ctx);
         self.update_keep_awake();
+        self.tidy_finished(&ctx);
+        self.save_usage(&ctx);
         self.tour_capture_tick(&ctx);
+        self.shortcuts(&ctx);
 
         // screen wall: only the screens, no other panels (back to home if every agent is gone)
         if self.view == View::Wall
@@ -574,6 +669,7 @@ impl eframe::App for GhostApp {
             self.leave_wall(&ctx, View::Grid);
         }
         // the title bar must be placed before the side panels to span the full window width
+        let mut toggle_sidebar = false;
         if titlebar::visible(&ctx) {
             let cols = if self.view == View::Wall { titlebar::Columns::default() } else { self.title_cols };
             egui::Panel::top("titlebar")
@@ -581,7 +677,10 @@ impl eframe::App for GhostApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| titlebar::bar(ui, cols));
+                .show(ui, |ui| toggle_sidebar |= titlebar::bar(ui, cols, self.sidebar_open));
+        }
+        if toggle_sidebar {
+            self.sidebar_open = !self.sidebar_open;
         }
         if self.view == View::Wall {
             let fade = theme::appear(&ctx, egui::Id::unique("view_in"), self.view_key(), 0.2);
@@ -601,6 +700,40 @@ impl eframe::App for GhostApp {
 }
 
 impl GhostApp {
+    /// App-wide shortcuts (⌘ on macOS, Ctrl elsewhere): K quick switcher, 1-4 switch views, N new agent,
+    /// comma Settings, B hide or show the sidebar. Ignored while a dialog is open so they never act behind it.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, k));
+        // the switcher closes with its own shortcut too
+        if self.palette.is_some() {
+            if pressed(Key::K) {
+                self.palette = None;
+            }
+            return;
+        }
+        if self.tour.is_some() || self.wizard_open || self.show_settings || !self.approvals.is_empty() || self.view == View::Wall {
+            return;
+        }
+        if pressed(Key::K) {
+            self.open_palette();
+        } else if pressed(Key::Num1) {
+            self.view = View::Home;
+        } else if pressed(Key::Num2) {
+            self.view = View::Grid;
+        } else if pressed(Key::Num3) {
+            self.view = View::Teams;
+        } else if pressed(Key::Num4) {
+            self.view = View::Usage;
+        } else if pressed(Key::N) {
+            self.open_wizard();
+        } else if pressed(Key::B) {
+            self.sidebar_open = !self.sidebar_open;
+        } else if pressed(Key::Comma) {
+            self.open_settings(settings::SettingsTab::General);
+        }
+    }
+
     /// Normal layout: left sidebar · (right panel in detail view) · center · modal windows.
     fn main_layout(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let ctx = ctx.clone();
@@ -610,26 +743,58 @@ impl GhostApp {
         // with a title bar, reduce the top margin so content follows right below it. The macOS title bar
         // is shorter (28), so leave a bit more room.
         let top = if titlebar::visible(&ctx) { if cfg!(target_os = "macos") { 10 } else { 4 } } else { 14 };
-        let side = egui::Panel::left("left")
-            .resizable(true)
-            .default_size(sidebar_w)
-            .min_size(200.0)
-            .max_size(if sidebar_w == 200.0 { 200.0 } else { 380.0 })
-            .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 10, right: 10, top, bottom: 14 }))
-            .show(ui, |ui| self.sidebar(ui));
-        self.title_cols = titlebar::Columns { left: side.response.rect.width(), right: 0.0 };
+        let side = if self.sidebar_open {
+            Some(
+                egui::Panel::left("left")
+                    .resizable(true)
+                    .default_size(sidebar_w)
+                    .min_size(200.0)
+                    .max_size(if sidebar_w == 200.0 { 200.0 } else { 380.0 })
+                    .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 10, right: 10, top, bottom: 14 }))
+                    .show(ui, |ui| self.sidebar(ui)),
+            )
+        } else {
+            // hidden: a slim rail keeps the way back (and the two most used actions) out of the page's way
+            Some(
+                egui::Panel::left("rail")
+                    .resizable(false)
+                    .exact_size(68.0)
+                    .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 8, right: 8, top, bottom: 14 }))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let held = ui.input(|i| i.modifiers.command);
+                        let k = |key: &str| held.then(|| palette::cmd_key(key));
+                        // the title bar holds the sidebar button; without one (full screen, Linux) it is here
+                        if !titlebar::visible(&ctx) && theme::rail_button(ui, icon::PANEL_LEFT, k("B").as_deref(), &format!("{} ({})", tr("사이드바 열기"), palette::cmd_key("B"))).clicked() {
+                            self.sidebar_open = true;
+                        }
+                        if theme::rail_button(ui, icon::PLUS, k("N").as_deref(), &format!("{} ({})", tr("새 에이전트"), palette::cmd_key("N"))).clicked() {
+                            self.open_wizard();
+                        }
+                        if theme::rail_button(ui, icon::SEARCH, k("K").as_deref(), &format!("{} ({})", tr("찾기"), palette::cmd_key("K"))).clicked() {
+                            self.open_palette();
+                        }
+                        if theme::rail_button(ui, icon::SETTINGS, k(",").as_deref(), &tr("설정").to_string()).clicked() {
+                            self.open_settings(settings::SettingsTab::General);
+                        }
+                    }),
+            )
+        };
+        let side_width = side.as_ref().map_or(0.0, |s| s.response.rect.width());
+        self.title_cols = titlebar::Columns { left: side_width, right: 0.0 };
         // detail view: right panel (status, controls, log, instructions) + live screen in the center
         if self.view == View::Detail && self.selected.is_none_or(|i| i >= self.agents.len()) {
             self.view = View::Grid;
         }
-        if self.view == View::Detail {
+        let compact_detail = ctx.content_rect().width() - side_width < 816.0;
+        if self.view == View::Detail && !compact_detail {
             if let Some(idx) = self.selected {
                 let mut remove = false;
                 let detail = egui::Panel::right("detail_side")
                     .resizable(true)
                     .default_size(detail_w)
                     .min_size(320.0)
-                    .max_size(detail_panel_limit(ctx.content_rect().width() - side.response.rect.width()))
+                    .max_size(detail_panel_limit(ctx.content_rect().width() - side_width))
                     .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin::same(16)))
                     .show(ui, |ui| {
                         ui.multiply_opacity(fade);
@@ -647,8 +812,10 @@ impl GhostApp {
                 ui.multiply_opacity(fade);
                 match self.view {
                     View::Home => self.welcome(ui),
+                    View::Detail if compact_detail => self.compact_detail(ui, self.selected.unwrap()),
                     View::Detail => self.detail_view(ui, self.selected.unwrap()),
                     View::Teams => self.teams_view(ui),
+                    View::Usage => self.usage_view(ui),
                     _ => self.grid(ui),
                 }
             });
@@ -658,6 +825,7 @@ impl GhostApp {
         if self.approvals.is_empty() {
             self.settings_window(&ctx);
             self.connect_window(&ctx);
+            self.palette_window(&ctx);
             self.new_agent_window(&ctx);
             self.tour_window(&ctx);
             // separate session guide (macOS: LaunchAgent; Windows: enabling child sessions)
@@ -675,6 +843,7 @@ impl GhostApp {
             View::Detail => 2,
             View::Wall => 3,
             View::Teams => 4,
+            View::Usage => 5,
         };
         let agent = self.selected.and_then(|i| self.agents.get(i)).map_or(0, |a| a.shared.id);
         view << 48 | agent

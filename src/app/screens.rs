@@ -41,90 +41,100 @@ impl GhostApp {
     }
 
     pub(super) fn welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            let w = ui.available_width().min(680.0);
-            ui.add_space((ui.available_height() * 0.24).max(24.0));
-            ui.label(RichText::new(tr("내 화면은 그대로, 일은 따로")).size(28.0).color(theme::text()));
-            ui.add_space(8.0);
-            ui.label(RichText::new(tr("웹사이트와 앱 작업을 맡기고, 진행 화면을 지켜보세요")).color(theme::muted()));
-            ui.add_space(24.0);
-            // task box: Enter (or the ↵ button) opens the new-agent window with the typed task
-            let id = egui::Id::unique("welcome_composer");
-            let focused = ui.memory(|m| m.has_focus(id));
-            let focus = ui.ctx().animate_bool_with_time(id.with("focus_t"), focused, 0.15);
-            let mut submit = false;
-            ui.allocate_ui(Vec2::new(w, 0.0), |ui| {
-                theme::composer_frame(focus).show(ui, |ui| {
-                    ui.set_width(w - 32.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                            submit |= theme::enter_button(ui, tr("시작하기 (Enter)")).clicked();
-                            let edit = egui::TextEdit::multiline(&mut self.form.task)
-                                .id(id)
-                                .hint_text(tr("에이전트에게 맡길 일을 적어 보세요"))
-                                .frame(egui::Frame::NONE)
-                                // nudge the first line down to balance against the ↵ button at the bottom right
-                                .margin(Margin { left: 4, right: 4, top: 8, bottom: 2 })
-                                .desired_rows(2)
-                                .desired_width(ui.available_width())
-                                .return_key(Some(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter)));
-                            let r = ui.add(edit);
-                            if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
-                                submit = true;
-                            }
+        let width = ui.available_width().min(800.0);
+        egui::ScrollArea::vertical().id_salt("home").auto_shrink([false, false]).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(width);
+                    ui.add_space(24.0);
+                    ui.heading(RichText::new(tr("어떤 일을 맡길까요?")).size(28.0).strong());
+                    ui.add_space(16.0);
+                    let id = egui::Id::unique("welcome_composer");
+                    let focused = ui.memory(|m| m.has_focus(id));
+                    let focus = ui.ctx().animate_bool_with_time(id.with("focus_t"), focused, 0.15);
+                    let mut next = false;
+                    theme::composer_frame(focus).show(ui, |ui| {
+                        ui.set_width(width - 32.0);
+                        let edit = ui.add(egui::TextEdit::multiline(&mut self.form.task)
+                            .id(id).hint_text(tr("에이전트에게 맡길 일을 적어 보세요"))
+                            .frame(egui::Frame::NONE).desired_rows(3).desired_width(f32::INFINITY)
+                            .return_key(Some(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter))));
+                        // typing starts right away when nothing else holds the keyboard
+                        if !self.wizard_open && self.tour.is_none() && !self.show_settings && ui.memory(|m| m.focused().is_none()) {
+                            edit.request_focus();
+                        }
+                        next = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                next |= theme::primary(ui, tr("다음")).on_hover_text("Enter").clicked();
+                                // quiet hint while typing; fades with focus so it doesn't crowd the idle card
+                                if focus > 0.01 {
+                                    ui.add_space(4.0);
+                                    ui.label(theme::hint(tr("Enter 다음 · Shift+Enter 줄바꿈")).color(theme::muted().gamma_multiply(focus)));
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.model_picker(ui));
+                            });
                         });
                     });
+                    if next { self.open_wizard(); }
+                    ui.add_space(24.0);
+                    theme::section(ui, tr("작업 장소로 시작"));
+                    ui.add_space(6.0);
+                    let places: Vec<_> = wizard::kinds().into_iter().filter(|k| matches!(k.choice, Choice::Web | Choice::App | Choice::Remote)).collect();
+                    let gap = 8.0;
+                    let tile_w = (width - gap * (places.len() - 1) as f32) / places.len() as f32;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for place in places {
+                            if theme::tile(ui, false, place.icon, place.title, Vec2::new(tile_w, 48.0)).on_hover_text(place.about).clicked() {
+                                self.open_wizard();
+                                self.form.choice = Some(place.choice);
+                            }
+                        }
+                    });
+                    if !self.agents.is_empty() {
+                        ui.add_space(32.0);
+                        ui.horizontal(|ui| {
+                            theme::section(ui, tr("최근 에이전트"));
+                            if ui.link(tr("모든 에이전트")).clicked() { self.view = View::Grid; }
+                        });
+                        ui.add_space(6.0);
+                        for (idx, agent) in self.agents.iter().enumerate().rev().take(4) {
+                            let (status, _) = display_status(&agent.shared.status(), agent.shared.paused.load(Ordering::Relaxed), agent.takeover);
+                            let label = format!("{}   ·   {}", agent.shared.name, status);
+                            if theme::nav_item(ui, false, icon::GHOST, &label, Some(crate::cursor::agent_color(agent.shared.id)))
+                                .on_hover_text(&label).clicked() {
+                                self.selected = Some(idx);
+                                self.view = View::Detail;
+                            }
+                        }
+                    }
                 });
             });
-            // right below the box, aligned to its left edge: which AI to work with
-            ui.add_space(6.0);
-            ui.allocate_ui_with_layout(Vec2::new(w, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add_space(4.0);
-                self.model_picker(ui);
-            });
-            ui.add_space(4.0);
-            // shortcuts as keycaps: Enter starts, Shift+Enter adds a line
-            // (centered with last frame's width, since the labels differ per language)
-            let wid = egui::Id::new("shortcut_hint_w");
-            let last_w: f32 = ui.data(|d| d.get_temp(wid)).unwrap_or(0.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.add_space(((ui.available_width() - last_w) / 2.0).max(0.0));
-                let start = ui.cursor().left();
-                theme::keycap(ui, "Enter");
-                ui.label(theme::hint(tr("바로 시작")));
-                ui.add_space(10.0);
-                theme::keycap(ui, "Shift");
-                theme::keycap(ui, "Enter");
-                let end = ui.label(theme::hint(tr("줄바꿈"))).rect.right();
-                let w = end - start;
-                if (w - last_w).abs() > 0.5 {
-                    ui.data_mut(|d| d.insert_temp(wid, w));
-                    ui.ctx().request_repaint();
-                }
-            });
-            if submit {
-                self.open_wizard();
-            }
         });
     }
 
     pub(super) fn grid(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(tr("모든 에이전트")).size(20.0).strong().color(theme::text()));
-            ui.label(RichText::new(self.agents.len().to_string()).size(14.0).color(theme::muted()));
+            theme::count_badge(ui, &self.agents.len().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::primary(ui, format!("{}  {}", icon::PLUS, tr("새 에이전트"))).clicked() {
+                    self.open_wizard();
+                }
+                if !self.agents.is_empty()
+                    && theme::secondary(ui, format!("{}  {}", icon::LAYOUT_DASHBOARD, tr("화면 모아보기"))).clicked()
+                {
+                    self.enter_wall(ui.ctx());
+                }
+            });
         });
         ui.add_space(16.0);
         if self.agents.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.3).max(24.0));
                 ui.label(RichText::new(tr("아직 에이전트가 없습니다")).size(20.0).color(theme::text()));
-                ui.add_space(8.0);
-                ui.label(theme::hint(tr("홈에서 할 일을 적거나 새 에이전트를 만들어 보세요")));
-                ui.add_space(20.0);
-                if theme::primary(ui, tr("새 에이전트")).clicked() {
-                    self.open_wizard();
-                }
             });
             return;
         }
@@ -182,7 +192,8 @@ impl GhostApp {
         let (cols, cell) = wall_layout(n, area.size(), aspect, gap);
         let rows = n.div_ceil(cols.max(1));
         let total_h = rows as f32 * cell.y + gap * (rows as f32 - 1.0);
-        let top = area.center().y - total_h / 2.0;
+        // the wall centers its screens; the list view starts under its header
+        let top = if immersive { area.center().y - total_h / 2.0 } else { area.min.y };
         let show_cursor = self.show_cursor;
         let mut open = None;
         let mut repaint = false;

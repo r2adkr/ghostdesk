@@ -3269,6 +3269,11 @@ async fn maintain_loop(
 }
 
 impl ElectronWorkspace {
+    /// The app's page (what its window shows), for reading and driving it by elements.
+    pub fn page(&self) -> &Arc<BrowserWorkspace> {
+        &self.inner
+    }
+
     pub fn inner(&self) -> &Arc<BrowserWorkspace> {
         &self.inner
     }

@@ -10,7 +10,9 @@
 mod agent;
 mod app;
 mod browser;
+mod browser_dom;
 mod cdp;
+mod cleanup;
 mod control;
 mod mcp;
 mod cursor;
@@ -40,6 +42,7 @@ mod selftest;
 mod team;
 mod turns;
 mod update;
+mod usage;
 
 fn main() -> anyhow::Result<()> {
     // DLL planting defense: DLLs loaded by name at runtime (graphics stack: opengl32, d3d12, dxgi,

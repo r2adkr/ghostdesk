@@ -38,7 +38,7 @@ pub(super) const PAGES: &[Page] = &[
         file: "1-home.jpg",
         image: include_bytes!("../../assets/tour/1-home.jpg"),
         title: "할 일을 적으면 시작해요",
-        body: "홈 화면에 맡길 일을 적고 Enter 를 누르세요. 입력 칸 아래 모델 단추에서 어떤 AI 로 일할지 고를 수 있어요.",
+        body: "홈에서 할 일과 모델을 고른 뒤 다음을 누르세요. 작업 장소를 먼저 선택할 수도 있어요.",
     },
     Page {
         scene: Scene::NewAgent,
@@ -142,7 +142,7 @@ impl GhostApp {
         let tex = page.and_then(|_| tour.texture(ctx, i));
         let mut done = false;
         let mut go: isize = 0;
-        // no skipping: it only closes via "Get started" on the last page (not Esc or clicking outside)
+        // closes via "Get started" or "Skip" (not Esc or clicking outside)
         egui::Modal::new(egui::Id::unique("tour")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(W);
             match page {
@@ -180,6 +180,9 @@ impl GhostApp {
                     }
                     if i > 0 && theme::secondary(ui, tr("이전")).clicked() {
                         go = -1;
+                    }
+                    if !last && ui.link(theme::hint(tr("건너뛰기"))).clicked() {
+                        done = true;
                     }
                 });
             });
