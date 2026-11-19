@@ -6,6 +6,8 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["암호는 키체인에 저장했어요. 설정 화면의 '암호 보기'로 언제든 다시 볼 수 있어요.", "The password is saved in your keychain. You can see it again any time with 'Show password' in the setup screen.", "パスワードはキーチェーンに保存しました。設定画面の「パスワードを表示」でいつでも確認できます。", "密码已保存到钥匙串。可随时通过设置界面的“查看密码”再次查看。"],
     ["세션 설정 적용", "Apply session setup", "セッション設定を適用", "应用会话设置"],
     ["세션 설정을 적용했어요", "Session setup applied", "セッション設定を適用しました", "已应用会话设置"],
+    ["VNC 비밀번호도 함께 복사", "Also copy the VNC password", "VNCパスワードも一緒にコピー", "同时复制 VNC 密码"],
+    ["비밀번호는 암호화되지 않은 텍스트로 들어가요. 믿을 수 있는 사람에게만 보내세요.", "The password is included as plain text. Send it only to someone you trust.", "パスワードは暗号化されないテキストで入ります。信頼できる相手にだけ送ってください。", "密码以未加密的文本形式包含。请只发送给可信任的人。"],
     ["암호 보기", "Show password", "パスワードを表示", "查看密码"],
     ["저장된 암호가 없어요", "No password is saved", "保存されたパスワードがありません", "没有已保存的密码"],
     ["이 계정 만들기", "Create this account", "このアカウントを作成", "创建此账户"],

@@ -18,6 +18,9 @@ struct Card {
     ssh: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vnc: Option<u16>,
+    /// VNC password, only when the sharer chose to include it (the text is not encrypted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pass: Option<String>,
 }
 
 impl Card {
@@ -47,6 +50,7 @@ impl Card {
             && self.ssh != Some(0)
             && self.vnc != Some(0)
             && self.user.len() <= 256
+            && self.pass.as_ref().map_or(true, |p| !p.is_empty() && p.len() <= 128 && self.vnc.is_some() && !p.chars().any(char::is_control))
             && !self.user.starts_with('-')
             && self.user.chars().all(|c| c.is_alphanumeric() || "-_.\\".contains(c))
     }
@@ -81,6 +85,9 @@ impl Card {
         form.remote_host.clear();
         form.remote_user.clear();
         form.remote_port = self.vnc.unwrap_or(5900);
+        if let Some(pass) = self.pass.clone() {
+            form.remote_pass = pass;
+        }
         if self.vnc.is_some() {
             form.remote_host = self.host.clone();
             form.remote_user = self.user.clone();
@@ -103,6 +110,8 @@ pub(super) struct Share {
     ssh_port: u16,
     vnc: bool,
     vnc_port: u16,
+    with_pass: bool,
+    pass: String,
     detected: bool,
 }
 
@@ -133,6 +142,8 @@ impl Share {
             ssh_port: 22,
             vnc,
             vnc_port: 5900,
+            with_pass: false,
+            pass: String::new(),
             detected: ssh || vnc,
         }
     }
@@ -143,6 +154,7 @@ impl Share {
             user: self.user.trim().into(),
             ssh: self.ssh.then_some(self.ssh_port),
             vnc: self.vnc.then_some(self.vnc_port),
+            pass: (self.vnc && self.with_pass && !self.pass.is_empty()).then(|| self.pass.clone()),
         }
     }
 }
@@ -179,6 +191,13 @@ impl GhostApp {
             ui.add_enabled(share.vnc, egui::DragValue::new(&mut share.vnc_port).range(1..=65535));
             ui.end_row();
         });
+        if share.vnc {
+            ui.checkbox(&mut share.with_pass, tr("VNC 비밀번호도 함께 복사"));
+            if share.with_pass {
+                ui.add(egui::TextEdit::singleline(&mut share.pass).password(true));
+                ui.label(theme::hint(tr("비밀번호는 암호화되지 않은 텍스트로 들어가요. 믿을 수 있는 사람에게만 보내세요.")));
+            }
+        }
         let encoded = share.card().encode();
         let mut copied = false;
         let mut close = false;
@@ -270,11 +289,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_vnc_password_travels_only_when_chosen_and_only_with_vnc() {
+        let card = Card { host: "192.0.2.5".into(), user: "me".into(), ssh: None, vnc: Some(5900), pass: Some("s3cret".into()) };
+        let loaded = Card::decode(&card.encode().unwrap()).unwrap();
+        let mut form = NewAgentForm::new(None);
+        loaded.apply(&mut form);
+        assert_eq!(form.remote_pass, "s3cret");
+        let ssh_only = Card { host: "192.0.2.5".into(), user: "me".into(), ssh: Some(22), vnc: None, pass: Some("x".into()) };
+        assert!(ssh_only.encode().is_none(), "a password without VNC is refused");
+        let none = Card { pass: None, ..card };
+        assert!(!none.encode().unwrap().is_empty() && Card::decode(&none.encode().unwrap()).unwrap().pass.is_none());
+    }
+
+    #[test]
     fn sharing_and_applying_only_copies_public_connection_fields() {
         for (ssh, vnc, mode) in
             [(Some(2222), Some(5910), RemoteMode::Both), (Some(22), None, RemoteMode::Ssh), (None, Some(5900), RemoteMode::Vnc)]
         {
-            let card = Card { host: "2001:db8::20".into(), user: "operator".into(), ssh, vnc };
+            let card = Card { host: "2001:db8::20".into(), user: "operator".into(), ssh, vnc, pass: None };
             let text = card.encode().unwrap();
             let mut form = NewAgentForm::new(None);
             form.remote_pass = "old password".into();
@@ -321,7 +353,7 @@ mod tests {
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
             ]);
         }
-        let card = Card { host: "dev.local".into(), user: "dev".into(), ssh: Some(2222), vnc: Some(5900) };
+        let card = Card { host: "dev.local".into(), user: "dev".into(), ssh: Some(2222), vnc: Some(5900), pass: None };
         let (applied, invalid, host, text) = frame(vec![egui::Event::Paste(card.encode().unwrap())]);
         assert!(applied && !invalid && text.is_empty());
         assert_eq!(host, "dev.local");
