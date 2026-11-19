@@ -31,7 +31,7 @@ impl NewAgentForm {
             app_search: String::new(),
             web_use_login: false,
             app_use_login: false,
-            session_account: "ghostdesk-agent".into(),
+            session_account: String::new(),
             kind: FormKind::Browser,
             electron_idx: None,
             electron_clone: false,
@@ -321,13 +321,18 @@ impl GhostApp {
                     return self.notify(ctx, unsupported(tr("별도 계정 세션")));
                 }
                 // Windows child sessions use the same account, so no account name is needed
-                if cfg!(target_os = "macos") && self.form.session_account.trim().is_empty() {
-                    return self.notify(ctx, tr("전용 에이전트 계정 이름을 입력하세요"));
-                }
-                // macOS: the account does not exist yet, so offer to make it instead of failing later
+                // macOS: an empty name means "whichever account is free"; a named one is used as is. If the account
+                // does not exist yet, offer to make it instead of failing later
+                #[cfg(target_os = "macos")]
+                let chosen = {
+                    let typed = self.form.session_account.trim();
+                    if typed.is_empty() { crate::agent_account::auto_pick() } else { typed.to_string() }
+                };
+                #[cfg(not(target_os = "macos"))]
+                let chosen = self.form.session_account.trim().to_string();
                 #[cfg(target_os = "macos")]
                 {
-                    let name = self.form.session_account.trim();
+                    let name = chosen.as_str();
                     if !crate::agent_account::valid_name(name) {
                         return self.notify(ctx, tr("계정 이름은 영문 소문자·숫자·'.'·'_'·'-' 만 쓸 수 있어요"));
                     }
@@ -336,7 +341,7 @@ impl GhostApp {
                         return;
                     }
                 }
-                DeskTarget::Session { account: self.form.session_account.trim().to_string() }
+                DeskTarget::Session { account: chosen }
             }
             FormKind::Remote => {
                 if self.form.remote_mode != RemoteMode::Ssh && self.form.remote_host.trim().is_empty() {
@@ -1041,11 +1046,8 @@ impl GhostApp {
     /// feature is on), plus the first-time setup guide.
     pub(super) fn form_session(&mut self, ui: &mut egui::Ui) {
         if cfg!(target_os = "macos") {
-            egui::Grid::new("form_session").num_columns(2).min_col_width(LABEL_W).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label(tr("전용 계정"));
-                ui.add(field(&mut self.form.session_account));
-                ui.end_row();
-            });
+            theme::section(ui, tr("전용 계정"));
+            ui.add_space(4.0);
             self.account_tools(ui);
         }
         #[cfg(windows)]
@@ -1056,34 +1058,43 @@ impl GhostApp {
         }
     }
 
-    /// Known dedicated accounts to pick from, plus "show password" / "make another account".
+    /// Which dedicated account the session uses: "Auto" (the least busy one, the default) or one of the accounts on
+    /// this Mac, picked from a list. New accounts get their names from GhostDesk, so nothing is typed.
     fn account_tools(&mut self, ui: &mut egui::Ui) {
-        let known = crate::agent_account::known();
-        let current = self.form.session_account.trim().to_string();
-        if !known.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                for n in &known {
-                    if ui.selectable_label(*n == current, n).clicked() {
-                        self.form.session_account = n.clone();
-                    }
-                }
-            });
+        let all = crate::agent_account::all();
+        // a remembered choice of an account that is gone goes back to auto
+        if !self.form.session_account.is_empty() && !all.contains(&self.form.session_account) {
+            self.form.session_account.clear();
         }
-        ui.horizontal(|ui| {
-            if crate::agent_account::valid_name(&current) && crate::agent_account::exists(&current) {
-                if theme::secondary(ui, tr("암호 보기")).clicked() {
-                    match account::AccountPrompt::show(&current) {
-                        Some(p) => self.account_prompt = Some(p),
-                        None => {
-                            self.toast = Some((tr("저장된 암호가 없어요").to_string(), ui.input(|i| i.time) + TOAST_SECS))
-                        }
-                    }
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.form.session_account.is_empty(), tr("자동")).clicked() {
+                self.form.session_account.clear();
+            }
+            for n in &all {
+                if ui.selectable_label(self.form.session_account == *n, n).clicked() {
+                    self.form.session_account = n.clone();
                 }
-            } else if crate::agent_account::valid_name(&current) && theme::secondary(ui, tr("이 계정 만들기")).clicked() {
-                self.account_prompt = Some(account::AccountPrompt::ask(&current));
             }
         });
-        ui.label(theme::hint(tr("다른 계정을 쓰려면 새 이름을 적고 '이 계정 만들기'를 눌러요")));
+        ui.horizontal(|ui| {
+            let chosen = self.form.session_account.clone();
+            if !chosen.is_empty() && theme::secondary(ui, tr("암호 보기")).clicked() {
+                match account::AccountPrompt::show(&chosen) {
+                    Some(p) => self.account_prompt = Some(p),
+                    None => self.toast = Some((tr("저장된 암호가 없어요").to_string(), ui.input(|i| i.time) + TOAST_SECS)),
+                }
+            }
+            if theme::secondary(ui, tr("새 계정 만들기")).clicked() {
+                let name = crate::agent_account::next_name();
+                self.account_prompt = Some(account::AccountPrompt::ask(&name));
+                self.form.session_account = name;
+            }
+        });
+        ui.label(theme::hint(if all.is_empty() {
+            tr("아직 계정이 없어요. 시작하면 만들지 물어봐요")
+        } else {
+            tr("자동은 비어 있는 계정을 골라요. 계정이 여러 개면 에이전트가 나뉘어 일해요")
+        }));
     }
 
     /// Advanced settings: name, workspace, max steps, plus details for the chosen kind (in one grid

@@ -178,9 +178,8 @@ impl Turns {
                     if let (Some(c), Some(p)) = (conn, place.take()) {
                         self.parked.lock().insert((key.to_string(), c), (p, Instant::now()));
                         bail!(
-                            "이 화면은 지금 {owner} 이(가) 쓰는 중입니다 (하나뿐인 화면이라 한 번에 한 에이전트만 씁니다). \
-                             대기열 {pos}번째로 자리를 잡아 두었습니다. 같은 요청을 다시 호출하면 이 자리에서 이어서 기다립니다 (2분 안에). \
-                             기다리는 동안 다른 mode(web, app 등)로 할 수 있는 일을 먼저 하세요"
+                            "{owner} 이(가) 쓰는 중이라 대기열 {pos}번째입니다. 자리는 2분간 유지됩니다. 폴링하지 말고 같은 호출을 한 번만 \
+                             다시 하세요 (서버가 기다리므로 토큰이 들지 않습니다). 그 사이 web/app mode 로 할 일이 있으면 먼저 하세요"
                         );
                     }
                     bail!(

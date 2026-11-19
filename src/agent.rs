@@ -176,6 +176,9 @@ pub struct AgentShared {
     pub external: Mutex<Option<String>>,
     /// Team membership identity. External agents use their MCP connection ID.
     pub team_member_id: AtomicU64,
+    /// An outside agent whose call is kept alive while it waits for a screen that exists once: it may wait
+    /// for minutes in one call instead of coming back every few seconds (each return costs it tokens).
+    pub queue_patient: AtomicBool,
     /// Stop after the current batch and wait for instructions (conversation context is kept).
     pub stop: AtomicBool,
     /// Removed in the GUI. A screen still being prepared must close as soon as it's ready (external
@@ -210,6 +213,7 @@ impl AgentShared {
             queue: Mutex::new(Default::default()),
             external: Mutex::new(None),
             team_member_id: AtomicU64::new(0),
+            queue_patient: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             tokens: Mutex::new((0, 0)),

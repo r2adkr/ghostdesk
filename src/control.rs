@@ -656,7 +656,11 @@ impl ControlServer {
                 self.app_target(app, p, use_login, &client, &workspace, conn).await?
             }
             "session" => {
-                let account = p["account"].as_str().unwrap_or("ghostdesk-agent").trim().to_string();
+                // no account named: the least busy one (several accounts share the agents; see agent_account::auto_pick)
+                let account = match p["account"].as_str().map(str::trim).filter(|a| !a.is_empty()) {
+                    Some(a) => a.to_string(),
+                    None => crate::agent_account::auto_pick(),
+                };
                 if !valid_account_name(&account) {
                     bail!("account 는 계정 이름(영문 소문자·숫자·'.'·'_'·'-', 64자 이하)이어야 합니다 (받은 값: {account})");
                 }
@@ -781,6 +785,8 @@ impl ControlServer {
         let shared = AgentShared::new(n, label.clone(), workspace.clone(), self.ctx.clone());
         *shared.external.lock() = Some(client.clone());
         shared.team_member_id.store(conn.id, Ordering::Relaxed);
+        // the caller keeps its call alive with progress notices, so waiting in line may take long (turns.rs)
+        shared.queue_patient.store(p["patient"].as_bool().unwrap_or(false), Ordering::Relaxed);
         shared.log(LogKind::Info, format!("{client} 이(가) 이 화면을 만들었습니다 (MCP)"));
         let _ = self.events.send(ControlEvent::Register(shared.clone()));
         self.ctx.request_repaint();

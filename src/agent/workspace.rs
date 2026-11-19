@@ -97,7 +97,10 @@ async fn take_session_turn(shared: &Arc<AgentShared>, account: &str) -> Result<c
         Some(client) => format!("{client} ({})", shared.name),
         None => shared.name.clone(),
     };
-    let max_wait = external.is_some().then(|| Duration::from_secs(40));
+    // an outside agent's call must end before its client gives up: ~55 s (Codex waits 60 s by default), or minutes when
+    // the client keeps the call alive with progress notices (mcp.rs sends them and says `patient`)
+    let patient = shared.queue_patient.load(Ordering::Relaxed);
+    let max_wait = external.is_some().then(|| Duration::from_secs(if patient { 600 } else { 55 }));
     let sh = shared.clone();
     let on_wait = move |owner: &str, place: usize| {
         sh.set_status(AgentStatus::Preparing(format!("{what} 차례를 기다리는 중 · 지금 {owner} 사용 중 · 대기 {place}번째")));

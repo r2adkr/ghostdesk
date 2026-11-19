@@ -852,8 +852,21 @@ fn to_content(r: &Value, head: Option<String>) -> Vec<Value> {
     c
 }
 
-async fn call_tool(conn: &Conn, name: &str, args: &Value) -> Result<Vec<Value>> {
-    let args = if args.is_object() { args.clone() } else { json!({}) };
+/// Stops a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn call_tool(conn: &Conn, name: &str, args: &Value, patient: bool) -> Result<Vec<Value>> {
+    let mut args = if args.is_object() { args.clone() } else { json!({}) };
+    if patient && name == "desk_open" {
+        // the client keeps this call alive while we send progress, so waiting in line may take minutes
+        args["patient"] = json!(true);
+    }
     let desk_id = args["desk_id"].clone();
     let res = match name {
         "desk_open" => {
@@ -1029,8 +1042,29 @@ where
         // spawn while holding the lock, so the task can't finish and fail to remove its entry before it's
         // registered
         let mut guard = inflight.lock();
+        // a client that asks for progress keeps a long call alive while it receives it
+        let progress_token = msg["params"]["_meta"]["progressToken"].clone();
+        let patient = !progress_token.is_null() && name == "desk_open";
         let handle = tasks.spawn(async move {
-            let resp = match call_tool(&conn, &name, &args).await {
+            let ticker = patient.then(|| {
+                let out = out.clone();
+                tokio::spawn(async move {
+                    let mut n = 0u64;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        n += 1;
+                        let note = json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+                            "params": { "progressToken": progress_token, "progress": n, "message": "waiting for the screen" } });
+                        if out.send(format!("{note}\n")).is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+            // the ticker ends with the call, also when the call is cancelled (the task is aborted and drops this)
+            let _ticker = ticker.map(AbortOnDrop);
+            let result = call_tool(&conn, &name, &args, patient).await;
+            let resp = match result {
                 Ok(content) => json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content, "isError": false } }),
                 Err(e) => json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [text(format!("오류: {e:#}"))], "isError": true } }),
             };

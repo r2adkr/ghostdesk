@@ -8,6 +8,79 @@
 
 use anyhow::{bail, Result};
 
+/// The account made when there is none yet.
+pub const DEFAULT_NAME: &str = "ghostdesk-agent";
+
+/// Accounts that can take a session now: the default and the ones GhostDesk made that exist on this Mac, those
+/// with a login session running first (an account nobody has logged in to can't show a screen yet).
+pub fn candidates() -> Vec<String> {
+    let mut all = vec![DEFAULT_NAME.to_string()];
+    for n in known() {
+        if !all.contains(&n) {
+            all.push(n);
+        }
+    }
+    all.retain(|n| exists(n));
+    let active: Vec<String> = all.iter().filter(|n| has_session(n)).cloned().collect();
+    if active.is_empty() { all } else { active }
+}
+
+/// Every agent account on this Mac: the default and the ones GhostDesk made (only those that still exist).
+pub fn all() -> Vec<String> {
+    let mut all = vec![DEFAULT_NAME.to_string()];
+    for n in known() {
+        if !all.contains(&n) {
+            all.push(n);
+        }
+    }
+    all.retain(|n| exists(n));
+    all
+}
+
+/// The name for the next account to make: `ghostdesk-agent`, then `ghostdesk-agent-2`, `-3`, …
+pub fn next_name() -> String {
+    std::iter::once(DEFAULT_NAME.to_string())
+        .chain((2..).map(|n| format!("{DEFAULT_NAME}-{n}")))
+        .find(|n| !exists(n))
+        .expect("endless iterator")
+}
+
+/// Whether the account is logged in (its per-user launchd domain exists).
+pub fn has_session(name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(uid) = crate::session::uid_of(name) else { return false };
+        std::process::Command::new("/bin/launchctl")
+            .args(["print", &format!("gui/{uid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// The least busy of `cands` (`load`: agents using or waiting for it); ties keep the list order, so a free
+/// account is always preferred and agents spread over the accounts instead of queueing on one.
+pub fn pick(cands: &[String], load: impl Fn(&str) -> usize) -> Option<String> {
+    cands.iter().min_by_key(|n| load(n)).cloned()
+}
+
+/// The account for a request that didn't name one: the least busy account that can take a session, or the
+/// default one (which then gets made) when none exists.
+pub fn auto_pick() -> String {
+    let cands = candidates();
+    pick(&cands, |n| {
+        let st = crate::turns::global().state(&crate::turns::account_key(n));
+        st.owner.is_some() as usize + st.waiting.len()
+    })
+    .unwrap_or_else(|| DEFAULT_NAME.to_string())
+}
+
 /// Account names GhostDesk will create or use: plain, so nothing in them can be read as a path or option.
 pub fn valid_name(a: &str) -> bool {
     !a.is_empty()
@@ -173,6 +246,17 @@ mod tests {
         for bad in ["", "-x", ".x", "A", "a b", "a;b", "a/b", "a'b", "$(x)", &"a".repeat(65)] {
             assert!(!valid_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn requests_spread_over_the_accounts() {
+        let c: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let load = |busy: &'static [(&'static str, usize)]| move |n: &str| busy.iter().find(|(k, _)| *k == n).map_or(0, |(_, v)| *v);
+        assert_eq!(pick(&c, load(&[])), Some("a".into()), "all free: first");
+        assert_eq!(pick(&c, load(&[("a", 1)])), Some("b".into()), "a is taken");
+        assert_eq!(pick(&c, load(&[("a", 1), ("b", 1)])), Some("c".into()));
+        assert_eq!(pick(&c, load(&[("a", 2), ("b", 1), ("c", 3)])), Some("b".into()), "all busy: the shortest line");
+        assert_eq!(pick(&[], load(&[])), None);
     }
 
     #[test]
