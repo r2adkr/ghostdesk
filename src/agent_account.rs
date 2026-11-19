@@ -143,11 +143,22 @@ pub fn create_command(name: &str, password: &str) -> Result<String> {
 pub async fn create(name: &str) -> Result<String> {
     let password = random_password()?;
     let command = create_command(name, &password)?;
-    // `command` holds only the validated name and an alphanumeric password, so it can sit in an AppleScript string
+    // the session setup that needs no click (helper, LaunchAgent, lock screen) runs in the same administrator step,
+    // so there is a single password prompt; if it can't be staged the account is still made
+    let staged = stage_setup(name).ok();
+    let chained = match &staged {
+        Some((_, path)) => format!("{command}; /bin/sh {}", path.display()),
+        None => command.clone(),
+    };
+    // `chained` holds only the validated name, an alphanumeric password and paths we made, so it can sit in an AppleScript string
     let script = format!(
-        "do shell script \"{command}\" with administrator privileges with prompt \"GhostDesk 가 에이전트 전용 계정 '{name}' 을(를) 만듭니다\""
+        "do shell script \"{chained}\" with administrator privileges with prompt \"GhostDesk 가 에이전트 전용 계정 '{name}' 을(를) 만들고 세션 설정을 적용합니다\""
     );
-    let out = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(script).output().await?;
+    let out = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(script).output().await;
+    if let Some((dir, _)) = &staged {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let out = out?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("-128") {
@@ -234,6 +245,96 @@ fn remember(name: &str) {
 #[cfg(not(target_os = "macos"))]
 pub async fn create(_name: &str) -> Result<String> {
     bail!("전용 에이전트 계정은 macOS 에서만 만들 수 있어요")
+}
+
+// ---- session setup for the account (macOS) ----
+
+/// Where the helper binary the agent account runs lives (the account can't read the person's home).
+pub const HELPER_DIR: &str = "/Users/Shared/GhostDesk/bin";
+
+/// The administrator script that does the setup steps of the session guide that need no permission click: the
+/// helper binary in the shared folder, the LaunchAgent in the account's home, and a lock screen that never asks for
+/// a password or starts the screen saver in that account. Each step is allowed to fail alone (the account still
+/// works; the guide says what is left). Granting Screen Recording and Accessibility to the helper stays a click in
+/// that account's own session: macOS offers no way to do it from outside.
+pub fn session_setup_script(account: &str, exe: &str, plist: &str) -> Result<String> {
+    if !valid_name(account) {
+        bail!("invalid account name");
+    }
+    for v in [exe, plist] {
+        if v.is_empty() || v.contains(['"', '\\', '$', '`', '\n', '\'']) {
+            bail!("unsafe path in setup script");
+        }
+    }
+    Ok(format!(
+        "ACC={account}\n\
+         H=/Users/$ACC\n\
+         [ -d \"$H\" ] || /usr/sbin/createhomedir -c -u $ACC > /dev/null 2>&1 || true\n\
+         /bin/mkdir -p {HELPER_DIR} || true\n\
+         /bin/cp \"{exe}\" {HELPER_DIR}/ghostdesk && /bin/chmod 755 {HELPER_DIR}/ghostdesk || true\n\
+         /bin/chmod 1777 /Users/Shared/GhostDesk || true\n\
+         /usr/bin/sudo -u $ACC /bin/mkdir -p \"$H/Library/LaunchAgents\" || true\n\
+         /bin/cp \"{plist}\" \"$H/Library/LaunchAgents/com.ghostdesk.session-helper.plist\" || true\n\
+         /usr/sbin/chown $ACC \"$H/Library/LaunchAgents/com.ghostdesk.session-helper.plist\" || true\n\
+         /usr/bin/sudo -u $ACC /usr/bin/defaults write com.apple.screensaver askForPassword -int 0 || true\n\
+         /usr/bin/sudo -u $ACC /usr/bin/defaults -currentHost write com.apple.screensaver idleTime -int 0 || true\n\
+         true\n"
+    ))
+}
+
+/// Writes the setup script and the LaunchAgent plist into a private temp folder; returns `(folder, script path)`.
+#[cfg(target_os = "macos")]
+fn stage_setup(account: &str) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe()?;
+    let uid = unsafe { libc::getuid() };
+    let dir = std::env::temp_dir().join(format!("ghostdesk-setup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    let plist = dir.join("helper.plist");
+    std::fs::write(&plist, crate::session::launch_agent_plist(&format!("{HELPER_DIR}/ghostdesk"), uid))?;
+    std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644))?;
+    let script = match session_setup_script(account, &exe.to_string_lossy(), &plist.to_string_lossy()) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    let path = dir.join("run.sh");
+    std::fs::write(&path, script)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    Ok((dir, path))
+}
+
+/// Applies the setup to an account that already exists (the New agent screen offers it for older accounts).
+#[cfg(target_os = "macos")]
+pub async fn setup_session(account: &str) -> Result<()> {
+    if !exists(account) {
+        bail!("'{account}' 계정이 없습니다");
+    }
+    let (dir, script_path) = stage_setup(account)?;
+    let osa = format!(
+        "do shell script \"/bin/sh {}\" with administrator privileges with prompt \"GhostDesk 가 '{account}' 계정의 세션 설정을 적용합니다\"",
+        script_path.display()
+    );
+    let res = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(osa).output().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let res = res?;
+    if !res.status.success() {
+        let err = String::from_utf8_lossy(&res.stderr);
+        if err.contains("-128") {
+            bail!("관리자 암호 입력을 취소해서 적용하지 않았어요");
+        }
+        bail!("세션 설정을 적용하지 못했어요: {}", err.trim().lines().last().unwrap_or("알 수 없는 오류"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn setup_session(_account: &str) -> Result<()> {
+    bail!("macOS 에서만 쓸 수 있어요")
 }
 
 // ---- browser login import (macOS) ----
@@ -393,6 +494,17 @@ mod tests {
         assert!(import_script("x; rm", "r", "/tmp/x", "/tmp/k", "s", "a", "/Applications/A.app").is_err());
         assert_eq!(safe_storage("Google Chrome"), Some(("Chrome Safe Storage", "Chrome")));
         assert_eq!(safe_storage("Firefox"), None);
+    }
+
+    #[test]
+    fn session_setup_script_installs_helper_and_plist_for_the_account_only() {
+        let s = session_setup_script("ghostdesk-agent", "/Applications/GhostDesk.app/Contents/MacOS/ghostdesk", "/tmp/x/helper.plist").unwrap();
+        assert!(s.contains("/Users/Shared/GhostDesk/bin/ghostdesk") && s.contains("LaunchAgents/com.ghostdesk.session-helper.plist"));
+        assert!(s.contains("sudo -u $ACC /usr/bin/defaults write com.apple.screensaver askForPassword -int 0"));
+        assert!(!s.contains("pmset"), "the person's own sleep settings are not touched");
+        assert!(session_setup_script("a;b", "/x", "/y").is_err());
+        assert!(session_setup_script("ok", "/x\"y", "/y").is_err());
+        assert!(session_setup_script("ok", "/x", "").is_err());
     }
 
     #[test]

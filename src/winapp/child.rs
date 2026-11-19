@@ -69,9 +69,10 @@ pub const SETUP_GUIDE_KO: &str = r#"## 자식 세션(PiP) — 같은 PC 의 별�
 Windows 의 공식 기능인 '자식 세션'으로, 지금 계정 그대로 **별도의 Windows 화면**을 하나 더 만들어 에이전트에게 줍니다.
 에이전트의 마우스·키보드는 그 화면 안에서만 움직이고 내 화면·커서·키보드에는 닿지 않습니다. 진행 상황은 GhostDesk 창에서 봅니다.
 
-### 처음 한 번
-1. 아래 '자식 세션 켜기' 를 누르고 관리자 승인(UAC)을 허락합니다. (`WTSEnableChildSessions` — 시스템 설정 하나를 켭니다)
-2. 그 뒤 에이전트를 시작하면 자식 세션이 로그온되고(처음엔 수십 초) GhostDesk 헬퍼가 그 안에서 자동으로 실행됩니다.
+### 처음 한 번 (대부분 자동)
+에이전트를 시작하면 자식 세션이 꺼져 있을 때 GhostDesk 가 스스로 켭니다. 관리자 승인(UAC) 창이 뜨면 허락만 하세요.
+(`WTSEnableChildSessions` — 시스템 설정 하나를 켭니다. '자식 세션 켜기' 버튼으로 미리 해 둘 수도 있습니다.)
+그 뒤 자식 세션이 로그온되고(처음엔 수십 초) GhostDesk 헬퍼가 그 안에서 자동으로 실행됩니다.
 
 ### 로그인 창이 뜨면 (Windows 보안)
 자식 세션은 지금 계정으로 이 PC 에 **한 번 더 로그인**하는 방식이라, 연결할 때 'Windows 보안 — 자격 증명 입력' 창이 뜰 수 있습니다
@@ -644,7 +645,12 @@ static CONNECTOR: Mutex<Option<Connector>> = Mutex::new(None);
 /// Makes sure the child session is connected (returns right away if it already is).
 pub async fn ensure_connected() -> Result<()> {
     if !enabled() {
-        bail!("Windows 자식 세션 기능이 꺼져 있습니다. 새 에이전트 창의 '자식 세션' 에서 '자식 세션 켜기' 를 눌러 관리자 승인 후 다시 시도하세요.");
+        // the first use switches the feature on by itself: Windows' own administrator prompt (UAC) is the one
+        // approval, so there is no separate button to find first
+        tokio::task::spawn_blocking(request_enable)
+            .await
+            .map_err(|e| anyhow!("자식 세션 켜기 중단: {e}"))?
+            .context("Windows 자식 세션 기능을 켜지 못했습니다. 관리자 승인(UAC) 창이 뜨면 '예' 를 누르세요")?;
     }
     {
         let g = CONNECTOR.lock();

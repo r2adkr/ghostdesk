@@ -64,6 +64,20 @@ impl GhostApp {
 
     /// Called every frame: when the AI has answered (or failed), starts the agent where it said.
     pub(super) fn poll_route(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.setup_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.setup_rx = None;
+                    let msg = match res {
+                        Ok(()) => tr("세션 설정을 적용했어요").to_string(),
+                        Err(e) => e,
+                    };
+                    self.toast = Some((msg, ctx.input(|i| i.time) + 6.0));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(300)),
+                Err(_) => self.setup_rx = None,
+            }
+        }
         let Some(r) = &self.routing else { return };
         let answer = r.slot.lock().take();
         let Some(answer) = answer else {

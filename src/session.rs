@@ -2027,38 +2027,37 @@ macOS 는 사용자당 GUI 세션 하나만 허용하므로 에이전트 전용 
 백그라운드에 띄워 두고, 그 안의 헬퍼가 화면 캡처·입력을 대신합니다. 사용자 화면·커서·키보드에는
 아무 영향이 없습니다.
 
-### 1. 전용 계정 만들기 (한 번)
-1. 시스템 설정 > 사용자 및 그룹 > **사용자 추가** — 이름 예: `ghostdesk-agent`, 종류는 반드시 **표준**.
-   (헬퍼는 관리자 계정이나 사용자 본인 계정에서는 실행을 거부합니다.)
-2. 제어 센터 > **빠른 사용자 전환** 메뉴를 켭니다 (시스템 설정 > 제어 센터 > 빠른 사용자 전환).
-3. 사용자 본인 계정에서 `id -u` 로 uid 를 확인해 둡니다 (보통 501).
+### 자동으로 되는 것 / 직접 해야 하는 것
+GhostDesk 에서 에이전트 계정을 만들면(관리자 암호 한 번) 아래가 **자동**으로 적용됩니다.
+- 표준 계정 생성, 암호를 키체인에 저장
+- 헬퍼 바이너리를 `/Users/Shared/GhostDesk/bin/ghostdesk` 에 복사
+- 그 계정의 LaunchAgent(`com.ghostdesk.session-helper.plist`) 설치
+- 그 계정의 화면 보호기·암호 요구 끄기
+macOS 가 밖에서 대신 해 주지 못하게 막는 것은 **한 번만 직접** 하세요 (아래 2).
 
-### 2. 헬퍼 바이너리 배치 (사용자 계정에서)
-에이전트 계정은 사용자 홈 폴더를 읽을 수 없으므로 공용 위치에 복사합니다.
-```sh
-sudo mkdir -p /Users/Shared/GhostDesk/bin
-sudo cp /path/to/ghostdesk /Users/Shared/GhostDesk/bin/ghostdesk
-sudo chmod 755 /Users/Shared/GhostDesk/bin/ghostdesk
-sudo chmod 1777 /Users/Shared/GhostDesk
-```
-바이너리를 교체(재빌드)하면 아래 3번의 권한을 다시 켜야 할 수 있습니다 (TCC 는 바이너리 서명/경로 기준).
+### 1. 빠른 사용자 전환
+제어 센터 > **빠른 사용자 전환** 메뉴를 켭니다 (시스템 설정 > 제어 센터). 본인 계정의 uid 는 `id -u` (보통 501).
+기존 계정에는 새 에이전트 화면의 '세션 설정 적용' 으로 같은 자동 설정을 다시 적용할 수 있습니다.
 
-### 3. 에이전트 세션 안에서 설정 (빠른 사용자 전환으로 `ghostdesk-agent` 로그인)
-1. LaunchAgent 설치 — 에이전트 계정의 터미널에서 (`<UID>` = 사용자 본인 uid):
-   ```sh
-   mkdir -p ~/Library/LaunchAgents
-   /Users/Shared/GhostDesk/bin/ghostdesk --print-session-plist <UID> > ~/Library/LaunchAgents/com.ghostdesk.session-helper.plist
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ghostdesk.session-helper.plist
-   ```
-   (`--print-session-plist` 가 없다면 GhostDesk 의 '세션 설정' 화면에서 plist 내용을 복사해 같은 경로에 저장.)
+### 2. 에이전트 세션 안에서 (빠른 사용자 전환으로 `ghostdesk-agent` 로그인, 한 번)
+1. 한 번 로그인해 둡니다 (로그인해야 LaunchAgent 가 뜹니다).
 2. 시스템 설정 > 개인정보 보호 및 보안 > **화면 및 시스템 오디오 기록** 에 `/Users/Shared/GhostDesk/bin/ghostdesk` 추가·허용.
 3. 같은 곳의 **손쉬운 사용** 에도 추가·허용 (입력 이벤트 게시에 필요).
-4. 권한을 켠 뒤 헬퍼를 재시작: `launchctl kickstart -k gui/$(id -u)/com.ghostdesk.session-helper`
+4. 헬퍼 재시작: `launchctl kickstart -k gui/$(id -u)/com.ghostdesk.session-helper`
    로그: `~/Library/Logs/GhostDesk/session-helper.log` (에이전트 계정).
-5. 잠금/절전 설정 (에이전트 계정): 시스템 설정 > 잠금 화면 — 화면 보호기 시작 **안 함**,
-   디스플레이 끄기 **안 함**, 화면 보호기/디스플레이 꺼짐 후 암호 요구 **안 함**.
-   시스템 설정 > 개인정보 보호 및 보안 > 고급 — "일정 시간 동안 사용하지 않으면 로그아웃" **끄기**.
+5. 시스템 설정 > 개인정보 보호 및 보안 > 고급 — "일정 시간 동안 사용하지 않으면 로그아웃" **끄기**. (절전·디스플레이 끄기 설정은 내 Mac 설정이라 GhostDesk 가 건드리지 않습니다.)
 6. 화면 기록 권한의 주기적 재확인 알림이 뜨면 에이전트 세션으로 전환해 허용해야 합니다.
+
+### 3. (수동 설치를 원할 때) 명령어
+```sh
+sudo mkdir -p /Users/Shared/GhostDesk/bin && sudo cp /path/to/ghostdesk /Users/Shared/GhostDesk/bin/ghostdesk
+sudo chmod 755 /Users/Shared/GhostDesk/bin/ghostdesk && sudo chmod 1777 /Users/Shared/GhostDesk
+# 에이전트 계정의 터미널에서 (<UID> = 본인 uid)
+mkdir -p ~/Library/LaunchAgents
+/Users/Shared/GhostDesk/bin/ghostdesk --print-session-plist <UID> > ~/Library/LaunchAgents/com.ghostdesk.session-helper.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ghostdesk.session-helper.plist
+```
+바이너리를 교체(재빌드)하면 권한(2번)을 다시 켜야 할 수 있습니다 (TCC 는 바이너리 서명/경로 기준).
 
 ### 4. 원래 계정으로 돌아오기
 빠른 사용자 전환 메뉴에서 본인 계정을 선택해 돌아옵니다. **에이전트 계정에서 로그아웃하지 마세요**

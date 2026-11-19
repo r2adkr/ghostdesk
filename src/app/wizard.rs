@@ -1087,6 +1087,17 @@ impl GhostApp {
             if !chosen.is_empty() && cfg!(target_os = "macos") && theme::secondary(ui, tr("브라우저 로그인 가져오기")).clicked() {
                 self.import_prompt = Some(account::ImportPrompt::new(&chosen));
             }
+            if !chosen.is_empty() && cfg!(target_os = "macos") && self.setup_rx.is_none() && theme::secondary(ui, tr("세션 설정 적용")).clicked() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.setup_rx = Some(rx);
+                let name = chosen.clone();
+                std::thread::spawn(move || {
+                    let res = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string()).and_then(|rt| {
+                        rt.block_on(crate::agent_account::setup_session(&name)).map_err(|e| e.to_string())
+                    });
+                    let _ = tx.send(res);
+                });
+            }
             if theme::secondary(ui, tr("새 계정 만들기")).clicked() {
                 let name = crate::agent_account::next_name();
                 self.account_prompt = Some(account::AccountPrompt::ask(&name));

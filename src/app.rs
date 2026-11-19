@@ -267,6 +267,8 @@ pub struct GhostApp {
     account_prompt: Option<account::AccountPrompt>,
     import_prompt: Option<account::ImportPrompt>,
     routing: Option<route::Routing>,
+    /// Result of an account session setup running in the background.
+    setup_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     usage_saved: Instant,
     sidebar_open: bool,
     /// When each outside agent's screen was first seen closed (for the list grace period).
@@ -407,6 +409,7 @@ impl GhostApp {
             account_prompt: None,
             import_prompt: None,
             routing: None,
+            setup_rx: None,
             usage_saved: Instant::now(),
             sidebar_open: true,
             closed_since: HashMap::new(),
