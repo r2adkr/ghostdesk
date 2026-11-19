@@ -329,6 +329,8 @@ pub struct GhostApp {
     /// Development: with GHOSTDESK_DEMO=<n>, auto-starts n empty-profile browser agents.
     pending_demo: u32,
     toast: Option<(String, f64)>,
+    /// Version whose update toast the person closed with X.
+    update_dismissed: Option<String>,
     /// Whether the screen wall turned on full screen (undone when the wall closes).
     wall_fullscreen: bool,
     /// Start was pressed without an API key (shows a hint under the key field in the new-agent
@@ -440,6 +442,7 @@ impl GhostApp {
             show_cursor: true,
             pending_demo: std::env::var("GHOSTDESK_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             toast: None,
+            update_dismissed: None,
             wall_fullscreen: false,
             key_warn: false,
             wizard_key_field: false,
@@ -736,6 +739,7 @@ impl eframe::App for GhostApp {
             self.main_layout(ui, &ctx);
         }
         self.toast_area(&ctx);
+        self.update_toast(&ctx);
         self.pip_windows(&ctx);
         titlebar::resize_edges(&ctx);
     }
@@ -891,6 +895,81 @@ impl GhostApp {
         };
         let agent = self.selected.and_then(|i| self.agents.get(i)).map_or(0, |a| a.shared.id);
         view << 48 | agent
+    }
+
+    /// Update notice as a toast at the bottom right. It stays until the person presses X (hidden for that version).
+    fn update_toast(&mut self, ctx: &egui::Context) {
+        use crate::update::State;
+        let st = self.update.lock().clone();
+        let r = match &st {
+            State::None => return,
+            State::Available(r) | State::Downloading(r, _) | State::Ready(r) | State::Failed(r, _) => r.clone(),
+        };
+        if self.update_dismissed.as_deref() == Some(r.version.as_str()) {
+            return;
+        }
+        let mut close = false;
+        egui::Area::new(egui::Id::new("update_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::card_hover())
+                    .stroke(Stroke::new(1.0, theme::border_hover()))
+                    .corner_radius(theme::CARD_RADIUS)
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .shadow(ui.style().visuals.popup_shadow)
+                    .show(ui, |ui| {
+                        ui.set_width(260.0);
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(trf("새 버전 {} 이 나왔어요", &[&r.version])).strong().color(theme::text()));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                close = theme::icon_button(ui, icon::X, tr("닫기")).clicked();
+                            });
+                        });
+                        match &st {
+                            State::Downloading(_, f) => {
+                                ui.horizontal(|ui| {
+                                    theme::spinner(ui, 13.0, theme::muted());
+                                    ui.label(theme::hint(trf("내려받는 중… {}%", &[&((f * 100.0) as u32)])));
+                                });
+                                theme::progress(ui, egui::Id::new("update_progress"), *f, ui.available_width());
+                            }
+                            State::Ready(_) => {
+                                if theme::primary(ui, tr("다시 시작해서 적용"))
+                                    .on_hover_text(tr("GhostDesk 를 껐다 켜요. 일하던 에이전트는 멈춰요."))
+                                    .clicked()
+                                {
+                                    crate::update::request_relaunch(ui.ctx());
+                                }
+                            }
+                            _ => {
+                                let failed = matches!(st, State::Failed(..));
+                                if let State::Failed(_, e) = &st {
+                                    ui.label(RichText::new(trf("업데이트 실패: {}", &[&crate::llm::short(e, 120)])).size(12.0).color(theme::warn()))
+                                        .on_hover_text(e.as_str());
+                                }
+                                ui.horizontal(|ui| {
+                                    if r.installable() {
+                                        if theme::primary(ui, if failed { tr("다시 시도") } else { tr("업데이트") })
+                                            .on_hover_text(tr("새 버전을 내려받아 바꿔 넣어요. 다 받으면 다시 시작해서 적용해요."))
+                                            .clicked()
+                                        {
+                                            crate::update::download(&self.rt, self.update.clone(), ui.ctx().clone());
+                                        }
+                                        ui.hyperlink_to(RichText::new(tr("새 소식")).size(12.0), &r.page);
+                                    } else {
+                                        ui.hyperlink_to(RichText::new(tr("내려받기")).size(12.0), &r.page);
+                                    }
+                                });
+                            }
+                        }
+                    });
+            });
+        if close {
+            self.update_dismissed = Some(r.version.clone());
+        }
     }
 
     /// Short-lived toast above every window. Rises slightly into view and fades out at the end.
