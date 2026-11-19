@@ -895,7 +895,8 @@ impl ControlServer {
         // Windows child session: `app` opens inside the session, so Store apps, console programs and
         // other things the hidden app mode refuses are one call away. A failure doesn't close the screen:
         // the agent can still start the app from the Start menu.
-        let mut launch_note = None;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut launch_note: Option<String> = None;
         #[cfg(windows)]
         if let (DeskKind::Session, Some(app)) = (desk.kind(), p["app"].as_str().map(str::trim).filter(|a| !a.is_empty())) {
             launch_note = Some(match self.launch_in_session(&desk, app).await {
