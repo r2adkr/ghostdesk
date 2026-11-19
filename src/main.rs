@@ -136,6 +136,9 @@ fn main() -> anyhow::Result<()> {
     // put back user app windows left off-screen by a crashed GhostDesk ("attach to a running app")
     #[cfg(windows)]
     std::thread::spawn(native::recover_parked_windows);
+    // a child-session helper start-up script left behind by a crash would run at the next logon
+    #[cfg(windows)]
+    winapp::child::forget_helper_start();
 
     // macOS: if the new version was opened right where it was unpacked, replace the old installed
     // copy with it and reopen from the install location

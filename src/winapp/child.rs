@@ -33,7 +33,7 @@ use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSEnableChildSessions, WTSGetActiveConsoleSessionId, WTSGetChildSessionId,
-    WTSIsChildSessionsEnabled,
+    WTSIsChildSessionsEnabled, WTSLogoffSession,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -587,6 +587,9 @@ fn read_marker() -> Option<u32> {
 pub async fn run_helper(_args: &[String]) -> Result<()> {
     let me = my_session_id();
     let console = unsafe { WTSGetActiveConsoleSessionId() };
+    // the helper has no console: without a line in the log a start that was refused or crashed leaves no trace
+    let log = crate::session::helper_logger();
+    log(&format!("시작: 세션 {me} (콘솔 {console}, 표시 {:?})", read_marker()));
     // logon may finish before the parent writes the marker, so wait a bit
     let deadline = Instant::now() + Duration::from_secs(60);
     let verdict = loop {
@@ -598,11 +601,10 @@ pub async fn run_helper(_args: &[String]) -> Result<()> {
     };
     if let Err(why) = verdict {
         // e.g. the user's own session: exit without calling any screen or input API
-        eprintln!("[ghostdesk-session-helper] 실행 거부: {why}");
+        log(&format!("실행 거부: {why}"));
         bail!("세션 헬퍼 실행 거부: {why}");
     }
     crate::platform::win::set_dpi_aware();
-    let log = crate::session::helper_logger();
     let ep = endpoint();
     let listener = crate::session::HelperListener::bind(&ep)
         .await
@@ -680,8 +682,49 @@ pub async fn ensure_connected() -> Result<()> {
     rx.await.map_err(|_| anyhow!("자식 세션 연결 스레드가 끝났습니다"))?
 }
 
+/// Logs the child session off so the next `ensure_connected` starts a fresh one (and RunOnce starts
+/// the helper in it again).
+///
+/// For a session that is logged on but whose helper isn't there (it crashed, was killed, or the
+/// session was left over from a run that never scheduled it): Windows runs RunOnce at logon only, so
+/// nothing would ever start the helper again. Nothing can be lost: with no helper there is no desk
+/// using that session.
+pub async fn restart_session() -> Result<()> {
+    let Some(id) = child_session_id() else { return Ok(()) };
+    // null = this machine (WTS_CURRENT_SERVER_HANDLE)
+    if unsafe { WTSLogoffSession(std::ptr::null_mut(), id, 0) } == 0 {
+        bail!("자식 세션 {id} 을 로그오프하지 못했습니다: {}", std::io::Error::last_os_error());
+    }
+    let alive = || CONNECTOR.lock().as_ref().is_some_and(|c| c.alive.load(Ordering::SeqCst));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while (alive() || child_session_id().is_some()) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Ok(())
+}
+
+/// The user's Startup folder, which the shell runs at every logon.
+fn startup_script() -> PathBuf {
+    dirs::data_dir().unwrap_or_default().join(r"Microsoft\Windows\Start Menu\Programs\Startup\GhostDeskChildHelper.cmd")
+}
+
+/// Schedules the helper for the child session's logon.
+///
+/// A script in the Startup folder is the dependable way: watched on Windows 11 build 26300, the child
+/// session's shell started what the Startup folder held but ignored new RunOnce and Run values (the
+/// value stayed, no process came up), and the RDP alternate shell (`StartProgram`) was not honoured for
+/// child sessions at all. RunOnce is still set as well, for Windows versions where it does work: a second
+/// helper finds the pipe taken and exits. `forget_helper_start` removes both once the connection attempt
+/// is over, so the user's own next logon never sees them (the helper refuses to run there anyway).
 fn set_run_once(cmd: &str) -> Result<()> {
     use windows_sys::Win32::System::Registry::{RegSetKeyValueW, REG_SZ};
+    let script = startup_script();
+    if let Some(dir) = script.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // `start` so the script ends at once instead of waiting for the helper
+    std::fs::write(&script, format!("@echo off\r\nstart \"\" {cmd}\r\n"))
+        .with_context(|| format!("헬퍼 시작 스크립트 {} 를 쓰지 못했습니다", script.display()))?;
     let data = wide(cmd);
     let r = unsafe {
         RegSetKeyValueW(
@@ -697,6 +740,13 @@ fn set_run_once(cmd: &str) -> Result<()> {
         bail!("헬퍼 실행 예약(RunOnce) 실패: 오류 {r}");
     }
     Ok(())
+}
+
+/// Removes what `set_run_once` left. Missing items are fine.
+pub fn forget_helper_start() {
+    use windows_sys::Win32::System::Registry::RegDeleteKeyValueW;
+    let _ = std::fs::remove_file(startup_script());
+    unsafe { RegDeleteKeyValueW(crate::platform::win::HKEY_CURRENT_USER, wide(RUNONCE_KEY).as_ptr(), wide(RUNONCE_VALUE).as_ptr()) };
 }
 
 mod rdp {

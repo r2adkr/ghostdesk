@@ -1300,19 +1300,36 @@ impl SessionDesk {
     /// connects to the helper inside it.
     #[cfg(windows)]
     pub async fn connect_with(_account: &str, sink: FrameSink, opts: SessionOptions) -> Result<Arc<SessionDesk>> {
-        crate::winapp::child::ensure_connected().await?;
         let ep = crate::winapp::child::endpoint();
-        // if the child session just logged on, the helper (RunOnce) takes a moment to start
-        let deadline = Instant::now() + crate::winapp::child::HELPER_WAIT;
-        loop {
-            match Self::connect_target(ep.clone(), None, "자식 세션", sink.clone(), opts.clone()).await {
-                Ok(d) => return Ok(d),
-                Err(e) if Instant::now() >= deadline => {
-                    return Err(e.context(crate::winapp::child::HELPER_MISSING));
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        // The helper only starts at the child session's logon (RunOnce). If the session was already logged
+        // on without one, log it off and start over once, instead of asking the user to do that by hand.
+        let mut restarted = false;
+        let result = loop {
+            if let Err(e) = crate::winapp::child::ensure_connected().await {
+                break Err(e);
             }
-        }
+            // if the child session just logged on, the helper takes a moment to start
+            let deadline = Instant::now() + crate::winapp::child::HELPER_WAIT;
+            let last = loop {
+                match Self::connect_target(ep.clone(), None, "자식 세션", sink.clone(), opts.clone()).await {
+                    Ok(d) => return {
+                        crate::winapp::child::forget_helper_start();
+                        Ok(d)
+                    },
+                    Err(e) if Instant::now() >= deadline => break e,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            };
+            if restarted {
+                break Err(last.context(crate::winapp::child::HELPER_MISSING));
+            }
+            restarted = true;
+            if let Err(e) = crate::winapp::child::restart_session().await {
+                break Err(last.context(format!("{e:#}")).context(crate::winapp::child::HELPER_MISSING));
+            }
+        };
+        crate::winapp::child::forget_helper_start();
+        result
     }
 
     #[cfg(unix)]

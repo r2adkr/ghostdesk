@@ -225,6 +225,9 @@ impl BrowserWorkspace {
         // don't create a tray icon or linger after Browser.close
         #[cfg(windows)]
         cmd.arg("--disable-background-mode");
+        // CI runners have no GPU: a software-only browser starts faster and can't hang in GPU setup
+        #[cfg(test)]
+        cmd.arg("--disable-gpu");
         cmd.arg("about:blank");
         cmd.stdin(Stdio::null()).stdout(Stdio::null());
         match log {
@@ -236,6 +239,10 @@ impl BrowserWorkspace {
         // invisible Chromium is left behind even if GhostDesk crashes.
         // The guard holds it until startup finishes and the workspace takes ownership: if this future is
         // aborted (agent removed) or errors out, Drop kills Chromium.
+        // Tests launch real browsers from many threads at once; on a small CI runner that made startup
+        // exceed the 40 s limit, so only one starts at a time (held until its port file appears).
+        #[cfg(test)]
+        let _startup_gate = tests_support::STARTUP_GATE.lock().await;
         let mut guard = ChildGuard::new(
             crate::platform::proc::spawn_group(&mut cmd)
                 .with_context(|| format!("브라우저 실행 실패: {}", opts.exe.display()))?,
@@ -267,14 +274,18 @@ impl BrowserWorkspace {
                 }
             }
             if start.elapsed() > Duration::from_secs(40) {
-                // the guard kills and reaps the process group on drop
+                // the guard kills and reaps the process group on drop; the browser's own last words say why
+                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let mut lines: Vec<&str> = tail.lines().rev().take(8).collect();
+                lines.reverse();
+                let tail = lines.join("\n");
                 #[cfg(windows)]
                 bail!(
                     "브라우저 디버깅 포트를 40초 안에 찾지 못했습니다. 회사·학교 관리 정책(RemoteDebuggingAllowed, \
-                     DeveloperToolsAvailability)으로 원격 디버깅이 막혀 있으면 이렇게 될 수 있습니다."
+                     DeveloperToolsAvailability)으로 원격 디버깅이 막혀 있으면 이렇게 될 수 있습니다.\n{tail}"
                 );
                 #[cfg(not(windows))]
-                bail!("브라우저 디버깅 포트를 40초 안에 찾지 못했습니다");
+                bail!("브라우저 디버깅 포트를 40초 안에 찾지 못했습니다\n{tail}");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
@@ -1539,6 +1550,9 @@ mod tests_support {
 
     static SPAWNED: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());
 
+    /// One browser start at a time across all tests.
+    pub static STARTUP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     pub fn record_spawn(dir: &Path, pid: u32) {
         SPAWNED.lock().unwrap_or_else(|e| e.into_inner()).push((dir.to_path_buf(), pid));
     }
@@ -1556,6 +1570,10 @@ mod win_tests {
     use crate::platform::fsx::remove_dir_all_retry;
     use crate::platform::proc::{group_pids, pid_alive};
     use std::sync::atomic::AtomicUsize;
+
+    /// Upper bound for "this call must not hang" checks. It only has to tell a hang from a slow call, so it
+    /// is generous: a loaded CI runner takes seconds over what a developer machine takes milliseconds for.
+    const HANG_GUARD: Duration = Duration::from_secs(20);
 
     async fn all_gone(pids: &[u32]) -> bool {
         for _ in 0..60 {
@@ -1641,7 +1659,7 @@ mod win_tests {
             start_url: r#"data:text/html,<button style='position:absolute;left:20px;top:20px;width:200px;height:40px' onclick='window.deleted=confirm("Delete?")'>Delete</button><button style='position:absolute;left:20px;top:80px;width:200px;height:40px' onclick='window.answer=prompt("Name?","seed")'>Name</button>"#.into(),
         }, Arc::new(|_| {})).await.unwrap();
         async fn pending(ws: &BrowserWorkspace) -> Value {
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(HANG_GUARD, async {
                 loop {
                     if let Some(dialog) = ws.dialog() { return dialog; }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1650,7 +1668,7 @@ mod win_tests {
         }
         let desk = crate::desk::Desk::Browser(ws.clone());
         for (y, kind) in [(40.0, "confirm"), (100.0, "prompt")] {
-            let click = tokio::time::timeout(Duration::from_secs(3), ws.click(Some((100.0, y)), MouseButton::Left, 1, 0))
+            let click = tokio::time::timeout(HANG_GUARD, ws.click(Some((100.0, y)), MouseButton::Left, 1, 0))
                 .await.expect("click stalled behind a pending JavaScript dialog");
             if let Err(error) = click { assert!(error.to_string().contains("대화상자"), "{error:#}"); }
             let dialog = pending(&ws).await;
@@ -1663,14 +1681,14 @@ mod win_tests {
                 assert_eq!(ws.dialog().unwrap()["id"], id, "missing/invalid accept must not answer the dialog");
             }
             assert!(ws.respond_dialog(id + 1, true, None).await.is_err());
-            assert!(tokio::time::timeout(Duration::from_secs(1), ws.screenshot()).await.unwrap().is_err());
+            assert!(tokio::time::timeout(HANG_GUARD, ws.screenshot()).await.unwrap().is_err());
             let mut reply = json!({"action":"respond_dialog", "id":id, "accept":kind == "prompt"});
             if kind == "prompt" { reply["prompt_text"] = json!("재용👋"); }
             crate::agent::exec_desk_tool(&desk, "browser_control", &reply).await.unwrap();
         }
         assert_eq!(ws.eval("window.deleted").await.unwrap(), false);
         assert_eq!(ws.eval("window.answer").await.unwrap(), "재용👋");
-        let evaluation = tokio::time::timeout(Duration::from_secs(3), ws.eval("window.third = confirm('From eval')"))
+        let evaluation = tokio::time::timeout(HANG_GUARD, ws.eval("window.third = confirm('From eval')"))
             .await.expect("evaluation stalled behind its JavaScript dialog");
         assert!(evaluation.is_err());
         let dialog = pending(&ws).await;
