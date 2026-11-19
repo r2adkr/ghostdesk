@@ -197,6 +197,9 @@ struct DeskEntry {
     reservation: String,
     /// The agent chose this screen's workspace name itself (so it may come back to it).
     named: bool,
+    /// What it was opened with (after `mode` became `kind` and options), so `upgrade_desk` can reopen it
+    /// with real input.
+    params: Value,
 }
 
 /// Workspace reservation. Released automatically on drop if opening fails.
@@ -342,6 +345,7 @@ impl ControlServer {
         match method {
             "hello" => Ok(json!({ "protocol": PROTOCOL_VERSION, "app": "GhostDesk", "version": env!("CARGO_PKG_VERSION") })),
             "list" => Ok(self.list(conn)),
+            "open" if p["upgrade_desk"].is_string() => self.upgrade(p, conn).await,
             "open" => self.open(p, conn).await,
             "act" => self.act(p, conn).await,
             "close" => self.close(p, conn).await,
@@ -823,7 +827,7 @@ impl ControlServer {
         shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
         crate::usage::global().screen(&client);
         let reservation = reservation.keep();
-        self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation, named: p["workspace"].is_string() });
+        self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation, named: p["workspace"].is_string(), params: p.clone() });
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         // a web page is read as text, so no picture unless asked for (it costs the agent over a thousand tokens)
@@ -1206,6 +1210,86 @@ impl ControlServer {
             crate::usage::global().shot(&client, false);
         }
         Ok(json!({}))
+    }
+
+    /// An agent whose hidden app ignores its clicks and keys asks for real input (`desk_open` with `upgrade_desk`).
+    ///
+    /// macOS: the same app is reopened on a virtual monitor (events go to that app's process only, never the
+    /// user's mouse or keyboard). Windows: the same PC's separate child session is opened next to the hidden app,
+    /// since a session shows the whole desktop and the agent starts the app in it. Both ask the user as every
+    /// opening does (the approval switch answers it), and a screen that exists once is waited for in line
+    /// (`turns`). If the new screen can't be had, the hidden one is brought back so the agent isn't left without.
+    async fn upgrade(&self, p: &Value, conn: &Conn) -> Result<Value> {
+        let id = p["upgrade_desk"].as_str().expect("checked by dispatch").to_string();
+        let old = {
+            let desks = self.desks.lock();
+            let e = desks.get(&id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다"))?;
+            if e.conn != conn.id && !e.shared_access {
+                bail!("화면 {id} 는 다른 에이전트(연결)가 연 화면이라 바꿀 수 없습니다");
+            }
+            (e.params.clone(), e.shared.workspace_name.clone())
+        };
+        let (old_params, workspace) = old;
+        let kind = old_params["kind"].as_str().unwrap_or_default().to_string();
+        let mut np = old_params.as_object().cloned().unwrap_or_default();
+        if let Some(c) = p["client"].as_str() {
+            np.insert("client".into(), json!(c));
+        }
+        let replace_old = if cfg!(target_os = "macos") {
+            if kind != "app" {
+                bail!("실제 입력으로 바꾸는 것은 앱 화면(mode=app…)만 됩니다. 웹 화면은 이미 실제 이벤트로 조작하고, session 은 이미 실제 입력입니다");
+            }
+            if np.get("virtual_display").and_then(|v| v.as_bool()).unwrap_or(false) {
+                bail!("이 화면은 이미 가상 모니터에서 실제 입력으로 조작하고 있습니다");
+            }
+            np.insert("virtual_display".into(), json!(true));
+            np.remove("app_host");
+            np.insert("workspace".into(), json!(workspace));
+            true
+        } else {
+            if kind == "session" {
+                bail!("이 화면은 이미 별도 세션의 실제 입력입니다");
+            }
+            // keep the hidden app: the session is another screen, and the app is started inside it
+            np = serde_json::Map::new();
+            np.insert("kind".into(), json!("session"));
+            if let Some(c) = p["client"].as_str() {
+                np.insert("client".into(), json!(c));
+            }
+            false
+        };
+        let np = Value::Object(np);
+        if replace_old {
+            // the app can't run twice at once, so the hidden one ends first (workspace data stays)
+            let e = self.desks.lock().remove(&id);
+            if let Some(e) = e {
+                self.shutdown_entry(e, "실제 입력 모드로 바꾸는 중입니다").await;
+            }
+        }
+        match self.open(&np, conn).await {
+            Ok(mut r) => {
+                r["upgraded_from"] = json!(id);
+                r["note"] = json!(if replace_old {
+                    "Reopened on a virtual monitor: clicks, drags and keys are real input for this app only; your own mouse and keyboard are untouched. The old desk_id is closed."
+                } else {
+                    "Opened the separate session (real mouse and keyboard inside it, not yours). The hidden app is still open as its own desk; start the app inside the session."
+                });
+                Ok(r)
+            }
+            Err(e) => {
+                if !replace_old {
+                    return Err(e);
+                }
+                // bring the hidden screen back so the agent still has its app
+                match self.open(&old_params, conn).await {
+                    Ok(r) => bail!(
+                        "{e:#}\n실제 입력 모드로 바꾸지 못해 숨김 모드로 다시 열었습니다 (새 desk_id: {}). 같은 요청을 다시 하면 이어서 시도합니다",
+                        r["desk_id"].as_str().unwrap_or("?")
+                    ),
+                    Err(e2) => bail!("{e:#}\n숨김 모드로 다시 여는 데도 실패했습니다: {e2:#}"),
+                }
+            }
+        }
     }
 
     async fn close(&self, p: &Value, conn: &Conn) -> Result<Value> {
@@ -2285,6 +2369,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrade_asks_for_real_input_only_where_it_makes_sense() {
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let srv = ControlServer::new(ev_tx, egui::Context::default());
+        let (_t1, a) = conn(1);
+        let (_t2, b) = conn(2);
+        let add = |id: &str, owner: u64, params: Value| {
+            let sh = AgentShared::new(1, id.into(), format!("mcp_{id}"), srv.ctx.clone());
+            srv.reserved.lock().insert(reservation_key(&format!("mcp_{id}")));
+            srv.desks.lock().insert(
+                id.into(),
+                DeskEntry { shared: sh, conn: owner, shared_access: false, reservation: reservation_key(&format!("mcp_{id}")), named: false, params },
+            );
+        };
+        add("web", 1, json!({ "kind": "browser" }));
+        add("vd", 1, json!({ "kind": "app", "app": "Notes", "virtual_display": true }));
+        // unknown screen, somebody else's screen
+        assert!(srv.upgrade(&json!({ "upgrade_desk": "nope" }), &a).await.is_err());
+        assert!(srv.upgrade(&json!({ "upgrade_desk": "web" }), &b).await.err().unwrap().to_string().contains("다른 에이전트"));
+        // a web screen already uses real events; an app already on a virtual monitor is already real input.
+        // Neither may be closed by the refusal.
+        // (on Windows the same request opens the child session, which asks a person: not exercised here)
+        if cfg!(target_os = "macos") {
+            let e = srv.upgrade(&json!({ "upgrade_desk": "web" }), &a).await.err().unwrap().to_string();
+            assert!(e.contains("앱 화면"), "{e}");
+            let e = srv.upgrade(&json!({ "upgrade_desk": "vd" }), &a).await.err().unwrap().to_string();
+            assert!(e.contains("이미"), "{e}");
+        }
+        assert!(srv.desks.lock().contains_key("web") && srv.desks.lock().contains_key("vd"));
+    }
+
+    #[tokio::test]
     async fn desks_bound_to_connection() {
         let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
         let srv = ControlServer::new(ev_tx, egui::Context::default());
@@ -2295,7 +2410,7 @@ mod tests {
             srv.reserved.lock().insert(reservation_key(&format!("mcp_{id}")));
             srv.desks.lock().insert(
                 id.into(),
-                DeskEntry { shared: sh, conn: owner, shared_access: shared, reservation: reservation_key(&format!("mcp_{id}")), named: false },
+                DeskEntry { shared: sh, conn: owner, shared_access: shared, reservation: reservation_key(&format!("mcp_{id}")), named: false, params: json!({}) },
             );
         }
         // other connections can't drive or close it, shared ones can

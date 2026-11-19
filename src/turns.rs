@@ -29,7 +29,13 @@ pub struct Turns {
     slots: Mutex<HashMap<String, Slot>>,
     changed: Notify,
     next: AtomicU64,
+    /// Places in line kept for external agents whose call ran out of time: (key, connection) → place.
+    /// The same agent asking again within `PARKED_FOR` continues from the same place.
+    parked: Mutex<HashMap<(String, u64), (Turn, Instant)>>,
 }
+
+/// How long a kept place in line waits for its agent to ask again.
+const PARKED_FOR: Duration = Duration::from_secs(120);
 
 /// Holding the turn on `key`. Dropping it hands the screen to the next in line.
 pub struct Turn {
@@ -81,6 +87,17 @@ impl Turns {
         self.changed.notify_waiters();
     }
 
+    /// Drops kept places whose agent never came back.
+    fn purge_parked(&self) {
+        let stale: Vec<_> = {
+            let mut parked = self.parked.lock();
+            let old: Vec<_> = parked.iter().filter(|(_, (_, at))| at.elapsed() >= PARKED_FOR).map(|(k, _)| k.clone()).collect();
+            old.iter().filter_map(|k| parked.remove(k)).collect()
+        };
+        // dropping a place hands the screen on, outside the lock
+        drop(stale);
+    }
+
     pub fn state(&self, key: &str) -> State {
         let slots = self.slots.lock();
         slots
@@ -102,13 +119,37 @@ impl Turns {
         on_wait: impl Fn(&str, usize),
         cancelled: impl Fn() -> bool,
     ) -> Result<Turn> {
-        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        self.slots.lock().entry(key.to_string()).or_default().line.push_back((ticket, who.to_string()));
-        // leaves the line if this future is dropped or gives up before getting the turn
-        let mut place = Some(Turn { key: key.to_string(), ticket, turns: self });
+        self.take_as(None, key, who, max_wait, on_wait, cancelled).await
+    }
+
+    /// Like `take`, for an agent that is one connection (`conn`): when `max_wait` runs out its place in line is
+    /// kept for `PARKED_FOR` instead of dropped, and asking again continues from that place. Without this an
+    /// outside agent, whose call must end quickly, would go to the back of the line on every retry.
+    pub async fn take_as(
+        &'static self,
+        conn: Option<u64>,
+        key: &str,
+        who: &str,
+        max_wait: Option<Duration>,
+        on_wait: impl Fn(&str, usize),
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Turn> {
+        self.purge_parked();
+        let kept = conn.and_then(|c| self.parked.lock().remove(&(key.to_string(), c))).map(|(t, _)| t);
+        let mut place = Some(match kept {
+            Some(t) => t,
+            None => {
+                let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+                self.slots.lock().entry(key.to_string()).or_default().line.push_back((ticket, who.to_string()));
+                // leaves the line if this future is dropped or gives up before getting the turn
+                Turn { key: key.to_string(), ticket, turns: self }
+            }
+        });
+        let ticket = place.as_ref().expect("just set").ticket;
         let start = Instant::now();
         let mut last: Option<(String, usize)> = None;
         loop {
+            self.purge_parked();
             let notified = self.changed.notified();
             {
                 let mut slots = self.slots.lock();
@@ -133,6 +174,15 @@ impl Turns {
                 if start.elapsed() >= m {
                     let st = self.state(key);
                     let owner = st.owner.unwrap_or_default();
+                    let pos = st.waiting.iter().position(|w| w == who).map(|i| i + 1).unwrap_or(1);
+                    if let (Some(c), Some(p)) = (conn, place.take()) {
+                        self.parked.lock().insert((key.to_string(), c), (p, Instant::now()));
+                        bail!(
+                            "이 화면은 지금 {owner} 이(가) 쓰는 중입니다 (하나뿐인 화면이라 한 번에 한 에이전트만 씁니다). \
+                             대기열 {pos}번째로 자리를 잡아 두었습니다. 같은 요청을 다시 호출하면 이 자리에서 이어서 기다립니다 (2분 안에). \
+                             기다리는 동안 다른 mode(web, app 등)로 할 수 있는 일을 먼저 하세요"
+                        );
+                    }
                     bail!(
                         "이 화면은 지금 {owner} 이(가) 쓰는 중입니다 (하나뿐인 화면이라 한 번에 한 에이전트만 씁니다). \
                          다른 mode(web, app 등)로 할 수 있으면 그렇게 하고, 꼭 이 화면이 필요하면 잠시 뒤 다시 desk_open 하세요"
@@ -217,5 +267,29 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         assert!(h.await.unwrap());
         assert!(t.state("k").waiting.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod parked_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_outside_agent_keeps_its_place_between_calls() {
+        let t: &'static Turns = Box::leak(Box::default());
+        let a = t.take("k", "A", None, |_, _| {}, || false).await.unwrap();
+        // B (connection 7) runs out of time, then C joins behind it
+        let e = t.take_as(Some(7), "k", "B", Some(Duration::from_millis(100)), |_, _| {}, || false).await.err().unwrap();
+        assert!(e.to_string().contains("대기열 1번째"), "{e}");
+        assert_eq!(t.state("k").waiting, ["B"], "place is kept");
+        let c = tokio::spawn(async move { t.take("k", "C", None, |_, _| {}, || false).await.map(|_| ()).is_ok() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(t.state("k").waiting, ["B", "C"]);
+        drop(a);
+        // B asks again and is first, ahead of C
+        let b = t.take_as(Some(7), "k", "B", Some(Duration::from_secs(2)), |_, _| {}, || false).await.unwrap();
+        assert_eq!(t.state("k").owner.as_deref(), Some("B"));
+        drop(b);
+        assert!(c.await.unwrap());
     }
 }

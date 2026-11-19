@@ -105,7 +105,9 @@ async fn take_session_turn(shared: &Arc<AgentShared>, account: &str) -> Result<c
     };
     let sh = shared.clone();
     let cancelled = move || sh.stop.load(Ordering::SeqCst) || sh.removed.load(Ordering::SeqCst);
-    crate::turns::global().take(&key, &who, max_wait, on_wait, cancelled).await
+    // an outside agent is one connection: its place in line outlives its (short) call
+    let conn = external.is_some().then(|| shared.team_member_id.load(Ordering::Relaxed)).filter(|c| *c != 0);
+    crate::turns::global().take_as(conn, &key, &who, max_wait, on_wait, cancelled).await
 }
 
 async fn prepare_electron(

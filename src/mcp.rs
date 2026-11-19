@@ -225,6 +225,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "account": { "type": "string", "description": "session: dedicated macOS account (default ghostdesk-agent)" },
                     "browser": { "type": "string", "description": "web: Chrome, Edge, Whale…" },
                     "browser_profile": { "type": "string", "description": "web_login: profile id (Default, Profile 1…) or name (default: first)" },
+                    "upgrade_desk": { "type": "string", "description": "desk_id whose app ignores hidden input (clicks, drags, keys have no effect): reopen with real input for that app only, never your user's mouse or keyboard. Asks the user; waits in line if that screen is in use. Set mode to any value; other fields are ignored." },
                     "workspace": { "type": "string", "description": "workspace to reuse (keeps cloned login/app data; opens under a new name if busy)" },
                     "refresh_login": { "type": "boolean", "description": "web_login/app_login: 원본에서 새로 복사해 복제 데이터를 교체 (replace the clone; its own changes may be lost)" },
                     "name": { "type": "string", "description": "screen name" },
