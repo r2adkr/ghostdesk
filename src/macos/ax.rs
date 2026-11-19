@@ -121,7 +121,24 @@ impl El {
     pub fn app(pid: i32) -> El {
         let a = unsafe { AXUIElement::new_application(pid) };
         unsafe { a.set_messaging_timeout(2.5) };
-        El(a)
+        let el = El(a);
+        el.enable_web_accessibility_once();
+        el
+    }
+
+    /// Chromium, Electron and CEF apps (Slack, Discord, Spotify, VS Code, …) only build their accessibility tree
+    /// once an assistive app says it is there; without it every control is one unnamed group and no semantic click
+    /// or typing has anything to land on. `AXManualAccessibility` is the switch made for this: apps that don't know
+    /// it just refuse the attribute. Done once per process.
+    fn enable_web_accessibility_once(&self) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static DONE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+        let Some(pid) = self.pid() else { return };
+        let fresh = DONE.get_or_init(Default::default).lock().map(|mut d| d.insert(pid)).unwrap_or(false);
+        if fresh {
+            let _ = self.set_bool("AXManualAccessibility", true);
+        }
     }
 
     pub fn get_raw(&self, attr: &str) -> Result<CFRetained<CFType>, AXError> {

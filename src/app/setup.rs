@@ -304,6 +304,12 @@ impl eframe::App for Setup {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
+        // while the worker runs, keep redrawing: a repaint requested from the worker thread can fail to wake the
+        // window on some machines (fresh installs, VMs without a GPU), which left the first message on screen
+        // even though the install had moved on or finished
+        if matches!(self.phase, Phase::Working) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         // closing mid-way would leave a half-installed copy: the close button waits for the worker
         if matches!(self.phase, Phase::Working) && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

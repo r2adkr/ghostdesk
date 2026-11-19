@@ -34,9 +34,21 @@ const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456
 
 /// 20 random letters and digits (no look-alikes such as 0/O or 1/l, so it can be typed from the screen).
 pub fn random_password() -> Result<String> {
-    use std::io::Read;
     let mut bytes = [0u8; 20];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    }
+    // accounts are only made on macOS; elsewhere the standard library's OS-seeded hasher stands in (tests, builds)
+    #[cfg(not(unix))]
+    {
+        use std::hash::{BuildHasher, Hasher};
+        for chunk in bytes.chunks_mut(8) {
+            let r = std::collections::hash_map::RandomState::new().build_hasher().finish().to_le_bytes();
+            chunk.copy_from_slice(&r[..chunk.len()]);
+        }
+    }
     Ok(bytes.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect())
 }
 
