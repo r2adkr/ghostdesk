@@ -30,6 +30,7 @@ mod platform;
 mod winapp;
 // macOS: dedicated account session; Windows: child session (PiP). Same helper RPC.
 #[cfg(any(unix, windows))]
+mod host;
 mod session;
 mod vdisplay;
 mod keys;
@@ -77,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         // test that creates a real virtual monitor: only runs with --yes
         Some("--selftest-vdisplay") => return rt.block_on(vdisplay::selftest(&args[2..])),
         Some("--selftest-session") => return rt.block_on(session::selftest(&args[2..])),
+        Some("--host") => return rt.block_on(host::run()),
         Some("--session-helper") => return rt.block_on(session::run_helper(&args[2..])),
         #[cfg(unix)]
         Some("--print-session-plist") => return session::print_session_plist(&args[2..]),

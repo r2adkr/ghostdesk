@@ -22,6 +22,7 @@ mod account;
 mod connect;
 mod detail;
 mod fonts;
+mod host_settings;
 mod ai;
 mod i18n;
 mod labels;
@@ -331,6 +332,7 @@ pub struct GhostApp {
     /// Development: with GHOSTDESK_DEMO=<n>, auto-starts n empty-profile browser agents.
     pending_demo: u32,
     toast: Option<(String, f64)>,
+    host_ui: host_settings::HostUi,
     /// Version whose update toast the person closed with X.
     update_dismissed: Option<String>,
     /// Whether the screen wall turned on full screen (undone when the wall closes).
@@ -445,6 +447,7 @@ impl GhostApp {
             show_cursor: true,
             pending_demo: std::env::var("GHOSTDESK_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             toast: None,
+            host_ui: Default::default(),
             update_dismissed: None,
             wall_fullscreen: false,
             key_warn: false,

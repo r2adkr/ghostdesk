@@ -676,6 +676,12 @@ pub async fn run_helper(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Host mode: this computer's own session (the one the person is logged in to), driven like a child session.
+pub fn host_platform() -> Arc<dyn SessionPlatform> {
+    crate::platform::win::set_dpi_aware();
+    Arc::new(ChildPlatform { session: my_session_id() })
+}
+
 /// `ghostdesk --selftest-session`: child session state (read only) plus a mock helper round
 /// trip. Changes no system settings.
 pub async fn selftest(_args: &[String]) -> Result<()> {

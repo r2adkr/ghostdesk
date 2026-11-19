@@ -444,6 +444,59 @@ pub fn spawn_server(mut listener: HelperListener, platform: Arc<dyn SessionPlatf
     ServerHandle { stop: stop_tx, task }
 }
 
+/// Serves connections that were already authenticated some other way (host mode: the pairing token over an
+/// end-to-end encrypted link). No uid check, and the console gate is lifted because the screen being served is
+/// this computer's own.
+pub struct HostServer {
+    srv: Arc<Server>,
+    stop: watch::Sender<bool>,
+}
+
+impl HostServer {
+    pub fn new(platform: Arc<dyn SessionPlatform>, label: String, log: LogFn) -> Self {
+        let cfg = ServerConfig { allow_uids: vec![], allow_on_console: true, label, log };
+        let (stop, _) = watch::channel(false);
+        HostServer { srv: Arc::new(Server { platform, cfg, input_lock: tokio::sync::Mutex::new(()) }), stop }
+    }
+
+    /// Runs one connection until it ends or `stop_all` is called.
+    pub async fn serve(&self, rd: Reader, wr: Writer) {
+        self.srv.clone().handle(rd, wr, None, self.stop.subscribe()).await
+    }
+
+    /// Ends every running connection.
+    pub fn stop_all(&self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+/// The screen and input of this computer's own session, for host mode. Errors say what is missing.
+pub fn host_platform() -> Result<Arc<dyn SessionPlatform>> {
+    #[cfg(target_os = "macos")]
+    {
+        let s = crate::macos::tcc_status();
+        let mut missing = Vec::new();
+        if !s.screen_capture {
+            missing.push("화면 기록");
+        }
+        if !s.accessibility || !s.post_event {
+            missing.push("손쉬운 사용");
+        }
+        if !missing.is_empty() {
+            bail!("호스트에 필요한 권한이 없습니다: {} (시스템 설정 > 개인정보 보호 및 보안 에서 GhostDesk 를 켜세요)", missing.join(", "));
+        }
+        Ok(Arc::new(mac::MacPlatform::new()))
+    }
+    #[cfg(windows)]
+    {
+        Ok(crate::winapp::child::host_platform())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        bail!("호스트 모드는 macOS 와 Windows 에서만 쓸 수 있습니다")
+    }
+}
+
 fn num(v: &Value, k: &str) -> Result<f64> {
     v[k].as_f64().ok_or_else(|| anyhow!("'{k}' 숫자가 필요합니다"))
 }
@@ -2100,7 +2153,7 @@ GhostDesk 에서 백엔드로 '별도 로그인 세션'을 고르고 계정 이�
 
 /// Synthetic framebuffer: pixel color = position (R = x fraction, G = y fraction, B = 77). Input
 /// is recorded as strings.
-struct MockPlatform {
+pub(crate) struct MockPlatform {
     disp: DisplayInfo,
     events: Mutex<Vec<String>>,
     console: AtomicBool,
@@ -2116,7 +2169,7 @@ fn mock_color(u: f64, v: f64) -> Rgb<u8> {
 }
 
 impl MockPlatform {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         MockPlatform {
             disp: DisplayInfo { origin_x: 0.0, origin_y: 0.0, width_pt: 1512.0, height_pt: 982.0, scale: 2.0 },
             events: Mutex::new(Vec::new()),

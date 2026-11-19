@@ -68,6 +68,7 @@ pub(super) fn fields(ui: &mut egui::Ui, options: &mut SshOptions, host_hint: &st
 impl GhostApp {
     pub(super) fn settings_ssh(&mut self, ui: &mut egui::Ui) {
         if self.ssh_editor.is_none() {
+            self.settings_host(ui);
             self.share_connection_info(ui);
             ui.add_space(8.0);
             ui.separator();
