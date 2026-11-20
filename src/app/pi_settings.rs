@@ -35,32 +35,19 @@ impl GhostApp {
                 ui.spinner();
                 ui.label(tr("pi 설치 중… (몇 분 걸릴 수 있어요)"));
             });
-        } else if !self.pi_confirm {
+        } else {
             ui.label(tr("pi 가 아직 설치되어 있지 않아요"));
             if theme::primary(ui, tr("pi 설치하기")).clicked() {
-                self.pi_confirm = true;
                 self.pi_note = None;
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.pi_install = Some(rx);
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::pi::install());
+                    ctx.request_repaint();
+                });
             }
-        } else {
-            ui.label(RichText::new(tr("아래 명령을 이 컴퓨터에서 실행해 pi 를 설치해요. Node.js 가 없으면 함께 설치될 수 있어요")).color(theme::warn()));
-            ui.add_space(4.0);
-            ui.label(RichText::new(crate::pi::install_command()).monospace());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if theme::primary(ui, tr("설치 진행")).clicked() {
-                    self.pi_confirm = false;
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.pi_install = Some(rx);
-                    let ctx = ui.ctx().clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(crate::pi::install());
-                        ctx.request_repaint();
-                    });
-                }
-                if theme::secondary(ui, tr("취소")).clicked() {
-                    self.pi_confirm = false;
-                }
-            });
+            ui.label(theme::hint(tr("버튼 한 번으로 설치해요. Node.js 가 없으면 Homebrew 로 함께 설치해요 (몇 분 걸려요)")));
         }
         if let Some(note) = &self.pi_note {
             ui.label(theme::hint(note.clone()));

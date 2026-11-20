@@ -29,23 +29,57 @@ pub fn install_command() -> &'static str {
     }
 }
 
-/// Runs the installer (blocking). The user confirmed the exact command in Settings first.
+/// PATH for the installer: an app launched from the Dock has a short one that misses Homebrew and node.
+#[cfg(not(windows))]
+fn installer_path() -> String {
+    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    let cur = std::env::var("PATH").unwrap_or_default();
+    format!("/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{cur}")
+}
+
+/// Whether `node` 22.19 or newer is available.
+#[cfg(not(windows))]
+fn node_ok() -> bool {
+    std::process::Command::new("/bin/sh")
+        .env("PATH", installer_path())
+        .args(["-c", "node -e 'const [a,b]=process.versions.node.split(\".\").map(Number);process.exit(a>22||(a===22&&b>=19)?0:1)'"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Runs the installer (blocking, no terminal): installs Node.js through Homebrew first when it is missing
+/// (the official script can only ask about that in a terminal), then pi's own installer.
 pub fn install() -> Result<(), String> {
-    let mut c = if cfg!(windows) {
-        let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-Command", "irm https://pi.dev/install.ps1 | iex"]);
-        c
-    } else {
-        let mut c = std::process::Command::new("/bin/sh");
-        c.args(["-c", install_command()]);
-        c
-    };
-    let out = c.stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
+    let fail = |what: &str, out: std::process::Output| {
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("설치에 실패했어요: {}", crate::llm::short(err.trim(), 300)))
+        let text = if err.trim().is_empty() { String::from_utf8_lossy(&out.stdout).into_owned() } else { err.into_owned() };
+        format!("{what}: {}", crate::llm::short(text.trim(), 300))
+    };
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "irm https://pi.dev/install.ps1 | iex"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        return if out.status.success() { Ok(()) } else { Err(fail("설치에 실패했어요", out)) };
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = |cmd: &str| std::process::Command::new("/bin/sh").env("PATH", installer_path()).args(["-c", cmd]).stdin(Stdio::null()).output();
+        if !node_ok() {
+            let has_brew = sh("command -v brew").is_ok_and(|o| o.status.success());
+            if !has_brew {
+                return Err("Node.js 22.19 이상이 필요해요. nodejs.org 에서 설치한 뒤 다시 눌러 주세요".into());
+            }
+            let out = sh("brew install node").map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(fail("Node.js 설치에 실패했어요", out));
+            }
+        }
+        let out = sh(install_command()).map_err(|e| e.to_string())?;
+        if out.status.success() { Ok(()) } else { Err(fail("설치에 실패했어요", out)) }
     }
 }
 

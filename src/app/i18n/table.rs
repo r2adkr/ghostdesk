@@ -85,6 +85,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["API 키로 쓰는 AI 를 pi 로 실행해요", "Run AIs used with an API key through pi", "APIキーで使うAIをpiで実行します", "使用 API 密钥的 AI 通过 pi 运行"],
     ["새로 시작하는 에이전트부터 적용돼요", "Applies to agents started from now on", "新しく開始するエージェントから適用されます", "对此后启动的代理生效"],
     ["켜져 있는데 꺼짐으로 보이면 '허용'을 눌러 다시 요청하세요", "If it looks off although it is on, press Allow to ask again", "オンなのにオフと表示される場合は「許可」を押して再リクエストしてください", "如果已开启却显示为关闭，请点击“允许”重新请求"],
+    ["버튼 한 번으로 설치해요. Node.js 가 없으면 Homebrew 로 함께 설치해요 (몇 분 걸려요)", "Installs with one click. If Node.js is missing it is installed too, through Homebrew (takes a few minutes).", "ボタン1つでインストールします。Node.jsがなければHomebrewで一緒にインストールします（数分かかります）。", "点击一次即可安装。若没有 Node.js，会通过 Homebrew 一并安装（需要几分钟）。"],
     ["암호 보기", "Show password", "パスワードを表示", "查看密码"],
     ["저장된 암호가 없어요", "No password is saved", "保存されたパスワードがありません", "没有已保存的密码"],
     ["이 계정 만들기", "Create this account", "このアカウントを作成", "创建此账户"],

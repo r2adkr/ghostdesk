@@ -296,7 +296,6 @@ pub struct GhostApp {
     /// Run key-based AI agents through pi when it is installed.
     use_pi: bool,
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-    pi_confirm: bool,
     pi_note: Option<String>,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
@@ -448,7 +447,6 @@ impl GhostApp {
             live_fps_limit: 60,
             use_pi: false,
             pi_install: None,
-            pi_confirm: false,
             pi_note: None,
             allow_experimental: false,
             tour: None,
