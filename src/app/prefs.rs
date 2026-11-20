@@ -304,11 +304,11 @@ pub(super) mod secret {
 
     const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-    pub(super) fn seal(plain: &str) -> Option<String> {
+    pub(in crate::app) fn seal(plain: &str) -> Option<String> {
         dpapi(plain.as_bytes(), true).map(|v| B64.encode(v))
     }
 
-    pub(super) fn open(sealed: &str) -> Option<String> {
+    pub(in crate::app) fn open(sealed: &str) -> Option<String> {
         let raw = B64.decode(sealed).ok()?;
         String::from_utf8(dpapi(&raw, false)?).ok().filter(|s| !s.trim().is_empty())
     }
