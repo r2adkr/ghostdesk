@@ -15,3 +15,27 @@ pub mod proc;
 pub mod text;
 #[cfg(windows)]
 pub mod win;
+
+/// Hands memory the allocator has freed but kept back to the OS (screenshots, decoded images and
+/// request bodies come and go; without this the process keeps their peak as its footprint).
+pub fn trim_memory() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means "all zones"; goal 0 means "as much as possible".
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(unix, not(target_os = "macos"), target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free pages to the OS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(windows)]
+    // SAFETY: compacts the process heap; it only coalesces free blocks.
+    unsafe {
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+        HeapCompact(GetProcessHeap(), 0);
+    }
+}

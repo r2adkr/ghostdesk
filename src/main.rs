@@ -177,7 +177,11 @@ fn main() -> anyhow::Result<()> {
     {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // One frame in flight instead of two: the window keeps fewer full-size drawables alive (tens of
+    // MB on a Retina display), and a UI that redraws on demand doesn't need the extra throughput.
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
+    let options = eframe::NativeOptions { viewport, wgpu_options, ..Default::default() };
     eframe::run_native(
         "GhostDesk",
         options,

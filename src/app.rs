@@ -605,6 +605,7 @@ impl GhostApp {
         if self.usage_saved.elapsed() >= Duration::from_secs(15) {
             self.usage_saved = Instant::now();
             save_usage_file();
+            crate::platform::trim_memory();
         }
         ctx.request_repaint_after(Duration::from_secs(15));
     }
