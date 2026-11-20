@@ -311,6 +311,7 @@ impl NewAgentForm {
             ui.add(egui::Label::new(RichText::new(&target).strong()).wrap());
             if ui.link(tr("연결 정보 수정")).clicked() {
                 self.remote_entry = RemoteEntry::Manual;
+                self.saved_id = None;
             }
         });
         let ports = match self.remote_mode {
@@ -349,6 +350,7 @@ impl NewAgentForm {
             if crate::host::parse_code(&self.card_input).is_ok() {
                 // a host computer's pairing code: no address, port or password to fill in
                 self.host_code = Some(self.card_input.trim().to_string());
+                self.saved_id = None;
                 self.remote_entry = RemoteEntry::Imported;
                 self.card_input.clear();
                 self.card_invalid = false;
@@ -356,6 +358,7 @@ impl NewAgentForm {
             }
             if let Some(card) = Card::decode(&self.card_input) {
                 self.host_code = None;
+                self.saved_id = None;
                 card.apply(self);
                 self.card_input.clear();
                 self.card_invalid = false;

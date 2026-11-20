@@ -36,7 +36,7 @@ pub async fn models(provider: Provider, explicit: &str) -> Result<Vec<String>> {
     if provider == Provider::ClaudeCli {
         // The CLI only has aliases, so ask it which exact model each one means right now. Anything it
         // can't resolve stays as the alias (the CLI still understands that).
-        let aliases = ["opus", "sonnet", "haiku"];
+        let aliases = ["opus", "sonnet", "haiku"]; // strongest first
         let resolved = futures_util::future::join_all(aliases.iter().map(|a| {
             let explicit = explicit.to_string();
             let alias = a.to_string();

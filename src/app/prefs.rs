@@ -288,7 +288,7 @@ fn write_document(path: &Path, update: impl FnOnce(Option<Document>) -> anyhow::
 
 /// API key sealing: DPAPI on Windows (only that user account can decrypt); not stored on other
 /// OSes.
-mod secret {
+pub(super) mod secret {
     use base64::Engine as _;
 
     const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;

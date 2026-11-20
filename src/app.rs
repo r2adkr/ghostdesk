@@ -35,6 +35,7 @@ pub mod setup;
 mod screens;
 mod settings;
 mod remote_info;
+mod saved_remotes;
 mod ssh_profiles;
 mod teams;
 mod usage;
@@ -174,6 +175,7 @@ enum RemoteMode {
 enum RemoteEntry {
     Paste,
     Manual,
+    Saved,
     Imported,
 }
 
@@ -208,6 +210,8 @@ struct NewAgentForm {
     remote_dedicated: bool,
     /// Pairing code of a host computer (kept instead of an address when one was pasted).
     host_code: Option<String>,
+    /// The saved entry this form was filled from (nothing to offer saving then).
+    saved_id: Option<String>,
     remote_mode: RemoteMode,
     card_input: String,
     card_invalid: bool,
@@ -335,6 +339,8 @@ pub struct GhostApp {
     pending_demo: u32,
     toast: Option<(String, f64)>,
     host_ui: host_settings::HostUi,
+    saved_remotes: Vec<saved_remotes::SavedRemote>,
+    save_prompt: Option<saved_remotes::SavePrompt>,
     /// Version whose update toast the person closed with X.
     update_dismissed: Option<String>,
     /// A manual update check in progress or just finished (Settings → About).
@@ -452,6 +458,8 @@ impl GhostApp {
             pending_demo: std::env::var("GHOSTDESK_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             toast: None,
             host_ui: Default::default(),
+            saved_remotes: saved_remotes::load(),
+            save_prompt: None,
             update_dismissed: None,
             update_check: None,
             wall_fullscreen: false,
@@ -885,6 +893,7 @@ impl GhostApp {
             self.palette_window(&ctx);
             self.account_window(&ctx);
             self.import_window(&ctx);
+            self.save_remote_window(&ctx);
             self.new_agent_window(&ctx);
             self.tour_window(&ctx);
             // separate session guide (macOS: LaunchAgent; Windows: enabling child sessions)

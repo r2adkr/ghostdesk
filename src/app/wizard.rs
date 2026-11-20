@@ -49,6 +49,7 @@ impl NewAgentForm {
             remote_pass: String::new(),
             remote_dedicated: false,
             host_code: None,
+            saved_id: None,
             remote_mode: RemoteMode::Vnc,
             card_input: String::new(),
             card_invalid: false,
@@ -411,6 +412,7 @@ impl GhostApp {
         self.form.card_invalid = false;
         self.form.remote_entry = RemoteEntry::Paste;
         self.form.host_code = None;
+        self.form.saved_id = None;
         self.form.team_id = None;
         self.form.team_role.clear();
         // auto comes preselected: just write the task and start (the window height is the same from the
@@ -626,7 +628,7 @@ impl GhostApp {
             });
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ready = self.form.choice.is_some() && (self.form.choice != Some(Choice::Remote) || self.form.remote_entry != RemoteEntry::Paste);
+                let ready = self.form.choice.is_some() && (self.form.choice != Some(Choice::Remote) || !matches!(self.form.remote_entry, RemoteEntry::Paste | RemoteEntry::Saved));
                 if ui.add_enabled_ui(ready, |ui| theme::primary(ui, tr("에이전트 시작"))).inner.clicked() {
                     start = true;
                 }
@@ -943,6 +945,10 @@ impl GhostApp {
         let before = self.agents.len();
         self.spawn_agent(ctx);
         if self.agents.len() > before {
+            // a remote connection used for the first time: offer to keep it
+            if self.form.kind == FormKind::Remote {
+                self.offer_save_remote();
+            }
             self.wizard_open = false;
             self.form.web_use_login = false;
             self.form.app_use_login = false;
@@ -958,6 +964,9 @@ impl GhostApp {
                 if theme::tab(ui, self.form.remote_entry == RemoteEntry::Paste, tr("받은 연결 정보")).clicked() {
                     self.form.remote_entry = RemoteEntry::Paste;
                 }
+                if theme::tab(ui, self.form.remote_entry == RemoteEntry::Saved, tr("저장된 정보")).clicked() {
+                    self.form.remote_entry = RemoteEntry::Saved;
+                }
                 if theme::tab(ui, self.form.remote_entry == RemoteEntry::Manual, tr("직접 설정")).clicked() {
                     self.form.remote_entry = RemoteEntry::Manual;
                 }
@@ -969,6 +978,11 @@ impl GhostApp {
             RemoteEntry::Paste => {
                 ui.label(theme::hint(tr("상대방의 설정 → 원격 연결에서 복사한 정보를 붙여넣으세요.")));
                 if !self.form.import_connection_info(ui) { return; }
+                self.form.show_connection_summary(ui);
+            }
+            RemoteEntry::Saved => {
+                self.saved_remotes_tab(ui);
+                if self.form.remote_entry == RemoteEntry::Saved { return; }
                 self.form.show_connection_summary(ui);
             }
             RemoteEntry::Manual => self.manual_connection_fields(ui),

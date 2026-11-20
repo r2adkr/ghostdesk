@@ -215,7 +215,74 @@ pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<S
     }
     ids.sort();
     ids.dedup();
+    sort_models(&mut ids);
     Ok(ids)
+}
+
+/// Orders a model list the way a person looks for one: the same vendor and family together, the strongest
+/// family first (Fable, Opus, Sonnet, Haiku), the newest version first, a plain name before its dated
+/// snapshots and before `mini`/`preview` style variants.
+pub fn sort_models(ids: &mut [String]) {
+    use std::cmp::Reverse;
+    // numbers that make up the version: dates (2025-05-14, 20250514, 0613) are not versions
+    fn version(id: &str) -> Vec<u32> {
+        let mut s = id.to_lowercase();
+        // yyyy-mm-dd
+        while let Some(i) = s.as_bytes().windows(10).position(|w| {
+            w[..4].iter().all(u8::is_ascii_digit) && w[4] == b'-' && w[5..7].iter().all(u8::is_ascii_digit) && w[7] == b'-' && w[8..].iter().all(u8::is_ascii_digit)
+        }) {
+            s.replace_range(i..i + 10, "");
+        }
+        let model = s.rsplit('/').next().unwrap_or(&s).to_string();
+        let mut out = Vec::new();
+        for piece in model.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+            let digits: String = piece.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+            // a piece that is only digits and dots; 4+ digit runs are dates or sizes, not versions
+            if digits.len() == piece.len() && !digits.is_empty() && !(piece.len() >= 4 && !piece.contains('.')) {
+                out.extend(digits.split('.').filter_map(|n| n.parse::<u32>().ok()));
+            } else if let Some(rest) = piece.strip_prefix(|c: char| c.is_ascii_alphabetic()) {
+                // o3, o4 (a letter then a number)
+                if piece.len() <= 3 && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    out.extend(rest.parse::<u32>().ok());
+                }
+            }
+        }
+        out
+    }
+    fn stem(id: &str) -> String {
+        let m = id.rsplit('/').next().unwrap_or(id).to_lowercase();
+        m.split(|c: char| c == '-' || c == '_' || c == ':').next().unwrap_or("").trim_end_matches(|c: char| c.is_ascii_digit() || c == '.').to_string()
+    }
+    fn family(id: &str) -> u8 {
+        let l = id.to_lowercase();
+        ["fable", "opus", "sonnet", "haiku"].iter().position(|f| l.contains(f)).map(|i| i as u8).unwrap_or(9)
+    }
+    fn dated(id: &str) -> bool {
+        let l = id.to_lowercase();
+        l.split(|c: char| !c.is_ascii_digit()).any(|t| t.len() == 8 || t.len() == 4) 
+    }
+    fn variant(id: &str) -> u8 {
+        let l = id.to_lowercase();
+        let mut v = 0;
+        if dated(&l) { v += 2; }
+        if ["mini", "nano", "lite", "preview", "exp", "latest", "turbo", "instruct", "vision", "thinking", "distill"].iter().any(|w| l.contains(w)) { v += 1; }
+        v
+    }
+    fn vendor(id: &str) -> String {
+        id.split_once('/').map(|(v, _)| v.to_lowercase()).unwrap_or_default()
+    }
+    // best version per vendor+stem, so a family with newer models sits above older families
+    let mut best: std::collections::HashMap<(String, String), Vec<u32>> = std::collections::HashMap::new();
+    for id in ids.iter() {
+        let k = (vendor(id), stem(id));
+        let v = version(id);
+        let e = best.entry(k).or_default();
+        if v > *e { *e = v; }
+    }
+    ids.sort_by_cached_key(|id| {
+        let k = (vendor(id), stem(id));
+        (k.0.clone(), Reverse(best.get(&k).cloned().unwrap_or_default()), k.1, family(id), Reverse(version(id)), variant(id), id.to_lowercase())
+    });
 }
 
 pub fn short(s: &str, n: usize) -> String {
@@ -223,6 +290,41 @@ pub fn short(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::sort_models;
+
+    fn sorted(v: &[&str]) -> Vec<String> {
+        let mut x: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        sort_models(&mut x);
+        x
+    }
+
+    #[test]
+    fn claude_models_go_by_family_then_newest() {
+        let out = sorted(&[
+            "claude-haiku-4-5", "claude-sonnet-4-20250514", "claude-opus-4-1-20250805", "claude-opus-5-5",
+            "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-opus-4-20250514", "claude-3-5-haiku-20241022",
+        ]);
+        assert_eq!(out[..4], ["claude-fable-5-2", "claude-opus-5-5", "claude-opus-4-1-20250805", "claude-opus-4-20250514"]);
+        let pos = |m: &str| out.iter().position(|x| x == m).unwrap();
+        assert!(pos("claude-opus-4-20250514") < pos("claude-sonnet-5-5") && pos("claude-sonnet-5-5") < pos("claude-sonnet-4-20250514"));
+        assert!(pos("claude-sonnet-4-20250514") < pos("claude-haiku-5-5") && pos("claude-haiku-5-5") < pos("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn other_vendors_newest_first_plain_before_variants() {
+        let out = sorted(&["gpt-4o", "gpt-5.5-mini", "gpt-5.5", "gpt-5", "gpt-4o-2024-08-06", "o3", "gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-2.5-pro"]);
+        let pos = |m: &str| out.iter().position(|x| x == m).unwrap();
+        assert!(pos("gpt-5.5") < pos("gpt-5.5-mini") && pos("gpt-5.5-mini") < pos("gpt-5") && pos("gpt-5") < pos("gpt-4o"));
+        assert!(pos("gpt-4o") < pos("gpt-4o-2024-08-06"));
+        assert!(pos("gemini-3.1-pro-preview") < pos("gemini-3-flash-preview") && pos("gemini-3-flash-preview") < pos("gemini-2.5-pro"));
+        // vendors stay together on OpenRouter
+        let or = sorted(&["openai/gpt-5.5", "anthropic/claude-sonnet-5-5", "openai/gpt-4o", "anthropic/claude-opus-5-5"]);
+        assert_eq!(or, ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5", "openai/gpt-5.5", "openai/gpt-4o"]);
     }
 }
 
