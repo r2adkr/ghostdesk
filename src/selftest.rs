@@ -191,6 +191,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         workspace: ws_name.clone(),
         // GHOSTDESK_TEST_PI_MODEL=<openai model>: runs the agent on the pi engine (its OpenAI endpoint redirected
         // to a fake server through <data dir>/engine/models.json)
+        files: std::env::var("GHOSTDESK_TEST_PI_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         use_pi: std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some(),
         task,
         // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend

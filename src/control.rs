@@ -257,6 +257,21 @@ fn reservation_key(workspace: &str) -> String {
     profiles::slug(workspace).to_lowercase()
 }
 
+/// The window's event channel, so code outside the control server (the pi engine) can ask the person for an
+/// approval the same way a control request does.
+static APPROVAL_EVENTS: parking_lot::Mutex<Option<mpsc::UnboundedSender<ControlEvent>>> = parking_lot::Mutex::new(None);
+
+/// Asks the person in the GhostDesk window and waits for the answer (only a click answers it, never the
+/// permission bypass). `false` when refused, unanswered for 3 minutes, or there is no window.
+pub async fn ask_person(title: &str, detail: String) -> bool {
+    let Some(events) = APPROVAL_EVENTS.lock().clone() else { return false };
+    let (tx, rx) = oneshot::channel();
+    if events.send(ControlEvent::Approval { title: title.to_string(), detail, experimental: false, manual: true, reply: tx }).is_err() {
+        return false;
+    }
+    matches!(tokio::time::timeout(APPROVAL_WAIT, rx).await, Ok(Ok(true)))
+}
+
 pub struct ControlServer {
     desks: Mutex<HashMap<String, DeskEntry>>,
     /// Workspace names in use (including ones being prepared), so two programs never use the same
@@ -275,6 +290,7 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn new(events: mpsc::UnboundedSender<ControlEvent>, ctx: egui::Context) -> Arc<Self> {
+        *APPROVAL_EVENTS.lock() = Some(events.clone());
         Arc::new(ControlServer {
             desks: Mutex::new(HashMap::new()),
             reserved: Mutex::new(HashSet::new()),

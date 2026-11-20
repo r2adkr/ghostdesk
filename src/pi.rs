@@ -121,18 +121,89 @@ pub fn usable(llm: &Llm) -> bool {
     supports(llm.provider) && !llm.api_key.is_empty() && llm.base_url == llm.provider.default_base_url() && find().is_some()
 }
 
+/// Why an agent with a key-based AI can't use pi although pi is installed (None: it can, or it isn't a
+/// case worth mentioning — no pi, or an AI that never goes through pi).
+pub fn unavailable(llm: &Llm) -> Option<&'static str> {
+    if find().is_none() || !supports(llm.provider) {
+        return None;
+    }
+    if llm.api_key.is_empty() {
+        return Some("API 키가 없어 기본 방식으로 실행해요");
+    }
+    if llm.base_url != llm.provider.default_base_url() {
+        return Some("사용자 지정 주소라 기본 방식으로 실행해요");
+    }
+    None
+}
+
 /// Marks an extension dialog as a tool call (the title is `MARK` + JSON).
 const MARK: &str = "\u{1}gd\u{1}";
 
+/// Marks an extension dialog as a request for the person's approval (`ASK` + JSON `{ tool, what }`).
+const ASK: &str = "\u{1}ask\u{1}";
+
+/// pi's own file and command tools an agent may use at a level (0 off, 1 read, 2 read/write/run).
+pub fn file_tools(level: u8) -> &'static [&'static str] {
+    match level {
+        0 => &[],
+        1 => &["read", "grep", "find", "ls"],
+        _ => &["read", "grep", "find", "ls", "write", "edit", "bash"],
+    }
+}
+
 /// The pi extension: registers GhostDesk's tools, forwards each call to GhostDesk and sets the system
-/// prompt. `tools` is a list of `{ name, description, parameters }`.
-pub fn extension_source(tools: &[Value], system: &str) -> String {
+/// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
+/// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
+/// person for approval first.
+pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>) -> String {
+    let (top, hook) = match files {
+        Some(dir) => (
+            format!(
+                r#"
+const WORK = {work};
+const ASK = "\u0001ask\u0001";
+import {{ resolve, relative, isAbsolute, dirname, basename }} from "node:path";
+import {{ realpathSync }} from "node:fs";
+const real = (p) => {{
+  const r = resolve(WORK, String(p ?? "."));
+  let t = r, tail = "";
+  for (;;) {{
+    try {{ return tail ? resolve(realpathSync(t), tail) : realpathSync(t); }} catch (e) {{}}
+    const up = dirname(t);
+    if (up === t) return r;
+    tail = tail ? resolve(basename(t), tail) : basename(t);
+    t = up;
+  }}
+}};
+const inside = (p) => {{ const rel = relative(realpathSync(WORK), real(p)); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); }};
+async function allowed(ctx, tool, what) {{
+  const v = await ctx.ui.input(ASK + JSON.stringify({{ tool, what }}), "");
+  return v === "yes";
+}}
+const DENIED = {{ block: true, reason: "The human operator did not allow this. Do not retry it; continue without it or ask the human." }};
+"#,
+                work = Value::String(dir.display().to_string()),
+            ),
+            r#"
+  const ours = new Set(TOOLS.map((t) => t.name));
+  pi.on("tool_call", async (event, ctx) => {
+    const n = event.toolName;
+    if (ours.has(n)) return;
+    if (n === "bash") return (await allowed(ctx, n, String(event.input.command ?? ""))) ? undefined : DENIED;
+    const p = event.input.path ?? event.input.file_path ?? ".";
+    if (inside(p)) return;
+    return (await allowed(ctx, n, real(p))) ? undefined : DENIED;
+  });"#
+                .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         r#"const TOOLS = {tools};
 const SYSTEM = {system};
-const MARK = "\u0001gd\u0001";
+const MARK = "\u0001gd\u0001";{top}
 export default function (pi) {{
-  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));
+  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));{hook}
   for (const t of TOOLS) {{
     pi.registerTool({{
       name: t.name, label: t.name, description: t.description, parameters: t.parameters,
@@ -149,6 +220,8 @@ export default function (pi) {{
 "#,
         tools = Value::Array(tools.to_vec()),
         system = Value::String(system.to_string()),
+        top = top,
+        hook = hook,
     )
 }
 
@@ -182,6 +255,8 @@ pub enum Event {
     Usage { input: u64, output: u64 },
     /// A tool call from the extension, waiting for its result under `ui_id`.
     ToolCall { ui_id: String, name: String, input: Value },
+    /// pi's own file or command tool wants the person's approval.
+    Ask { ui_id: String, tool: String, what: String },
     /// Any other dialog pi opens (none are expected): answered with "cancelled".
     Dialog { ui_id: String },
     /// pi has nothing more to do on its own.
@@ -227,6 +302,10 @@ pub fn parse_event(line: &str) -> Option<Event> {
             if !matches!(v["method"].as_str()?, "select" | "confirm" | "input" | "editor") {
                 return None;
             }
+            if let Some(ask) = v["title"].as_str().and_then(|t| t.strip_prefix(ASK)) {
+                let a: Value = serde_json::from_str(ask).ok()?;
+                return Some(Event::Ask { ui_id, tool: a["tool"].as_str()?.to_string(), what: a["what"].as_str().unwrap_or_default().to_string() });
+            }
             match v["title"].as_str().and_then(|t| t.strip_prefix(MARK)) {
                 Some(call) => {
                     let c: Value = serde_json::from_str(call).ok()?;
@@ -261,14 +340,23 @@ fn home_dir() -> PathBuf {
 }
 
 /// Command-line arguments for one pi process.
-pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str) -> Vec<String> {
+pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8) -> Vec<String> {
     let mut a: Vec<String> = ["--mode", "rpc", "--no-session", "--provider", provider, "--model", model]
         .into_iter()
         .map(String::from)
         .collect();
-    // nothing of pi's own: no shell/file tools, no MCP servers, no discovered extensions, skills,
+    // nothing of pi's own beyond the chosen file tools: no MCP servers, no discovered extensions, skills,
     // templates, themes or project context files
-    a.extend(["--no-builtin-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"].map(String::from));
+    a.extend(["--no-mcp", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"].map(String::from));
+    if files == 0 {
+        a.push("--no-builtin-tools".into());
+    } else {
+        // the allowlist names every tool the model gets: GhostDesk's own plus the file tools of this level
+        let mut all: Vec<String> = tools.to_vec();
+        all.extend(file_tools(files).iter().map(|t| t.to_string()));
+        a.push("--tools".into());
+        a.push(all.join(","));
+    }
     a.push("-e".into());
     a.push(extension.display().to_string());
     if let Some(level) = thinking_level(effort) {
@@ -278,10 +366,12 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str) -
     a
 }
 
-fn base_command(exe: &Path, home: &Path, env_key: &str, api_key: &str) -> std::process::Command {
+fn base_command(exe: &Path, home: &Path, cwd: &Path, env_key: &str, api_key: &str) -> std::process::Command {
     let mut c = crate::install::cli_command(exe);
     #[cfg(not(windows))]
-    c.current_dir(home);
+    c.current_dir(cwd);
+    #[cfg(windows)]
+    let _ = cwd;
     c.env(env_key, api_key)
         .env("PI_CODING_AGENT_DIR", home)
         .env("PI_SKIP_VERSION_CHECK", "1")
@@ -292,7 +382,7 @@ fn base_command(exe: &Path, home: &Path, env_key: &str, api_key: &str) -> std::p
 
 /// Whether pi's model list has this model for this provider (else the built-in loop is used).
 async fn model_known(exe: &Path, home: &Path, provider: &str, env_key: &str, llm: &Llm) -> bool {
-    let mut c = base_command(exe, home, env_key, &llm.api_key);
+    let mut c = base_command(exe, home, home, env_key, &llm.api_key);
     c.args(["--list-models", &llm.model]).stdout(Stdio::piped()).stderr(Stdio::null());
     let out = tokio::task::spawn_blocking(move || {
         let mut child = crate::ssh::ProcessGuard(crate::platform::proc::spawn_group(&mut c).ok()?);
@@ -418,11 +508,11 @@ fn recap(shared: &AgentShared) -> String {
     format!("[Earlier in this conversation, before an interruption]\n{}\n\n", lines.join("\n"))
 }
 
-/// The agent loop on pi. Returns `Ok(false)` (before touching anything) when pi can't serve this agent,
-/// so the caller runs its own loop instead.
-pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<bool> {
+/// The agent loop on pi. Returns `Ok(Some(reason))` (before touching anything) when pi can't serve this
+/// agent, so the caller runs its own loop instead.
+pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<Option<&'static str>> {
     let Job { shared, cfg, ws, system, tools, membership } = job;
-    let (Some(exe), Some((name, env_key))) = (find(), provider_args(cfg.llm.provider)) else { return Ok(false) };
+    let (Some(exe), Some((name, env_key))) = (find(), provider_args(cfg.llm.provider)) else { return Ok(None) };
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
     #[cfg(unix)]
@@ -431,12 +521,35 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
     }
     if !model_known(&exe, &home, name, env_key, &cfg.llm).await {
-        return Ok(false);
+        return Ok(Some("이 모델은 고급 엔진이 몰라서 기본 방식으로 실행해요"));
     }
     // per process and agent, so two GhostDesk windows never share (or delete) each other's file
     let extension = TempFile(home.join(format!("bridge-{}-{}.mjs", std::process::id(), shared.id)));
-    std::fs::write(&extension.0, extension_source(&tool_defs(tools), system))?;
-    drive_agent(shared, cfg, ws, &exe, &home, &extension.0, name, env_key, membership, rx).await.map(|_| true)
+    // the agent's own folder for files (pi's file tools are offered only where paths can be confined to it)
+    let work = (cfg.files > 0 && !cfg!(windows)).then(|| crate::profiles::workspaces_root().join(crate::profiles::slug(&cfg.workspace)).join("files"));
+    if let Some(dir) = &work {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut system = system.to_string();
+    if let Some(dir) = &work {
+        system.push_str(&format!(
+            "\n\nFiles: you also have file tools (read, grep, find, ls{}). Your work folder is {}; keep files you create there. Anything outside it, and every command, is shown to the human for approval first; if they refuse, do not retry — continue without it or ask.",
+            if cfg.files >= 2 { ", write, edit, bash" } else { "" },
+            dir.display()
+        ));
+    }
+    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref()))?;
+    let names: Vec<String> = tool_defs(tools).iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
+    let cwd = work.clone().unwrap_or_else(|| home.clone());
+    let spec = Spec { extension: &extension.0, tools: names, cwd };
+    drive_agent(shared, cfg, ws, &exe, &home, &spec, name, env_key, membership, rx).await.map(|_| None)
+}
+
+/// How to start the process: the extension, the names of GhostDesk's tools and the working folder.
+struct Spec<'a> {
+    extension: &'a Path,
+    tools: Vec<String>,
+    cwd: PathBuf,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -446,7 +559,7 @@ async fn drive_agent(
     ws: &Desk,
     exe: &Path,
     home: &Path,
-    extension: &Path,
+    spec: &Spec<'_>,
     provider: &str,
     env_key: &str,
     membership: Option<&Membership>,
@@ -506,8 +619,8 @@ async fn drive_agent(
             bail!("에이전트 화면이 닫혔습니다");
         }
         if proc.is_none() {
-            let mut c = base_command(exe, home, env_key, &cfg.llm.api_key);
-            c.args(build_args(provider, &cfg.llm.model, extension, &cfg.llm.effort));
+            let mut c = base_command(exe, home, &spec.cwd, env_key, &cfg.llm.api_key);
+            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files));
             proc = Some(Proc::spawn(c)?);
         }
         let p = proc.as_mut().expect("just started");
@@ -612,6 +725,19 @@ async fn drive(
                             abort_by = Some(Instant::now() + Duration::from_secs(8));
                         }
                     }
+                    Some(Event::Ask { ui_id, tool, what }) => {
+                        let (title, kind) = match tool.as_str() {
+                            "bash" => ("에이전트가 명령을 실행하려고 해요", "실행할 명령"),
+                            "write" | "edit" => ("에이전트가 내 컴퓨터의 파일을 바꾸려고 해요", "파일"),
+                            _ => ("에이전트가 내 컴퓨터의 파일을 읽으려고 해요", "파일"),
+                        };
+                        shared.log(LogKind::Info, format!("허락을 기다리는 중: {kind} {}", crate::llm::short(&what, 200)));
+                        let allowed = tokio::select! {
+                            a = crate::control::ask_person(title, format!("{}\n\n{kind}: {what}", shared.name)) => a,
+                            _ = shared.wait_for_stop() => false,
+                        };
+                        p.send(json!({ "type": "extension_ui_response", "id": ui_id, "value": if allowed { "yes" } else { "no" } }));
+                    }
                     Some(Event::Dialog { ui_id }) => {
                         p.send(json!({ "type": "extension_ui_response", "id": ui_id, "cancelled": true }));
                     }
@@ -655,14 +781,29 @@ mod tests {
 
     #[test]
     fn args_isolate_pi_and_keep_the_key_out() {
-        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high");
+        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0);
         for f in ["--no-builtin-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--no-session"] {
             assert!(a.iter().any(|x| x == f), "{f}");
         }
         assert!(a.windows(2).any(|w| w == ["-e", "/x/bridge.mjs"]));
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
-        assert!(!build_args("openai", "m", Path::new("e"), "weird").iter().any(|x| x == "--thinking"));
+        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0).iter().any(|x| x == "--thinking"));
+    }
+
+    #[test]
+    fn file_tools_are_allowed_by_level_and_ask_before_leaving_the_folder() {
+        let tools = vec!["computer".to_string(), "ask_user".to_string()];
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1);
+        assert!(!a.iter().any(|x| x == "--no-builtin-tools"));
+        assert!(a.windows(2).any(|w| w == ["--tools", "computer,ask_user,read,grep,find,ls"]));
+        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2);
+        assert!(b.iter().any(|x| x.ends_with("write,edit,bash")));
+        let src = extension_source(&[], "s", Some(Path::new("/work/files")));
+        assert!(src.contains(r#"const WORK = "/work/files";"#) && src.contains("tool_call") && src.contains("DENIED"));
+        assert!(!extension_source(&[], "s", None).contains("tool_call"));
+        let ask = json!({ "type": "extension_ui_request", "id": "a1", "method": "input", "title": format!("{ASK}{}", json!({ "tool": "bash", "what": "ls" })) });
+        assert_eq!(parse_event(&ask.to_string()), Some(Event::Ask { ui_id: "a1".into(), tool: "bash".into(), what: "ls".into() }));
     }
 
     #[test]
@@ -714,7 +855,7 @@ mod tests {
     #[test]
     fn the_extension_carries_tools_and_the_system_prompt() {
         let tools = vec![json!({ "name": "ask_user", "description": "d", "parameters": { "type": "object" } })];
-        let src = extension_source(&tools, "Line 1\n\"quoted\"");
+        let src = extension_source(&tools, "Line 1\n\"quoted\"", None);
         assert!(src.contains(r#""name":"ask_user""#));
         assert!(src.contains(r#"const SYSTEM = "Line 1\n\"quoted\"";"#));
         assert!(src.contains("before_agent_start"));

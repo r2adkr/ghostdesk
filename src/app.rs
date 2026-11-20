@@ -230,6 +230,8 @@ struct NewAgentForm {
     headless: bool,
     size_idx: usize,
     max_steps: u64,
+    /// Files and commands for pi-backed agents (0 off, 1 read, 2 read, write and run).
+    files: u8,
 }
 
 pub struct GhostApp {
@@ -736,6 +738,11 @@ impl eframe::App for GhostApp {
         self.approval_window(&ctx);
         self.spawn_demos(&ctx);
         self.update_textures(&ctx);
+        let notices: Vec<String> = self.agents.iter().flat_map(|a| std::mem::take(&mut *a.shared.notices.lock())).collect();
+        if let Some(n) = notices.last() {
+            let text = i18n::tr(n).to_string();
+            self.notify(&ctx, text);
+        }
         self.update_keep_awake();
         self.tidy_finished(&ctx);
         self.save_usage(&ctx);

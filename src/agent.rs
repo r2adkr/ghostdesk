@@ -152,6 +152,9 @@ pub struct AgentConfig {
     pub llm: Llm,
     /// Run through pi instead of GhostDesk's own loop (only for key-based AIs, when pi is installed).
     pub use_pi: bool,
+    /// Files and commands for pi-backed agents: 0 off, 1 read files, 2 also write files and run commands.
+    /// Anything outside the agent's own folder, and every command, needs the person's approval.
+    pub files: u8,
 }
 
 /// Name an agent's usage is counted under in the Usage tab: the AI and its model.
@@ -195,6 +198,8 @@ pub struct AgentShared {
     /// Steps used since the last instruction (stops at the step limit; drives the on-screen progress
     /// bar).
     pub run_steps: AtomicU64,
+    /// Short messages for the window to show as a toast (taken by the GUI).
+    pub notices: Mutex<Vec<String>>,
     pub ctx: egui::Context,
     started: Instant,
 }
@@ -225,6 +230,7 @@ impl AgentShared {
             tokens: Mutex::new((0, 0)),
             steps: AtomicU64::new(0),
             run_steps: AtomicU64::new(0),
+            notices: Mutex::new(Vec::new()),
             ctx,
             started: Instant::now(),
         })
@@ -244,6 +250,12 @@ impl AgentShared {
         }
         log.push(LogEntry { kind, text, secs: self.started.elapsed().as_secs_f32() });
         drop(log);
+        self.ctx.request_repaint();
+    }
+
+    /// A one-line message the window shows as a toast.
+    pub fn notice(&self, text: &str) {
+        self.notices.lock().push(text.to_string());
         self.ctx.request_repaint();
     }
 
@@ -363,10 +375,17 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
     }
 
     // key-based AIs run on the pi engine when it is installed (same screen, tools, prompt and controls)
-    if cfg.use_pi && crate::pi::usable(&cfg.llm) {
-        let job = crate::pi::Job { shared, cfg, ws: &ws, system: &system, tools: &tools, membership: membership.as_ref() };
-        if crate::pi::run(job, rx).await? {
-            return Ok(());
+    if cfg.use_pi {
+        match crate::pi::unavailable(&cfg.llm) {
+            Some(why) => shared.notice(why),
+            None if crate::pi::usable(&cfg.llm) => {
+                let job = crate::pi::Job { shared, cfg, ws: &ws, system: &system, tools: &tools, membership: membership.as_ref() };
+                match crate::pi::run(job, rx).await? {
+                    None => return Ok(()),
+                    Some(why) => shared.notice(why),
+                }
+            }
+            None => {}
         }
     }
 
