@@ -198,6 +198,15 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
 /// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
 /// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
 /// person for approval first.
+/// Short description of the skill in a folder (for searching).
+fn skill_desc(dir: &Path) -> String {
+    let text = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
+    crate::llm::short(&crate::skillbox::frontmatter(&text).1.unwrap_or_default(), 300)
+}
+
+/// Above this many skills the system prompt only counts them; the agent searches with read_skill.
+const SKILLS_LISTED: usize = 12;
+
 pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool, skills: &[(String, PathBuf)], plugins: bool) -> String {
     let mcp = mcp || plugins;
     let (top, hook) = match (files, mcp) {
@@ -279,15 +288,21 @@ const DENIED = { block: true, reason: "The human operator did not allow this. Do
     let skill_tool = if skills.is_empty() {
         String::new()
     } else {
-        let list: Vec<Value> = skills.iter().map(|(n, d)| json!({ "name": n, "dir": d.display().to_string() })).collect();
+        let list: Vec<Value> = skills.iter().map(|(n, d)| json!({ "name": n, "dir": d.display().to_string(), "desc": skill_desc(d) })).collect();
         format!(
             r#"
   const SKILLS = {list};
   pi.registerTool({{
     name: "read_skill", label: "read_skill",
     description: "Read a skill's instructions (SKILL.md) or a file that belongs to it. Skills are listed in the system prompt.",
-    parameters: {{ type: "object", properties: {{ name: {{ type: "string", description: "Skill name" }}, file: {{ type: "string", description: "File inside the skill folder; default SKILL.md" }} }}, required: ["name"] }},
+    parameters: {{ type: "object", properties: {{ name: {{ type: "string", description: "Skill name" }}, file: {{ type: "string", description: "File inside the skill folder; default SKILL.md" }}, query: {{ type: "string", description: "Instead of a name: words to search skill names and descriptions" }} }} }},
     async execute(id, params) {{
+      if (!params.name) {{
+        const q = String(params.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+        const hits = SKILLS.filter((s) => !q.length || q.some((w) => (s.name + " " + s.desc).toLowerCase().includes(w))).slice(0, 15);
+        const text = hits.length ? hits.map((s) => "- " + s.name + ": " + s.desc).join("\n") : "No skill matches.";
+        return {{ content: [{{ type: "text", text }}], details: {{}} }};
+      }}
       const sk = SKILLS.find((s) => s.name === params.name);
       if (!sk) throw new Error("No such skill.");
       const root = rps(sk.dir);
@@ -754,9 +769,13 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
         system.push_str("\n\nTool box: extra tools from connected services are available. Use tool_search to find them by what you need; each tool is shown to the human for approval the first time you use it. If they refuse, do not retry.");
     }
     if !skills.is_empty() {
-        system.push_str("\n\nSkills (instructions for particular kinds of work). When a task matches one, read it first with read_skill before acting:");
-        for k in &skills {
-            system.push_str(&format!("\n- {}: {}", k.name, crate::llm::short(&k.description, 300)));
+        if skills.len() <= SKILLS_LISTED {
+            system.push_str("\n\nSkills (instructions for particular kinds of work). When a task matches one, read it first with read_skill before acting:");
+            for k in &skills {
+                system.push_str(&format!("\n- {}: {}", k.name, crate::llm::short(&k.description, 300)));
+            }
+        } else {
+            system.push_str(&format!("\n\nSkills: {} skills (instructions for particular kinds of work) are available. Before acting on a task, search them with read_skill using query (words about the task), then read a match with read_skill name.", skills.len()));
         }
     }
     if let Some(dir) = &work {
@@ -1033,6 +1052,20 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
         assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[], &[], &[]).iter().any(|x| x == "--thinking"));
+    }
+
+    #[test]
+    fn extension_with_skills_is_valid_javascript() {
+        let dir = std::env::temp_dir().join(format!("gd-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = extension_source(&[], "s", None, true, &[("demo".into(), dir.clone())], true);
+        let f = dir.join("ext.mjs");
+        std::fs::write(&f, src).unwrap();
+        // skipped where node is missing
+        if let Ok(o) = std::process::Command::new("node").arg("--check").arg(&f).output() {
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

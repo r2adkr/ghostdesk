@@ -168,6 +168,107 @@ pub fn check(servers: &[Server], new: &Server) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A tool found in another app's settings, ready to be added here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    /// Where it was found ("Claude Desktop", "Codex", …).
+    pub from: &'static str,
+    pub server: Server,
+}
+
+/// Name made fit for the engine (letters, digits, `_` and `-`).
+fn clean_name(name: &str) -> String {
+    let n: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' }).collect();
+    n.trim_matches('-').chars().take(40).collect()
+}
+
+/// GhostDesk's own entry (the one that connects other apps to it) is never offered back.
+fn is_own(name: &str, command: &str, args: &[String]) -> bool {
+    let low = |s: &str| s.to_ascii_lowercase();
+    low(name).contains("ghostdesk") || low(command).contains("ghostdesk") || args.iter().any(|a| low(a).contains("ghostdesk"))
+}
+
+fn found_json(from: &'static str, text: &str) -> Vec<Found> {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let Some(map) = v["mcpServers"].as_object() else { return Vec::new() };
+    map.iter()
+        .filter_map(|(raw, s)| {
+            let command = s["command"].as_str().unwrap_or_default().to_string();
+            let url = s["url"].as_str().unwrap_or_default().to_string();
+            // the engine reads stdio and streamable HTTP only
+            if (command.is_empty() && url.is_empty()) || s["type"] == "sse" || s["disabled"] == true {
+                return None;
+            }
+            let args: Vec<String> = s["args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            let name = clean_name(raw);
+            if name.is_empty() || is_own(raw, &command, &args) {
+                return None;
+            }
+            let env = s["env"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default();
+            Some(Found { from, server: Server { name, command, args, url, env, enabled: true, exposure: DEFERRED.into() } })
+        })
+        .collect()
+}
+
+fn found_codex(text: &str) -> Vec<Found> {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return Vec::new() };
+    let Some(table) = doc.get("mcp_servers").and_then(|t| t.as_table_like()) else { return Vec::new() };
+    table
+        .iter()
+        .filter_map(|(raw, item)| {
+            let t = item.as_table_like()?;
+            let get = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let (command, url) = (get("command"), get("url"));
+            if command.is_empty() && url.is_empty() || t.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                return None;
+            }
+            let args: Vec<String> = t.get("args").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            let name = clean_name(raw);
+            if name.is_empty() || is_own(raw, &command, &args) {
+                return None;
+            }
+            let env = t.get("env").and_then(|e| e.as_table_like()).map(|e| e.iter().filter_map(|(k, v)| Some((k.to_string(), v.as_str()?.to_string()))).collect()).unwrap_or_default();
+            Some(Found { from: "Codex", server: Server { name, command, args, url, env, enabled: true, exposure: DEFERRED.into() } })
+        })
+        .collect()
+}
+
+/// Tools the person already set up in other apps on this computer, not yet in the tool box. Only reads
+/// the settings files; nothing is started.
+pub fn discover() -> Vec<Found> {
+    let have = load();
+    let home = dirs::home_dir();
+    let mut out: Vec<Found> = Vec::new();
+    let mut files: Vec<(&'static str, PathBuf, bool)> = Vec::new();
+    if let Some(cfg) = dirs::config_dir() {
+        files.push(("Claude Desktop", cfg.join("Claude").join("claude_desktop_config.json"), false));
+    }
+    if let Some(h) = &home {
+        files.push(("Claude Code", h.join(".claude.json"), false));
+        files.push(("Cursor", h.join(".cursor").join("mcp.json"), false));
+        files.push(("Gemini CLI", h.join(".gemini").join("settings.json"), false));
+        files.push(("Codex", h.join(".codex").join("config.toml"), true));
+    }
+    for (from, path, toml) in files {
+        // settings files are small; anything huge is not one
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.len() > 4 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        out.extend(if toml { found_codex(&text) } else { found_json(from, &text) });
+    }
+    let mut seen: Vec<Server> = have;
+    out.retain(|f| {
+        if seen.iter().any(|s| same_name(&s.name, &f.server.name) || (s.runs() == f.server.runs() && !f.server.runs().is_empty())) {
+            return false;
+        }
+        seen.push(f.server.clone());
+        true
+    });
+    out
+}
+
 /// Connection state of one server, as the engine reports it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Status {
@@ -258,6 +359,20 @@ mod tests {
         w.url = "https://ok.example/mcp".into();
         assert!(check(&list, &w).is_ok());
         assert_eq!(s("a-b").tool_prefix(), "mcp__a_b__");
+    }
+
+    #[test]
+    fn tools_from_other_apps_are_read_without_our_own_entry_or_unsupported_ones() {
+        let json = r#"{"mcpServers":{"ghostdesk":{"command":"/x/ghostdesk","args":["--mcp"]},"my tool":{"command":"npx","args":["-y","pkg"],"env":{"K":"v"}},"old":{"url":"https://a/sse","type":"sse"},"off":{"command":"x","disabled":true},"web":{"url":"https://example.com/mcp"}}}"#;
+        let f = found_json("Cursor", json);
+        let names: Vec<&str> = f.iter().map(|x| x.server.name.as_str()).collect();
+        assert_eq!(names, ["my-tool", "web"]);
+        assert_eq!(f[0].server.env, [("K".to_string(), "v".to_string())]);
+        let toml = "[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"fs\"]\n[mcp_servers.fs.env]\nA = \"1\"\n[mcp_servers.gd]\ncommand = \"/a/ghostdesk\"\n";
+        let c = found_codex(toml);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].server.command.as_str(), c[0].server.args.len(), c[0].from), ("npx", 2, "Codex"));
+        assert_eq!(c[0].server.env.len(), 1);
     }
 
     #[test]

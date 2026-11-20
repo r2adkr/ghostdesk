@@ -27,6 +27,13 @@ pub(super) struct State {
     importing: bool,
     skill_confirm: Option<(Candidate, usize, u64)>,
     skill_note: Option<String>,
+    skill_filter: String,
+    import_all: bool,
+    /// Tools found in other apps (and which are ticked), read when the tab opens.
+    found: Vec<toolbox::Found>,
+    found_on: Vec<bool>,
+    found_loaded: bool,
+    found_confirm: bool,
     plugins: Vec<Plugin>,
     plugins_loaded: bool,
     plugin_source: String,
@@ -238,6 +245,7 @@ impl GhostApp {
             }
         }
         ui.add_space(18.0);
+        self.found_section(ui);
         self.skills_section(ui);
         ui.add_space(18.0);
         self.plugins_section(ui);
@@ -245,6 +253,68 @@ impl GhostApp {
 }
 
 impl GhostApp {
+    /// Tools already set up in other apps on this computer; ticked ones are added after the person approves.
+    fn found_section(&mut self, ui: &mut egui::Ui) {
+        if !self.toolbox.found_loaded {
+            self.toolbox.found = toolbox::discover();
+            self.toolbox.found_on = vec![true; self.toolbox.found.len()];
+            self.toolbox.found_loaded = true;
+        }
+        if self.toolbox.found.is_empty() {
+            return;
+        }
+        theme::section(ui, tr("다른 앱에서 찾은 도구"));
+        ui.add_space(4.0);
+        ui.label(theme::hint(tr("Claude, Cursor, Codex 등에 이미 설정해 둔 도구예요. 고른 것만 가져오고, 가져오기 전에 실행 명령을 보여 드려요.")));
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().id_salt("found_tools").max_height(240.0).show(ui, |ui| {
+            for (f, on) in self.toolbox.found.iter().zip(self.toolbox.found_on.iter_mut()) {
+                ui.horizontal(|ui| {
+                    ui.checkbox(on, "");
+                    ui.label(RichText::new(&f.server.name).strong());
+                    ui.label(theme::hint(f.from));
+                });
+                ui.label(RichText::new(crate::llm::short(&f.server.runs(), 120)).monospace().small().color(theme::muted()));
+            }
+        });
+        ui.add_space(6.0);
+        let picked: Vec<Server> = self.toolbox.found.iter().zip(&self.toolbox.found_on).filter(|(_, on)| **on).map(|(f, _)| f.server.clone()).collect();
+        if self.toolbox.found_confirm {
+            theme::tinted(theme::warn()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(trf("도구 {}개를 가져올까요? 아래 명령이 이 컴퓨터에서 실행될 수 있어요", &[&picked.len()])).strong());
+                for s in &picked {
+                    ui.label(RichText::new(crate::llm::short(&format!("{} · {}", s.name, s.runs()), 140)).monospace().small());
+                }
+                ui.label(theme::hint(tr("믿을 수 있는 도구만 가져오세요. 환경 변수는 이 컴퓨터에만 저장돼요.")));
+                ui.horizontal(|ui| {
+                    if theme::primary(ui, tr("허락하고 추가")).clicked() {
+                        let before = self.toolbox.servers.len();
+                        for s in picked.iter() {
+                            if toolbox::check(&self.toolbox.servers, s).is_ok() {
+                                self.toolbox.servers.push(s.clone());
+                            }
+                        }
+                        if self.toolbox.servers.len() > before {
+                            match toolbox::save(&self.toolbox.servers) {
+                                Ok(()) => self.toolbox.status.clear(),
+                                Err(e) => self.toolbox.note = Some(trf("저장하지 못했어요 ({})", &[&e])),
+                            }
+                        }
+                        self.toolbox.found_loaded = false;
+                        self.toolbox.found_confirm = false;
+                    }
+                    if theme::secondary(ui, tr("취소")).clicked() {
+                        self.toolbox.found_confirm = false;
+                    }
+                });
+            });
+        } else if ui.add_enabled(!picked.is_empty(), egui::Button::new(tr("고른 도구 가져오기"))).clicked() {
+            self.toolbox.found_confirm = true;
+        }
+        ui.add_space(18.0);
+    }
+
     fn reload_skills(&mut self) {
         self.toolbox.skills = skillbox::list();
         self.toolbox.candidates = skillbox::candidates();
@@ -263,7 +333,17 @@ impl GhostApp {
         let mut changed = false;
         let mut remove: Option<usize> = None;
         let mut toggle: Option<(usize, bool)> = None;
-        for (i, s) in self.toolbox.skills.iter().enumerate() {
+        if self.toolbox.skills.len() > 6 {
+            let w = ui.available_width();
+            ui.add(egui::TextEdit::singleline(&mut self.toolbox.skill_filter).desired_width(w).margin(Margin::symmetric(10, 6)).hint_text(tr("스킬 찾기")));
+            ui.add_space(6.0);
+        }
+        let q = self.toolbox.skill_filter.trim().to_lowercase();
+        egui::ScrollArea::vertical().id_salt("skills_list").max_height(360.0).show(ui, |ui| {
+          for (i, s) in self.toolbox.skills.iter().enumerate() {
+            if !q.is_empty() && !s.name.to_lowercase().contains(&q) && !s.description.to_lowercase().contains(&q) {
+                continue;
+            }
             theme::soft_card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -281,7 +361,8 @@ impl GhostApp {
                 ui.label(theme::hint(crate::llm::short(&s.description, 160)));
             });
             ui.add_space(6.0);
-        }
+          }
+        });
         if let Some((i, on)) = toggle {
             if let Err(e) = skillbox::set_enabled(&self.toolbox.skills[i], on) {
                 self.toolbox.skill_note = Some(trf("저장하지 못했어요 ({})", &[&e]));
@@ -331,15 +412,44 @@ impl GhostApp {
         }
         let mut pick: Option<std::path::PathBuf> = None;
         if !self.toolbox.candidates.is_empty() {
-            ui.label(theme::hint(tr("이 컴퓨터에서 찾은 스킬")));
-            for c in &self.toolbox.candidates {
-                ui.horizontal(|ui| {
-                    if theme::secondary(ui, tr("가져오기")).clicked() {
-                        pick = Some(c.path.clone());
-                    }
-                    ui.label(RichText::new(&c.name).strong()).on_hover_text(crate::llm::short(&c.description, 200));
+            ui.label(theme::hint(trf("이 컴퓨터에서 찾은 스킬 {}개", &[&self.toolbox.candidates.len()])));
+            if self.toolbox.import_all {
+                theme::tinted(theme::warn()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(trf("스킬 {}개를 모두 가져올까요?", &[&self.toolbox.candidates.len()])).strong());
+                    ui.label(theme::hint(tr("각 스킬이 이 앱 안에 복사돼요. 스킬에 든 스크립트는 에이전트가 실행하려 할 때 내게 허락을 물어요.")));
+                    ui.horizontal(|ui| {
+                        if theme::primary(ui, tr("모두 가져오기")).clicked() {
+                            let (mut ok, mut bad) = (0usize, 0usize);
+                            for c in self.toolbox.candidates.clone() {
+                                match skillbox::import(&c.path) {
+                                    Ok(_) => ok += 1,
+                                    Err(_) => bad += 1,
+                                }
+                            }
+                            self.toolbox.skill_note = (bad > 0).then(|| trf("{}개는 가져오지 못했어요 (너무 크거나 형식이 달라요)", &[&bad]));
+                            self.toolbox.import_all = false;
+                            let _ = ok;
+                            self.reload_skills();
+                        }
+                        if theme::secondary(ui, tr("취소")).clicked() {
+                            self.toolbox.import_all = false;
+                        }
+                    });
                 });
+            } else if self.toolbox.candidates.len() > 1 && theme::secondary(ui, tr("모두 가져오기")).clicked() {
+                self.toolbox.import_all = true;
             }
+            egui::ScrollArea::vertical().id_salt("skill_candidates").max_height(200.0).show(ui, |ui| {
+                for c in &self.toolbox.candidates {
+                    ui.horizontal(|ui| {
+                        if theme::secondary(ui, tr("가져오기")).clicked() {
+                            pick = Some(c.path.clone());
+                        }
+                        ui.label(RichText::new(&c.name).strong()).on_hover_text(crate::llm::short(&c.description, 200));
+                    });
+                }
+            });
             ui.add_space(6.0);
         }
         ui.horizontal(|ui| {
