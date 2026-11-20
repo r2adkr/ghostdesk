@@ -46,7 +46,8 @@ impl GhostApp {
             ui.vertical_centered(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(width);
-                    ui.add_space(24.0);
+                    // with nothing else on the page the composer sits a little above the middle, not under the title bar
+                    ui.add_space(if self.agents.is_empty() { (ui.ctx().content_rect().height() * 0.12).clamp(24.0, 120.0) } else { 24.0 });
                     ui.heading(RichText::new(tr("어떤 일을 맡길까요?")).size(28.0).strong());
                     ui.add_space(16.0);
                     let id = egui::Id::unique("welcome_composer");
@@ -89,8 +90,25 @@ impl GhostApp {
                             self.wizard_open = false;
                         }
                     }
+                    // examples for a first-time user: one click fills the box
+                    if self.form.task.trim().is_empty() {
+                        ui.add_space(14.0);
+                        ui.label(theme::hint(tr("이런 일을 맡겨 볼 수 있어요")));
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for example in [
+                                tr("네이버에서 오늘 서울 날씨를 찾아 요약해줘"),
+                                tr("메모 앱에 이번 주 장보기 목록을 만들어줘"),
+                                tr("구글 캘린더에 내일 오후 3시 회의를 추가해줘"),
+                            ] {
+                                if theme::secondary(ui, example).clicked() {
+                                    self.form.task = example.to_string();
+                                }
+                            }
+                        });
+                    }
                     ui.add_space(24.0);
-                    theme::section(ui, tr("작업 장소로 시작"));
+                    theme::section(ui, tr("어디서 일할지 직접 고르기"));
                     ui.add_space(6.0);
                     let places: Vec<_> = wizard::kinds().into_iter().filter(|k| matches!(k.choice, Choice::Web | Choice::App | Choice::Remote)).collect();
                     let gap = 8.0;
