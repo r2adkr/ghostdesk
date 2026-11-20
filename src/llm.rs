@@ -115,7 +115,10 @@ impl Llm {
                 "description": "Ask the human operator a question and wait for the answer. Use it when you need information only they have, a decision, a 2FA/CAPTCHA step, a login that is missing in the cloned profile, or explicit confirmation before an irreversible action (sending messages, purchases, deleting data, submitting forms).",
                 "input_schema": {
                     "type": "object",
-                    "properties": { "question": { "type": "string" } },
+                    "properties": {
+                        "question": { "type": "string" },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "Optional 2-6 short answers shown as buttons" }
+                    },
                     "required": ["question"]
                 }
             })

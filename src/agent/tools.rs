@@ -322,7 +322,14 @@ async fn exec_custom(
         "ask_user" => {
             let q = input["question"].as_str().unwrap_or("(질문 없음)").to_string();
             shared.log(LogKind::Assistant, format!("{} {q}", crate::icon::CIRCLE_HELP));
-            shared.set_status(AgentStatus::WaitingUser(q));
+            // options arrive as buttons: they ride along as "- option" lines the UI turns back into buttons
+            let mut asked = q;
+            if let Some(opts) = input["options"].as_array() {
+                for o in opts.iter().filter_map(|o| o.as_str()).map(str::trim).filter(|o| !o.is_empty()).take(6) {
+                    asked.push_str(&format!("\n- {o}"));
+                }
+            }
+            shared.set_status(AgentStatus::WaitingUser(asked));
             let ans = loop {
                 let command = tokio::select! {
                     biased;

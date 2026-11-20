@@ -149,14 +149,29 @@ impl GhostApp {
 
         if let AgentStatus::WaitingUser(q) = &st {
             ui.add_space(2.0);
+            let (body, choices) = split_choices(q);
+            let mut picked = None;
             theme::tinted(theme::warn()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(tr("에이전트의 질문")).strong().color(theme::warn()));
                 // cap the height so a long question doesn't push the answer box away
                 egui::ScrollArea::vertical().id_salt("question").max_height(160.0).show(ui, |ui| {
-                    ui.label(q);
+                    ui.label(body);
                 });
+                if !choices.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for c in &choices {
+                            if theme::secondary(ui, c).clicked() {
+                                picked = Some(c.clone());
+                            }
+                        }
+                    });
+                }
             });
+            if let Some(c) = picked {
+                let _ = a.tx.send(AgentCmd::Answer(c));
+            }
         }
         let external = a.shared.external.lock().clone();
         if let Some(client) = &external {
@@ -186,23 +201,8 @@ impl GhostApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 7.0;
                         let log = a.shared.log.lock();
-                        // the last action row gets a spinner while that action is still running
                         let acting = matches!(st, AgentStatus::Acting(_)) && !paused;
-                        let last_action = log.iter().rposition(|l| l.kind == LogKind::Action);
-                        let n = log.len();
-                        for (i, l) in log.iter().enumerate() {
-                            let live = acting && Some(i) == last_action;
-                            if i + 1 == n {
-                                // new rows fade in
-                                let t = theme::appear(ui.ctx(), egui::Id::unique(("log_in", a.shared.id)), n as u64, 0.25);
-                                ui.scope(|ui| {
-                                    ui.multiply_opacity(t);
-                                    log_row(ui, l, live);
-                                });
-                            } else {
-                                log_row(ui, l, live);
-                            }
-                        }
+                        chat_log(ui, &log, acting, a.shared.id);
                     });
             });
         }
@@ -603,6 +603,130 @@ fn browser_address(ui: &mut egui::Ui, browser: &Arc<crate::browser::BrowserWorks
 /// hover.
 ///
 /// Action rows look like steps: finished ones get ✓, the running one (`live`) a spinner.
+/// "- a" / "• a" / "1. a" / "1) a" → "a".
+fn list_item(line: &str) -> Option<&str> {
+    let l = line.trim();
+    let rest = l
+        .strip_prefix("- ").or_else(|| l.strip_prefix("• ")).or_else(|| l.strip_prefix("* "))
+        .or_else(|| {
+            let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
+            let after = &l[digits..];
+            if digits > 0 && digits <= 2 { after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) } else { None }
+        })?
+        .trim();
+    (!rest.is_empty() && rest.chars().count() <= 80).then_some(rest)
+}
+
+/// Splits a question into its text and the trailing list of answers (2–6 items) shown as buttons.
+fn split_choices(q: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = q.lines().collect();
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() { end -= 1; }
+    let mut opts = Vec::new();
+    while end > 0 {
+        match list_item(lines[end - 1]) {
+            Some(o) => { opts.push(o.to_string()); end -= 1; }
+            None => break,
+        }
+    }
+    opts.reverse();
+    if opts.len() < 2 || opts.len() > 6 {
+        return (q.to_string(), Vec::new());
+    }
+    (lines[..end].join("\n").trim_end().to_string(), opts)
+}
+
+/// A reply with a numbered list of 2+ steps → (before, steps, after).
+fn split_plan(text: &str) -> Option<(String, Vec<String>, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let numbered = |l: &str| {
+        let t = l.trim();
+        let d = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        d > 0 && d <= 2 && (t[d..].starts_with(". ") || t[d..].starts_with(") "))
+    };
+    let first = lines.iter().position(|l| numbered(l))?;
+    let mut last = first;
+    while last + 1 < lines.len() && numbered(lines[last + 1]) { last += 1; }
+    if last == first { return None; }
+    let steps = lines[first..=last].iter().filter_map(|l| list_item(l)).map(String::from).collect::<Vec<_>>();
+    (steps.len() == last - first + 1).then(|| (lines[..first].join("\n").trim().to_string(), steps, lines[last + 1..].join("\n").trim().to_string()))
+}
+
+/// The conversation: your messages as bubbles, replies as text (a numbered list becomes a plan card),
+/// thinking and runs of actions folded into one-line cards you can open.
+fn chat_log(ui: &mut egui::Ui, log: &[crate::agent::LogEntry], acting: bool, agent: u64) {
+    ui.spacing_mut().item_spacing.y = 8.0;
+    let n = log.len();
+    let mut i = 0;
+    while i < n {
+        let l = &log[i];
+        match l.kind {
+            LogKind::User => {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    egui::Frame::new().fill(theme::raised()).corner_radius(theme::CARD_RADIUS).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                        ui.set_max_width((ui.available_width() * 0.88).max(120.0));
+                        ui.add(egui::Label::new(RichText::new(&l.text).color(theme::text())).wrap());
+                    });
+                });
+                i += 1;
+            }
+            LogKind::Assistant => {
+                match split_plan(&l.text) {
+                    Some((before, steps, after)) => {
+                        if !before.is_empty() { ui.add(egui::Label::new(RichText::new(before).color(theme::text())).wrap()); }
+                        theme::tinted(theme::info()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(format!("{}  {}", icon::LIST_TODO, tr("계획"))).strong().color(theme::info_text()));
+                            for (k, step) in steps.iter().enumerate() {
+                                ui.horizontal_top(|ui| {
+                                    ui.label(theme::hint(format!("{}", k + 1)));
+                                    ui.add(egui::Label::new(RichText::new(step).color(theme::text())).wrap());
+                                });
+                            }
+                        });
+                        if !after.is_empty() { ui.add(egui::Label::new(RichText::new(after).color(theme::text())).wrap()); }
+                    }
+                    None => { ui.add(egui::Label::new(RichText::new(&l.text).size(14.0).color(theme::text())).wrap()); }
+                }
+                i += 1;
+            }
+            LogKind::Thinking | LogKind::Action => {
+                // fold the whole run of thinking/actions into one card
+                let start = i;
+                while i < n && matches!(log[i].kind, LogKind::Thinking | LogKind::Action) { i += 1; }
+                let run = &log[start..i];
+                let live = acting && i == n && run.iter().any(|e| e.kind == LogKind::Action);
+                let steps = run.iter().filter(|e| e.kind == LogKind::Action).count();
+                let head = if steps == 0 {
+                    tr("생각").to_string()
+                } else if live {
+                    run.iter().rev().find(|e| e.kind == LogKind::Action).map(|e| crate::llm::short(&e.text, 40)).unwrap_or_default()
+                } else {
+                    trf("작업 {}단계", &[&steps])
+                };
+                let id = egui::Id::new(("chat_run", agent, start));
+                egui::CollapsingHeader::new(RichText::new(head).size(13.0).color(theme::muted()))
+                    .id_salt(id)
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let last_action = run.iter().rposition(|e| e.kind == LogKind::Action);
+                        for (k, e) in run.iter().enumerate() {
+                            log_row(ui, e, live && Some(k) == last_action);
+                        }
+                    });
+                if live {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                }
+            }
+            _ => {
+                log_row(ui, l, false);
+                i += 1;
+            }
+        }
+    }
+}
+
 pub(super) fn log_row(ui: &mut egui::Ui, l: &crate::agent::LogEntry, live: bool) {
     let (dot, color) = match l.kind {
         LogKind::User => (theme::info_text(), theme::text()),
@@ -677,4 +801,27 @@ pub(super) fn egui_key_combo(key: egui::Key, m: egui::Modifiers) -> Option<Strin
     if m.shift { s.push_str("shift+"); }
     s.push_str(&base);
     Some(s)
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn question_options_become_buttons() {
+        let (body, c) = split_choices("Which one?\n- today\n- tomorrow");
+        assert_eq!(body, "Which one?");
+        assert_eq!(c, vec!["today", "tomorrow"]);
+        let (_, c) = split_choices("Go on?\n- yes");
+        assert!(c.is_empty());
+        let (b, c) = split_choices("just text");
+        assert_eq!((b.as_str(), c.len()), ("just text", 0));
+    }
+
+    #[test]
+    fn numbered_steps_make_a_plan() {
+        let (before, steps, after) = split_plan("Here is the plan\n1. open\n2. type\ndone").unwrap();
+        assert_eq!((before.as_str(), steps.len(), after.as_str()), ("Here is the plan", 2, "done"));
+        assert!(split_plan("1. only one").is_none());
+    }
 }
