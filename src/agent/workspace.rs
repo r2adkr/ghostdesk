@@ -272,21 +272,21 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
         LogKind::Info,
         format!("원격 데스크톱 접속됨: '{}' ({fw}x{fh}, 에이전트 좌표 {:?})", desk.desktop_name(), desk.size()),
     );
-    // live screen: push to the UI whenever the framebuffer changes (at most 10 fps)
+    // live screen: event-driven, pushed to the UI as soon as the framebuffer changes (coalesced to ~60 fps)
     let (sh, weak) = (shared.clone(), Arc::downgrade(&desk));
+    let mut rx = desk.subscribe_frames();
     tokio::spawn(async move {
-        let mut last = u64::MAX;
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if rx.changed().await.is_err() {
+                break;
+            }
             let Some(d) = weak.upgrade() else { break };
             if d.is_closed() {
                 break;
             }
-            let s = d.frame_seq();
-            if s != last {
-                last = s;
-                d.with_frame(|w, h, rgba| sh.push_rgba(w, h, rgba));
-            }
+            d.with_frame(|w, h, rgba| sh.push_rgba(w, h, rgba));
+            drop(d);
+            tokio::time::sleep(Duration::from_millis(16)).await;
         }
     });
     Ok(Desk::Remote(desk))

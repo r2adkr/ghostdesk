@@ -604,6 +604,11 @@ impl RfbDesk {
         agent_size(w, h, self.opts.max_agent_size)
     }
 
+    /// Notification channel that ticks on every completed FramebufferUpdate.
+    pub fn subscribe_frames(&self) -> watch::Receiver<u64> {
+        self.seq_tx.subscribe()
+    }
+
     /// Number of completed FramebufferUpdates (lets the UI decide whether to refresh its texture).
     pub fn frame_seq(&self) -> u64 {
         *self.seq_tx.borrow()
@@ -1312,11 +1317,11 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                 me.note_update();
                 me.seq_tx.send_modify(|s| *s += 1);
                 (me.on_frame)();
-                // next incremental request (at least 8 ms apart: it is the only thing that makes the server send
+                // next incremental request (at least 2 ms apart: it is the only thing that makes the server send
                 // more, so every ms spent here is added to the delay of the next picture)
                 let wait = {
                     let last = *me.last_request.lock();
-                    Duration::from_millis(8).saturating_sub(last.elapsed())
+                    Duration::from_millis(2).saturating_sub(last.elapsed())
                 };
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;

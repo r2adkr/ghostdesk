@@ -1225,7 +1225,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions {
             max_long_edge: DEFAULT_MAX_LONG_EDGE,
-            live_fps: 2.0,
+            live_fps: 8.0,
             live_max_long_edge: 960,
             reconnect_window: Duration::from_secs(5),
         }
