@@ -62,6 +62,18 @@ impl GhostApp {
                 });
             });
         });
+        // layout: how much room the screen and the chat get (the screen stays visible in all three)
+        if !self.compact_now {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (i, label) in [(0u8, tr("화면 크게")), (1, tr("반반")), (2, tr("채팅 크게"))] {
+                    if ui.add(egui::Button::selectable(self.detail_layout == i, label)).clicked() {
+                        self.detail_layout = i;
+                    }
+                }
+            });
+        }
+        let a = &mut self.agents[idx];
         let files = a.shared.received_files.lock().clone();
         if !files.is_empty() {
             theme::section(ui, tr("받은 파일"));

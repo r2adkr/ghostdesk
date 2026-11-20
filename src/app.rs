@@ -315,6 +315,10 @@ pub struct GhostApp {
     next_id: u64,
     /// Whether to draw the virtual mouse over agent screens.
     show_cursor: bool,
+    /// Agent screen layout: 0 = screen first, 1 = balanced, 2 = chat first (the side panel's width).
+    detail_layout: u8,
+    /// The agent screen is in the narrow one-column form this frame (no layout choice then).
+    compact_now: bool,
     /// Events from the external agent (MCP) control server.
     control_rx: mpsc::UnboundedReceiver<crate::control::ControlEvent>,
     /// Control server state (`None` = running fine).
@@ -467,6 +471,8 @@ impl GhostApp {
             view: View::default(),
             next_id: 1,
             show_cursor: true,
+            detail_layout: 0,
+            compact_now: false,
             pending_demo: std::env::var("GHOSTDESK_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             toast: None,
             host_ui: Default::default(),
@@ -865,14 +871,19 @@ impl GhostApp {
             self.view = View::Grid;
         }
         let compact_detail = ctx.content_rect().width() - side_width < 816.0;
+        self.compact_now = compact_detail;
         if self.view == View::Detail && !compact_detail {
             if let Some(idx) = self.selected {
                 let mut remove = false;
-                let detail = egui::Panel::right("detail_side")
+                let room = ctx.content_rect().width() - side_width;
+                let layout = self.detail_layout.min(2);
+                let (default_w, max_w) = detail_panel_widths(layout, room, detail_w);
+                // a new id per layout so choosing one resets the panel to that layout's width
+                let detail = egui::Panel::right(("detail_side", layout))
                     .resizable(true)
-                    .default_size(detail_w)
+                    .default_size(default_w)
                     .min_size(320.0)
-                    .max_size(detail_panel_limit(ctx.content_rect().width() - side_width))
+                    .max_size(max_w)
                     .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin::same(16)))
                     .show(ui, |ui| {
                         ui.multiply_opacity(fade);
@@ -1096,6 +1107,16 @@ fn panel_sizes(width: f32) -> (f32, f32, f32) {
 
 fn detail_panel_limit(available: f32) -> f32 {
     (available - 368.0).clamp(320.0, 520.0)
+}
+
+/// Side panel (default, max) width for an agent-screen layout: 0 screen first, 1 balanced, 2 chat first.
+fn detail_panel_widths(layout: u8, room: f32, base: f32) -> (f32, f32) {
+    let wide_max = (room - 280.0).max(320.0);
+    match layout {
+        1 => ((room * 0.5).clamp(320.0, wide_max), wide_max),
+        2 => ((room * 0.72).clamp(320.0, wide_max), wide_max),
+        _ => (base, detail_panel_limit(room).max(base.min(wide_max)).min(wide_max.max(320.0))),
+    }
 }
 
 /// How long a toast stays visible (seconds).
