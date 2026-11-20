@@ -54,7 +54,7 @@ pub(crate) async fn exec_remote_tool(shared: &Arc<AgentShared>, input: &Value) -
 ///
 /// The last result gets the current screenshot and window/tab list attached, unless the model
 /// has already seen the same thing (`seen`).
-pub(super) async fn execute_batch(
+pub(crate) async fn execute_batch(
     shared: &Arc<AgentShared>,
     ws: &Desk,
     tool_uses: &[Value],

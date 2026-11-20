@@ -1,17 +1,26 @@
-//! Settings → AI → "pi": detect it, install it (after the user confirms the exact command), and choose
-//! whether key-based AI agents run through it.
+//! Settings → AI and the new-agent dialog: offer to install pi while it is missing. Once installed it is never
+//! mentioned again (agents with a key-based AI simply use it).
 use super::*;
 
 impl GhostApp {
+    /// Settings → AI: only while pi is missing (or just installed) there is anything to show. Once it is
+    /// installed, key-based AIs use it on their own and nothing about it appears anywhere.
     pub(super) fn pi_section(&mut self, ui: &mut egui::Ui) {
         self.poll_pi_install(ui.ctx());
-        theme::section(ui, tr("pi 로 실행"));
-        ui.add_space(4.0);
         let installed = crate::pi::find().is_some();
         if installed {
-            ui.add(theme::switch(&mut self.use_pi, tr("API 키로 쓰는 AI 는 pi 로 실행")))
-                .on_hover_text(tr("pi 가 설치되어 있어요. 새로 시작하는 에이전트부터 적용돼요"));
-        } else if self.pi_install.is_some() {
+            if let Some(note) = &self.pi_note {
+                ui.label(theme::hint(note.clone()));
+                ui.add_space(8.0);
+            }
+            return;
+        }
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
+        theme::section(ui, tr("pi 로 실행"));
+        ui.add_space(4.0);
+        if self.pi_install.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(tr("pi 설치 중… (몇 분 걸릴 수 있어요)"));
@@ -39,7 +48,6 @@ impl GhostApp {
                     self.pi_install = None;
                     match result {
                         Ok(()) if crate::pi::find().is_some() => {
-                            self.use_pi = true;
                             self.pi_note = Some(tr("pi 를 설치했어요").to_string());
                         }
                         Ok(()) => self.pi_note = Some(tr("설치는 끝났지만 pi 를 찾지 못했어요. 앱을 다시 시작해 보세요").to_string()),

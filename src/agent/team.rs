@@ -16,7 +16,7 @@ pub(crate) struct TeamAssignment {
 }
 
 /// Membership lasts as long as the agent loop, including between user instructions.
-pub(super) struct Membership {
+pub(crate) struct Membership {
     team: TeamAssignment,
     shared: Arc<AgentShared>,
     id: u64,

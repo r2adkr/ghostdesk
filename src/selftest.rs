@@ -189,7 +189,9 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         name: "cli".into(),
         team: None,
         workspace: ws_name.clone(),
-        use_pi: false,
+        // GHOSTDESK_TEST_PI_MODEL=<openai model>: runs the agent on the pi engine (its OpenAI endpoint redirected
+        // to a fake server through <data dir>/engine/models.json)
+        use_pi: std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some(),
         task,
         // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend
         target: if let Ok(name) = std::env::var("GHOSTDESK_TEST_ELECTRON") {
@@ -223,6 +225,13 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         max_steps: 10,
         reply_lang: "Korean",
         llm: match std::env::var("GHOSTDESK_TEST_OPENAI_URL") {
+            _ if std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some() => Llm::new(
+                crate::llm::Provider::OpenAi,
+                crate::llm::Provider::OpenAi.default_base_url(),
+                "test-key".into(),
+                std::env::var("GHOSTDESK_TEST_PI_MODEL").unwrap_or_default(),
+                "medium".into(),
+            ),
             Ok(url) => Llm::new(
                 crate::llm::Provider::Custom,
                 crate::llm::Provider::normalize_base_url(&url),

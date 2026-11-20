@@ -294,7 +294,6 @@ pub struct GhostApp {
     allow_shell_tools: bool,
     live_fps_limit: u32,
     /// Run key-based AI agents through pi when it is installed.
-    use_pi: bool,
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pi_note: Option<String>,
     pi_offer_dismissed: bool,
@@ -450,7 +449,6 @@ impl GhostApp {
             auto_approve: false,
             allow_shell_tools: true,
             live_fps_limit: 60,
-            use_pi: false,
             pi_install: None,
             pi_note: None,
             pi_offer_dismissed: false,

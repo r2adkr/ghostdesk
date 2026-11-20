@@ -587,9 +587,6 @@ impl GhostApp {
                 .on_hover_text(tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
         }
 
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(10.0);
         self.pi_section(ui);
 
         if self.ai.is_empty() {

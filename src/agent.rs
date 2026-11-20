@@ -9,7 +9,7 @@ mod history;
 mod prompt;
 mod tools;
 mod team;
-pub(crate) use team::TeamAssignment;
+pub(crate) use team::{Membership, TeamAssignment};
 mod workspace;
 
 use std::{
@@ -153,7 +153,7 @@ pub struct AgentConfig {
 }
 
 /// Name an agent's usage is counted under in the Usage tab: the AI and its model.
-fn usage_source(llm: &Llm) -> String {
+pub(crate) fn usage_source(llm: &Llm) -> String {
     format!("{} · {}", llm.provider.short_name(), llm.model)
 }
 
@@ -317,9 +317,6 @@ pub async fn run_agent(shared: Arc<AgentShared>, cfg: AgentConfig, mut rx: mpsc:
 }
 
 async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<()> {
-    if cfg.use_pi && crate::pi::supports(cfg.llm.provider) {
-        return crate::pi::run(shared, cfg, rx).await;
-    }
     if cfg.llm.provider.is_cli() {
         crate::cli::verify_login(cfg.llm.provider, &cfg.llm.base_url).await?;
     }
@@ -354,6 +351,14 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             "Avoid checkout, reset, or other repository-wide changes in a shared checkout while teammates are working."
         ));
         tools.as_array_mut().expect("tool list").push(team::tool());
+    }
+
+    // key-based AIs run on the pi engine when it is installed (same screen, tools, prompt and controls)
+    if cfg.use_pi && crate::pi::usable(&cfg.llm) {
+        let job = crate::pi::Job { shared, cfg, ws: &ws, system: &system, tools: &tools, membership: membership.as_ref() };
+        if crate::pi::run(job, rx).await? {
+            return Ok(());
+        }
     }
 
     let mut messages: Vec<Value> = Vec::new();
@@ -586,6 +591,50 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         shared.run_steps.store(steps_since_input, Ordering::Relaxed);
         shared.steps.fetch_add(1, Ordering::Relaxed);
         crate::usage::global().step(&usage_source(&cfg.llm));
+    }
+}
+
+/// Runs tool calls that come from another engine (pi) through the same executor as the built-in loop,
+/// so screens, logs, pause/stop, `ask_user` and team tools behave identically.
+pub(crate) struct ToolBridge {
+    seen: Seen,
+}
+
+impl ToolBridge {
+    pub(crate) fn new() -> Self {
+        ToolBridge { seen: Seen::default() }
+    }
+
+    /// The current screen as one content block (an image, or a note when there is no screen).
+    pub(crate) async fn screen(&mut self, ws: &Desk) -> Value {
+        screenshot_context(ws, &mut self.seen).await
+    }
+
+    /// Runs one tool call; returns its result blocks (Claude format) and whether it failed.
+    pub(crate) async fn call(
+        &mut self,
+        shared: &Arc<AgentShared>,
+        ws: &Desk,
+        name: &str,
+        input: &Value,
+        rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+        membership: Option<&Membership>,
+    ) -> (Vec<Value>, bool) {
+        let tool_use = if name == "computer" {
+            let mut input = input.clone();
+            let action = input.as_object_mut().and_then(|o| o.remove("action")).and_then(|a| a.as_str().map(String::from)).unwrap_or_default();
+            json!({ "type": "tool_use", "id": "bridge", "name": action, "input": input, "toolset_name": "computer" })
+        } else {
+            json!({ "type": "tool_use", "id": "bridge", "name": name, "input": input })
+        };
+        let results = tools::execute_batch(shared, ws, &[tool_use], rx, &mut self.seen, membership).await;
+        let r = results.into_iter().next().unwrap_or_default();
+        let content = match &r["content"] {
+            Value::Array(a) => a.clone(),
+            Value::String(s) => vec![json!({ "type": "text", "text": s })],
+            _ => Vec::new(),
+        };
+        (content, r["is_error"] == true)
     }
 }
 

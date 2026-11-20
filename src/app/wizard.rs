@@ -388,7 +388,7 @@ impl GhostApp {
             target,
             max_steps: self.form.max_steps,
             reply_lang: self.lang.english_name(),
-            use_pi: self.use_pi && crate::pi::find().is_some(),
+            use_pi: true,
             // missing_setup was checked above, so a connection exists
             llm: self.cur().map(|c| c.llm(EFFORTS[self.effort_idx])).expect("missing_setup checked the connection"),
         };

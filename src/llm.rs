@@ -17,6 +17,11 @@ use serde_json::{json, Value};
 pub(crate) use anthropic::{CLEAR_TOOL_USES_AT, KEEP_TOOL_USES};
 pub use provider::Provider;
 
+/// A Claude-format tool list as OpenAI-style function definitions (the computer toolset becomes one `computer` function).
+pub(crate) fn function_tools(tools: &Value) -> Value {
+    openai::to_tools(tools)
+}
+
 pub(crate) fn cli_tools(tools: &Value) -> Value { openai::to_tools(tools) }
 
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
