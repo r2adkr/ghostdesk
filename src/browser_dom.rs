@@ -250,7 +250,7 @@ impl BrowserWorkspace {
                     return { error: "'" + a.text + "' 라는 이름의 요소를 못 찾았어요. 화면에 있는 것: " + some + " (find 로 찾아 보세요)" };
                   }
                   el = best;
-                } else return { error: 'ref 또는 text 가 필요해요' };
+                } else return { error: 'ref(번호) 또는 label(이름) 이 필요해요' };
                 el.scrollIntoView({ block: 'center', inline: 'center' });
                 const r = el.getBoundingClientRect();
                 const x = Math.min(Math.max(r.left + r.width / 2, 1), innerWidth - 1);

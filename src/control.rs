@@ -1452,7 +1452,7 @@ fn is_browser_action(name: &str, step: &Value) -> bool {
         "navigate" | "back" | "forward" | "reload" | "new_tab" | "switch_tab" | "close_tab" | "list_tabs" | "read" | "text" | "find"
         | "links" | "click" | "fill" | "select" | "scroll_to" | "wait_for" | "dialog" | "respond_dialog" => true,
         // `double_click` with coordinates is the pixel action
-        "double_click" => step.get("ref").is_some() || step.get("label").is_some(),
+        "double_click" => step.get("ref").is_some() || step.get("label").is_some() || step.get("text").is_some() || step.get("name").is_some(),
         _ => false,
     }
 }

@@ -21,6 +21,19 @@ pub(crate) struct Outcome {
     pub(crate) image: Option<Vec<u8>>,
 }
 
+/// The element number of a page action: a number, or one written as text ("12", "[12]") the way some AI apps send it.
+fn element_ref(input: &Value) -> Value {
+    match &input["ref"] {
+        Value::String(t) => t.trim().trim_matches(['[', ']']).parse::<u64>().map(Value::from).unwrap_or(Value::Null),
+        v => v.clone(),
+    }
+}
+
+/// The element's name of a page action: `label`, or `text` / `name`, which callers often use for the same thing.
+fn element_label(input: &Value) -> Option<&str> {
+    ["label", "text", "name"].iter().find_map(|k| input[*k].as_str().map(str::trim).filter(|t| !t.is_empty()))
+}
+
 fn ok(text: impl Into<String>) -> Result<Outcome> {
     Ok(Outcome { text: text.into(), image: None })
 }
@@ -508,18 +521,18 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                 }
                 "links" => return ok(ws.dom_links(input["max_items"].as_u64().unwrap_or(40).clamp(5, 200) as usize).await?),
                 "click" | "double_click" => {
-                    let (r, l) = (&input["ref"], input["label"].as_str());
+                    let (r, l) = (&element_ref(input), element_label(input));
                     return ok(ws.dom_click(r, l, input["action"] == "double_click").await?);
                 }
                 "fill" => {
                     let value = input["value"].as_str().ok_or_else(|| anyhow!("value 가 필요합니다"))?;
-                    return ok(ws.dom_fill(&input["ref"], input["label"].as_str(), value, input["submit"].as_bool().unwrap_or(false)).await?);
+                    return ok(ws.dom_fill(&element_ref(input), element_label(input), value, input["submit"].as_bool().unwrap_or(false)).await?);
                 }
                 "select" => {
                     let option = input["option"].as_str().ok_or_else(|| anyhow!("option 이 필요합니다"))?;
-                    return ok(ws.dom_select(&input["ref"], input["label"].as_str(), option).await?);
+                    return ok(ws.dom_select(&element_ref(input), element_label(input), option).await?);
                 }
-                "scroll_to" => return ok(ws.dom_scroll_to(&input["ref"], input["label"].as_str()).await?),
+                "scroll_to" => return ok(ws.dom_scroll_to(&element_ref(input), element_label(input)).await?),
                 "wait_for" => {
                     let t = input["text"].as_str().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("text 가 필요합니다"))?;
                     return ok(ws.dom_wait_for(t, input["gone"].as_bool().unwrap_or(false), input["timeout"].as_f64().unwrap_or(10.0)).await?);
@@ -595,6 +608,19 @@ pub(crate) fn describe(name: &str, input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_actions_accept_the_ref_as_text_and_the_name_as_text() {
+        assert_eq!(element_ref(&json!({"ref": 12})), json!(12));
+        assert_eq!(element_ref(&json!({"ref": "12"})), json!(12));
+        assert_eq!(element_ref(&json!({"ref": "[12]"})), json!(12));
+        assert_eq!(element_ref(&json!({"ref": "abc"})), Value::Null);
+        assert_eq!(element_ref(&json!({})), Value::Null);
+        assert_eq!(element_label(&json!({"label": "검색"})), Some("검색"));
+        assert_eq!(element_label(&json!({"text": " 검색 "})), Some("검색"));
+        assert_eq!(element_label(&json!({"label": "", "name": "x"})), Some("x"));
+        assert_eq!(element_label(&json!({})), None);
+    }
 
     #[test]
     fn menu_sources_never_fall_back_from_dialog_or_invalid_sources() {
