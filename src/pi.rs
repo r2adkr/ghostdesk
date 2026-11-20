@@ -54,14 +54,24 @@ fn node_ok() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// What went wrong, from an installer's output: its progress bars and spinners are dropped, and a line that
+/// says "error" wins over the last lines.
+fn installer_message(stdout: &[u8], stderr: &[u8]) -> String {
+    let text = format!("{}\n{}", String::from_utf8_lossy(stdout), String::from_utf8_lossy(stderr));
+    let lines: Vec<&str> = text
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.chars().any(|c| c.is_alphabetic()))
+        .collect();
+    let errors: Vec<&str> = lines.iter().copied().filter(|l| l.to_lowercase().contains("error") || l.to_lowercase().contains("fail")).collect();
+    let pick = if errors.is_empty() { &lines[lines.len().saturating_sub(3)..] } else { &errors[errors.len().saturating_sub(3)..] };
+    if pick.is_empty() { "(no details)".into() } else { pick.join(" / ") }
+}
+
 /// Runs the installer (blocking, no terminal): installs Node.js through Homebrew first when it is missing
 /// (the official script can only ask about that in a terminal), then pi's own installer.
 pub fn install() -> Result<(), String> {
-    let fail = |what: &str, out: std::process::Output| {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let text = if err.trim().is_empty() { String::from_utf8_lossy(&out.stdout).into_owned() } else { err.into_owned() };
-        format!("{what}: {}", crate::llm::short(text.trim(), 300))
-    };
+    let fail = |what: &str, out: std::process::Output| format!("{what}: {}", crate::llm::short(&installer_message(&out.stdout, &out.stderr), 300));
     #[cfg(windows)]
     {
         let out = std::process::Command::new("powershell")
@@ -1052,6 +1062,15 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
         assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[], &[], &[]).iter().any(|x| x == "--thinking"));
+    }
+
+    #[test]
+    fn installer_errors_skip_progress_bars() {
+        let err = b"######## 100.0%\r##### 20%\n";
+        let out = b"checking node\nerror: Pi requires Node.js 22.19.0 or newer. Found v18.\n";
+        assert_eq!(installer_message(out, err), "error: Pi requires Node.js 22.19.0 or newer. Found v18.");
+        assert_eq!(installer_message(b"", b"###\r##"), "(no details)");
+        assert_eq!(installer_message(b"a\nb\nc\nd\n", b""), "b / c / d");
     }
 
     #[test]
