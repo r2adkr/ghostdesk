@@ -73,11 +73,24 @@ impl Llm {
     fn browser_control_tool() -> Value {
         json!({
                 "name": "browser_control",
-                "description": "Control the isolated browser outside the page viewport. There is no address bar or tab strip. Actions: navigate(url), back, forward, reload, new_tab(url optional), switch_tab(index), close_tab(index), list_tabs. Read pending JavaScript confirmations/prompts with dialog; respond_dialog requires the returned id and explicit accept=true/false, plus prompt_text for a prompt. Dialogs are never accepted automatically. A dialog can interrupt an input that already ran; query it instead of repeating the input. Follow the task's authorization before confirming an irreversible action.",
+                "description": "Read and drive the page by element, and control the browser outside the page viewport (there is no address bar or tab strip). PREFER THIS TO SCREENSHOTS for web pages: read returns the page as a numbered list [n] of what can be clicked or typed into (text only, far cheaper than an image); then click/fill/select by ref=n (or label=its name) without guessing pixels. Page-element actions return text and attach no screenshot, so read again or call the computer screenshot only when you need to see layout, images or a canvas, or when an element action fails. Numbers stay valid until the next read/find. Page actions: read(scope=viewport|page, max_items), text(selector, max_chars), find(query), links, click(ref|label), double_click(ref|label), fill(ref|label, value, submit), select(ref|label, option), scroll_to(ref|label), wait_for(text, gone, timeout). Browser actions: navigate(url), back, forward, reload, new_tab(url optional), switch_tab(index), close_tab(index), list_tabs. Several actions can go in one turn as separate calls. Read pending JavaScript confirmations/prompts with dialog; respond_dialog requires the returned id and explicit accept=true/false, plus prompt_text for a prompt. Dialogs are never accepted automatically. A dialog can interrupt an input that already ran; query it instead of repeating the input. Follow the task's authorization before confirming an irreversible action.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
+                        "action": { "type": "string", "enum": ["read", "text", "find", "links", "click", "double_click", "fill", "select", "scroll_to", "wait_for", "navigate", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab", "list_tabs", "dialog", "respond_dialog"] },
+                        "ref": { "type": "integer", "minimum": 1, "description": "element number from the last read/find" },
+                        "label": { "type": "string", "description": "instead of ref: the element's name (button text, placeholder)" },
+                        "value": { "type": "string", "description": "fill: text (replaces the content)" },
+                        "submit": { "type": "boolean", "description": "fill: press Enter afterwards" },
+                        "option": { "type": "string", "description": "select: option text or value" },
+                        "query": { "type": "string", "description": "find: text to look for" },
+                        "selector": { "type": "string", "description": "text: CSS selector (default: whole page)" },
+                        "max_chars": { "type": "integer", "description": "text: most characters to return (4000)" },
+                        "max_items": { "type": "integer", "description": "read/links: most items to return" },
+                        "scope": { "type": "string", "enum": ["viewport", "page"], "description": "read: what is on screen now (default) or the whole page" },
+                        "text": { "type": "string", "description": "wait_for: text to wait for" },
+                        "gone": { "type": "boolean", "description": "wait_for: wait until the text is gone" },
+                        "timeout": { "type": "number", "description": "wait_for: seconds (10)" },
                         "url": { "type": "string", "description": "URL or search words for navigate/new_tab" },
                         "index": { "type": "integer", "description": "Tab index for switch_tab/close_tab" },
                         "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: current dialog ID from dialog" },

@@ -34,6 +34,30 @@ fn element_label(input: &Value) -> Option<&str> {
     ["label", "text", "name"].iter().find_map(|k| input[*k].as_str().map(str::trim).filter(|t| !t.is_empty()))
 }
 
+/// Page-element actions of `browser_control`: answered in text.
+const PAGE_READS: &[&str] = &["read", "text", "find", "links", "wait_for", "list_tabs", "dialog"];
+const PAGE_CHANGES: &[&str] = &["click", "double_click", "fill", "select", "scroll_to", "respond_dialog"];
+const NO_SCREEN_NOTE: &str = "(no screenshot attached for page-element actions: read again to see the result, or call computer screenshot to look)";
+
+/// For the calls of one turn: (a screenshot is needed, the page may have changed). Only a turn made entirely of
+/// page-element actions goes without a picture.
+fn batch_needs(tool_uses: &[Value]) -> (bool, bool) {
+    let (mut picture, mut changes) = (false, false);
+    for tu in tool_uses {
+        let action = tu["input"]["action"].as_str().unwrap_or_default();
+        let element = tu["name"] == "browser_control" && tu["toolset_name"].is_null() && !tu["input"]["action"].is_null();
+        if element && PAGE_READS.contains(&action) {
+            continue;
+        }
+        if element && PAGE_CHANGES.contains(&action) && (!tu["input"]["ref"].is_null() || element_label(&tu["input"]).is_some() || action == "respond_dialog") {
+            changes = true;
+            continue;
+        }
+        picture = true;
+    }
+    (picture, changes)
+}
+
 fn ok(text: impl Into<String>) -> Result<Outcome> {
     Ok(Outcome { text: text.into(), image: None })
 }
@@ -149,7 +173,13 @@ pub(crate) async fn execute_batch(
 
     // if the batch didn't end with a screenshot, attach the latest screen and tabs to the last result
     if !ws.has_screen() { return results; }
-    settle(ws).await;
+    // a batch of page-element actions (read, click by number, fill…) is answered in text: no screenshot is
+    // attached, which saves its tokens and the wait for the picture; only an action that changes the page waits
+    // for it to settle so the next read sees the result
+    let (picture, changes) = batch_needs(tool_uses);
+    if changes || picture {
+        settle(ws).await;
+    }
     let uses = tool_uses.len();
     let mut extra = Vec::new();
     let views = ws.views_text();
@@ -161,10 +191,12 @@ pub(crate) async fn execute_batch(
     if !info.is_empty() {
         extra.push(json!({ "type": "text", "text": info }));
     }
-    if !last_has_image {
+    if !last_has_image && picture {
         if let Ok(png) = ws.screenshot().await {
             extra.push(seen.screen(&png, uses));
         }
+    } else if !picture && changes {
+        extra.push(json!({ "type": "text", "text": NO_SCREEN_NOTE }));
     }
     if let Some(last) = results.last_mut() {
         let mut c = match last["content"].take() {
@@ -608,6 +640,23 @@ pub(crate) fn describe(name: &str, input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_turn_of_page_element_actions_goes_without_a_screenshot() {
+        let call = |name: &str, input: Value| json!({"type": "tool_use", "name": name, "input": input});
+        let read = call("browser_control", json!({"action": "read"}));
+        let click = call("browser_control", json!({"action": "click", "ref": 3}));
+        let by_name = call("browser_control", json!({"action": "fill", "label": "검색", "value": "x"}));
+        let nav = call("browser_control", json!({"action": "navigate", "url": "https://a.b"}));
+        let shot = call("computer", json!({"action": "screenshot"}));
+        assert_eq!(batch_needs(&[read.clone()]), (false, false));
+        assert_eq!(batch_needs(&[read.clone(), click.clone(), by_name]), (false, true));
+        assert_eq!(batch_needs(&[click.clone(), nav]), (true, true));
+        assert_eq!(batch_needs(&[read, shot.clone()]), (true, false));
+        // a click without an element is a pixel action in the old sense: it needs the picture
+        assert_eq!(batch_needs(&[call("browser_control", json!({"action": "click"}))]), (true, false));
+        assert_eq!(batch_needs(&[shot, click]), (true, true));
+    }
 
     #[test]
     fn page_actions_accept_the_ref_as_text_and_the_name_as_text() {

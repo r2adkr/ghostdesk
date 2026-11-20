@@ -12,7 +12,7 @@ const ENV_BROWSER: &str = r#"Environment
 - The instance uses a clone of the human's browser profile, so websites where they are already signed in are usually signed in here too. Treat their accounts with care.
 - Screenshots show ONLY the page viewport. There is no address bar, tab strip or OS chrome. Use the `browser_control` tool to navigate to URLs, go back/forward, reload, and open/switch/close tabs. Keyboard shortcuts that rely on browser UI (Cmd+L, Cmd+T, …) do not work.
 - JavaScript dialogs are never accepted automatically and do not appear in page screenshots. Use browser_control action=dialog, then respond_dialog with its current id and explicit accept=true/false (plus prompt_text for prompts). If a dialog interrupted input, do not repeat that input. Confirm irreversible actions only when authorized.
-- After every batch of actions you automatically receive a fresh screenshot plus the current tab list, so you rarely need to request `screenshot` yourself.
+- Work on pages by element, not by pixels: `browser_control` read lists what can be clicked or typed into as numbered text; click, fill and select by ref (or label); find/text/links read content. This costs a fraction of a screenshot and does not miss. Use screenshots and coordinates only for layout, images, canvases or when an element action fails. After a batch of pixel actions you automatically receive a fresh screenshot plus the current tab list; page-element actions return text only (read again, or take a screenshot, when you need to see).
 - Coordinates are in the pixel space of the screenshots (origin top-left)."#;
 
 const ENV_REMOTE: &str = r#"Environment
@@ -73,7 +73,7 @@ fn env_browser_pc() -> String {
 - Screenshots show ONLY the page viewport. There is no address bar, tab strip or OS chrome. Use the `browser_control` tool to navigate to URLs, go back/forward, reload, and open/switch/close tabs. Keyboard shortcuts that rely on browser UI (Ctrl+L, Ctrl+T, …) do not work.
 - JavaScript dialogs are never accepted automatically and do not appear in page screenshots. Use browser_control action=dialog, then respond_dialog with its current id and explicit accept=true/false (plus prompt_text for prompts). If a dialog interrupted input, do not repeat that input. Confirm irreversible actions only when authorized.
 - The browser runs on {OS_NAME}, so page shortcuts use ctrl (ctrl+a, ctrl+c, ctrl+v, ctrl+z, ctrl+f). `cmd` in key names is sent as ctrl.
-- After every batch of actions you automatically receive a fresh screenshot plus the current tab list, so you rarely need to request `screenshot` yourself.
+- Work on pages by element, not by pixels: `browser_control` read lists what can be clicked or typed into as numbered text; click, fill and select by ref (or label); find/text/links read content. This costs a fraction of a screenshot and does not miss. Use screenshots and coordinates only for layout, images, canvases or when an element action fails. After a batch of pixel actions you automatically receive a fresh screenshot plus the current tab list; page-element actions return text only (read again, or take a screenshot, when you need to see).
 - Coordinates are in the pixel space of the screenshots (origin top-left)."#
     )
 }
