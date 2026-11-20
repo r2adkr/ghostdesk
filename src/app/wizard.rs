@@ -629,6 +629,7 @@ impl GhostApp {
                         }
                     }
                 }
+                self.pi_offer(ui);
             });
             ui.add_space(16.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

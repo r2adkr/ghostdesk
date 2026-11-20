@@ -492,18 +492,16 @@ impl GhostApp {
         ui.add_space(4.0);
         ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
             .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
-        ui.label(theme::hint(tr("노트북 덮개를 닫으면 전원에 연결하고 외부 모니터를 쓰는 경우가 아니면 잠자기에 들어가요")));
 
         ui.add_space(8.0);
         ui.add(theme::switch(&mut self.auto_clean, tr("끝난 화면 자동 정리")))
             .on_hover_text(tr("외부 에이전트가 닫은 화면을 목록에서 지우고, 이름 없이 열린 임시 작업공간 폴더도 삭제해요. 이름을 정해 둔 작업공간과 로그인 복제본은 그대로 둬요."));
-        ui.label(theme::hint(tr("닫힌 지 1분 반쯤 지나면 목록에서 사라져요")));
 
         ui.add_space(18.0);
         theme::section(ui, tr("실험적 기능"));
         ui.add_space(4.0);
-        ui.add(theme::switch(&mut self.allow_experimental, tr("실험적 기능 허용")));
-        ui.label(theme::hint(tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요")));
+        ui.add(theme::switch(&mut self.allow_experimental, tr("실험적 기능 허용")))
+            .on_hover_text(tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요"));
     }
 
     /// Permissions tab: approval rules for outside agents (and the macOS permission list above them).
@@ -515,15 +513,17 @@ impl GhostApp {
         }
         theme::section(ui, tr("승인"));
         ui.add_space(4.0);
-        ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기")));
-        // the warning stays visible while it's on, not only on hover
+        // the warning stays visible while it's on; otherwise the explanation is a tooltip
         let warn = tr("외부 에이전트가 로그인 복제, 실행 중인 앱, 원격 접속을 묻지 않고 바로 시작해요. 믿는 에이전트만 연결했을 때 켜세요");
-        ui.label(if self.auto_approve { RichText::new(warn).size(12.0).color(theme::warn()) } else { theme::hint(warn) });
+        ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기"))).on_hover_text(warn);
+        if self.auto_approve {
+            ui.label(RichText::new(warn).size(12.0).color(theme::warn()));
+        }
 
         // the shell and system-tool refusals of the app modes
         {
             ui.add_space(8.0);
-            ui.add(theme::switch(&mut self.allow_shell_tools, tr("셸·터미널·시스템 도구 허용")));
+            let shell_switch = ui.add(theme::switch(&mut self.allow_shell_tools, tr("셸·터미널·시스템 도구 허용")));
             let off = if cfg!(windows) {
                 tr("끄면 터미널, PowerShell, 레지스트리 편집기 같은 도구는 외부 에이전트가 열 수 없어요")
             } else {
@@ -542,7 +542,11 @@ impl GhostApp {
             } else {
                 tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자는 항상 막혀요")
             };
-            ui.label(if self.allow_shell_tools && self.auto_approve { RichText::new(note).size(12.0).color(theme::warn()) } else { theme::hint(note) });
+            if self.allow_shell_tools && self.auto_approve {
+                ui.label(RichText::new(note).size(12.0).color(theme::warn()));
+            } else {
+                shell_switch.on_hover_text(note);
+            }
         }
 
     }
@@ -553,11 +557,10 @@ impl GhostApp {
         ui.add_space(4.0);
         {
             ui.label(tr("원격 화면 최대 프레임 (fps)"));
-            ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"));
+            ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"))
+                .on_hover_text(tr("낮출수록 CPU와 네트워크를 덜 써요. 이 값이 호스트 모드를 포함한 모든 원격 화면의 상한이에요"));
             if self.live_fps_limit > 30 {
                 ui.label(RichText::new(tr("30fps보다 높으면 CPU와 네트워크를 많이 써서 오히려 끊기거나 컴퓨터가 느려질 수 있어요. 느려지면 낮추세요")).size(12.0).color(theme::warn()));
-            } else {
-                ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 이 값이 호스트 모드를 포함한 모든 원격 화면의 상한이에요")));
             }
         }
     }
@@ -582,8 +585,6 @@ impl GhostApp {
         if prefs::CAN_REMEMBER_KEYS {
             ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
                 .on_hover_text(tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
-        } else {
-            ui.label(theme::hint(self.key_storage_note()));
         }
 
         ui.add_space(14.0);
@@ -767,7 +768,6 @@ impl GhostApp {
                 }
             });
         }
-        ui.label(theme::hint(tr("켜져 있는데 꺼짐으로 보이면 '허용'을 눌러 다시 요청하세요")));
     }
 
     /// One card per connection: name (editable for OpenAI-compatible) · provider · ✕, with URL and
@@ -807,7 +807,6 @@ impl GhostApp {
                     self.url_field(ui, i, inner);
                 }
                 if p.is_cli() {
-                    ui.label(theme::hint(tr("CLI에 로그인된 계정으로 실행해요")));
                     let changed = ui.add(egui::TextEdit::singleline(&mut self.ai[i].url).desired_width(inner).hint_text(tr("경로 (보통 비워 두세요)"))).changed();
                     let id = self.ai[i].id;
                     if changed { self.refetch(id); }

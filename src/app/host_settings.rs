@@ -61,7 +61,6 @@ impl GhostApp {
             ui.add_space(8.0);
             return;
         }
-        ui.label(theme::hint(tr("꺼면 백그라운드 실행도, 시작 프로그램 등록도 함께 사라져요.")));
         ui.add_space(6.0);
         if ui_state.code.is_none() {
             ui_state.code = crate::host::pairing_code().ok();

@@ -297,6 +297,7 @@ pub struct GhostApp {
     use_pi: bool,
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pi_note: Option<String>,
+    pi_offer_dismissed: bool,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
@@ -448,6 +449,7 @@ impl GhostApp {
             use_pi: false,
             pi_install: None,
             pi_note: None,
+            pi_offer_dismissed: false,
             allow_experimental: false,
             tour: None,
             tour_seen: false,
