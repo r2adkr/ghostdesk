@@ -317,11 +317,11 @@ fn usage(stdout: &str, provider: Provider) -> Value {
     json!({})
 }
 
-pub async fn send(provider: Provider, explicit: &str, model: &str, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
+pub async fn send(provider: Provider, explicit: &str, model: &str, effort: &str, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
     let tools = crate::llm::cli_tools(tools);
     let schema = output_schema(&tools);
     let (history, images) = conversation(messages);
-    let prompt = format!("{system}\n\nYou are the model for a GhostDesk agent. GhostDesk executes the tools below after your reply. Do not execute any CLI-native tools, shell commands, MCP tools or modify local files. Return only the requested structured response: message is your user-facing text; calls contains tool names and JSON-encoded arguments, or [] when done. Never claim an action happened until a subsequent tool result confirms it. Screenshots are in chronological order and coordinates refer to the latest.\n\nAvailable tools:\n{tools}\n\nConversation:\n{history}");
+    let prompt = format!("{system}\n\nYou are the model for a GhostDesk agent. GhostDesk executes the tools below after your reply. Do not execute any CLI-native tools, shell commands, MCP tools or modify local files. Return only the requested structured response: message is your user-facing text; calls contains tool names and JSON-encoded arguments, or [] when done. Never claim an action happened until a subsequent tool result confirms it. Work fast: every reply costs several seconds, so when the next actions do not depend on seeing the result of the previous one (click a field, type, press Enter), return them together in calls instead of one per reply, and do not ask for a screenshot you do not need. Screenshots are in chronological order and coordinates refer to the latest.\n\nAvailable tools:\n{tools}\n\nConversation:\n{history}");
     let scratch = Scratch::new()?;
     let mut c = command(provider, explicit)?;
     c.current_dir(&scratch.0);
@@ -359,11 +359,20 @@ pub async fn send(provider: Provider, explicit: &str, model: &str, system: &str,
         let schema_path = scratch.0.join("response.schema.json");
         let output_path = scratch.0.join("response.json");
         let catalog_path = scratch.0.join("restricted-models.json");
-        let mut catalog_command = command(provider, explicit)?;
-        catalog_command.args(["debug", "models"]);
-        let catalog: Value = serde_json::from_str(&run(catalog_command, None, 20).await?)
-            .context("This Codex version does not expose its native model catalog; update the CLI")?;
-        std::fs::write(&catalog_path, restrict_codex_catalog(catalog, model)?.to_string())?;
+        // the restricted model catalog only changes with the CLI or the model, so it is fetched once per run of the app
+        let restricted = match cached_catalog(provider, explicit, model).await {
+            Some(c) => c,
+            None => {
+                let mut catalog_command = command(provider, explicit)?;
+                catalog_command.args(["debug", "models"]);
+                let catalog: Value = serde_json::from_str(&run(catalog_command, None, 20).await?)
+                    .context("This Codex version does not expose its native model catalog; update the CLI")?;
+                let restricted = restrict_codex_catalog(catalog, model)?.to_string();
+                store_catalog(provider, explicit, model, &restricted);
+                restricted
+            }
+        };
+        std::fs::write(&catalog_path, restricted)?;
         std::fs::write(&schema_path, schema.to_string())?;
         c.args([
             "exec",
@@ -383,6 +392,9 @@ pub async fn send(provider: Provider, explicit: &str, model: &str, system: &str,
         .arg("--output-last-message")
         .arg(&output_path);
         codex_isolation_args(&mut c, &catalog_path);
+        if let Some(level) = codex_effort(effort) {
+            c.arg("-c").arg(format!("model_reasoning_effort=\"{level}\""));
+        }
         for (i, image) in images.iter().enumerate() {
             let data = image["source"]["data"].as_str().ok_or_else(|| anyhow!("Invalid screenshot"))?;
             let path = scratch.0.join(format!("screen-{i}.{}", if image["source"]["media_type"] == "image/png" { "png" } else { "jpg" }));
@@ -401,6 +413,39 @@ pub async fn send(provider: Provider, explicit: &str, model: &str, system: &str,
         reply["usage"] = usage(&stdout, provider);
         Ok(reply)
     }
+}
+
+static CATALOGS: parking_lot::Mutex<Vec<(String, String)>> = parking_lot::Mutex::new(Vec::new());
+
+fn catalog_key(provider: Provider, explicit: &str, model: &str) -> String {
+    let exe = executable(provider, explicit).map(|p| p.display().to_string()).unwrap_or_default();
+    format!("{exe}|{model}")
+}
+
+async fn cached_catalog(provider: Provider, explicit: &str, model: &str) -> Option<String> {
+    let key = catalog_key(provider, explicit, model);
+    CATALOGS.lock().iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+}
+
+fn store_catalog(provider: Provider, explicit: &str, model: &str, restricted: &str) {
+    let key = catalog_key(provider, explicit, model);
+    let mut g = CATALOGS.lock();
+    g.retain(|(k, _)| *k != key);
+    g.push((key, restricted.to_string()));
+    let extra = g.len().saturating_sub(8);
+    g.drain(..extra);
+}
+
+/// Codex's reasoning level for GhostDesk's effort setting (a screen agent needs many short replies, so the
+/// person's chosen level is passed on instead of the CLI's own, usually higher, default).
+fn codex_effort(effort: &str) -> Option<&'static str> {
+    Some(match effort {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "max" => "xhigh",
+        _ => return None,
+    })
 }
 
 async fn run(mut c: Command, input: Option<String>, seconds: u64) -> Result<String> {
@@ -565,7 +610,7 @@ mod tests {
         let path = std::env::var("GHOSTDESK_TEST_CODEX").expect("Set GHOSTDESK_TEST_CODEX to the installed executable");
         let models = models(Provider::CodexCli, &path).await.unwrap();
         let model = models.first().expect("account must expose a model");
-        let reply = send(Provider::CodexCli,&path,model,"Transport test. Reply with the message GhostDesk CLI OK and calls [].",&json!([{"name":"ask_user","description":"Ask human","input_schema":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}]),&[json!({"role":"user","content":"Return GhostDesk CLI OK without any tool calls."})]).await.unwrap();
+        let reply = send(Provider::CodexCli,&path,model,"low","Transport test. Reply with the message GhostDesk CLI OK and calls [].",&json!([{"name":"ask_user","description":"Ask human","input_schema":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}]),&[json!({"role":"user","content":"Return GhostDesk CLI OK without any tool calls."})]).await.unwrap();
         assert_eq!(reply["stop_reason"], "end_turn");
         assert!(reply["content"].as_array().unwrap().iter().any(|b| b["text"].as_str().is_some_and(|s| s.contains("GhostDesk CLI OK"))));
     }

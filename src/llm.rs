@@ -127,7 +127,7 @@ impl Llm {
     /// Sends one turn and returns the reply in Claude format (`content`, `stop_reason`, `usage`).
     pub async fn send(&self, system: &str, tools: &Value, messages: &[Value]) -> Result<Value> {
         if self.provider.is_cli() {
-            crate::cli::send(self.provider, &self.base_url, &self.model, system, tools, messages).await
+            crate::cli::send(self.provider, &self.base_url, &self.model, &self.effort, system, tools, messages).await
         } else if self.provider == Provider::Anthropic {
             self.send_anthropic(system, tools, messages).await
         } else {
