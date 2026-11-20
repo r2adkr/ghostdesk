@@ -13,6 +13,7 @@ pub(super) struct Editor {
     options: SshOptions,
     error: Option<String>,
     confirm_delete: bool,
+    code: String,
 }
 
 pub(super) fn trim_options(options: &mut SshOptions) {
@@ -119,6 +120,28 @@ impl GhostApp {
                 ui.text_edit_singleline(&mut editor.name);
             });
             fields(ui, &mut editor.options, tr("예) 192.168.0.20 또는 vm.local"));
+            // adding: a connection code from the other computer fills the form
+            if editor.original.is_none() {
+                ui.add_space(6.0);
+                ui.label(theme::hint(tr("또는 연결 코드로 채우기")));
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 90.0).max(120.0);
+                    ui.add(egui::TextEdit::singleline(&mut editor.code).desired_width(w).hint_text(tr("연결 코드를 붙여 넣으세요")));
+                    if theme::secondary(ui, tr("코드로 채우기")).clicked() {
+                        match super::remote_info::ssh_from_code(&editor.code) {
+                            Ok((name, options)) => {
+                                if editor.name.trim().is_empty() {
+                                    editor.name = name;
+                                }
+                                editor.options = options;
+                                editor.code.clear();
+                                editor.error = None;
+                            }
+                            Err(why) => editor.error = Some(tr(why).to_string()),
+                        }
+                    }
+                });
+            }
         }
         if let Some(error) = &editor.error {
             ui.colored_label(theme::danger(), error);

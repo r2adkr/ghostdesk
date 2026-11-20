@@ -28,6 +28,7 @@ pub(super) struct Prefs {
     lang: String,
     /// AI connections (`None` for an old-format file).
     conns: Option<Vec<SavedConn>>,
+    #[serde(deserialize_with = "lenient_profiles")]
     ssh_profiles: ssh_profiles::Profiles,
     /// Index of the current connection in `conns`.
     current: Option<usize>,
@@ -129,6 +130,7 @@ fn migrate(p: &Prefs) -> (Vec<SavedConn>, Option<usize>) {
 impl GhostApp {
     /// Applies saved preferences once at startup (defaults stay if missing or broken).
     pub(super) fn load_prefs(&mut self) {
+        backup_before_new_version();
         match read_document(&path()) {
             Ok(Some(doc)) => match serde_json::from_value(doc) {
                 Ok(prefs) => self.apply_prefs(prefs),
@@ -262,6 +264,33 @@ impl GhostApp {
     }
 }
 
+/// Saved SSH connections, read entry by entry: one entry written by another version (or damaged) is skipped
+/// instead of making the whole preferences file unreadable, which would hide every saved connection.
+fn lenient_profiles<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ssh_profiles::Profiles, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_object()
+        .map(|m| m.iter().filter_map(|(k, e)| Some((k.clone(), serde_json::from_value::<crate::ssh::SshOptions>(e.clone()).ok()?))).collect())
+        .unwrap_or_default())
+}
+
+/// Keeps a copy of the preferences from before an update: the first start of a new version saves
+/// `prefs.json` as `prefs.json.bak-<old version>`.
+fn backup_before_new_version() {
+    let marker = crate::platform::paths::data_root().join("last-version.txt");
+    let now = env!("CARGO_PKG_VERSION");
+    let old = fs::read_to_string(&marker).unwrap_or_default();
+    let old = old.trim();
+    if old == now {
+        return;
+    }
+    let file = path();
+    if file.exists() {
+        let tag = if old.is_empty() { "unknown" } else { old };
+        let _ = fs::copy(&file, file.with_extension(format!("json.bak-{tag}")));
+    }
+    let _ = fs::write(marker, now);
+}
+
 type Document = serde_json::Value;
 
 fn read_document(path: &Path) -> anyhow::Result<Option<Document>> {
@@ -348,6 +377,15 @@ pub(super) mod secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_unreadable_connection_does_not_hide_the_others() {
+        let prefs: Prefs = serde_json::from_str(r#"{"ssh_profiles":{"a":{"host":"h1","port":2200},"bad":{"host":5,"port":"x"},"c":{"host":"h3"}}}"#).unwrap();
+        assert_eq!(prefs.ssh_profiles.len(), 2);
+        assert_eq!(prefs.ssh_profiles["a"].port, 2200);
+        let none: Prefs = serde_json::from_str(r#"{"ssh_profiles":null}"#).unwrap();
+        assert!(none.ssh_profiles.is_empty());
+    }
 
     #[test]
     fn multiple_ssh_profiles_round_trip_and_old_preferences_still_load() {

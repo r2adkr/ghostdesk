@@ -103,6 +103,14 @@ impl Card {
     }
 }
 
+/// A connection code (what "Share connection info" produces) as a saved SSH connection: `(name, options)`.
+pub(super) fn ssh_from_code(text: &str) -> Result<(String, crate::ssh::SshOptions), &'static str> {
+    let card = Card::decode(text).ok_or("연결 코드를 읽을 수 없어요. 복사한 코드 전체를 붙여 넣었는지 확인하세요")?;
+    let port = card.ssh.ok_or("이 코드에는 SSH 정보가 없어요")?;
+    let options = crate::ssh::SshOptions { host: card.host.clone(), port, username: card.user.clone(), ..Default::default() };
+    Ok((card.host, options))
+}
+
 pub(super) struct Share {
     host: String,
     user: String,
@@ -377,6 +385,16 @@ impl NewAgentForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_code_becomes_a_saved_ssh_connection() {
+        let both = Card { host: "10.0.0.5".into(), user: "me".into(), ssh: Some(2222), vnc: Some(5900), pass: Some("secret".into()) };
+        let (name, o) = ssh_from_code(&both.encode().unwrap()).unwrap();
+        assert_eq!((name.as_str(), o.host.as_str(), o.port, o.username.as_str()), ("10.0.0.5", "10.0.0.5", 2222, "me"));
+        let vnc_only = Card { host: "10.0.0.5".into(), user: "me".into(), ssh: None, vnc: Some(5900), pass: None };
+        assert!(ssh_from_code(&vnc_only.encode().unwrap()).is_err());
+        assert!(ssh_from_code("hello").is_err());
+    }
 
     #[test]
     fn the_vnc_password_travels_only_when_chosen_and_only_with_vnc() {

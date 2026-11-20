@@ -40,8 +40,19 @@ fn asset_suffixes() -> &'static [&'static str] {
         _ => &[],
     }
 }
-/// The app tends to stay open for a long time, so check again once a day.
-const RECHECK: Duration = Duration::from_secs(24 * 60 * 60);
+/// The app tends to stay open for a long time, so check again every few hours.
+const RECHECK: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Wait before the next try after `failures` failed checks in a row: 2, 5, 15, 30 minutes, then hourly.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(match failures {
+        0 | 1 => 120,
+        2 => 300,
+        3 => 900,
+        4 => 1800,
+        _ => 3600,
+    })
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
@@ -91,16 +102,28 @@ pub fn start(rt: &Handle, ctx: &egui::Context) -> Shared {
     let (s, ctx) = (st.clone(), ctx.clone());
     rt.spawn_blocking(sweep_leftovers);
     rt.spawn(async move {
+        // a failed check (offline, GitHub's request limit) is retried soon, not a day later
+        let mut failures = 0u32;
         loop {
-            if let Ok(Some(r)) = latest(env!("CARGO_PKG_VERSION")).await {
-                let mut g = s.lock();
-                // leave a download in progress or one already done alone
-                if !matches!(*g, State::Downloading(..) | State::Ready(_)) {
-                    *g = State::Available(r);
-                    ctx.request_repaint();
+            let wait = match latest(env!("CARGO_PKG_VERSION")).await {
+                Ok(found) => {
+                    failures = 0;
+                    if let Some(r) = found {
+                        let mut g = s.lock();
+                        // leave a download in progress or one already done alone
+                        if !matches!(*g, State::Downloading(..) | State::Ready(_)) {
+                            *g = State::Available(r);
+                            ctx.request_repaint();
+                        }
+                    }
+                    RECHECK
                 }
-            }
-            tokio::time::sleep(RECHECK).await;
+                Err(_) => {
+                    failures += 1;
+                    retry_delay(failures)
+                }
+            };
+            tokio::time::sleep(wait).await;
         }
     });
     st
@@ -213,6 +236,18 @@ fn client() -> Result<reqwest::Client> {
 
 /// A stable release newer than `current`, if any.
 async fn latest(current: &str) -> Result<Option<Release>> {
+    // with nowhere to swap into (macOS, running outside a bundle) pick no file, so the release
+    // page opens
+    let suffixes = if update_target().is_ok() { asset_suffixes() } else { &[] };
+    match latest_from_api(current, suffixes).await {
+        Ok(r) => Ok(r),
+        // the API allows few requests per address and hour (shared networks hit that often): the
+        // release pages themselves are not limited
+        Err(api_err) => latest_from_pages(current, suffixes).await.map_err(|e| e.context(format!("{api_err:#}"))),
+    }
+}
+
+async fn latest_from_api(current: &str, suffixes: &[&str]) -> Result<Option<Release>> {
     let v: Value = client()?
         .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
@@ -222,10 +257,43 @@ async fn latest(current: &str) -> Result<Option<Release>> {
         .error_for_status()?
         .json()
         .await?;
-    // with nowhere to swap into (macOS, running outside a bundle) pick no file, so the release
-    // page opens
-    let suffixes = if update_target().is_ok() { asset_suffixes() } else { &[] };
     Ok(parse_release(&v, current, suffixes))
+}
+
+/// Without the API: `/releases/latest` redirects to the newest stable release's tag, and its
+/// SHA256SUMS.txt names the files.
+async fn latest_from_pages(current: &str, suffixes: &[&str]) -> Result<Option<Release>> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("GhostDesk/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let resp = http.get(format!("https://github.com/{REPO}/releases/latest")).send().await?;
+    let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).context("최신 릴리스 주소를 알 수 없습니다")?;
+    let tag = location.rsplit('/').next().unwrap_or_default().to_string();
+    if tag.is_empty() || !newer(tag.trim_start_matches('v'), current) {
+        return Ok(None);
+    }
+    let sums = http.get(format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS.txt")).send().await.and_then(|r| r.error_for_status());
+    let sums = match sums {
+        Ok(r) => r.text().await.ok(),
+        Err(_) => None,
+    };
+    Ok(release_from_sums(&tag, sums.as_deref(), suffixes))
+}
+
+/// A release from its tag and SHA256SUMS.txt (lines of "<hash>  <file name>"): no sums means no file,
+/// so the release page opens instead.
+fn release_from_sums(tag: &str, sums: Option<&str>, suffixes: &[&str]) -> Option<Release> {
+    let version = tag.trim_start_matches('v').to_string();
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let names: Vec<&str> = sums.unwrap_or_default().lines().filter_map(|l| l.trim().split_once(char::is_whitespace).map(|(_, f)| f.trim().trim_start_matches('*'))).collect();
+    let asset = suffixes.iter().find_map(|suf| {
+        let name = names.iter().find(|n| n.ends_with(suf))?;
+        Some(Asset { name: name.to_string(), url: format!("{base}/{name}"), size: 0, sums_url: Some(format!("{base}/SHA256SUMS.txt")) })
+    });
+    Some(Release { version, page: format!("https://github.com/{REPO}/releases/tag/{tag}"), asset })
 }
 
 /// What an update replaces: the running exe on Windows, the .app bundle containing it on macOS.
@@ -318,6 +386,8 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
     }
     let res: Result<()> = async {
         let mut resp = http.get(&asset.url).send().await?.error_for_status()?;
+        // the size is unknown when the release came from its page instead of the API
+        let total = if asset.size > 0 { asset.size } else { resp.content_length().unwrap_or(0) };
         let mut f = tokio::fs::File::create(&staging)
             .await
             .with_context(|| format!("{} 에 새 버전을 쓸 수 없습니다", staging.display()))?;
@@ -325,11 +395,11 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
         while let Some(chunk) = resp.chunk().await? {
             f.write_all(&chunk).await?;
             got += chunk.len() as u64;
-            progress(got as f32 / asset.size.max(1) as f32);
+            progress(got as f32 / total.max(1) as f32);
         }
         f.flush().await?;
         drop(f);
-        anyhow::ensure!(got == asset.size, "내려받은 크기가 다릅니다 ({got} / {} 바이트)", asset.size);
+        anyhow::ensure!(total == 0 || got == total, "내려받은 크기가 다릅니다 ({got} / {total} 바이트)");
         let (staging, me) = (staging.clone(), me.clone());
         tokio::task::spawn_blocking(move || -> Result<()> {
             if let Some(want) = expected {
@@ -480,6 +550,25 @@ mod tests {
         if cfg!(any(windows, target_os = "macos")) {
             assert!(!asset_suffixes().is_empty());
         }
+    }
+
+    #[test]
+    fn a_release_is_found_from_its_sums_file_without_the_api() {
+        let sums = "aa11  GhostDesk-0.12.0-windows-x64.exe\nbb22 *GhostDesk-0.12.0-macos-universal.zip\n";
+        let r = release_from_sums("v0.12.0", Some(sums), &["-windows-x64.exe"]).unwrap();
+        assert_eq!(r.version, "0.12.0");
+        assert!(r.installable());
+        assert!(r.asset.as_ref().unwrap().url.ends_with("/v0.12.0/GhostDesk-0.12.0-windows-x64.exe"));
+        // nothing for this OS, or no sums: the release page opens instead
+        assert!(!release_from_sums("v0.12.0", Some(sums), &["-linux.tar"]).unwrap().installable());
+        assert!(!release_from_sums("v0.12.0", None, &["-windows-x64.exe"]).unwrap().installable());
+    }
+
+    #[test]
+    fn failed_checks_are_retried_soon_then_hourly() {
+        assert!(retry_delay(1) < Duration::from_secs(600));
+        assert!(retry_delay(3) < retry_delay(6));
+        assert_eq!(retry_delay(99), Duration::from_secs(3600));
     }
 
     #[test]
