@@ -42,6 +42,9 @@ impl GhostApp {
     /// URL or required key).
     fn fetch_models(&mut self, ctx: &egui::Context, id: u64) -> ModelFetch {
         let Some(c) = self.ai.iter().find(|c| c.id == id) else { return ModelFetch::Idle };
+        if c.provider.is_cli() && crate::cli::login_changed(id, c.provider) {
+            self.model_fetch.lock().remove(&id);
+        }
         let state = self.model_fetch.lock().get(&id).cloned().unwrap_or_default();
         if !matches!(state, ModelFetch::Idle) || !c.configured() {
             return state;

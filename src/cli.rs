@@ -425,7 +425,38 @@ static CATALOGS: parking_lot::Mutex<Vec<(String, String)>> = parking_lot::Mutex:
 
 fn catalog_key(provider: Provider, explicit: &str, model: &str) -> String {
     let exe = executable(provider, explicit).map(|p| p.display().to_string()).unwrap_or_default();
-    format!("{exe}|{model}")
+    // a different login (another account) can offer other models
+    format!("{exe}|{model}|{}", login_stamp(provider))
+}
+
+/// Changes when the CLI's login file does (signing in as another account). Empty where it can't be told.
+pub fn login_stamp(provider: Provider) -> String {
+    if provider != Provider::CodexCli {
+        return String::new();
+    }
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+    let Some(meta) = home.and_then(|h| std::fs::metadata(h.join("auth.json")).ok()) else { return String::new() };
+    let secs = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{secs}:{}", meta.len())
+}
+
+static SEEN_LOGIN: parking_lot::Mutex<Vec<(u64, String)>> = parking_lot::Mutex::new(Vec::new());
+
+/// True once after the CLI of connection `id` was signed in again (its model list must be read anew).
+pub fn login_changed(id: u64, provider: Provider) -> bool {
+    let now = login_stamp(provider);
+    let mut g = SEEN_LOGIN.lock();
+    match g.iter_mut().find(|(i, _)| *i == id) {
+        Some((_, old)) if *old != now => {
+            *old = now;
+            true
+        }
+        Some(_) => false,
+        None => {
+            g.push((id, now));
+            false
+        }
+    }
 }
 
 async fn cached_catalog(provider: Provider, explicit: &str, model: &str) -> Option<String> {
