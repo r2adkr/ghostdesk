@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod account;
+mod agent_panel;
 mod connect;
 mod detail;
 mod fonts;

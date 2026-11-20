@@ -1,6 +1,7 @@
 //! Detail view for one agent: live screen, takeover, log and instructions.
 
 use super::*;
+use super::agent_panel::chat_log;
 use super::labels::display_status;
 
 /// One takeover input from the user, in agent coordinates.
@@ -38,6 +39,10 @@ impl GhostApp {
     /// Right panel of the detail view: name/status → controls → (question / external notice) → log
     /// → instruction box at the bottom.
     pub(super) fn detail_side(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
+        // an agent inside GhostDesk gets the conversation panel; one driven from another AI app is only watched
+        if self.agents[idx].shared.external.lock().is_none() {
+            return self.agent_panel(ui, idx);
+        }
         let compact_now = self.compact_now;
         let layout = &mut self.detail_layout;
         let a = &mut self.agents[idx];
@@ -630,7 +635,7 @@ fn list_item(line: &str) -> Option<&str> {
 }
 
 /// Splits a question into its text and the trailing list of answers (2–6 items) shown as buttons.
-fn split_choices(q: &str) -> (String, Vec<String>) {
+pub(super) fn split_choices(q: &str) -> (String, Vec<String>) {
     let lines: Vec<&str> = q.lines().collect();
     let mut end = lines.len();
     while end > 0 && lines[end - 1].trim().is_empty() { end -= 1; }
@@ -649,7 +654,7 @@ fn split_choices(q: &str) -> (String, Vec<String>) {
 }
 
 /// A reply with a numbered list of 2+ steps → (before, steps, after).
-fn split_plan(text: &str) -> Option<(String, Vec<String>, String)> {
+pub(super) fn split_plan(text: &str) -> Option<(String, Vec<String>, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let numbered = |l: &str| {
         let t = l.trim();
@@ -662,81 +667,6 @@ fn split_plan(text: &str) -> Option<(String, Vec<String>, String)> {
     if last == first { return None; }
     let steps = lines[first..=last].iter().filter_map(|l| list_item(l)).map(String::from).collect::<Vec<_>>();
     (steps.len() == last - first + 1).then(|| (lines[..first].join("\n").trim().to_string(), steps, lines[last + 1..].join("\n").trim().to_string()))
-}
-
-/// The conversation: your messages as bubbles, replies as text (a numbered list becomes a plan card),
-/// thinking and runs of actions folded into one-line cards you can open.
-fn chat_log(ui: &mut egui::Ui, log: &[crate::agent::LogEntry], acting: bool, agent: u64) {
-    ui.spacing_mut().item_spacing.y = 8.0;
-    let n = log.len();
-    let mut i = 0;
-    while i < n {
-        let l = &log[i];
-        match l.kind {
-            LogKind::User => {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    egui::Frame::new().fill(theme::raised()).corner_radius(theme::CARD_RADIUS).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
-                        ui.set_max_width((ui.available_width() * 0.88).max(120.0));
-                        ui.add(egui::Label::new(RichText::new(&l.text).color(theme::text())).wrap());
-                    });
-                });
-                i += 1;
-            }
-            LogKind::Assistant => {
-                match split_plan(&l.text) {
-                    Some((before, steps, after)) => {
-                        if !before.is_empty() { ui.add(egui::Label::new(RichText::new(before).color(theme::text())).wrap()); }
-                        theme::soft_card().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(theme::hint(format!("{}  {}", icon::LIST_TODO, tr("계획"))));
-                            for (k, step) in steps.iter().enumerate() {
-                                ui.horizontal_top(|ui| {
-                                    ui.label(theme::hint(format!("{}", k + 1)));
-                                    ui.add(egui::Label::new(RichText::new(step).color(theme::text())).wrap());
-                                });
-                            }
-                        });
-                        if !after.is_empty() { ui.add(egui::Label::new(RichText::new(after).color(theme::text())).wrap()); }
-                    }
-                    None => { ui.add(egui::Label::new(RichText::new(&l.text).size(14.0).color(theme::text())).wrap()); }
-                }
-                i += 1;
-            }
-            LogKind::Thinking | LogKind::Action => {
-                // fold the whole run of thinking/actions into one card
-                let start = i;
-                while i < n && matches!(log[i].kind, LogKind::Thinking | LogKind::Action) { i += 1; }
-                let run = &log[start..i];
-                let live = acting && i == n && run.iter().any(|e| e.kind == LogKind::Action);
-                let steps = run.iter().filter(|e| e.kind == LogKind::Action).count();
-                let head = if steps == 0 {
-                    tr("생각").to_string()
-                } else if live {
-                    run.iter().rev().find(|e| e.kind == LogKind::Action).map(|e| crate::llm::short(&e.text, 40)).unwrap_or_default()
-                } else {
-                    trf("작업 {}단계", &[&steps])
-                };
-                let id = egui::Id::new(("chat_run", agent, start));
-                egui::CollapsingHeader::new(RichText::new(head).size(13.0).color(theme::muted()))
-                    .id_salt(id)
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 6.0;
-                        let last_action = run.iter().rposition(|e| e.kind == LogKind::Action);
-                        for (k, e) in run.iter().enumerate() {
-                            log_row(ui, e, live && Some(k) == last_action);
-                        }
-                    });
-                if live {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-                }
-            }
-            _ => {
-                log_row(ui, l, false);
-                i += 1;
-            }
-        }
-    }
 }
 
 pub(super) fn log_row(ui: &mut egui::Ui, l: &crate::agent::LogEntry, live: bool) {
