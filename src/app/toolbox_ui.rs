@@ -2,6 +2,7 @@
 //! removed here; the person approves exactly what will run before it is added, and agents ask again the first
 //! time each tool is used.
 use super::*;
+use crate::skillbox::{self, Candidate, Skill};
 use crate::toolbox::{self, Server, Status};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -18,6 +19,13 @@ pub(super) struct State {
     env: String,
     /// The server waiting for the person's go-ahead (what will run is shown).
     confirm: Option<Server>,
+    skills: Vec<Skill>,
+    skills_loaded: bool,
+    candidates: Vec<Candidate>,
+    import_path: String,
+    importing: bool,
+    skill_confirm: Option<(Candidate, usize, u64)>,
+    skill_note: Option<String>,
 }
 
 /// Environment lines `KEY=VALUE` (blank and malformed lines are skipped).
@@ -220,6 +228,125 @@ impl GhostApp {
             if cancel {
                 self.toolbox.adding = false;
                 self.toolbox.note = None;
+            }
+        }
+        ui.add_space(18.0);
+        self.skills_section(ui);
+    }
+}
+
+impl GhostApp {
+    fn reload_skills(&mut self) {
+        self.toolbox.skills = skillbox::list();
+        self.toolbox.candidates = skillbox::candidates();
+        self.toolbox.skills_loaded = true;
+    }
+
+    /// Skills: imported folders agents can read when a task matches.
+    fn skills_section(&mut self, ui: &mut egui::Ui) {
+        if !self.toolbox.skills_loaded {
+            self.reload_skills();
+        }
+        theme::section(ui, tr("스킬"));
+        ui.add_space(4.0);
+        ui.label(theme::hint(tr("스킬은 특정 작업을 잘 하게 해 주는 안내서예요. 가져온 스킬은 이 앱 안에 복사되어 따로 보관돼요.")));
+        ui.add_space(8.0);
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        let mut toggle: Option<(usize, bool)> = None;
+        for (i, s) in self.toolbox.skills.iter().enumerate() {
+            theme::soft_card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&s.name).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::icon_button(ui, icon::X, tr("지우기")).clicked() {
+                            remove = Some(i);
+                        }
+                        let mut on = s.enabled;
+                        if ui.add(theme::switch(&mut on, "")).changed() {
+                            toggle = Some((i, on));
+                        }
+                    });
+                });
+                ui.label(theme::hint(crate::llm::short(&s.description, 160)));
+            });
+            ui.add_space(6.0);
+        }
+        if let Some((i, on)) = toggle {
+            if let Err(e) = skillbox::set_enabled(&self.toolbox.skills[i], on) {
+                self.toolbox.skill_note = Some(trf("저장하지 못했어요 ({})", &[&e]));
+            }
+            changed = true;
+        }
+        if let Some(i) = remove {
+            if let Err(e) = skillbox::remove(&self.toolbox.skills[i]) {
+                self.toolbox.skill_note = Some(trf("저장하지 못했어요 ({})", &[&e]));
+            }
+            changed = true;
+        }
+        if changed {
+            self.reload_skills();
+        }
+        if self.toolbox.skills.is_empty() {
+            ui.label(theme::hint(tr("아직 가져온 스킬이 없어요")));
+            ui.add_space(6.0);
+        }
+        if let Some(n) = &self.toolbox.skill_note {
+            ui.label(RichText::new(n.clone()).small().color(theme::danger()));
+        }
+        if let Some((c, files, bytes)) = self.toolbox.skill_confirm.clone() {
+            theme::tinted(theme::warn()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(trf("'{}' 스킬을 가져올까요?", &[&c.name])).strong());
+                ui.label(theme::hint(crate::llm::short(&c.description, 160)));
+                ui.label(theme::hint(trf("파일 {}개 · {}KB. 스킬에 든 스크립트는 에이전트가 실행하려 할 때 내게 허락을 물어요.", &[&files, &(bytes / 1024)])));
+                ui.horizontal(|ui| {
+                    if theme::primary(ui, tr("가져오기")).clicked() {
+                        match skillbox::import(&c.path) {
+                            Ok(_) => {
+                                self.toolbox.skill_note = None;
+                                self.toolbox.import_path.clear();
+                                self.reload_skills();
+                            }
+                            Err(e) => self.toolbox.skill_note = Some(tr(&e).to_string()),
+                        }
+                        self.toolbox.skill_confirm = None;
+                    }
+                    if theme::secondary(ui, tr("취소")).clicked() {
+                        self.toolbox.skill_confirm = None;
+                    }
+                });
+            });
+            return;
+        }
+        let mut pick: Option<std::path::PathBuf> = None;
+        if !self.toolbox.candidates.is_empty() {
+            ui.label(theme::hint(tr("이 컴퓨터에서 찾은 스킬")));
+            for c in &self.toolbox.candidates {
+                ui.horizontal(|ui| {
+                    if theme::secondary(ui, tr("가져오기")).clicked() {
+                        pick = Some(c.path.clone());
+                    }
+                    ui.label(RichText::new(&c.name).strong()).on_hover_text(crate::llm::short(&c.description, 200));
+                });
+            }
+            ui.add_space(6.0);
+        }
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 90.0).max(120.0);
+            ui.add(egui::TextEdit::singleline(&mut self.toolbox.import_path).desired_width(w).margin(Margin::symmetric(10, 6)).hint_text(tr("스킬 폴더 경로 (SKILL.md 가 든 폴더)")));
+            if theme::secondary(ui, tr("확인")).clicked() && !self.toolbox.import_path.trim().is_empty() {
+                pick = Some(std::path::PathBuf::from(self.toolbox.import_path.trim()));
+            }
+        });
+        if let Some(path) = pick {
+            match skillbox::inspect(&path) {
+                Ok(found) => {
+                    self.toolbox.skill_note = None;
+                    self.toolbox.skill_confirm = Some(found);
+                }
+                Err(e) => self.toolbox.skill_note = Some(tr(&e).to_string()),
             }
         }
     }

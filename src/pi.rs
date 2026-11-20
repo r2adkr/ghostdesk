@@ -155,7 +155,7 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
 /// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
 /// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
 /// person for approval first.
-pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool) -> String {
+pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool, skills: &[(String, PathBuf)]) -> String {
     let (top, hook) = match (files, mcp) {
         (Some(dir), _) => (
             format!(
@@ -185,7 +185,7 @@ const DENIED = {{ block: true, reason: "The human operator did not allow this. D
                 work = Value::String(dir.display().to_string()),
             ),
             r#"
-  const ours = new Set(TOOLS.map((t) => t.name));
+  const ours = new Set([...TOOLS.map((t) => t.name), "read_skill"]);
   const okMcp = new Set();
   pi.on("tool_call", async (event, ctx) => {
     const n = event.toolName;
@@ -215,7 +215,7 @@ const DENIED = { block: true, reason: "The human operator did not allow this. Do
 "#
             .to_string(),
             r#"
-  const ours = new Set(TOOLS.map((t) => t.name));
+  const ours = new Set([...TOOLS.map((t) => t.name), "read_skill"]);
   const okMcp = new Set();
   pi.on("tool_call", async (event, ctx) => {
     const n = event.toolName;
@@ -229,12 +229,44 @@ const DENIED = { block: true, reason: "The human operator did not allow this. Do
         ),
         (None, false) => (String::new(), String::new()),
     };
+    let skill_tool = if skills.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<Value> = skills.iter().map(|(n, d)| json!({ "name": n, "dir": d.display().to_string() })).collect();
+        format!(
+            r#"
+  const SKILLS = {list};
+  pi.registerTool({{
+    name: "read_skill", label: "read_skill",
+    description: "Read a skill's instructions (SKILL.md) or a file that belongs to it. Skills are listed in the system prompt.",
+    parameters: {{ type: "object", properties: {{ name: {{ type: "string", description: "Skill name" }}, file: {{ type: "string", description: "File inside the skill folder; default SKILL.md" }} }}, required: ["name"] }},
+    async execute(id, params) {{
+      const sk = SKILLS.find((s) => s.name === params.name);
+      if (!sk) throw new Error("No such skill.");
+      const root = rps(sk.dir);
+      const target = rps(res(root, String(params.file ?? "SKILL.md")));
+      const r = rel2(root, target);
+      if (r.startsWith("..") || isabs(r)) throw new Error("Outside the skill folder.");
+      const text = rfs(target, "utf8");
+      return {{ content: [{{ type: "text", text: text.length > 40000 ? text.slice(0, 40000) + "\n…(truncated)" : text }}], details: {{}} }};
+    }},
+  }});"#,
+            list = Value::Array(list)
+        )
+    };
+    let skill_import = if skills.is_empty() {
+        ""
+    } else {
+        "
+import { readFileSync as rfs, realpathSync as rps } from \"node:fs\";
+import { resolve as res, relative as rel2, isAbsolute as isabs } from \"node:path\";"
+    };
     format!(
         r#"const TOOLS = {tools};
 const SYSTEM = {system};
-const MARK = "\u0001gd\u0001";{top}
+const MARK = "\u0001gd\u0001";{skill_import}{top}
 export default function (pi) {{
-  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));{hook}
+  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));{hook}{skill_tool}
   for (const t of TOOLS) {{
     pi.registerTool({{
       name: t.name, label: t.name, description: t.description, parameters: t.parameters,
@@ -253,6 +285,8 @@ export default function (pi) {{
         system = Value::String(system.to_string()),
         top = top,
         hook = hook,
+        skill_tool = skill_tool,
+        skill_import = skill_import,
     )
 }
 
@@ -371,7 +405,7 @@ fn home_dir() -> PathBuf {
 }
 
 /// Command-line arguments for one pi process.
-pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8, mcp: &[crate::toolbox::Server]) -> Vec<String> {
+pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8, mcp: &[crate::toolbox::Server], skills: &[PathBuf]) -> Vec<String> {
     let mut a: Vec<String> = ["--mode", "rpc", "--no-session", "--provider", provider, "--model", model]
         .into_iter()
         .map(String::from)
@@ -392,6 +426,9 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, t
         // the tool box (found through tool search; a server's exposure decides what is shown up front)
         let mut all: Vec<String> = tools.to_vec();
         all.extend(file_tools(files).iter().map(|t| t.to_string()));
+        if !skills.is_empty() {
+            all.push("read_skill".into());
+        }
         if !mcp.is_empty() {
             all.push("tool_search".into());
             all.extend(mcp.iter().map(|s| format!("{}*", s.tool_prefix())));
@@ -577,9 +614,16 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
     }
     // the tool box: switched-on servers (the engine reads them from its private folder)
     let mcp = crate::toolbox::active();
+    let skills: Vec<crate::skillbox::Skill> = crate::skillbox::list().into_iter().filter(|s| s.enabled).collect();
     let mut system = system.to_string();
     if !mcp.is_empty() {
         system.push_str("\n\nTool box: extra tools from connected services are available. Use tool_search to find them by what you need; each tool is shown to the human for approval the first time you use it. If they refuse, do not retry.");
+    }
+    if !skills.is_empty() {
+        system.push_str("\n\nSkills (instructions for particular kinds of work). When a task matches one, read it first with read_skill before acting:");
+        for k in &skills {
+            system.push_str(&format!("\n- {}: {}", k.name, crate::llm::short(&k.description, 300)));
+        }
     }
     if let Some(dir) = &work {
         system.push_str(&format!(
@@ -588,10 +632,10 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
             dir.display()
         ));
     }
-    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty()))?;
+    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty(), &skills.iter().map(|k| (k.name.clone(), k.path.clone())).collect::<Vec<_>>()))?;
     let names: Vec<String> = tool_defs(tools).iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
     let cwd = work.clone().unwrap_or_else(|| home.clone());
-    let spec = Spec { extension: &extension.0, tools: names, cwd, mcp };
+    let spec = Spec { extension: &extension.0, tools: names, cwd, mcp, skills: skills.iter().map(|k| k.path.clone()).collect() };
     drive_agent(shared, cfg, ws, &exe, &home, &spec, name, env_key, membership, rx).await.map(|_| None)
 }
 
@@ -601,6 +645,7 @@ struct Spec<'a> {
     tools: Vec<String>,
     cwd: PathBuf,
     mcp: Vec<crate::toolbox::Server>,
+    skills: Vec<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -671,7 +716,7 @@ async fn drive_agent(
         }
         if proc.is_none() {
             let mut c = base_command(exe, home, &spec.cwd, env_key, &cfg.llm.api_key);
-            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp));
+            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp, &spec.skills));
             proc = Some(Proc::spawn(c)?);
         }
         let p = proc.as_mut().expect("just started");
@@ -833,39 +878,40 @@ mod tests {
 
     #[test]
     fn args_isolate_pi_and_keep_the_key_out() {
-        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0, &[]);
+        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0, &[], &[]);
         for f in ["--no-builtin-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--no-session"] {
             assert!(a.iter().any(|x| x == f), "{f}");
         }
         assert!(a.windows(2).any(|w| w == ["-e", "/x/bridge.mjs"]));
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
-        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[]).iter().any(|x| x == "--thinking"));
+        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[], &[]).iter().any(|x| x == "--thinking"));
     }
 
     #[test]
     fn tool_box_adds_mcp_and_tool_search_but_never_codemode() {
         let srv = crate::toolbox::Server { name: "my-fs".into(), command: "x".into(), args: vec![], url: String::new(), env: vec![], enabled: true, exposure: "deferred".into() };
         let tools = vec!["computer".to_string()];
-        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()]);
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()], &[PathBuf::from("/s/a")]);
         assert!(!a.iter().any(|x| x == "--no-mcp" || x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["-e", "builtin:mcp"]));
         assert!(a.windows(2).any(|w| w == ["--exclude-tools", "codemode"]));
-        assert!(a.windows(2).any(|w| w == ["--tools", "computer,tool_search,mcp__my_fs__*"]));
-        assert!(extension_source(&[], "s", None, true).contains("mcp__"));
+        assert!(extension_source(&[], "s", None, true, &[]).contains("mcp__"));
+        assert!(a.windows(2).any(|w| w == ["--tools", "computer,read_skill,tool_search,mcp__my_fs__*"]));
+        assert!(extension_source(&[], "s", None, false, &[("demo".into(), PathBuf::from("/s/demo"))]).contains("read_skill"));
     }
 
     #[test]
     fn file_tools_are_allowed_by_level_and_ask_before_leaving_the_folder() {
         let tools = vec!["computer".to_string(), "ask_user".to_string()];
-        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[]);
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[], &[]);
         assert!(!a.iter().any(|x| x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["--tools", "computer,ask_user,read,grep,find,ls"]));
-        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[]);
+        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[], &[]);
         assert!(b.iter().any(|x| x.ends_with("write,edit,bash")));
-        let src = extension_source(&[], "s", Some(Path::new("/work/files")), false);
+        let src = extension_source(&[], "s", Some(Path::new("/work/files")), false, &[]);
         assert!(src.contains(r#"const WORK = "/work/files";"#) && src.contains("tool_call") && src.contains("DENIED"));
-        assert!(!extension_source(&[], "s", None, false).contains("tool_call"));
+        assert!(!extension_source(&[], "s", None, false, &[]).contains("tool_call"));
         let ask = json!({ "type": "extension_ui_request", "id": "a1", "method": "input", "title": format!("{ASK}{}", json!({ "tool": "bash", "what": "ls" })) });
         assert_eq!(parse_event(&ask.to_string()), Some(Event::Ask { ui_id: "a1".into(), tool: "bash".into(), what: "ls".into() }));
     }
@@ -919,7 +965,7 @@ mod tests {
     #[test]
     fn the_extension_carries_tools_and_the_system_prompt() {
         let tools = vec![json!({ "name": "ask_user", "description": "d", "parameters": { "type": "object" } })];
-        let src = extension_source(&tools, "Line 1\n\"quoted\"", None, false);
+        let src = extension_source(&tools, "Line 1\n\"quoted\"", None, false, &[]);
         assert!(src.contains(r#""name":"ask_user""#));
         assert!(src.contains(r#"const SYSTEM = "Line 1\n\"quoted\"";"#));
         assert!(src.contains("before_agent_start"));
