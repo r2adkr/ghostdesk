@@ -84,6 +84,10 @@ pub fn install() -> Result<(), String> {
 }
 
 pub fn find() -> Option<PathBuf> {
+    // lets screenshots and tests show the not-installed state
+    if std::env::var_os("GHOSTDESK_NO_PI").is_some() {
+        return None;
+    }
     crate::install::find_cli("pi")
 }
 
