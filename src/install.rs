@@ -931,7 +931,7 @@ fn sweep_install_leftovers(dir: &Path) {
 // ---- SHA-256 ----
 // hand-rolled to avoid another dependency (a fingerprint for deciding whether to install)
 
-struct Sha256 {
+pub(crate) struct Sha256 {
     h: [u32; 8],
     buf: [u8; 64],
     buf_len: usize,
@@ -948,7 +948,7 @@ const SHA256_K: [u32; 64] = [
 ];
 
 impl Sha256 {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Sha256 {
             h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
             buf: [0; 64],
@@ -989,7 +989,7 @@ impl Sha256 {
         }
     }
 
-    fn update(&mut self, mut data: &[u8]) {
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u64);
         if self.buf_len > 0 {
             let n = (64 - self.buf_len).min(data.len());
@@ -1012,7 +1012,7 @@ impl Sha256 {
         self.buf_len = rest.len();
     }
 
-    fn finish_hex(mut self) -> String {
+    pub(crate) fn finish_hex(mut self) -> String {
         let bits = self.total.wrapping_mul(8);
         let mut pad = vec![0x80u8];
         let used = (self.buf_len + 1) % 64;

@@ -31,7 +31,7 @@ pub fn install_command() -> &'static str {
     if cfg!(windows) {
         "powershell -c \"irm https://pi.dev/install.ps1 | iex\""
     } else {
-        "curl -fsSL https://pi.dev/install.sh | sh"
+        "curl --proto '=https' --tlsv1.2 -fsSL https://pi.dev/install.sh | sh"
     }
 }
 
@@ -154,7 +154,7 @@ export default function (pi) {{
 
 /// The tools in pi's shape, from the Claude-format list the built-in loop uses.
 pub fn tool_defs(tools: &Value) -> Vec<Value> {
-    crate::llm::function_tools(tools)
+    crate::llm::cli_tools(tools)
         .as_array()
         .into_iter()
         .flatten()
@@ -384,6 +384,14 @@ struct Outcome {
     closed: bool,
 }
 
+/// A file removed when dropped (also when the agent is cancelled mid-run).
+struct TempFile(PathBuf);
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Everything `run` needs from the agent.
 pub struct Job<'a> {
     pub shared: &'a Arc<AgentShared>,
@@ -417,14 +425,18 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
     let (Some(exe), Some((name, env_key))) = (find(), provider_args(cfg.llm.provider)) else { return Ok(false) };
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
+    }
     if !model_known(&exe, &home, name, env_key, &cfg.llm).await {
         return Ok(false);
     }
-    let extension = home.join(format!("bridge-{}.mjs", shared.id));
-    std::fs::write(&extension, extension_source(&tool_defs(tools), system))?;
-    let result = drive_agent(shared, cfg, ws, &exe, &home, &extension, name, env_key, membership, rx).await;
-    let _ = std::fs::remove_file(&extension);
-    result.map(|_| true)
+    // per process and agent, so two GhostDesk windows never share (or delete) each other's file
+    let extension = TempFile(home.join(format!("bridge-{}-{}.mjs", std::process::id(), shared.id)));
+    std::fs::write(&extension.0, extension_source(&tool_defs(tools), system))?;
+    drive_agent(shared, cfg, ws, &exe, &home, &extension.0, name, env_key, membership, rx).await.map(|_| true)
 }
 
 #[allow(clippy::too_many_arguments)]

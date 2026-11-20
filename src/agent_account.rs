@@ -146,13 +146,14 @@ pub async fn create(name: &str) -> Result<String> {
     // the session setup that needs no click (helper, LaunchAgent, lock screen) runs in the same administrator step,
     // so there is a single password prompt; if it can't be staged the account is still made
     let staged = stage_setup(name).ok();
-    let chained = match &staged {
-        Some((_, path)) => format!("{command}; /bin/sh {}", path.display()),
-        None => command.clone(),
+    let chained = match staged.as_ref().map(|(_, path)| guarded_command(path)) {
+        Some(Ok(run)) => format!("{command}; {run}"),
+        _ => command.clone(),
     };
     // `chained` holds only the validated name, an alphanumeric password and paths we made, so it can sit in an AppleScript string
     let script = format!(
-        "do shell script \"{chained}\" with administrator privileges with prompt \"GhostDesk 가 에이전트 전용 계정 '{name}' 을(를) 만들고 세션 설정을 적용합니다\""
+        "do shell script \"{}\" with administrator privileges with prompt \"GhostDesk 가 에이전트 전용 계정 '{name}' 을(를) 만들고 세션 설정을 적용합니다\"",
+        applescript_string(&chained)
     );
     let out = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(script).output().await;
     if let Some((dir, _)) = &staged {
@@ -282,6 +283,35 @@ pub fn session_setup_script(account: &str, exe: &str, plist: &str) -> Result<Str
     ))
 }
 
+/// The administrator step must run exactly the script that was just staged. The staging folder belongs to the
+/// current user, so another process of theirs could swap the file between writing it and root running it.
+/// This reads the file once, checks its hash and runs what it read (not the path again).
+#[cfg(target_os = "macos")]
+fn guarded_command(script: &std::path::Path) -> Result<String> {
+    let body = std::fs::read(script)?;
+    let trimmed: &[u8] = {
+        let mut end = body.len();
+        while end > 0 && body[end - 1] == b'\n' {
+            end -= 1;
+        }
+        &body[..end]
+    };
+    let mut h = crate::install::Sha256::new();
+    h.update(trimmed);
+    let hash = h.finish_hex();
+    let path = script.display().to_string();
+    anyhow::ensure!(!path.contains(['\'', '"', '\\', '$', '`']), "경로에 쓸 수 없는 문자가 있어요");
+    Ok(format!(
+        "s=$(/bin/cat '{path}'); [ \"$(printf %s \"$s\" | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1)\" = {hash} ] && /bin/sh -c \"$s\""
+    ))
+}
+
+/// Text for an AppleScript string literal.
+#[cfg(target_os = "macos")]
+fn applescript_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Writes the setup script and the LaunchAgent plist into a private temp folder; returns `(folder, script path)`.
 #[cfg(target_os = "macos")]
 fn stage_setup(account: &str) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
@@ -315,9 +345,16 @@ pub async fn setup_session(account: &str) -> Result<()> {
         bail!("'{account}' 계정이 없습니다");
     }
     let (dir, script_path) = stage_setup(account)?;
+    let run = match guarded_command(&script_path) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     let osa = format!(
-        "do shell script \"/bin/sh {}\" with administrator privileges with prompt \"GhostDesk 가 '{account}' 계정의 세션 설정을 적용합니다\"",
-        script_path.display()
+        "do shell script \"{}\" with administrator privileges with prompt \"GhostDesk 가 '{account}' 계정의 세션 설정을 적용합니다\"",
+        applescript_string(&run)
     );
     let res = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(osa).output().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -448,9 +485,16 @@ pub async fn import_browser_login(account: &str, browser: &crate::profiles::Inst
     };
     std::fs::write(&script_path, script)?;
     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))?;
+    let run = match guarded_command(&script_path) {
+        Ok(r) => r,
+        Err(e) => {
+            cleanup(&stage);
+            return Err(e);
+        }
+    };
     let osa = format!(
-        "do shell script \"/bin/sh {}\" with administrator privileges with prompt \"GhostDesk 가 브라우저 로그인을 '{account}' 계정으로 복사합니다\"",
-        script_path.display()
+        "do shell script \"{}\" with administrator privileges with prompt \"GhostDesk 가 브라우저 로그인을 '{account}' 계정으로 복사합니다\"",
+        applescript_string(&run)
     );
     let res = tokio::process::Command::new("/usr/bin/osascript").arg("-e").arg(osa).output().await;
     cleanup(&stage);
@@ -535,5 +579,30 @@ mod tests {
         assert!(create_command("x; rm -rf /", "Abcdefghjk23456789xy").is_err());
         assert!(create_command("ok", "has space and 'quote'").is_err());
         assert!(create_command("ok", "short").is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_swapped_script_does_not_run() {
+        let dir = std::env::temp_dir().join(format!("gd-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (script, mark) = (dir.join("run.sh"), dir.join("ran"));
+        std::fs::write(&script, format!("touch '{}'\n", mark.display())).unwrap();
+        let run = guarded_command(&script).unwrap();
+        // the unchanged script runs
+        assert!(std::process::Command::new("/bin/sh").args(["-c", &run]).status().unwrap().success());
+        assert!(mark.exists());
+        std::fs::remove_file(&mark).unwrap();
+        // a replaced one does not
+        std::fs::write(&script, format!("touch '{}'\n# changed\n", mark.display())).unwrap();
+        assert!(!std::process::Command::new("/bin/sh").args(["-c", &run]).status().unwrap().success());
+        assert!(!mark.exists());
+        assert_eq!(applescript_string(r#"a"b\c"#), r#"a\"b\\c"#);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

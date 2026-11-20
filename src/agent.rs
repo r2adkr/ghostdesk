@@ -45,6 +45,8 @@ pub(crate) use workspace::prepare_workspace_with;
 /// dropped, so memory doesn't grow on long runs.
 const LOG_CAP: usize = 2000;
 const LOG_DRAIN: usize = 500;
+/// Longest single log row kept (bytes).
+const LOG_TEXT_MAX: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentStatus {
@@ -233,7 +235,14 @@ impl AgentShared {
         if log.len() >= LOG_CAP {
             log.drain(..LOG_DRAIN);
         }
-        log.push(LogEntry { kind, text: text.into(), secs: self.started.elapsed().as_secs_f32() });
+        let mut text: String = text.into();
+        // one huge message (a command's output, a long page) must not pin megabytes in the log
+        if text.len() > LOG_TEXT_MAX {
+            let cut = (0..=LOG_TEXT_MAX).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+            text.truncate(cut);
+            text.push('…');
+        }
+        log.push(LogEntry { kind, text, secs: self.started.elapsed().as_secs_f32() });
         drop(log);
         self.ctx.request_repaint();
     }
