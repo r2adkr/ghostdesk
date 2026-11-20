@@ -291,6 +291,7 @@ pub struct GhostApp {
     /// once with the permission bypass). Off refuses them. The password managers and GhostDesk itself
     /// stay refused either way.
     allow_shell_tools: bool,
+    live_fps_limit: u32,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
@@ -438,6 +439,7 @@ impl GhostApp {
             pip_auto_close: true,
             auto_approve: false,
             allow_shell_tools: true,
+            live_fps_limit: 60,
             allow_experimental: false,
             tour: None,
             tour_seen: false,
@@ -715,6 +717,7 @@ impl eframe::App for GhostApp {
             }
         }
         crate::control::set_shell_tools_allowed(self.allow_shell_tools);
+        crate::rfb::set_live_fps_limit(self.live_fps_limit);
         self.poll_route(&ctx);
         self.approval_window(&ctx);
         self.spawn_demos(&ctx);

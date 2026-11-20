@@ -43,6 +43,8 @@ pub(super) struct Prefs {
     auto_approve: Option<bool>,
     /// Windows: external agents may open shells, terminals and system tools (default on: each one asks).
     allow_shell_tools: Option<bool>,
+    /// Live view frame-rate ceiling.
+    live_fps_limit: Option<u32>,
     allow_experimental: Option<bool>,
     /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
@@ -184,6 +186,7 @@ impl GhostApp {
         self.ssh_profiles = p.ssh_profiles;
         self.auto_approve = p.auto_approve.unwrap_or(false);
         self.allow_shell_tools = p.allow_shell_tools.unwrap_or(true);
+        self.live_fps_limit = p.live_fps_limit.unwrap_or(60).clamp(1, 120);
         self.allow_experimental = p.allow_experimental.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
@@ -220,6 +223,7 @@ impl GhostApp {
             pip_auto_close: Some(self.pip_auto_close),
             auto_approve: Some(self.auto_approve),
             allow_shell_tools: Some(self.allow_shell_tools),
+            live_fps_limit: Some(self.live_fps_limit),
             allow_experimental: Some(self.allow_experimental),
             tour_seen: Some(self.tour_seen),
             other: self.prefs_other.clone(),

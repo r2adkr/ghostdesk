@@ -486,6 +486,17 @@ pub fn is_local_addr(addr: std::net::SocketAddr) -> bool {
     std::net::UdpSocket::bind(probe).is_ok()
 }
 
+static LIVE_FPS_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+/// User-set ceiling for the live view's frame rate (1..=120).
+pub fn set_live_fps_limit(fps: u32) {
+    LIVE_FPS_LIMIT.store(fps.clamp(1, 120), Ordering::Relaxed);
+}
+
+pub fn live_fps_limit() -> u32 {
+    LIVE_FPS_LIMIT.load(Ordering::Relaxed)
+}
+
 impl RfbDesk {
     pub async fn connect_with(mut opts: RfbOptions, on_frame: FrameCallback) -> Result<Arc<RfbDesk>> {
         let (h, p) = normalize_endpoint(&opts.host, opts.port);
