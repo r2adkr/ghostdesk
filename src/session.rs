@@ -1225,7 +1225,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions {
             max_long_edge: DEFAULT_MAX_LONG_EDGE,
-            live_fps: (crate::rfb::live_fps_limit() as f64).min(30.0),
+            live_fps: crate::rfb::live_fps_limit() as f64,
             live_max_long_edge: 960,
             reconnect_window: Duration::from_secs(5),
         }
@@ -1432,7 +1432,7 @@ impl SessionDesk {
         *me.conn.lock().await = Some(c);
         if me.opts.live_fps > 0.0 {
             let weak = Arc::downgrade(&me);
-            let period = Duration::from_secs_f64(1.0 / me.opts.live_fps.clamp(0.1, 30.0));
+            let period = Duration::from_secs_f64(1.0 / me.opts.live_fps.clamp(0.1, 120.0));
             *me.poller.lock() = Some(tokio::spawn(live_poller(weak, period)));
         }
         Ok(me)

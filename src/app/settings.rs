@@ -555,7 +555,11 @@ impl GhostApp {
         {
             ui.label(tr("원격 화면 최대 프레임 (fps)"));
             ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"));
-            ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 30fps까지만 올라가요")));
+            if self.live_fps_limit > 30 {
+                ui.label(RichText::new(tr("30fps보다 높으면 CPU와 네트워크를 많이 써서 오히려 끊기거나 컴퓨터가 느려질 수 있어요. 느려지면 낮추세요")).size(12.0).color(theme::warn()));
+            } else {
+                ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 이 값이 호스트 모드를 포함한 모든 원격 화면의 상한이에요")));
+            }
         }
     }
 
