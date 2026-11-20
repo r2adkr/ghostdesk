@@ -184,11 +184,16 @@ pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<S
     let mut ids: Vec<String> = Vec::new();
     // Anthropic returns at most 100 per page, so follow `after_id` until `has_more` is false
     let mut after: Option<String> = None;
+    // Gemini-style lists come in pages of 50 with a token for the next one
+    let mut page_token: Option<String> = None;
     for _ in 0..20 {
         let url = match (p, &after) {
             (Provider::Anthropic, None) => format!("{base_url}/v1/models?limit=100"),
             (Provider::Anthropic, Some(a)) => format!("{base_url}/v1/models?limit=100&after_id={a}"),
-            _ => format!("{base_url}/models"),
+            (_, _) => match &page_token {
+                None => format!("{base_url}/models?pageSize=1000"),
+                Some(t) => format!("{base_url}/models?pageSize=1000&pageToken={t}"),
+            },
         };
         let mut req = auth(http().get(url), p, key).timeout(Duration::from_secs(20));
         if p == Provider::Anthropic {
@@ -211,6 +216,15 @@ pub async fn list_models(p: Provider, base_url: &str, key: &str) -> Result<Vec<S
                 .map(|id| id.trim_start_matches("models/").to_string())
                 .filter(|id| !SKIP.iter().any(|s| id.to_lowercase().contains(s))),
         );
+        if p != Provider::Anthropic {
+            match v["nextPageToken"].as_str().filter(|t| !t.is_empty()) {
+                Some(t) => {
+                    page_token = Some(t.to_string());
+                    continue;
+                }
+                None => break,
+            }
+        }
         match v["last_id"].as_str() {
             Some(last) if p == Provider::Anthropic && v["has_more"].as_bool() == Some(true) => after = Some(last.to_string()),
             _ => break,
