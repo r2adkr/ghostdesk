@@ -189,6 +189,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         name: "cli".into(),
         team: None,
         workspace: ws_name.clone(),
+        use_pi: false,
         task,
         // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend
         target: if let Ok(name) = std::env::var("GHOSTDESK_TEST_ELECTRON") {

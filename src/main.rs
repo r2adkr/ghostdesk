@@ -40,6 +40,7 @@ mod profiles;
 mod rfb;
 mod ssh;
 mod cli;
+mod pi;
 mod selftest;
 mod team;
 mod turns;

@@ -148,6 +148,8 @@ pub struct AgentConfig {
     /// language.
     pub reply_lang: &'static str,
     pub llm: Llm,
+    /// Run through pi instead of GhostDesk's own loop (only for key-based AIs, when pi is installed).
+    pub use_pi: bool,
 }
 
 /// Name an agent's usage is counted under in the Usage tab: the AI and its model.
@@ -245,7 +247,7 @@ impl AgentShared {
         self.status.lock().clone()
     }
 
-    async fn wait_for_stop(&self) {
+    pub(crate) async fn wait_for_stop(&self) {
         while !self.stop.load(Ordering::SeqCst) && !self.removed.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(75)).await;
         }
@@ -315,6 +317,9 @@ pub async fn run_agent(shared: Arc<AgentShared>, cfg: AgentConfig, mut rx: mpsc:
 }
 
 async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<()> {
+    if cfg.use_pi && crate::pi::supports(cfg.llm.provider) {
+        return crate::pi::run(shared, cfg, rx).await;
+    }
     if cfg.llm.provider.is_cli() {
         crate::cli::verify_login(cfg.llm.provider, &cfg.llm.base_url).await?;
     }

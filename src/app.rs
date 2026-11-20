@@ -27,6 +27,7 @@ mod ai;
 mod i18n;
 mod labels;
 mod palette;
+mod pi_settings;
 mod pip;
 mod prefs;
 mod route;
@@ -292,6 +293,11 @@ pub struct GhostApp {
     /// stay refused either way.
     allow_shell_tools: bool,
     live_fps_limit: u32,
+    /// Run key-based AI agents through pi when it is installed.
+    use_pi: bool,
+    pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    pi_confirm: bool,
+    pi_note: Option<String>,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
     /// Whether sleep is being blocked right now (`keep_awake` and an agent working).
@@ -440,6 +446,10 @@ impl GhostApp {
             auto_approve: false,
             allow_shell_tools: true,
             live_fps_limit: 60,
+            use_pi: false,
+            pi_install: None,
+            pi_confirm: false,
+            pi_note: None,
             allow_experimental: false,
             tour: None,
             tour_seen: false,

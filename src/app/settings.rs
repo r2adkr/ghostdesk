@@ -580,6 +580,8 @@ impl GhostApp {
                 }
             }
         }
+        ui.add_space(14.0);
+        self.pi_section(ui);
         ui.add_space(4.0);
         if prefs::CAN_REMEMBER_KEYS {
             ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
