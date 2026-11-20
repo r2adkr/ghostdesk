@@ -155,9 +155,9 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
 /// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
 /// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
 /// person for approval first.
-pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>) -> String {
-    let (top, hook) = match files {
-        Some(dir) => (
+pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool) -> String {
+    let (top, hook) = match (files, mcp) {
+        (Some(dir), _) => (
             format!(
                 r#"
 const WORK = {work};
@@ -186,9 +186,17 @@ const DENIED = {{ block: true, reason: "The human operator did not allow this. D
             ),
             r#"
   const ours = new Set(TOOLS.map((t) => t.name));
+  const okMcp = new Set();
   pi.on("tool_call", async (event, ctx) => {
     const n = event.toolName;
     if (ours.has(n)) return;
+    if (n.startsWith("mcp__") || n === "read_mcp_resource") {
+      if (okMcp.has(n)) return;
+      const what = n + " " + JSON.stringify(event.input ?? {}).slice(0, 300);
+      if (!(await allowed(ctx, "mcp", what))) return DENIED;
+      okMcp.add(n);
+      return;
+    }
     if (n === "bash") return (await allowed(ctx, n, String(event.input.command ?? ""))) ? undefined : DENIED;
     const p = event.input.path ?? event.input.file_path ?? ".";
     if (inside(p)) return;
@@ -196,7 +204,30 @@ const DENIED = {{ block: true, reason: "The human operator did not allow this. D
   });"#
                 .to_string(),
         ),
-        None => (String::new(), String::new()),
+        (None, true) => (
+            r#"
+const ASK = "\u0001ask\u0001";
+async function allowed(ctx, tool, what) {
+  const v = await ctx.ui.input(ASK + JSON.stringify({ tool, what }), "");
+  return v === "yes";
+}
+const DENIED = { block: true, reason: "The human operator did not allow this. Do not retry it; continue without it or ask the human." };
+"#
+            .to_string(),
+            r#"
+  const ours = new Set(TOOLS.map((t) => t.name));
+  const okMcp = new Set();
+  pi.on("tool_call", async (event, ctx) => {
+    const n = event.toolName;
+    if (ours.has(n) || !(n.startsWith("mcp__") || n === "read_mcp_resource")) return;
+    if (okMcp.has(n)) return;
+    const what = n + " " + JSON.stringify(event.input ?? {}).slice(0, 300);
+    if (!(await allowed(ctx, "mcp", what))) return DENIED;
+    okMcp.add(n);
+  });"#
+                .to_string(),
+        ),
+        (None, false) => (String::new(), String::new()),
     };
     format!(
         r#"const TOOLS = {tools};
@@ -340,20 +371,31 @@ fn home_dir() -> PathBuf {
 }
 
 /// Command-line arguments for one pi process.
-pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8) -> Vec<String> {
+pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8, mcp: &[crate::toolbox::Server]) -> Vec<String> {
     let mut a: Vec<String> = ["--mode", "rpc", "--no-session", "--provider", provider, "--model", model]
         .into_iter()
         .map(String::from)
         .collect();
     // nothing of pi's own beyond the chosen file tools: no MCP servers, no discovered extensions, skills,
     // templates, themes or project context files
-    a.extend(["--no-mcp", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"].map(String::from));
-    if files == 0 {
+    a.extend(["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"].map(String::from));
+    if mcp.is_empty() {
+        a.push("--no-mcp".into());
+    } else {
+        // only the MCP support itself and tool search (tools are found on demand); never codemode scripts
+        a.extend(["-e", "builtin:mcp", "-e", "builtin:tool-search", "--exclude-tools", "codemode"].map(String::from));
+    }
+    if files == 0 && mcp.is_empty() {
         a.push("--no-builtin-tools".into());
     } else {
-        // the allowlist names every tool the model gets: GhostDesk's own plus the file tools of this level
+        // the allowlist names every tool the model gets: GhostDesk's own, the file tools of this level and
+        // the tool box (found through tool search; a server's exposure decides what is shown up front)
         let mut all: Vec<String> = tools.to_vec();
         all.extend(file_tools(files).iter().map(|t| t.to_string()));
+        if !mcp.is_empty() {
+            all.push("tool_search".into());
+            all.extend(mcp.iter().map(|s| format!("{}*", s.tool_prefix())));
+        }
         a.push("--tools".into());
         a.push(all.join(","));
     }
@@ -366,17 +408,20 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, t
     a
 }
 
-fn base_command(exe: &Path, home: &Path, cwd: &Path, env_key: &str, api_key: &str) -> std::process::Command {
+/// A pi command in the private config folder (no key, no session).
+pub fn engine_command(exe: &Path, home: &Path) -> std::process::Command {
     let mut c = crate::install::cli_command(exe);
+    c.env("PI_CODING_AGENT_DIR", home).env("PI_SKIP_VERSION_CHECK", "1").env("PI_TELEMETRY", "0").stdin(Stdio::null());
+    c
+}
+
+fn base_command(exe: &Path, home: &Path, cwd: &Path, env_key: &str, api_key: &str) -> std::process::Command {
+    let mut c = engine_command(exe, home);
     #[cfg(not(windows))]
     c.current_dir(cwd);
     #[cfg(windows)]
     let _ = cwd;
-    c.env(env_key, api_key)
-        .env("PI_CODING_AGENT_DIR", home)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env("PI_TELEMETRY", "0")
-        .stdin(Stdio::null());
+    c.env(env_key, api_key);
     c
 }
 
@@ -530,7 +575,12 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
     if let Some(dir) = &work {
         std::fs::create_dir_all(dir)?;
     }
+    // the tool box: switched-on servers (the engine reads them from its private folder)
+    let mcp = crate::toolbox::active();
     let mut system = system.to_string();
+    if !mcp.is_empty() {
+        system.push_str("\n\nTool box: extra tools from connected services are available. Use tool_search to find them by what you need; each tool is shown to the human for approval the first time you use it. If they refuse, do not retry.");
+    }
     if let Some(dir) = &work {
         system.push_str(&format!(
             "\n\nFiles: you also have file tools (read, grep, find, ls{}). Your work folder is {}; keep files you create there. Anything outside it, and every command, is shown to the human for approval first; if they refuse, do not retry — continue without it or ask.",
@@ -538,10 +588,10 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
             dir.display()
         ));
     }
-    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref()))?;
+    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty()))?;
     let names: Vec<String> = tool_defs(tools).iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
     let cwd = work.clone().unwrap_or_else(|| home.clone());
-    let spec = Spec { extension: &extension.0, tools: names, cwd };
+    let spec = Spec { extension: &extension.0, tools: names, cwd, mcp };
     drive_agent(shared, cfg, ws, &exe, &home, &spec, name, env_key, membership, rx).await.map(|_| None)
 }
 
@@ -550,6 +600,7 @@ struct Spec<'a> {
     extension: &'a Path,
     tools: Vec<String>,
     cwd: PathBuf,
+    mcp: Vec<crate::toolbox::Server>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -620,7 +671,7 @@ async fn drive_agent(
         }
         if proc.is_none() {
             let mut c = base_command(exe, home, &spec.cwd, env_key, &cfg.llm.api_key);
-            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files));
+            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp));
             proc = Some(Proc::spawn(c)?);
         }
         let p = proc.as_mut().expect("just started");
@@ -728,6 +779,7 @@ async fn drive(
                     Some(Event::Ask { ui_id, tool, what }) => {
                         let (title, kind) = match tool.as_str() {
                             "bash" => ("에이전트가 명령을 실행하려고 해요", "실행할 명령"),
+                            "mcp" => ("에이전트가 연결된 도구를 쓰려고 해요", "도구"),
                             "write" | "edit" => ("에이전트가 내 컴퓨터의 파일을 바꾸려고 해요", "파일"),
                             _ => ("에이전트가 내 컴퓨터의 파일을 읽으려고 해요", "파일"),
                         };
@@ -781,27 +833,39 @@ mod tests {
 
     #[test]
     fn args_isolate_pi_and_keep_the_key_out() {
-        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0);
+        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0, &[]);
         for f in ["--no-builtin-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--no-session"] {
             assert!(a.iter().any(|x| x == f), "{f}");
         }
         assert!(a.windows(2).any(|w| w == ["-e", "/x/bridge.mjs"]));
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
-        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0).iter().any(|x| x == "--thinking"));
+        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[]).iter().any(|x| x == "--thinking"));
+    }
+
+    #[test]
+    fn tool_box_adds_mcp_and_tool_search_but_never_codemode() {
+        let srv = crate::toolbox::Server { name: "my-fs".into(), command: "x".into(), args: vec![], url: String::new(), env: vec![], enabled: true, exposure: "deferred".into() };
+        let tools = vec!["computer".to_string()];
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()]);
+        assert!(!a.iter().any(|x| x == "--no-mcp" || x == "--no-builtin-tools"));
+        assert!(a.windows(2).any(|w| w == ["-e", "builtin:mcp"]));
+        assert!(a.windows(2).any(|w| w == ["--exclude-tools", "codemode"]));
+        assert!(a.windows(2).any(|w| w == ["--tools", "computer,tool_search,mcp__my_fs__*"]));
+        assert!(extension_source(&[], "s", None, true).contains("mcp__"));
     }
 
     #[test]
     fn file_tools_are_allowed_by_level_and_ask_before_leaving_the_folder() {
         let tools = vec!["computer".to_string(), "ask_user".to_string()];
-        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1);
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[]);
         assert!(!a.iter().any(|x| x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["--tools", "computer,ask_user,read,grep,find,ls"]));
-        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2);
+        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[]);
         assert!(b.iter().any(|x| x.ends_with("write,edit,bash")));
-        let src = extension_source(&[], "s", Some(Path::new("/work/files")));
+        let src = extension_source(&[], "s", Some(Path::new("/work/files")), false);
         assert!(src.contains(r#"const WORK = "/work/files";"#) && src.contains("tool_call") && src.contains("DENIED"));
-        assert!(!extension_source(&[], "s", None).contains("tool_call"));
+        assert!(!extension_source(&[], "s", None, false).contains("tool_call"));
         let ask = json!({ "type": "extension_ui_request", "id": "a1", "method": "input", "title": format!("{ASK}{}", json!({ "tool": "bash", "what": "ls" })) });
         assert_eq!(parse_event(&ask.to_string()), Some(Event::Ask { ui_id: "a1".into(), tool: "bash".into(), what: "ls".into() }));
     }
@@ -855,7 +919,7 @@ mod tests {
     #[test]
     fn the_extension_carries_tools_and_the_system_prompt() {
         let tools = vec![json!({ "name": "ask_user", "description": "d", "parameters": { "type": "object" } })];
-        let src = extension_source(&tools, "Line 1\n\"quoted\"", None);
+        let src = extension_source(&tools, "Line 1\n\"quoted\"", None, false);
         assert!(src.contains(r#""name":"ask_user""#));
         assert!(src.contains(r#"const SYSTEM = "Line 1\n\"quoted\"";"#));
         assert!(src.contains("before_agent_start"));

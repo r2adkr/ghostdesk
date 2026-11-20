@@ -396,7 +396,7 @@ impl GhostApp {
         let mut close = false;
         let mut lang = self.lang;
         let perm_ok = self.permissions_ok(ctx);
-        let mut tabs = vec![SettingsTab::General, SettingsTab::Ai, SettingsTab::Ssh];
+        let mut tabs = vec![SettingsTab::General, SettingsTab::Ai, SettingsTab::Toolbox, SettingsTab::Ssh];
         tabs.push(SettingsTab::Permissions);
         tabs.push(SettingsTab::About);
         let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
@@ -416,6 +416,7 @@ impl GhostApp {
                             SettingsTab::General => icon::SETTINGS,
                             SettingsTab::Ai => icon::PLUG,
                             SettingsTab::Ssh => icon::MONITOR,
+                            SettingsTab::Toolbox => icon::APP_WINDOW,
                             SettingsTab::Permissions => icon::SHIELD_ALERT,
                             SettingsTab::About => icon::BOOK_OPEN,
                         };
@@ -437,6 +438,7 @@ impl GhostApp {
                             match self.settings_tab {
                                 SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
                                 SettingsTab::Ssh => self.settings_ssh(ui),
+                                SettingsTab::Toolbox => self.settings_toolbox(ui),
                                 SettingsTab::Ai => self.settings_ai(ui, body_w, LABEL, field),
                                 SettingsTab::Permissions => self.settings_permissions(ui),
                                 SettingsTab::About => self.settings_about(ui),
@@ -978,6 +980,7 @@ pub(super) enum SettingsTab {
     General,
     Ai,
     Ssh,
+    Toolbox,
     /// macOS only (permissions needed to drive Mac apps).
     Permissions,
     About,
@@ -989,6 +992,7 @@ impl SettingsTab {
             Self::General => "일반",
             Self::Ai => "AI",
             Self::Ssh => "원격 연결",
+            Self::Toolbox => "도구 상자",
             Self::Permissions => "권한",
             Self::About => "정보",
         }

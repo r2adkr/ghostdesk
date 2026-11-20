@@ -28,6 +28,7 @@ mod i18n;
 mod labels;
 mod palette;
 mod pi_settings;
+mod toolbox_ui;
 mod pip;
 mod prefs;
 mod route;
@@ -298,6 +299,7 @@ pub struct GhostApp {
     /// Run key-based AI agents through pi when it is installed.
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pi_note: Option<String>,
+    toolbox: toolbox_ui::State,
     pi_offer_dismissed: bool,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
@@ -453,6 +455,7 @@ impl GhostApp {
             live_fps_limit: 60,
             pi_install: None,
             pi_note: None,
+            toolbox: Default::default(),
             pi_offer_dismissed: false,
             allow_experimental: false,
             tour: None,

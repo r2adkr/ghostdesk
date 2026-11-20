@@ -16,6 +16,7 @@ mod cdp;
 mod cleanup;
 mod control;
 mod mcp;
+mod toolbox;
 mod cursor;
 mod icon;
 mod install;
