@@ -549,7 +549,7 @@ impl GhostApp {
             ui.add_space(8.0);
             ui.label(tr("원격 화면 최대 프레임 (fps)"));
             ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"));
-            ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 15fps까지만 올라가요")));
+            ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 30fps까지만 올라가요")));
         }
     }
 

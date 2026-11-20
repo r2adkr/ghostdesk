@@ -47,7 +47,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["연결 정보를 저장했어요", "Connection saved", "接続情報を保存しました", "已保存连接信息"],
     ["연결 정보를 저장했어요. 비밀번호는 이 컴퓨터에 저장할 수 없어서 빠졌어요", "Connection saved. The password could not be stored on this computer, so it was left out.", "接続情報を保存しました。パスワードはこのコンピューターに保存できないため含まれていません。", "已保存连接信息。密码无法保存在这台电脑上，因此未包含。"],
     ["원격 화면 최대 프레임 (fps)", "Remote screen max frame rate (fps)", "リモート画面の最大フレームレート (fps)", "远程屏幕最大帧率 (fps)"],
-    ["낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 15fps까지만 올라가요", "Lower values use less CPU and network. Host-mode connections go up to 15 fps at most.", "下げるほどCPUとネットワークの使用量が減ります。ホストモード接続は最大15fpsまでです。", "数值越低，占用的CPU和网络越少。主机模式连接最高为15fps。"],
+    ["낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 30fps까지만 올라가요", "Lower values use less CPU and network. Host-mode connections go up to 30 fps at most.", "下げるほどCPUとネットワークの使用量が減ります。ホストモード接続は最大30fpsまでです。", "数值越低，占用的CPU和网络越少。主机模式连接最高为30fps。"],
     ["암호 보기", "Show password", "パスワードを表示", "查看密码"],
     ["저장된 암호가 없어요", "No password is saved", "保存されたパスワードがありません", "没有已保存的密码"],
     ["이 계정 만들기", "Create this account", "このアカウントを作成", "创建此账户"],
