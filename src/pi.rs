@@ -1064,7 +1064,7 @@ mod tests {
         assert!(!a.iter().any(|x| x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["--tools", "computer,ask_user,read,grep,find,ls"]));
         let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[], &[], &[]);
-        assert!(b.iter().any(|x| x.ends_with("write,edit,bash")));
+        assert!(b.iter().any(|x| x.ends_with(if cfg!(windows) { "write,edit,powershell" } else { "write,edit,bash" })));
         let src = extension_source(&[], "s", Some(Path::new("/work/files")), false, &[], false);
         assert!(src.contains(r#"const WORK = "/work/files";"#) && src.contains("tool_call") && src.contains("DENIED"));
         assert!(!extension_source(&[], "s", None, false, &[], false).contains("tool_call"));
