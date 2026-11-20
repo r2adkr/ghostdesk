@@ -145,6 +145,14 @@ impl GhostApp {
             }
         });
 
+        // with answer buttons showing, the input box stays hidden until "직접 입력" is pressed
+        let typing_id = egui::Id::new(("typing_answer", a.shared.id));
+        let input_id = egui::Id::new(("composer_input", a.shared.id));
+        let choices_pending = matches!(&st, AgentStatus::WaitingUser(q) if !split_choices(q).1.is_empty());
+        if !choices_pending {
+            ui.data_mut(|d| d.insert_temp(typing_id, false));
+        }
+        let typing: bool = ui.data(|d| d.get_temp(typing_id)).unwrap_or(false);
         if let AgentStatus::WaitingUser(q) = &st {
             ui.add_space(2.0);
             let (body, choices) = split_choices(q);
@@ -163,6 +171,11 @@ impl GhostApp {
                             if theme::secondary(ui, c).clicked() {
                                 picked = Some(c.clone());
                             }
+                        }
+                        // always offered: opens the input box below to write your own answer
+                        if theme::secondary(ui, tr("직접 입력")).clicked() {
+                            ui.data_mut(|d| d.insert_temp(typing_id, true));
+                            ui.ctx().memory_mut(|m| m.request_focus(input_id));
                         }
                     });
                 }
@@ -185,7 +198,7 @@ impl GhostApp {
         // middle: the log; bottom: the instruction box (only for agents inside GhostDesk).
         // reserve the log area using the composer height measured last frame, and redraw once more if
         // it changed. When space runs short the log shrinks; the box and send button always stay visible.
-        let has_composer = external.is_none();
+        let has_composer = external.is_none() && (!choices_pending || typing);
         let composer_id = egui::Id::unique(("composer_h", a.shared.id));
         let composer_h: f32 = ui.data(|d| d.get_temp(composer_id)).unwrap_or(150.0);
         let log_h = (ui.available_height() - if has_composer { composer_h + 10.0 } else { 0.0 }).max(0.0);
@@ -235,6 +248,7 @@ impl GhostApp {
                 };
                 let te = ui.add(
                     egui::TextEdit::multiline(&mut a.input)
+                        .id(input_id)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
                         .margin(Margin::symmetric(10, 8))
