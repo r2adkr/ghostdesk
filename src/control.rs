@@ -57,7 +57,6 @@ pub fn set_shell_tools_allowed(on: bool) {
     SHELL_TOOLS_ALLOWED.store(on, Ordering::Relaxed);
 }
 
-#[cfg(windows)]
 fn shell_tools_allowed() -> bool {
     SHELL_TOOLS_ALLOWED.load(Ordering::Relaxed)
 }
@@ -86,6 +85,18 @@ const BLANK_MARKER: &str = crate::cleanup::SCRATCH_MARKER;
 /// GhostDesk itself isn't listed here: it's only opened as a separate test instance
 /// (`is_ghostdesk`, `app_target`). Bundle ids are compared case-insensitively.
 const EXTERNAL_DENY: &[&str] = &[
+    // credentials
+    "com.apple.keychainaccess",
+    "com.apple.Passwords",
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.bitwarden.desktop",
+    "org.keepassxc.keepassxc",
+];
+
+/// macOS shells, terminals, scripting and system tools by bundle id: the class the "allow shells, terminals
+/// and system tools" setting governs (asks each time while on, refused while off).
+const MAC_TOOLS: &[&str] = &[
     // terminals and shells
     "com.apple.Terminal",
     "com.googlecode.iterm2",
@@ -103,13 +114,6 @@ const EXTERNAL_DENY: &[&str] = &[
     "com.apple.Automator",
     "com.apple.shortcuts",
     "com.latenightsw.ScriptDebugger8",
-    // credentials
-    "com.apple.keychainaccess",
-    "com.apple.Passwords",
-    "com.1password.1password",
-    "com.agilebits.onepassword7",
-    "com.bitwarden.desktop",
-    "org.keepassxc.keepassxc",
     // system and security settings, file and process management
     "com.apple.systempreferences",
     "com.apple.finder",
@@ -125,6 +129,16 @@ const GHOSTDESK_BUNDLE_ID: &str = "dev.ghostdesk.app";
 
 /// Deny list by name (bundle file name, lowercase) for when the bundle id can't be read.
 const EXTERNAL_DENY_NAMES: &[&str] = &[
+    "keychain access",
+    "passwords",
+    "1password",
+    "1password 7",
+    "bitwarden",
+    "keepassxc",
+];
+
+/// Names of the [`MAC_TOOLS`] class.
+const MAC_TOOL_NAMES: &[&str] = &[
     "terminal",
     "iterm",
     "iterm2",
@@ -138,8 +152,6 @@ const EXTERNAL_DENY_NAMES: &[&str] = &[
     "script editor",
     "automator",
     "shortcuts",
-    "keychain access",
-    "passwords",
     "system settings",
     "system preferences",
     "finder",
@@ -147,10 +159,6 @@ const EXTERNAL_DENY_NAMES: &[&str] = &[
     "console",
     "disk utility",
     "directory utility",
-    "1password",
-    "1password 7",
-    "bitwarden",
-    "keepassxc",
 ];
 
 /// Events sent to the GUI.
@@ -978,7 +986,12 @@ impl ControlServer {
         }
         // a shell or system tool that the setting allows still needs a person's yes (the permission bypass gives it)
         #[cfg(windows)]
-        if win_policy::is_tool(&r) {
+        let is_tool = win_policy::is_tool(&r);
+        #[cfg(target_os = "macos")]
+        let is_tool = is_mac_tool(&r);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let is_tool = false;
+        if is_tool {
             self.ask(conn, "셸·시스템 도구 실행 요청", tool_request_text(client, &r.name, &r.path.display().to_string())).await?;
         }
         // GhostDesk itself: driving the current window could click its own approval dialogs or change
@@ -1652,10 +1665,9 @@ async fn wants_child_session(p: &Value) -> bool {
 #[cfg(windows)]
 const DENIED_WHY: &str = "암호 관리자와 GhostDesk 자신은 항상 차단되고, 터미널·스크립트·시스템 설정 계열 앱은 설정의 '셸·터미널·시스템 도구 허용'을 켜야 열 수 있습니다.";
 #[cfg(not(windows))]
-const DENIED_WHY: &str = "터미널·스크립트·암호·시스템 설정 계열 앱은 차단됩니다.";
+const DENIED_WHY: &str = "암호 관리자는 항상 차단되고, 터미널·스크립트·시스템 설정 계열 앱은 설정의 '셸·터미널·시스템 도구 허용'을 켜야 열 수 있습니다.";
 
 /// The approval text for a shell or system tool.
-#[cfg(windows)]
 fn tool_request_text(client: &str, name: &str, path: &str) -> String {
     format!(
         "{client} 이(가) 셸·터미널·시스템 도구 '{name}' 을(를) 열려고 합니다.\n경로: {path}\n이런 도구는 명령을 실행하거나 시스템 설정을 바꿀 수 있어 \
@@ -1870,6 +1882,11 @@ fn is_ghostdesk(r: &ResolvedApp) -> bool {
 }
 
 fn is_denied(r: &ResolvedApp) -> bool {
+    is_denied_with(r, shell_tools_allowed())
+}
+
+/// [`is_denied`] with the shell and system tool setting given (so tests need not flip the global one).
+fn is_denied_with(r: &ResolvedApp, tools_allowed: bool) -> bool {
     if let Some(b) = &r.bundle_id {
         if EXTERNAL_DENY.iter().any(|d| d.eq_ignore_ascii_case(b)) {
             return true;
@@ -1879,6 +1896,10 @@ fn is_denied(r: &ResolvedApp) -> bool {
     if EXTERNAL_DENY_NAMES.contains(&stem.as_str()) {
         return true;
     }
+    // macOS shells and system tools are refused while the setting is off (Windows has its own list below)
+    if !tools_allowed && is_mac_tool(r) {
+        return true;
+    }
     // Windows: executable name, original file name, display name, location (system folders,
     // packages), GhostDesk itself
     #[cfg(windows)]
@@ -1886,6 +1907,15 @@ fn is_denied(r: &ResolvedApp) -> bool {
         return true;
     }
     false
+}
+
+/// Whether the app is a macOS shell, terminal, scripting or system tool (allowed only with a person's approval).
+fn is_mac_tool(r: &ResolvedApp) -> bool {
+    if r.bundle_id.as_deref().is_some_and(|b| MAC_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(b))) {
+        return true;
+    }
+    let stem = r.path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    MAC_TOOL_NAMES.contains(&stem.as_str())
 }
 
 /// Outside macOS: whether a kind=remote target is this computer itself (loopback, unspecified, one
@@ -2527,6 +2557,12 @@ mod tests {
         if !cfg!(windows) {
             assert!(!is_denied(&mk("/x/Foo.app", Some("dev.ghostdesk.app"))));
         }
+        // the setting splits the list: tools are allowed (after a person's yes), credentials never
+        let term = mk("/System/Applications/Utilities/Terminal.app", Some("com.apple.Terminal"));
+        let vault = mk("/Applications/1Password.app", Some("com.1password.1password"));
+        assert!(is_denied_with(&term, false) && !is_denied_with(&term, true) && is_mac_tool(&term));
+        assert!(is_denied_with(&vault, true) && is_denied_with(&vault, false) && !is_mac_tool(&vault));
+        assert!(is_denied_with(&mk("/x/Keychain Access.app", None), true));
         assert!(is_ghostdesk(&mk("/x/Foo.app", Some("DEV.GHOSTDESK.APP"))));
         assert!(is_ghostdesk(&mk("/Applications/GhostDesk.app", None)));
         assert!(!is_ghostdesk(&mk("/System/Applications/TextEdit.app", Some("com.apple.TextEdit"))));

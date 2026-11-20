@@ -519,17 +519,27 @@ impl GhostApp {
         let warn = tr("외부 에이전트가 로그인 복제, 실행 중인 앱, 원격 접속을 묻지 않고 바로 시작해요. 믿는 에이전트만 연결했을 때 켜세요");
         ui.label(if self.auto_approve { RichText::new(warn).size(12.0).color(theme::warn()) } else { theme::hint(warn) });
 
-        // Windows: the shell and system-tool refusals of the app modes
-        #[cfg(windows)]
+        // the shell and system-tool refusals of the app modes
         {
             ui.add_space(8.0);
             ui.add(theme::switch(&mut self.allow_shell_tools, tr("셸·터미널·시스템 도구 허용")));
-            let note = if !self.allow_shell_tools {
+            let off = if cfg!(windows) {
                 tr("끄면 터미널, PowerShell, 레지스트리 편집기 같은 도구는 외부 에이전트가 열 수 없어요")
-            } else if self.auto_approve {
-                tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
             } else {
+                tr("끄면 터미널, 스크립트 편집기, 시스템 설정 같은 도구는 외부 에이전트가 열 수 없어요")
+            };
+            let note = if !self.allow_shell_tools {
+                off
+            } else if self.auto_approve {
+                if cfg!(windows) {
+                    tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
+                } else {
+                    tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자는 항상 막혀요")
+                }
+            } else if cfg!(windows) {
                 tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
+            } else {
+                tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자는 항상 막혀요")
             };
             ui.label(if self.allow_shell_tools && self.auto_approve { RichText::new(note).size(12.0).color(theme::warn()) } else { theme::hint(note) });
         }
@@ -609,6 +619,33 @@ impl GhostApp {
             ui.add_space(8.0);
             ui.label(theme::hint(trf("새 버전 {} 이 나왔어요", &[&r.version])));
         }
+        // manual update check
+        ui.add_space(8.0);
+        let result = self.update_check.as_ref().map(|s| s.lock().clone());
+        let checking = matches!(result, Some(None));
+        ui.horizontal(|ui| {
+            if ui.add_enabled_ui(!checking, |ui| theme::secondary(ui, tr("업데이트 확인"))).inner.clicked() {
+                // a check by hand shows the toast again even if it was closed for this version
+                self.update_dismissed = None;
+                self.update_check = Some(crate::update::check_now(&self.rt, self.update.clone(), ui.ctx().clone()));
+            }
+            match &result {
+                Some(None) => {
+                    theme::spinner(ui, 13.0, theme::muted());
+                    ui.label(theme::hint(tr("확인하는 중…")));
+                }
+                Some(Some(Ok(false))) => {
+                    ui.label(theme::hint(tr("지금 최신 버전이에요")));
+                }
+                Some(Some(Ok(true))) => {
+                    ui.label(theme::hint(tr("새 버전이 있어요. 오른쪽 아래 알림에서 업데이트하세요")));
+                }
+                Some(Some(Err(e))) => {
+                    ui.label(RichText::new(trf("확인하지 못했어요: {}", &[&crate::llm::short(e, 80)])).size(12.0).color(theme::warn())).on_hover_text(e.as_str());
+                }
+                None => {}
+            }
+        });
         let (ti, to) = self.agents.iter().fold((0, 0), |acc, a| {
             let t = *a.shared.tokens.lock();
             (acc.0 + t.0, acc.1 + t.1)

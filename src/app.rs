@@ -337,6 +337,8 @@ pub struct GhostApp {
     host_ui: host_settings::HostUi,
     /// Version whose update toast the person closed with X.
     update_dismissed: Option<String>,
+    /// A manual update check in progress or just finished (Settings → About).
+    update_check: Option<crate::update::CheckSlot>,
     /// Whether the screen wall turned on full screen (undone when the wall closes).
     wall_fullscreen: bool,
     /// Start was pressed without an API key (shows a hint under the key field in the new-agent
@@ -451,6 +453,7 @@ impl GhostApp {
             toast: None,
             host_ui: Default::default(),
             update_dismissed: None,
+            update_check: None,
             wall_fullscreen: false,
             key_warn: false,
             wizard_key_field: false,

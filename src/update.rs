@@ -106,6 +106,32 @@ pub fn start(rt: &Handle, ctx: &egui::Context) -> Shared {
     st
 }
 
+/// Settings → "Check for updates": asks now instead of waiting for the daily check. The answer is
+/// `Ok(true)` for a newer version (also put into `st` so the update toast appears), `Ok(false)` when
+/// this is the latest, or why it could not be checked.
+pub type CheckSlot = Arc<parking_lot::Mutex<Option<std::result::Result<bool, String>>>>;
+
+pub fn check_now(rt: &Handle, st: Shared, ctx: egui::Context) -> CheckSlot {
+    let slot = CheckSlot::default();
+    let out = slot.clone();
+    rt.spawn(async move {
+        let res = match latest(env!("CARGO_PKG_VERSION")).await {
+            Ok(Some(r)) => {
+                let mut g = st.lock();
+                if !matches!(*g, State::Downloading(..) | State::Ready(_)) {
+                    *g = State::Available(r);
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        *out.lock() = Some(res);
+        ctx.request_repaint();
+    });
+    slot
+}
+
 /// "Update": downloads the new exe and puts it where the running one is (progress in
 /// `State::Downloading`).
 pub fn download(rt: &Handle, st: Shared, ctx: egui::Context) {
