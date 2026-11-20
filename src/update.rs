@@ -272,7 +272,11 @@ async fn latest_from_pages(current: &str, suffixes: &[&str]) -> Result<Option<Re
     let resp = http.get(format!("https://github.com/{REPO}/releases/latest")).send().await?;
     let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).context("최신 릴리스 주소를 알 수 없습니다")?;
     let tag = location.rsplit('/').next().unwrap_or_default().to_string();
-    if tag.is_empty() || !newer(tag.trim_start_matches('v'), current) {
+    // the tag goes into download addresses: only a plain version is taken
+    if !plain_tag(&tag) {
+        anyhow::bail!("최신 릴리스 이름이 올바르지 않습니다");
+    }
+    if !newer(tag.trim_start_matches('v'), current) {
         return Ok(None);
     }
     let sums = http.get(format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS.txt")).send().await.and_then(|r| r.error_for_status());
@@ -283,6 +287,17 @@ async fn latest_from_pages(current: &str, suffixes: &[&str]) -> Result<Option<Re
     Ok(release_from_sums(&tag, sums.as_deref(), suffixes))
 }
 
+/// `v1.2.3` (digits and dots only).
+fn plain_tag(tag: &str) -> bool {
+    let v = tag.strip_prefix('v').unwrap_or(tag);
+    !v.is_empty() && v.len() <= 32 && v.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A file name from a release (no folders, no dots-only names).
+fn plain_file_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 200 && n != "." && n != ".." && !n.contains(['/', '\\', '?', '#', '%', ':']) && n.chars().all(|c| !c.is_control())
+}
+
 /// A release from its tag and SHA256SUMS.txt (lines of "<hash>  <file name>"): no sums means no file,
 /// so the release page opens instead.
 fn release_from_sums(tag: &str, sums: Option<&str>, suffixes: &[&str]) -> Option<Release> {
@@ -290,7 +305,7 @@ fn release_from_sums(tag: &str, sums: Option<&str>, suffixes: &[&str]) -> Option
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     let names: Vec<&str> = sums.unwrap_or_default().lines().filter_map(|l| l.trim().split_once(char::is_whitespace).map(|(_, f)| f.trim().trim_start_matches('*'))).collect();
     let asset = suffixes.iter().find_map(|suf| {
-        let name = names.iter().find(|n| n.ends_with(suf))?;
+        let name = names.iter().find(|n| n.ends_with(suf) && plain_file_name(n))?;
         Some(Asset { name: name.to_string(), url: format!("{base}/{name}"), size: 0, sums_url: Some(format!("{base}/SHA256SUMS.txt")) })
     });
     Some(Release { version, page: format!("https://github.com/{REPO}/releases/tag/{tag}"), asset })
@@ -335,14 +350,21 @@ fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release>
         return None;
     }
     let assets = v["assets"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let url_of = |a: &Value| a["browser_download_url"].as_str().map(str::to_string);
+    // only files of this project's own releases are ever downloaded
+    let url_of = |a: &Value| a["browser_download_url"].as_str().filter(|u| trusted_download(u)).map(str::to_string);
     let sums_url = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(url_of);
     let asset = suffixes.iter().find_map(|suf| {
         let a = assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suf)))?;
         Some(Asset { name: a["name"].as_str()?.to_string(), url: url_of(a)?, size: a["size"].as_u64()?, sums_url: sums_url.clone() })
     });
-    let page = v["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("https://github.com/{REPO}/releases/latest"));
+    let page = v["html_url"].as_str().filter(|u| u.starts_with(&format!("https://github.com/{REPO}/"))).map(str::to_string).unwrap_or_else(|| format!("https://github.com/{REPO}/releases/latest"));
     Some(Release { version, page, asset })
+}
+
+/// An https address inside this project's release downloads, with nothing that could lead elsewhere.
+fn trusted_download(url: &str) -> bool {
+    url.strip_prefix(&format!("https://github.com/{REPO}/releases/download/"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains("..") && !rest.contains(['\\', '?', '#', '@']) && rest.chars().all(|c| !c.is_control() && c != ' '))
 }
 
 /// Whether `candidate` is newer than `current` ("0.2.0" > "0.1.10", "0.2" == "0.2.0", suffixes
@@ -371,6 +393,7 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
 async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let me = target.to_path_buf();
+    anyhow::ensure!(trusted_download(&asset.url) && asset.sums_url.as_deref().is_none_or(trusted_download), "다운로드 주소가 이 프로젝트의 릴리스가 아닙니다");
     let http = client()?;
     let expected = match &asset.sums_url {
         Some(u) => {
@@ -512,15 +535,15 @@ mod tests {
             "tag_name": "v0.3.0", "html_url": "https://github.com/r2adkr/ghostdesk/releases/tag/v0.3.0",
             "draft": false, "prerelease": false,
             "assets": [
-                {"name": "SHA256SUMS.txt", "size": 98, "browser_download_url": "https://x/SHA256SUMS.txt"},
-                {"name": "GhostDesk-0.3.0-windows-x64.exe", "size": 123, "browser_download_url": "https://x/a.exe"}
+                {"name": "SHA256SUMS.txt", "size": 98, "browser_download_url": "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/SHA256SUMS.txt"},
+                {"name": "GhostDesk-0.3.0-windows-x64.exe", "size": 123, "browser_download_url": "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/a.exe"}
             ]
         });
         let r = parse_release(&v, "0.2.0", &["-windows-x64.exe"]).unwrap();
         assert_eq!(r.version, "0.3.0");
         assert!(r.installable());
         let a = r.asset.unwrap();
-        assert_eq!((a.size, a.url.as_str(), a.sums_url.as_deref()), (123, "https://x/a.exe", Some("https://x/SHA256SUMS.txt")));
+        assert_eq!((a.size, a.url.as_str(), a.sums_url.as_deref()), (123, "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/a.exe", Some("https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/SHA256SUMS.txt")));
         // OS without a downloadable file: notify only (opens the page)
         assert!(!parse_release(&v, "0.2.0", &[]).unwrap().installable());
         // same version, prereleases and drafts aren't announced
@@ -536,7 +559,7 @@ mod tests {
         let rel = |names: &[&str]| {
             json!({
                 "tag_name": "v0.3.0", "draft": false, "prerelease": false,
-                "assets": names.iter().map(|n| json!({"name": n, "size": 1, "browser_download_url": format!("https://x/{n}")})).collect::<Vec<_>>()
+                "assets": names.iter().map(|n| json!({"name": n, "size": 1, "browser_download_url": format!("https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/{n}")})).collect::<Vec<_>>()
             })
         };
         let arm = ["-macos-arm64.zip", "-macos-universal.zip"];
@@ -550,6 +573,31 @@ mod tests {
         if cfg!(any(windows, target_os = "macos")) {
             assert!(!asset_suffixes().is_empty());
         }
+    }
+
+    #[test]
+    fn downloads_only_come_from_this_projects_releases() {
+        let base = "https://github.com/r2adkr/ghostdesk/releases/download/v1.0.0";
+        assert!(trusted_download(&format!("{base}/a.zip")));
+        for bad in ["https://evil.com/a.zip", "http://github.com/r2adkr/ghostdesk/releases/download/v1/a", &format!("{base}/../../../x"), &format!("{base}/a.zip?x=1"), "https://github.com/other/repo/releases/download/v1/a", "https://github.com/r2adkr/ghostdesk/releases/download/"] {
+            assert!(!trusted_download(bad), "{bad}");
+        }
+        let v = json!({"tag_name": "v9.0.0", "html_url": "https://evil.com/x", "assets": [{"name": "SHA256SUMS.txt", "size": 1, "browser_download_url": "https://evil.com/s"}, {"name": "x-windows-x64.exe", "size": 1, "browser_download_url": "https://evil.com/a.exe"}]});
+        let r = parse_release(&v, "0.1.0", &["-windows-x64.exe"]).unwrap();
+        assert!(!r.installable() && r.page.starts_with("https://github.com/r2adkr/ghostdesk/"));
+    }
+
+    #[test]
+    fn tags_and_file_names_from_a_release_page_are_plain() {
+        for ok in ["v0.11.1", "1.2.3", "v10.0"] {
+            assert!(plain_tag(ok), "{ok}");
+        }
+        for bad in ["", "v", "v1..2", "v1.2.3/../x", "v1.2.3?x", "latest", "v1.2.3\n"] {
+            assert!(!plain_tag(bad), "{bad:?}");
+        }
+        let sums = "aa  ../../evil/a-windows-x64.exe\nbb  ok-windows-x64.exe\n";
+        let r = release_from_sums("v1.0.0", Some(sums), &["-windows-x64.exe"]).unwrap();
+        assert_eq!(r.asset.unwrap().name, "ok-windows-x64.exe");
     }
 
     #[test]

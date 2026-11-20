@@ -151,6 +151,21 @@ pub fn save(servers: &[Server]) -> std::io::Result<()> {
     std::fs::rename(&tmp, &p)
 }
 
+/// A plain-http address that points at this computer (the host is checked, not just the start of the text:
+/// `http://localhost.example.com` is somewhere else).
+fn local_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
+}
+
 /// Whether a server can be added as it is (the reason in Korean otherwise).
 pub fn check(servers: &[Server], new: &Server) -> Result<(), &'static str> {
     if !valid_name(&new.name) {
@@ -162,7 +177,7 @@ pub fn check(servers: &[Server], new: &Server) -> Result<(), &'static str> {
     if new.url.is_empty() && new.command.trim().is_empty() {
         return Err("실행할 명령이나 주소를 입력하세요");
     }
-    if !new.url.is_empty() && !(new.url.starts_with("https://") || new.url.starts_with("http://localhost") || new.url.starts_with("http://127.0.0.1")) {
+    if !new.url.is_empty() && !(new.url.starts_with("https://") || local_http(&new.url)) {
         return Err("주소는 https:// 로 시작해야 해요");
     }
     Ok(())
@@ -322,6 +337,16 @@ mod tests {
 
     fn s(name: &str) -> Server {
         Server { name: name.into(), command: "npx".into(), args: vec!["-y".into(), "pkg".into()], url: String::new(), env: vec![("K".into(), "v".into())], enabled: true, exposure: DEFERRED.into() }
+    }
+
+    #[test]
+    fn plain_http_is_only_for_this_computer() {
+        for ok in ["http://localhost:3000/mcp", "http://127.0.0.1/x", "http://[::1]:8080/", "http://LOCALHOST"] {
+            assert!(local_http(ok), "{ok}");
+        }
+        for bad in ["http://localhost.evil.com/mcp", "http://127.0.0.1.evil.com", "http://localhost@evil.com/", "http://evil.com/localhost", "http://localhost:80@evil.com", "https://localhost"] {
+            assert!(!local_http(bad), "{bad}");
+        }
     }
 
     #[test]
