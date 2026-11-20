@@ -160,7 +160,8 @@ impl GhostApp {
 
     pub(super) fn agent_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.add_space(8.0);
+            // same left edge as the icons of the menu rows above (icon centre 18 pt in, glyph ~8 wide)
+            ui.add_space(12.0);
             theme::section(ui, tr("에이전트"));
             theme::count_badge(ui, &self.agents.len().to_string());
         });
@@ -179,12 +180,14 @@ impl GhostApp {
             let r = egui::Frame::new()
                 .fill(fill)
                 .corner_radius(theme::CARD_RADIUS)
-                .inner_margin(Margin::symmetric(10, 8))
+                .inner_margin(Margin { left: 13, right: 10, top: 8, bottom: 8 })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.horizontal(|ui| {
+                        // dot centred where the menu rows' icons are, name where their labels start
                         theme::dot(ui, crate::cursor::agent_color(a.shared.id), 4.5);
+                        ui.add_space(4.0);
                         // place the right-hand bits (status dot, external marker) first, then truncate the name to fit
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             match (&st, a.takeover, paused, attention(&st, a.takeover)) {
@@ -224,7 +227,7 @@ impl GhostApp {
                     });
                     if q > 0 {
                         ui.horizontal(|ui| {
-                            ui.add_space(14.0);
+                            ui.add_space(23.0);
                             ui.label(theme::hint(trf("대기 중인 작업 {}개", &[&q])));
                         });
                     }
