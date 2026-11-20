@@ -69,7 +69,6 @@ impl GhostApp {
         // lay out the pinned bottom rows first; the agent list gets whatever height is left
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref())
-                .on_hover_text(tr("AI 회사 · API 키 · 모델 고르기"))
                 .clicked()
             {
                 self.open_settings(settings::SettingsTab::General);

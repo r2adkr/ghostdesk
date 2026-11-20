@@ -23,13 +23,13 @@ impl GhostApp {
             }
         }
         theme::section(ui, tr("pi 로 실행"));
-        ui.label(theme::hint(tr("API 키로 쓰는 AI 는 pi 가 더 잘 해내요. pi 가 GhostDesk 화면을 직접 다뤄요 (Claude Code CLI·Codex CLI 는 해당 없음)")));
+        ui.label(theme::hint(tr("API 키로 쓰는 AI 를 pi 로 실행해요")));
         ui.add_space(4.0);
         let installed = crate::pi::find().is_some();
         if installed {
             ui.label(RichText::new(trf("{}  pi 가 설치되어 있어요", &[&icon::CIRCLE_CHECK])).color(theme::body()));
             ui.add(theme::switch(&mut self.use_pi, tr("API 키로 쓰는 AI 는 pi 로 실행")));
-            ui.label(theme::hint(tr("끄면 GhostDesk 자체 방식으로 실행해요. 새로 시작하는 에이전트부터 적용돼요")));
+            ui.label(theme::hint(tr("새로 시작하는 에이전트부터 적용돼요")));
         } else if self.pi_install.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();

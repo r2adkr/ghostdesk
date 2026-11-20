@@ -582,8 +582,11 @@ impl GhostApp {
                     ui.label(theme::hint(tr("에이전트가 일할 곳을 하나 골라 주세요")));
                     return;
                 };
-                if let Some(k) = kinds.iter().find(|k| k.choice == choice) {
-                    ui.label(theme::hint(k.about));
+                // (Auto explains itself in the line below)
+                if choice != Choice::Auto {
+                    if let Some(k) = kinds.iter().find(|k| k.choice == choice) {
+                        ui.label(theme::hint(k.about));
+                    }
                 }
                 ui.add_space(14.0);
                 match choice {
@@ -663,11 +666,10 @@ impl GhostApp {
         let line = match self.auto_pick() {
             AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
             AutoPick::ChildSession { label } => trf("→ '{}' 앱은 별도 Windows 화면에서 실행해요. 실제 계정·데이터를 사용해요.", &[&label]),
-            AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 어디서 일할지 정해요 (적지 않으면 웹사이트)").to_string(),
+            AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 알맞은 곳을 골라요").to_string(),
             AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
         };
         ui.label(RichText::new(line).color(theme::text()));
-        ui.label(theme::hint(tr("다르게 하려면 위에서 직접 고르세요")));
     }
 
     /// Auto mode's decision: the app if the task names an app on this computer, otherwise the web.
@@ -1253,7 +1255,7 @@ pub(super) fn kinds() -> Vec<Kind> {
         choice: Choice::Web,
         icon: icon::GLOBE,
         title: tr("웹사이트"),
-        about: tr("보이지 않는 브라우저에서 일해요. 내 화면 · 마우스 · 키보드는 그대로예요."),
+        about: tr("보이지 않는 브라우저에서 일해요. 내 화면은 그대로예요."),
     });
     if LOCAL_APP_CARD {
         v.push(Kind { choice: Choice::App, icon: text::APP_ICON, title: tr(text::LOCAL_APPS), about: tr("앱을 보이지 않게 띄워서 일해요. 내 화면은 그대로예요.") });
@@ -1269,7 +1271,7 @@ pub(super) fn kinds() -> Vec<Kind> {
             ),
         });
     }
-    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터에서 VNC로 화면을 조작하거나 SSH로 명령을 실행하고 파일을 받아요") });
+    v.push(Kind { choice: Choice::Remote, icon: icon::MONITOR, title: tr("원격 컴퓨터"), about: tr("다른 컴퓨터의 화면을 조작하거나 명령을 실행해요") });
     v
 }
 

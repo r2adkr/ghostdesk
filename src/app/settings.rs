@@ -356,13 +356,12 @@ impl GhostApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if p.needs_url() {
-                ui.label(theme::hint(tr("DeepSeek·Groq·Together·LM Studio·vLLM 처럼 OpenAI 와 같은 방식의 API 를 쓸 수 있어요")));
+                ui.label(theme::hint(tr("OpenAI 호환 API 의 주소와 키를 입력하세요")));
             } else if p.needs_key() {
                 ui.label(theme::hint(tr("키가 없나요?")));
                 ui.hyperlink_to(RichText::new(trf("{} 에서 만들기", &[&p.short_name()])).size(12.0), p.key_page());
-                ui.label(theme::hint(format!("· {}", self.key_storage_note())));
-            } else {
-                ui.label(theme::hint(tr("Ollama 를 설치해 켜 두면 키 없이 내 PC 에서 돌아갑니다.")));
+            } else if !p.is_cli() {
+                ui.label(theme::hint(tr("키 없이 내 PC 에서 실행해요")));
                 ui.hyperlink_to(RichText::new(tr("내려받기")).size(12.0), p.key_page());
             }
         });
@@ -566,7 +565,6 @@ impl GhostApp {
     /// AI tab: connections (keys) and the AI/model in use.
     fn settings_ai(&mut self, ui: &mut egui::Ui, width: f32, label_w: f32, field: f32) {
         theme::section(ui, tr("AI 연결"));
-        ui.label(theme::hint(tr("여러 AI 를 추가해 두면 홈 화면의 모델 단추에서 바로 바꿔 쓸 수 있어요")));
         ui.add_space(4.0);
         self.conn_cards(ui, width);
         self.add_conn_button(ui);
@@ -769,7 +767,7 @@ impl GhostApp {
                 }
             });
         }
-        ui.label(theme::hint(tr("스위치가 이미 켜져 있는데 여기서 꺼짐으로 보이면 업데이트로 앱 서명이 바뀐 거예요. '허용'을 누르면 옛 항목을 지우고 새로 요청해요.")));
+        ui.label(theme::hint(tr("켜져 있는데 꺼짐으로 보이면 '허용'을 눌러 다시 요청하세요")));
     }
 
     /// One card per connection: name (editable for OpenAI-compatible) · provider · ✕, with URL and
@@ -809,9 +807,8 @@ impl GhostApp {
                     self.url_field(ui, i, inner);
                 }
                 if p.is_cli() {
-                    ui.label(theme::hint(tr("이 CLI의 기존 로그인으로 실행해요. 인증 정보는 앱에 복사하지 않아요")));
-                    if p == Provider::ClaudeCli { ui.label(theme::hint(tr("Claude 모델 별칭을 표시해요. 모델 ID를 직접 입력할 수도 있어요"))); }
-                    let changed = ui.add(egui::TextEdit::singleline(&mut self.ai[i].url).desired_width(inner).hint_text(tr("CLI 실행 파일 경로 (비워 두면 자동 탐지)"))).changed();
+                    ui.label(theme::hint(tr("CLI에 로그인된 계정으로 실행해요")));
+                    let changed = ui.add(egui::TextEdit::singleline(&mut self.ai[i].url).desired_width(inner).hint_text(tr("경로 (보통 비워 두세요)"))).changed();
                     let id = self.ai[i].id;
                     if changed { self.refetch(id); }
                     let state = self.fetch_models(ui.ctx(), id);

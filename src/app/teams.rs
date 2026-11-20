@@ -101,13 +101,17 @@ impl GhostApp {
             ui.label(RichText::new(tr("팀")).size(20.0).strong().color(theme::text()));
             ui.label(RichText::new(ts.cache.len().to_string()).size(14.0).color(theme::muted()));
         });
-        ui.label(theme::hint(tr("팀에서 에이전트와 목표·할 일·메모를 공유해요")));
+        ui.label(theme::hint(tr("여러 에이전트가 목표를 나눠 함께 일해요")));
         ui.add_space(16.0);
 
         if ts.cache.is_empty() {
             egui::ScrollArea::vertical().id_salt("team_create").show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(480.0));
-                if !ts.creating { ui.label(tr("아직 팀이 없어요")); }
+                if !ts.creating {
+                    ui.label(RichText::new(tr("아직 팀이 없어요")).color(theme::text()));
+                    ui.label(theme::hint(tr("예) 한 에이전트는 조사, 다른 에이전트는 예약을 맡아 같은 목표로 일해요")));
+                    ui.add_space(6.0);
+                }
                 team_list(ui, ts, &store, true);
             });
             return;
@@ -174,7 +178,7 @@ fn team_list(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore
                 }
             });
         }
-        if !ts.creating && theme::secondary(ui, format!("{}  {}", icon::PLUS, tr("새 팀"))).clicked() {
+        if !ts.creating && theme::secondary(ui, format!("{}  {}", icon::PLUS, tr("팀 만들기"))).clicked() {
             ts.creating = true;
             ts.focus_new_name = true;
             ts.error = None;
@@ -278,14 +282,15 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
         ui.label(RichText::new(&team.goal).color(theme::body()));
     }
     ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        theme::section(ui, trf("참여 에이전트 {}명", &[&team.members.len()]).as_str());
-        for member in &team.members {
-            ui.label(theme::hint(member.label()));
-        }
-    });
     if team.members.is_empty() {
-        ui.label(theme::hint(tr("팀 에이전트를 시작하거나, 참여 요청을 연결된 외부 AI 앱에 붙여넣으세요")));
+        ui.label(theme::hint(tr("아직 참여한 에이전트가 없어요. 아래 버튼으로 시작하세요")));
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            theme::section(ui, trf("참여 에이전트 {}명", &[&team.members.len()]).as_str());
+            for member in &team.members {
+                ui.label(theme::hint(member.label()));
+            }
+        });
     }
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
@@ -294,28 +299,29 @@ fn board(ui: &mut egui::Ui, ts: &mut TeamsUi, store: &crate::team::TeamStore, te
         }
         let copy_key = ui.scope_id().with("copied_team_join_request");
         let now = ui.input(|input| input.time);
-        if theme::secondary(ui, tr("참여 요청 복사")).clicked() {
+        if theme::secondary(ui, tr("외부 AI 앱을 참여시키기"))
+            .on_hover_text(tr("문장을 복사해요. Claude 같은 AI 앱에 붙여넣으면 이 팀에 참여해요"))
+            .clicked()
+        {
             ui.ctx().copy_text(trf("GhostDesk 팀 ‘{}’에 참여해서 목표와 할 일을 확인해 줘", &[&team.name]));
             ui.ctx().data_mut(|data| data.insert_temp(copy_key, now + 2.0));
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(2));
         }
 
-        let btn = ui.add_enabled_ui(screens > 0, |ui| theme::secondary(ui, format!("{}  {}", icon::LAYOUT_DASHBOARD, tr("팀 화면 모아보기")))).inner;
+        let btn = ui.add_enabled_ui(screens > 0, |ui| theme::secondary(ui, format!("{}  {}", icon::LAYOUT_DASHBOARD, tr("팀원 화면 보기")))).inner;
         let hint = if screens == 0 { tr("팀원이 연 화면이 아직 없어요").to_string() } else { trf("팀원 화면 {}개", &[&screens]) };
         if btn.on_disabled_hover_text(&hint).on_hover_text(hint).clicked() {
             action = Some(BoardAction::WatchScreens);
         }
 
         if ui.ctx().data(|data| data.get_temp::<f64>(copy_key)).is_some_and(|until| until > now) {
-            ui.label(theme::hint(tr("참여 요청을 복사했어요")));
+            ui.label(theme::hint(tr("문장을 복사했어요")));
         }
     });
     ui.add_space(12.0);
 
     let files: Vec<_> = team.file_edits().collect();
-    if files.is_empty() {
-        ui.label(theme::hint(tr("수정 중인 파일 없음")));
-    } else {
+    if !files.is_empty() {
         egui::CollapsingHeader::new(trf("수정 중인 파일 {}개", &[&files.len()]))
             .id_salt("file_edits")
             .default_open(true)
