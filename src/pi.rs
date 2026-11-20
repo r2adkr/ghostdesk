@@ -40,8 +40,36 @@ pub fn install_command() -> &'static str {
 fn installer_path() -> String {
     let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
     let cur = std::env::var("PATH").unwrap_or_default();
-    format!("/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{cur}")
+    let own = standalone_node_bin().display().to_string();
+    format!("/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{cur}:{own}")
 }
+
+/// Where the Node.js GhostDesk installs itself (when the computer has none and Homebrew can't provide it).
+pub fn standalone_node_bin() -> PathBuf {
+    crate::platform::paths::data_root().join("node").join("current").join("bin")
+}
+
+/// Downloads Node.js 22 from nodejs.org (checked against its published hash) into GhostDesk's own folder.
+#[cfg(not(windows))]
+const NODE_STANDALONE: &str = r#"
+set -e
+case "$(uname -s)" in Darwin) p=darwin;; Linux) p=linux;; *) echo "error: no automatic Node.js for this system"; exit 1;; esac
+case "$(uname -m)" in arm64|aarch64) a=arm64;; x86_64|amd64) a=x64;; *) echo "error: no automatic Node.js for this CPU"; exit 1;; esac
+base=https://nodejs.org/dist/latest-v22.x
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl --proto '=https' --tlsv1.2 -fsSL "$base/SHASUMS256.txt" -o "$tmp/S"
+f=$(awk -v s="-$p-$a.tar.xz" 'index($2,"node-v")==1 && substr($2,length($2)-length(s)+1)==s {print $2; exit}' "$tmp/S")
+[ -n "$f" ] || { echo "error: no Node.js build for $p-$a"; exit 1; }
+curl --proto '=https' --tlsv1.2 -fsSL "$base/$f" -o "$tmp/$f"
+grep " $f\$" "$tmp/S" > "$tmp/one"
+if command -v shasum >/dev/null 2>&1; then (cd "$tmp" && shasum -a 256 -c one >/dev/null); else (cd "$tmp" && sha256sum -c one >/dev/null); fi
+mkdir -p "$DEST"
+rm -rf "$DEST/${f%.tar.xz}"
+tar -xf "$tmp/$f" -C "$DEST"
+rm -f "$DEST/current"
+ln -s "$DEST/${f%.tar.xz}" "$DEST/current"
+"#;
 
 /// Whether `node` 22.19 or newer is available.
 #[cfg(not(windows))]
@@ -85,17 +113,33 @@ pub fn install() -> Result<(), String> {
     {
         let sh = |cmd: &str| std::process::Command::new("/bin/sh").env("PATH", installer_path()).args(["-c", cmd]).stdin(Stdio::null()).output();
         if !node_ok() {
-            let has_brew = sh("command -v brew").is_ok_and(|o| o.status.success());
-            if !has_brew {
-                return Err("Node.js 22.19 이상이 필요해요. nodejs.org 에서 설치한 뒤 다시 눌러 주세요".into());
-            }
-            let out = sh("brew install node").map_err(|e| e.to_string())?;
-            if !out.status.success() {
-                return Err(fail("Node.js 설치에 실패했어요", out));
+            // Homebrew first (when there is one); if that is missing or fails, a Node.js of our own
+            let brewed = sh("command -v brew").is_ok_and(|o| o.status.success()) && sh("brew install node").is_ok_and(|o| o.status.success());
+            if !brewed || !node_ok() {
+                let dest = crate::platform::paths::data_root().join("node");
+                let out = std::process::Command::new("/bin/sh")
+                    .env("PATH", installer_path())
+                    .env("DEST", &dest)
+                    .args(["-c", NODE_STANDALONE])
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    return Err(fail("Node.js 설치에 실패했어요", out));
+                }
+                if !node_ok() {
+                    return Err("Node.js 를 설치했지만 쓸 수 없어요. nodejs.org 에서 22.19 이상을 설치한 뒤 다시 눌러 주세요".into());
+                }
             }
         }
         let out = sh(install_command()).map_err(|e| e.to_string())?;
-        if out.status.success() { Ok(()) } else { Err(fail("설치에 실패했어요", out)) }
+        if !out.status.success() {
+            return Err(fail("설치에 실패했어요", out));
+        }
+        if find().is_none() {
+            return Err(format!("설치는 끝났지만 pi 를 찾지 못했어요: {}", crate::llm::short(&installer_message(&out.stdout, &out.stderr), 200)));
+        }
+        Ok(())
     }
 }
 

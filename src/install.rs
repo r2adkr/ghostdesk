@@ -1189,6 +1189,8 @@ fn cli_path_env(cli: &Path) -> OsString {
     if let Some(cur) = b.var("PATH") {
         dirs.extend(std::env::split_paths(&cur));
     }
+    // the Node.js GhostDesk installed for itself (pi needs one), after every other
+    dirs.push(crate::pi::standalone_node_bin());
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
     std::env::join_paths(dirs).unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
@@ -1261,6 +1263,7 @@ pub(crate) fn find_cli(name: &str) -> Option<PathBuf> {
         h.join(".local/bin").join(name),
         h.join(format!(".{name}/local/{name}")),
         h.join(format!(".{name}/bin/{name}")), // opencode install script (~/.opencode/bin)
+        h.join(format!(".{name}/agent/bin/{name}")), // pi's own installer (~/.pi/agent/bin)
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
         PathBuf::from("/Applications/Codex.app/Contents/Resources").join(name),
@@ -1304,6 +1307,7 @@ pub(crate) fn find_cli(name: &str) -> Option<PathBuf> {
         b.local.join("Volta").join("bin"),                       // volta
         b.home.join(format!(".{name}")).join("local"), // claude's old local install
         b.home.join(format!(".{name}")).join("bin"), // opencode install script (~/.opencode/bin)
+        b.home.join(format!(".{name}")).join("agent").join("bin"), // pi's own installer
     ];
     if let Some(cur) = b.var("PATH") {
         dirs.extend(std::env::split_paths(&cur).filter(|d| d.is_absolute()));
