@@ -57,7 +57,7 @@ pub fn set_shell_tools_allowed(on: bool) {
     SHELL_TOOLS_ALLOWED.store(on, Ordering::Relaxed);
 }
 
-fn shell_tools_allowed() -> bool {
+pub(crate) fn shell_tools_allowed() -> bool {
     SHELL_TOOLS_ALLOWED.load(Ordering::Relaxed)
 }
 

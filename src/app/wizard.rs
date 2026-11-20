@@ -390,7 +390,7 @@ impl GhostApp {
             max_steps: self.form.max_steps,
             reply_lang: self.lang.english_name(),
             use_pi: true,
-            files: if cfg!(windows) { 0 } else { self.form.files },
+            files: self.form.files,
             // missing_setup was checked above, so a connection exists
             llm: self.cur().map(|c| c.llm(EFFORTS[self.effort_idx])).expect("missing_setup checked the connection"),
         };
@@ -1158,7 +1158,7 @@ impl GhostApp {
             });
             ui.end_row();
             // files and commands: only where the engine behind this AI can offer them
-            if !cfg!(windows) && self.cur().is_some_and(|c| crate::pi::supports(c.provider)) && crate::pi::find().is_some() {
+            if self.cur().is_some_and(|c| crate::pi::supports(c.provider)) && crate::pi::find().is_some() {
                 ui.label(tr("내 파일 도구")).on_hover_text(tr("에이전트가 파일을 읽고, 쓰고, 명령을 실행하게 해요. 작업공간 폴더 밖과 모든 명령은 그때마다 내가 허락해야 해요."));
                 ui.horizontal(|ui| {
                     for (level, label) in [(0u8, tr("끄기")), (1, tr("읽기")), (2, tr("읽기·쓰기·명령"))] {

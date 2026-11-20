@@ -97,9 +97,20 @@ pub fn find() -> Option<PathBuf> {
     crate::install::find_cli("pi")
 }
 
-/// pi's name for a provider and the environment variable holding its key. `None` for providers pi
-/// can't be pointed at with just a key (local servers, custom URLs, CLI logins).
-pub fn provider_args(p: Provider) -> Option<(&'static str, &'static str)> {
+/// How pi reaches an agent's AI: a provider it knows by name, or one GhostDesk describes to it (a custom
+/// address, a local server such as Ollama, a proxy) in its private `models.json`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Route {
+    pub provider: String,
+    pub env_key: &'static str,
+    /// `(base URL, API style)` of a provider GhostDesk defines itself.
+    pub custom: Option<(String, &'static str)>,
+}
+
+/// The variable that carries the key of a GhostDesk-defined provider.
+const CUSTOM_KEY: &str = "GHOSTDESK_API_KEY";
+
+fn builtin(p: Provider) -> Option<(&'static str, &'static str)> {
     Some(match p {
         Provider::Anthropic => ("anthropic", "ANTHROPIC_API_KEY"),
         Provider::OpenAi => ("openai", "OPENAI_API_KEY"),
@@ -111,14 +122,45 @@ pub fn provider_args(p: Provider) -> Option<(&'static str, &'static str)> {
     })
 }
 
-/// Whether an agent with this AI can run through pi.
-pub fn supports(p: Provider) -> bool {
-    provider_args(p).is_some()
+/// Name of a GhostDesk-defined provider: stable for one address and API style.
+fn custom_name(base_url: &str, api: &str) -> String {
+    let mut h = crate::install::Sha256::new();
+    h.update(format!("{api}\n{base_url}").as_bytes());
+    format!("gd-{}", &h.finish_hex()[..10])
 }
 
-/// pi is installed and this AI (with its default endpoint and a key) can use it.
+/// Where pi should send this AI's requests (`None`: not through pi, e.g. the CLI logins).
+pub fn route(llm: &Llm) -> Option<Route> {
+    if llm.provider.is_cli() {
+        return None;
+    }
+    let default = llm.provider.default_base_url();
+    let url = llm.base_url.trim().trim_end_matches('/').to_string();
+    if let Some((name, env_key)) = builtin(llm.provider) {
+        if url.is_empty() || url == default.trim_end_matches('/') {
+            return Some(Route { provider: name.into(), env_key, custom: None });
+        }
+    }
+    if url.is_empty() {
+        return None;
+    }
+    let api = if llm.provider == Provider::Anthropic { "anthropic-messages" } else { "openai-completions" };
+    Some(Route { provider: custom_name(&url, api), env_key: CUSTOM_KEY, custom: Some((url, api)) })
+}
+
+/// Whether an agent with this AI can run through pi.
+pub fn supports(p: Provider) -> bool {
+    !p.is_cli()
+}
+
+/// The key to hand pi (a placeholder for servers that need none).
+fn key_for(llm: &Llm) -> String {
+    if llm.api_key.is_empty() { "none".into() } else { llm.api_key.clone() }
+}
+
+/// pi is installed and this AI can use it.
 pub fn usable(llm: &Llm) -> bool {
-    supports(llm.provider) && !llm.api_key.is_empty() && llm.base_url == llm.provider.default_base_url() && find().is_some()
+    route(llm).is_some() && (!llm.api_key.is_empty() || !llm.provider.needs_key()) && find().is_some()
 }
 
 /// Why an agent with a key-based AI can't use pi although pi is installed (None: it can, or it isn't a
@@ -127,11 +169,11 @@ pub fn unavailable(llm: &Llm) -> Option<&'static str> {
     if find().is_none() || !supports(llm.provider) {
         return None;
     }
-    if llm.api_key.is_empty() {
+    if llm.provider.needs_key() && llm.api_key.is_empty() {
         return Some("API 키가 없어 기본 방식으로 실행해요");
     }
-    if llm.base_url != llm.provider.default_base_url() {
-        return Some("사용자 지정 주소라 기본 방식으로 실행해요");
+    if route(llm).is_none() {
+        return Some("주소가 없어 기본 방식으로 실행해요");
     }
     None
 }
@@ -147,6 +189,7 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
     match level {
         0 => &[],
         1 => &["read", "grep", "find", "ls"],
+        _ if cfg!(windows) => &["read", "grep", "find", "ls", "write", "edit", "powershell"],
         _ => &["read", "grep", "find", "ls", "write", "edit", "bash"],
     }
 }
@@ -155,7 +198,8 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
 /// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
 /// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
 /// person for approval first.
-pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool, skills: &[(String, PathBuf)]) -> String {
+pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool, skills: &[(String, PathBuf)], plugins: bool) -> String {
+    let mcp = mcp || plugins;
     let (top, hook) = match (files, mcp) {
         (Some(dir), _) => (
             format!(
@@ -175,7 +219,8 @@ const real = (p) => {{
     t = up;
   }}
 }};
-const inside = (p) => {{ const rel = relative(realpathSync(WORK), real(p)); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); }};
+const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
+const inside = (p) => {{ const rel = relative(norm(realpathSync(WORK)), norm(real(p))); return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)); }};
 async function allowed(ctx, tool, what) {{
   const v = await ctx.ui.input(ASK + JSON.stringify({{ tool, what }}), "");
   return v === "yes";
@@ -187,17 +232,18 @@ const DENIED = {{ block: true, reason: "The human operator did not allow this. D
             r#"
   const ours = new Set([...TOOLS.map((t) => t.name), "read_skill"]);
   const okMcp = new Set();
+  const plug = new Set();
   pi.on("tool_call", async (event, ctx) => {
     const n = event.toolName;
     if (ours.has(n)) return;
-    if (n.startsWith("mcp__") || n === "read_mcp_resource") {
+    if (n.startsWith("mcp__") || n === "read_mcp_resource" || plug.has(n)) {
       if (okMcp.has(n)) return;
       const what = n + " " + JSON.stringify(event.input ?? {}).slice(0, 300);
       if (!(await allowed(ctx, "mcp", what))) return DENIED;
       okMcp.add(n);
       return;
     }
-    if (n === "bash") return (await allowed(ctx, n, String(event.input.command ?? ""))) ? undefined : DENIED;
+    if (n === "bash" || n === "powershell") return (await allowed(ctx, n, String(event.input.command ?? ""))) ? undefined : DENIED;
     const p = event.input.path ?? event.input.file_path ?? ".";
     if (inside(p)) return;
     return (await allowed(ctx, n, real(p))) ? undefined : DENIED;
@@ -217,9 +263,10 @@ const DENIED = { block: true, reason: "The human operator did not allow this. Do
             r#"
   const ours = new Set([...TOOLS.map((t) => t.name), "read_skill"]);
   const okMcp = new Set();
+  const plug = new Set();
   pi.on("tool_call", async (event, ctx) => {
     const n = event.toolName;
-    if (ours.has(n) || !(n.startsWith("mcp__") || n === "read_mcp_resource")) return;
+    if (ours.has(n) || !(n.startsWith("mcp__") || n === "read_mcp_resource" || plug.has(n))) return;
     if (okMcp.has(n)) return;
     const what = n + " " + JSON.stringify(event.input ?? {}).slice(0, 300);
     if (!(await allowed(ctx, "mcp", what))) return DENIED;
@@ -261,12 +308,22 @@ const DENIED = { block: true, reason: "The human operator did not allow this. Do
 import { readFileSync as rfs, realpathSync as rps } from \"node:fs\";
 import { resolve as res, relative as rel2, isAbsolute as isabs } from \"node:path\";"
     };
+    let plugin_tools = if plugins {
+        r#"
+  pi.on("session_start", async () => {
+    const own = new Set([...TOOLS.map((t) => t.name), "read_skill"]);
+    const extra = pi.getAllTools().filter((t) => t.sourceInfo && t.sourceInfo.source !== "builtin" && t.sourceInfo.source !== "sdk" && !own.has(t.name) && !String(t.name).startsWith("mcp__")).map((t) => t.name);
+    for (const n of extra) plug.add(n);
+  });"#
+    } else {
+        ""
+    };
     format!(
         r#"const TOOLS = {tools};
 const SYSTEM = {system};
 const MARK = "\u0001gd\u0001";{skill_import}{top}
 export default function (pi) {{
-  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));{hook}{skill_tool}
+  pi.on("before_agent_start", async () => ({{ systemPrompt: SYSTEM }}));{hook}{skill_tool}{plugin_tools}
   for (const t of TOOLS) {{
     pi.registerTool({{
       name: t.name, label: t.name, description: t.description, parameters: t.parameters,
@@ -286,6 +343,7 @@ export default function (pi) {{
         top = top,
         hook = hook,
         skill_tool = skill_tool,
+        plugin_tools = plugin_tools,
         skill_import = skill_import,
     )
 }
@@ -405,7 +463,7 @@ fn home_dir() -> PathBuf {
 }
 
 /// Command-line arguments for one pi process.
-pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8, mcp: &[crate::toolbox::Server], skills: &[PathBuf]) -> Vec<String> {
+pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, tools: &[String], files: u8, mcp: &[crate::toolbox::Server], skills: &[PathBuf], plugins: &[String]) -> Vec<String> {
     let mut a: Vec<String> = ["--mode", "rpc", "--no-session", "--provider", provider, "--model", model]
         .into_iter()
         .map(String::from)
@@ -417,9 +475,32 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, t
         a.push("--no-mcp".into());
     } else {
         // only the MCP support itself and tool search (tools are found on demand); never codemode scripts
-        a.extend(["-e", "builtin:mcp", "-e", "builtin:tool-search", "--exclude-tools", "codemode"].map(String::from));
+        a.extend(["-e", "builtin:mcp", "-e", "builtin:tool-search"].map(String::from));
     }
-    if files == 0 && mcp.is_empty() {
+    // never codemode scripts
+    let mut exclude: Vec<&str> = vec!["codemode"];
+    if !plugins.is_empty() {
+        // a plugin's tools are not known in advance, so no allowlist: the built-in tools this agent may not
+        // have are switched off instead
+        let allowed = file_tools(files);
+        exclude.extend(["read", "grep", "find", "ls", "write", "edit", "bash", "powershell"].into_iter().filter(|t| !allowed.contains(t)));
+        a.push("--exclude-tools".into());
+        a.push(exclude.join(","));
+        // by default pi has only read, bash, edit and write: the search tools are switched on explicitly
+        let mut plus: Vec<&str> = allowed.iter().copied().filter(|t| matches!(*t, "grep" | "find" | "ls")).collect();
+        if !mcp.is_empty() {
+            plus.push("tool_search");
+        }
+        if !plus.is_empty() {
+            a.push("--tools".into());
+            a.push(plus.iter().map(|t| format!("+{t}")).collect::<Vec<_>>().join(","));
+        }
+    } else if !mcp.is_empty() {
+        a.push("--exclude-tools".into());
+        a.push("codemode".into());
+    }
+    if !plugins.is_empty() {
+    } else if files == 0 && mcp.is_empty() {
         a.push("--no-builtin-tools".into());
     } else {
         // the allowlist names every tool the model gets: GhostDesk's own, the file tools of this level and
@@ -438,6 +519,10 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, t
     }
     a.push("-e".into());
     a.push(extension.display().to_string());
+    for p in plugins {
+        a.push("-e".into());
+        a.push(p.clone());
+    }
     if let Some(level) = thinking_level(effort) {
         a.push("--thinking".into());
         a.push(level.into());
@@ -454,17 +539,62 @@ pub fn engine_command(exe: &Path, home: &Path) -> std::process::Command {
 
 fn base_command(exe: &Path, home: &Path, cwd: &Path, env_key: &str, api_key: &str) -> std::process::Command {
     let mut c = engine_command(exe, home);
-    #[cfg(not(windows))]
     c.current_dir(cwd);
-    #[cfg(windows)]
-    let _ = cwd;
     c.env(env_key, api_key);
     c
 }
 
-/// Whether pi's model list has this model for this provider (else the built-in loop is used).
+static MODELS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Tells pi about this agent's model in its private `models.json`: a GhostDesk-defined provider with its
+/// address, or a model id pi's catalog doesn't list yet. Entries of other agents are kept.
+fn register_model(home: &Path, route: &Route, llm: &Llm, listed: bool) -> Result<()> {
+    if listed && route.custom.is_none() {
+        return Ok(());
+    }
+    let _g = MODELS_LOCK.lock();
+    let path = home.join("models.json");
+    let mut root: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    let providers = root.as_object_mut().expect("object").entry("providers").or_insert_with(|| json!({}));
+    if !providers.is_object() {
+        *providers = json!({});
+    }
+    let entry = providers.as_object_mut().expect("object").entry(route.provider.clone()).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let e = entry.as_object_mut().expect("object");
+    if let Some((url, api)) = &route.custom {
+        e.insert("baseUrl".into(), json!(url));
+        e.insert("api".into(), json!(api));
+        e.insert("apiKey".into(), json!(format!("${CUSTOM_KEY}")));
+    }
+    let models = e.entry("models").or_insert_with(|| json!([]));
+    if !models.is_array() {
+        *models = json!([]);
+    }
+    let list = models.as_array_mut().expect("array");
+    if !list.iter().any(|m| m["id"] == llm.model.as_str()) {
+        // screenshots go to the model, so it is declared as taking images
+        list.push(json!({ "id": llm.model, "input": ["text", "image"] }));
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Whether pi's model list has this model for this provider.
 async fn model_known(exe: &Path, home: &Path, provider: &str, env_key: &str, llm: &Llm) -> bool {
-    let mut c = base_command(exe, home, home, env_key, &llm.api_key);
+    let mut c = base_command(exe, home, home, env_key, &key_for(llm));
     c.args(["--list-models", &llm.model]).stdout(Stdio::piped()).stderr(Stdio::null());
     let out = tokio::task::spawn_blocking(move || {
         let mut child = crate::ssh::ProcessGuard(crate::platform::proc::spawn_group(&mut c).ok()?);
@@ -594,7 +724,7 @@ fn recap(shared: &AgentShared) -> String {
 /// agent, so the caller runs its own loop instead.
 pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Result<Option<&'static str>> {
     let Job { shared, cfg, ws, system, tools, membership } = job;
-    let (Some(exe), Some((name, env_key))) = (find(), provider_args(cfg.llm.provider)) else { return Ok(None) };
+    let (Some(exe), Some(route)) = (find(), route(&cfg.llm)) else { return Ok(None) };
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
     #[cfg(unix)]
@@ -602,18 +732,22 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
     }
-    if !model_known(&exe, &home, name, env_key, &cfg.llm).await {
-        return Ok(Some("이 모델은 고급 엔진이 몰라서 기본 방식으로 실행해요"));
+    // a model pi's catalog doesn't list (new, local, custom address) is described to it instead of refused
+    let listed = route.custom.is_none() && model_known(&exe, &home, &route.provider, route.env_key, &cfg.llm).await;
+    if let Err(e) = register_model(&home, &route, &cfg.llm, listed) {
+        shared.log(LogKind::Error, format!("모델 정보를 저장하지 못했어요: {e}"));
+        return Ok(Some("이 모델을 고급 엔진에 알리지 못해서 기본 방식으로 실행해요"));
     }
     // per process and agent, so two GhostDesk windows never share (or delete) each other's file
     let extension = TempFile(home.join(format!("bridge-{}-{}.mjs", std::process::id(), shared.id)));
     // the agent's own folder for files (pi's file tools are offered only where paths can be confined to it)
-    let work = (cfg.files > 0 && !cfg!(windows)).then(|| crate::profiles::workspaces_root().join(crate::profiles::slug(&cfg.workspace)).join("files"));
+    let work = (cfg.files > 0).then(|| crate::profiles::workspaces_root().join(crate::profiles::slug(&cfg.workspace)).join("files"));
     if let Some(dir) = &work {
         std::fs::create_dir_all(dir)?;
     }
     // the tool box: switched-on servers (the engine reads them from its private folder)
     let mcp = crate::toolbox::active();
+    let plugins = crate::pluginbox::active();
     let skills: Vec<crate::skillbox::Skill> = crate::skillbox::list().into_iter().filter(|s| s.enabled).collect();
     let mut system = system.to_string();
     if !mcp.is_empty() {
@@ -628,15 +762,15 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
     if let Some(dir) = &work {
         system.push_str(&format!(
             "\n\nFiles: you also have file tools (read, grep, find, ls{}). Your work folder is {}; keep files you create there. Anything outside it, and every command, is shown to the human for approval first; if they refuse, do not retry — continue without it or ask.",
-            if cfg.files >= 2 { ", write, edit, bash" } else { "" },
+            if cfg.files >= 2 { if cfg!(windows) { ", write, edit, powershell" } else { ", write, edit, bash" } } else { "" },
             dir.display()
         ));
     }
-    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty(), &skills.iter().map(|k| (k.name.clone(), k.path.clone())).collect::<Vec<_>>()))?;
+    std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty(), &skills.iter().map(|k| (k.name.clone(), k.path.clone())).collect::<Vec<_>>(), !plugins.is_empty()))?;
     let names: Vec<String> = tool_defs(tools).iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
     let cwd = work.clone().unwrap_or_else(|| home.clone());
-    let spec = Spec { extension: &extension.0, tools: names, cwd, mcp, skills: skills.iter().map(|k| k.path.clone()).collect() };
-    drive_agent(shared, cfg, ws, &exe, &home, &spec, name, env_key, membership, rx).await.map(|_| None)
+    let spec = Spec { extension: &extension.0, tools: names, cwd, mcp, skills: skills.iter().map(|k| k.path.clone()).collect(), plugins };
+    drive_agent(shared, cfg, ws, &exe, &home, &spec, &route, membership, rx).await.map(|_| None)
 }
 
 /// How to start the process: the extension, the names of GhostDesk's tools and the working folder.
@@ -646,6 +780,7 @@ struct Spec<'a> {
     cwd: PathBuf,
     mcp: Vec<crate::toolbox::Server>,
     skills: Vec<PathBuf>,
+    plugins: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -656,8 +791,7 @@ async fn drive_agent(
     exe: &Path,
     home: &Path,
     spec: &Spec<'_>,
-    provider: &str,
-    env_key: &str,
+    route: &Route,
     membership: Option<&Membership>,
     rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
 ) -> Result<()> {
@@ -715,8 +849,8 @@ async fn drive_agent(
             bail!("에이전트 화면이 닫혔습니다");
         }
         if proc.is_none() {
-            let mut c = base_command(exe, home, &spec.cwd, env_key, &cfg.llm.api_key);
-            c.args(build_args(provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp, &spec.skills));
+            let mut c = base_command(exe, home, &spec.cwd, route.env_key, &key_for(&cfg.llm));
+            c.args(build_args(&route.provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp, &spec.skills, &spec.plugins));
             proc = Some(Proc::spawn(c)?);
         }
         let p = proc.as_mut().expect("just started");
@@ -823,15 +957,28 @@ async fn drive(
                     }
                     Some(Event::Ask { ui_id, tool, what }) => {
                         let (title, kind) = match tool.as_str() {
-                            "bash" => ("에이전트가 명령을 실행하려고 해요", "실행할 명령"),
+                            "bash" | "powershell" => ("에이전트가 명령을 실행하려고 해요", "실행할 명령"),
                             "mcp" => ("에이전트가 연결된 도구를 쓰려고 해요", "도구"),
                             "write" | "edit" => ("에이전트가 내 컴퓨터의 파일을 바꾸려고 해요", "파일"),
                             _ => ("에이전트가 내 컴퓨터의 파일을 읽으려고 해요", "파일"),
                         };
-                        shared.log(LogKind::Info, format!("허락을 기다리는 중: {kind} {}", crate::llm::short(&what, 200)));
-                        let allowed = tokio::select! {
-                            a = crate::control::ask_person(title, format!("{}\n\n{kind}: {what}", shared.name)) => a,
-                            _ = shared.wait_for_stop() => false,
+                        // the person's permission settings decide first; only "ask" shows the window
+                        let allowed = match crate::access::decide(crate::access::kind_of(&tool), crate::control::shell_tools_allowed()) {
+                            crate::access::Rule::Allow => {
+                                shared.log(LogKind::Info, format!("설정에 따라 허용: {kind} {}", crate::llm::short(&what, 200)));
+                                true
+                            }
+                            crate::access::Rule::Deny => {
+                                shared.log(LogKind::Info, format!("설정에 따라 막음: {kind} {}", crate::llm::short(&what, 200)));
+                                false
+                            }
+                            crate::access::Rule::Ask => {
+                                shared.log(LogKind::Info, format!("허락을 기다리는 중: {kind} {}", crate::llm::short(&what, 200)));
+                                tokio::select! {
+                                    a = crate::control::ask_person(title, format!("{}\n\n{kind}: {what}", shared.name)) => a,
+                                    _ = shared.wait_for_stop() => false,
+                                }
+                            }
                         };
                         p.send(json!({ "type": "extension_ui_response", "id": ui_id, "value": if allowed { "yes" } else { "no" } }));
                     }
@@ -878,40 +1025,49 @@ mod tests {
 
     #[test]
     fn args_isolate_pi_and_keep_the_key_out() {
-        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0, &[], &[]);
+        let a = build_args("anthropic", "claude-sonnet-5-5", Path::new("/x/bridge.mjs"), "high", &[], 0, &[], &[], &[]);
         for f in ["--no-builtin-tools", "--no-mcp", "--no-extensions", "--no-skills", "--no-context-files", "--no-session"] {
             assert!(a.iter().any(|x| x == f), "{f}");
         }
         assert!(a.windows(2).any(|w| w == ["-e", "/x/bridge.mjs"]));
         assert!(a.windows(2).any(|w| w == ["--thinking", "high"]));
         assert!(!a.iter().any(|x| x.contains("api-key")));
-        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[], &[]).iter().any(|x| x == "--thinking"));
+        assert!(!build_args("openai", "m", Path::new("e"), "weird", &[], 0, &[], &[], &[]).iter().any(|x| x == "--thinking"));
     }
 
     #[test]
     fn tool_box_adds_mcp_and_tool_search_but_never_codemode() {
         let srv = crate::toolbox::Server { name: "my-fs".into(), command: "x".into(), args: vec![], url: String::new(), env: vec![], enabled: true, exposure: "deferred".into() };
         let tools = vec!["computer".to_string()];
-        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()], &[PathBuf::from("/s/a")]);
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()], &[PathBuf::from("/s/a")], &["npm:x@1.0.0".to_string()]);
         assert!(!a.iter().any(|x| x == "--no-mcp" || x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["-e", "builtin:mcp"]));
-        assert!(a.windows(2).any(|w| w == ["--exclude-tools", "codemode"]));
-        assert!(extension_source(&[], "s", None, true, &[]).contains("mcp__"));
-        assert!(a.windows(2).any(|w| w == ["--tools", "computer,read_skill,tool_search,mcp__my_fs__*"]));
-        assert!(extension_source(&[], "s", None, false, &[("demo".into(), PathBuf::from("/s/demo"))]).contains("read_skill"));
+        assert!(a.windows(2).any(|w| w[0] == "--exclude-tools" && w[1].starts_with("codemode")));
+        let nopl = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()], &[], &[]);
+        assert!(nopl.windows(2).any(|w| w == ["--exclude-tools", "codemode"]));
+        let pl = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[], &[], &["npm:x@1.0.0".to_string()]);
+        assert!(!pl.iter().any(|x| x == "--no-builtin-tools"));
+        assert!(pl.windows(2).any(|w| w == ["--tools", "+grep,+find,+ls"]));
+        assert!(pl.windows(2).any(|w| w == ["--exclude-tools", "codemode,write,edit,bash,powershell"]));
+        assert!(a.windows(2).any(|w| w == ["-e", "npm:x@1.0.0"]));
+        assert!(extension_source(&[], "s", None, true, &[], false).contains("mcp__"));
+        assert!(extension_source(&[], "s", None, false, &[], true).contains("session_start"));
+        let sk = build_args("openai", "m", Path::new("e"), "high", &tools, 0, &[srv.clone()], &[PathBuf::from("/s/a")], &[]);
+        assert!(sk.windows(2).any(|w| w == ["--tools", "computer,read_skill,tool_search,mcp__my_fs__*"]));
+        assert!(extension_source(&[], "s", None, false, &[("demo".into(), PathBuf::from("/s/demo"))], false).contains("read_skill"));
     }
 
     #[test]
     fn file_tools_are_allowed_by_level_and_ask_before_leaving_the_folder() {
         let tools = vec!["computer".to_string(), "ask_user".to_string()];
-        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[], &[]);
+        let a = build_args("openai", "m", Path::new("e"), "high", &tools, 1, &[], &[], &[]);
         assert!(!a.iter().any(|x| x == "--no-builtin-tools"));
         assert!(a.windows(2).any(|w| w == ["--tools", "computer,ask_user,read,grep,find,ls"]));
-        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[], &[]);
+        let b = build_args("openai", "m", Path::new("e"), "high", &tools, 2, &[], &[], &[]);
         assert!(b.iter().any(|x| x.ends_with("write,edit,bash")));
-        let src = extension_source(&[], "s", Some(Path::new("/work/files")), false, &[]);
+        let src = extension_source(&[], "s", Some(Path::new("/work/files")), false, &[], false);
         assert!(src.contains(r#"const WORK = "/work/files";"#) && src.contains("tool_call") && src.contains("DENIED"));
-        assert!(!extension_source(&[], "s", None, false, &[]).contains("tool_call"));
+        assert!(!extension_source(&[], "s", None, false, &[], false).contains("tool_call"));
         let ask = json!({ "type": "extension_ui_request", "id": "a1", "method": "input", "title": format!("{ASK}{}", json!({ "tool": "bash", "what": "ls" })) });
         assert_eq!(parse_event(&ask.to_string()), Some(Event::Ask { ui_id: "a1".into(), tool: "bash".into(), what: "ls".into() }));
     }
@@ -965,15 +1121,53 @@ mod tests {
     #[test]
     fn the_extension_carries_tools_and_the_system_prompt() {
         let tools = vec![json!({ "name": "ask_user", "description": "d", "parameters": { "type": "object" } })];
-        let src = extension_source(&tools, "Line 1\n\"quoted\"", None, false, &[]);
+        let src = extension_source(&tools, "Line 1\n\"quoted\"", None, false, &[], false);
         assert!(src.contains(r#""name":"ask_user""#));
         assert!(src.contains(r#"const SYSTEM = "Line 1\n\"quoted\"";"#));
         assert!(src.contains("before_agent_start"));
     }
 
+    fn llm(p: Provider, url: &str) -> Llm {
+        Llm::new(p, url.into(), "k".into(), "m1".into(), "medium".into())
+    }
+
     #[test]
-    fn only_key_based_providers_can_use_pi() {
-        assert!(supports(Provider::Anthropic) && supports(Provider::Gemini));
-        assert!(!supports(Provider::ClaudeCli) && !supports(Provider::Ollama) && !supports(Provider::Custom));
+    fn every_api_ai_has_a_route_but_the_cli_logins_do_not() {
+        assert!(supports(Provider::Anthropic) && supports(Provider::Ollama) && supports(Provider::Custom));
+        assert!(!supports(Provider::ClaudeCli) && !supports(Provider::CodexCli));
+        let r = route(&llm(Provider::OpenAi, &Provider::OpenAi.default_base_url())).unwrap();
+        assert_eq!((r.provider.as_str(), r.env_key, r.custom.is_none()), ("openai", "OPENAI_API_KEY", true));
+        // a changed address, a local server and a custom API become providers GhostDesk describes
+        let proxy = route(&llm(Provider::OpenAi, "https://proxy.example.com/v1/")).unwrap();
+        assert_eq!(proxy.custom, Some(("https://proxy.example.com/v1".to_string(), "openai-completions")));
+        assert!(proxy.provider.starts_with("gd-") && proxy.env_key == "GHOSTDESK_API_KEY");
+        assert_eq!(route(&llm(Provider::Anthropic, "https://gw.example.com")).unwrap().custom.unwrap().1, "anthropic-messages");
+        assert!(route(&llm(Provider::Ollama, "http://localhost:11434/v1")).unwrap().custom.is_some());
+        assert!(route(&llm(Provider::Custom, "")).is_none());
+        // one address, one provider name
+        assert_eq!(route(&llm(Provider::Custom, "http://a/v1")), route(&llm(Provider::Custom, "http://a/v1/")));
+        assert_ne!(route(&llm(Provider::Custom, "http://a/v1")), route(&llm(Provider::Custom, "http://b/v1")));
+    }
+
+    #[test]
+    fn unlisted_and_custom_models_are_registered_without_touching_other_entries() {
+        let home = std::env::temp_dir().join(format!("gd-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("models.json"), r#"{"providers":{"other":{"models":[{"id":"x"}]}}}"#).unwrap();
+        let local = llm(Provider::Ollama, "http://localhost:11434/v1");
+        let r = route(&local).unwrap();
+        register_model(&home, &r, &local, false).unwrap();
+        register_model(&home, &r, &local, false).unwrap();
+        let known = llm(Provider::OpenAi, &Provider::OpenAi.default_base_url());
+        let rk = route(&known).unwrap();
+        register_model(&home, &rk, &known, true).unwrap(); // listed: nothing to add
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(home.join("models.json")).unwrap()).unwrap();
+        assert_eq!(v["providers"]["other"]["models"][0]["id"], "x");
+        let e = &v["providers"][r.provider.as_str()];
+        assert_eq!(e["models"].as_array().unwrap().len(), 1);
+        assert_eq!((e["api"].as_str(), e["apiKey"].as_str()), (Some("openai-completions"), Some("$GHOSTDESK_API_KEY")));
+        assert!(v["providers"].get("openai").is_none());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

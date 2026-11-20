@@ -185,6 +185,18 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
     let ctx = eframe::egui::Context::default();
     let ws_name = format!("agent-test-{}", std::process::id());
     let shared = AgentShared::new(1, "cli".into(), ws_name.clone(), ctx);
+
+    // GHOSTDESK_TEST_PI_ACCESS=run=allow,read=deny,write=ask,tool=allow: the engine's permission settings
+    if let Ok(spec) = std::env::var("GHOSTDESK_TEST_PI_ACCESS") {
+        use crate::access::Rule;
+        let mut a = crate::access::get();
+        for part in spec.split(',') {
+            let Some((k, v)) = part.split_once('=') else { continue };
+            let rule = match v { "allow" => Rule::Allow, "deny" => Rule::Deny, _ => Rule::Ask };
+            match k { "read" => a.read = rule, "write" => a.write = rule, "run" => a.run = rule, "tool" => a.tool = rule, "plugins" => a.plugins = v == "allow", _ => {} }
+        }
+        crate::access::set(a);
+    }
     let cfg = AgentConfig {
         name: "cli".into(),
         team: None,
@@ -192,7 +204,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         // GHOSTDESK_TEST_PI_MODEL=<openai model>: runs the agent on the pi engine (its OpenAI endpoint redirected
         // to a fake server through <data dir>/engine/models.json)
         files: std::env::var("GHOSTDESK_TEST_PI_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-        use_pi: std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some(),
+        use_pi: std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some() || std::env::var_os("GHOSTDESK_TEST_PI").is_some(),
         task,
         // GHOSTDESK_TEST_REMOTE=host:port[:dedicated] runs against the remote desktop (VNC) backend
         target: if let Ok(name) = std::env::var("GHOSTDESK_TEST_ELECTRON") {
@@ -226,7 +238,7 @@ pub async fn run_agent_cli(task: String) -> Result<()> {
         max_steps: 10,
         reply_lang: "Korean",
         llm: match std::env::var("GHOSTDESK_TEST_OPENAI_URL") {
-            _ if std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some() => Llm::new(
+            _ if std::env::var_os("GHOSTDESK_TEST_PI_MODEL").is_some() && std::env::var_os("GHOSTDESK_TEST_OPENAI_URL").is_none() => Llm::new(
                 crate::llm::Provider::OpenAi,
                 crate::llm::Provider::OpenAi.default_base_url(),
                 "test-key".into(),

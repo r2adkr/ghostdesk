@@ -2,6 +2,7 @@
 //! removed here; the person approves exactly what will run before it is added, and agents ask again the first
 //! time each tool is used.
 use super::*;
+use crate::pluginbox::{self, Plugin};
 use crate::skillbox::{self, Candidate, Skill};
 use crate::toolbox::{self, Server, Status};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -26,6 +27,12 @@ pub(super) struct State {
     importing: bool,
     skill_confirm: Option<(Candidate, usize, u64)>,
     skill_note: Option<String>,
+    plugins: Vec<Plugin>,
+    plugins_loaded: bool,
+    plugin_source: String,
+    plugin_ack: bool,
+    plugin_busy: Option<Receiver<Result<(), String>>>,
+    plugin_note: Option<String>,
 }
 
 /// Environment lines `KEY=VALUE` (blank and malformed lines are skipped).
@@ -232,6 +239,8 @@ impl GhostApp {
         }
         ui.add_space(18.0);
         self.skills_section(ui);
+        ui.add_space(18.0);
+        self.plugins_section(ui);
     }
 }
 
@@ -349,6 +358,115 @@ impl GhostApp {
                 Err(e) => self.toolbox.skill_note = Some(tr(&e).to_string()),
             }
         }
+    }
+}
+
+impl GhostApp {
+    /// Plugins: code that runs inside the engine. Adding one needs the permission switch, a warning and a tick.
+    fn plugins_section(&mut self, ui: &mut egui::Ui) {
+        if !self.toolbox.plugins_loaded {
+            self.toolbox.plugins = pluginbox::load();
+            self.toolbox.plugins_loaded = true;
+        }
+        if let Some(rx) = &self.toolbox.plugin_busy {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.toolbox.plugin_busy = None;
+                    self.toolbox.plugins = pluginbox::load();
+                    match r {
+                        Ok(()) => {
+                            self.toolbox.plugin_note = None;
+                            self.toolbox.plugin_source.clear();
+                            self.toolbox.plugin_ack = false;
+                        }
+                        Err(e) => self.toolbox.plugin_note = Some(e),
+                    }
+                }
+                Err(TryRecvError::Empty) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(300)),
+                Err(_) => self.toolbox.plugin_busy = None,
+            }
+        }
+        theme::section(ui, tr("플러그인"));
+        ui.add_space(4.0);
+        ui.label(theme::hint(tr("플러그인은 에이전트에 새 기능을 더하는 코드예요.")));
+        ui.add_space(6.0);
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        for (i, p) in self.toolbox.plugins.iter_mut().enumerate() {
+            theme::soft_card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::llm::short(&p.source, 60)).monospace());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::icon_button(ui, icon::X, tr("지우기")).clicked() {
+                            remove = Some(i);
+                        }
+                        changed |= ui.add(theme::switch(&mut p.enabled, "")).changed();
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        }
+        if let Some(i) = remove {
+            let src = self.toolbox.plugins[i].source.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.toolbox.plugin_busy = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(pluginbox::remove(&src));
+            });
+        }
+        if changed {
+            if let Err(e) = pluginbox::save(&self.toolbox.plugins) {
+                self.toolbox.plugin_note = Some(trf("저장하지 못했어요 ({})", &[&e]));
+            }
+        }
+        if !self.access.plugins {
+            ui.label(theme::hint(tr("플러그인을 쓰려면 설정 → 권한에서 '플러그인 설치 허용'을 먼저 켜세요")));
+            return;
+        }
+        if self.toolbox.plugins.is_empty() {
+            ui.label(theme::hint(tr("아직 설치한 플러그인이 없어요")));
+            ui.add_space(6.0);
+        }
+        let busy = self.toolbox.plugin_busy.is_some();
+        let w = ui.available_width();
+        ui.add(egui::TextEdit::singleline(&mut self.toolbox.plugin_source).desired_width(w).margin(Margin::symmetric(10, 6)).hint_text(tr("npm:이름@버전  ·  git:주소@태그  ·  폴더 전체 경로")));
+        let ready = !self.toolbox.plugin_source.trim().is_empty();
+        if ready {
+            ui.add_space(6.0);
+            theme::tinted(theme::danger()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(tr("설치 전에 꼭 읽어 주세요")).strong().color(theme::danger()));
+                ui.label(tr("플러그인은 이 앱 안에서 코드를 그대로 실행해요. 에이전트의 AI 키와 이 컴퓨터의 파일에 접근할 수 있고, 내 승인 창을 거치지 않고 일할 수도 있어요. 만든 사람을 믿을 수 있을 때만 설치하세요. 가능하면 버전을 고정해서 쓰세요."));
+                ui.add_space(4.0);
+                ui.label(RichText::new(self.toolbox.plugin_source.trim()).monospace());
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.toolbox.plugin_ack, tr("위험을 이해했고, 이 플러그인을 믿고 설치해요"));
+            });
+        }
+        if let Some(n) = &self.toolbox.plugin_note {
+            ui.label(RichText::new(n.clone()).small().color(theme::danger()));
+        }
+        ui.horizontal(|ui| {
+            let can = ready && self.toolbox.plugin_ack && !busy;
+            if ui.add_enabled(can, egui::Button::new(tr("설치"))).clicked() {
+                let src = self.toolbox.plugin_source.trim().to_string();
+                match pluginbox::valid_source(&src) {
+                    Ok(()) => {
+                        self.toolbox.plugin_note = None;
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.toolbox.plugin_busy = Some(rx);
+                        std::thread::spawn(move || {
+                            let _ = tx.send(pluginbox::install(&src));
+                        });
+                    }
+                    Err(why) => self.toolbox.plugin_note = Some(tr(why).to_string()),
+                }
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
     }
 }
 

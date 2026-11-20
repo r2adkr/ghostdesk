@@ -21,30 +21,26 @@ impl GhostApp {
             });
             ui.add_space(16.0);
         }
-        // quick actions first: start something, find something
-        if titlebar::visible(ui.ctx()) {
-            if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
-                self.open_wizard();
-            }
-        } else {
-            // no title bar (full screen, Linux): the sidebar button sits here. It is wider than its 32pt minimum, so
-            // leave it room (a row wider than the panel would make the panel grow on every frame)
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let w = ui.available_width() - theme::KEY_BUTTON_W - 6.0;
-                ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
-                        self.open_wizard();
-                    }
-                });
-                if theme::icon_button_keys(ui, icon::PANEL_LEFT, key("B").as_deref(), &format!("{} ({})", tr("사이드바 접기"), palette::cmd_key("B"))).clicked() {
-                    self.sidebar_open = false;
+        // quick actions first: start something (wide button), find something and fold the sidebar (icons)
+        let folds = !titlebar::visible(ui.ctx());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let icons = if folds { 2.0 } else { 1.0 };
+            // the buttons are wider than their 32pt minimum, so leave them room (a row wider than the panel
+            // would make the panel grow on every frame)
+            let w = ui.available_width() - theme::KEY_BUTTON_W * icons - 6.0;
+            ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
+                    self.open_wizard();
                 }
             });
-        }
-        if theme::nav_item_keys(ui, false, icon::SEARCH, tr("찾기"), None, key("K").as_deref()).on_hover_text(palette::cmd_key("K")).clicked() {
-            self.open_palette();
-        }
+            if theme::icon_button_keys(ui, icon::SEARCH, key("K").as_deref(), &format!("{} ({})", tr("찾기"), palette::cmd_key("K"))).clicked() {
+                self.open_palette();
+            }
+            if folds && theme::icon_button_keys(ui, icon::PANEL_LEFT, key("B").as_deref(), &format!("{} ({})", tr("사이드바 접기"), palette::cmd_key("B"))).clicked() {
+                self.sidebar_open = false;
+            }
+        });
         ui.add_space(6.0);
         if theme::nav_item_keys(ui, self.view == View::Home, icon::GHOST, tr("홈"), None, key("1").as_deref()).clicked() {
             self.view = View::Home;
@@ -52,40 +48,54 @@ impl GhostApp {
         if theme::nav_item_keys(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None, key("2").as_deref()).clicked() {
             self.view = View::Grid;
         }
-        // green dot while any agent is in a team
+        // teams and usage are the less used views: folded away unless one is open or a team is active
         let active = self.teams_ui_active();
-        if theme::nav_item_keys(ui, self.view == View::Teams, icon::LIST_TODO, tr("팀"), active.then(theme::success), key("3").as_deref())
-            .on_hover_text(tr("여러 에이전트가 같은 목표·메모·할 일을 보며 함께 일해요"))
-            .clicked()
-        {
-            self.view = View::Teams;
-        }
-        if theme::nav_item_keys(ui, self.view == View::Usage, icon::CHART_COLUMN, tr("사용량"), None, key("4").as_deref())
-            .on_hover_text(tr("에이전트가 쓴 토큰·동작·화면을 날짜별로 봐요"))
-            .clicked()
-        {
-            self.view = View::Usage;
+        let in_more = matches!(self.view, View::Teams | View::Usage);
+        let more_open = self.more_views_open || in_more || active;
+        if !more_open {
+            if theme::nav_item(ui, false, icon::ELLIPSIS, tr("더 보기"), None).on_hover_text(tr("팀 · 사용량")).clicked() {
+                self.more_views_open = true;
+            }
+        } else {
+            // green dot while any agent is in a team
+            if theme::nav_item_keys(ui, self.view == View::Teams, icon::LIST_TODO, tr("팀"), active.then(theme::success), key("3").as_deref())
+                .on_hover_text(tr("여러 에이전트가 같은 목표·메모·할 일을 보며 함께 일해요"))
+                .clicked()
+            {
+                self.view = View::Teams;
+            }
+            if theme::nav_item_keys(ui, self.view == View::Usage, icon::CHART_COLUMN, tr("사용량"), None, key("4").as_deref())
+                .on_hover_text(tr("에이전트가 쓴 토큰·동작·화면을 날짜별로 봐요"))
+                .clicked()
+            {
+                self.view = View::Usage;
+            }
         }
         // lay out the pinned bottom rows first; the agent list gets whatever height is left
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref())
-                .clicked()
-            {
-                self.open_settings(settings::SettingsTab::General);
-            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let w = ui.available_width() - theme::KEY_BUTTON_W - 6.0;
+                ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref()).clicked() {
+                        self.open_settings(settings::SettingsTab::General);
+                    }
+                });
+                // green dot when connected, red when the control server failed
+                let r = theme::icon_button(ui, icon::PLUG, tr("Claude 앱 · Claude Code · Codex 에서 GhostDesk 쓰기 (키 필요 없음)"));
+                if let Some(c) = self.connect_badge() {
+                    ui.painter().circle_filled(r.rect.right_top() + Vec2::new(-8.0, 8.0), 3.5, c);
+                }
+                if r.on_hover_text(tr("외부 연결")).clicked() {
+                    self.open_connect(ui.ctx());
+                }
+            });
             if self.auto_approve
                 && theme::nav_item(ui, false, icon::SHIELD_ALERT, tr("권한 확인 꺼짐"), Some(theme::warn()))
                     .on_hover_text(tr("외부 에이전트의 요청을 묻지 않고 허용하고 있어요. 눌러서 설정 열기"))
                     .clicked()
             {
                 self.open_settings(settings::SettingsTab::Permissions);
-            }
-            // green dot when connected, red when the control server failed
-            if theme::nav_item(ui, false, icon::PLUG, tr("외부 연결"), self.connect_badge())
-                .on_hover_text(tr("Claude 앱 · Claude Code · Codex 에서 GhostDesk 쓰기 (키 필요 없음)"))
-                .clicked()
-            {
-                self.open_connect(ui.ctx());
             }
             ui.add_space(4.0);
             // Right below the menu: agent list and notices. Notices go in this top-down layout

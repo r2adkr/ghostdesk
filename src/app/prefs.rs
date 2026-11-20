@@ -43,6 +43,8 @@ pub(super) struct Prefs {
     auto_approve: Option<bool>,
     /// Windows: external agents may open shells, terminals and system tools (default on: each one asks).
     allow_shell_tools: Option<bool>,
+    /// What engine agents may do on this computer.
+    pi_access: Option<crate::access::Access>,
     /// Live view frame-rate ceiling.
     live_fps_limit: Option<u32>,
     pi_offer_dismissed: Option<bool>,
@@ -187,6 +189,7 @@ impl GhostApp {
         self.ssh_profiles = p.ssh_profiles;
         self.auto_approve = p.auto_approve.unwrap_or(false);
         self.allow_shell_tools = p.allow_shell_tools.unwrap_or(true);
+        self.access = p.pi_access.unwrap_or_default();
         self.live_fps_limit = p.live_fps_limit.unwrap_or(60).clamp(1, 120);
         self.pi_offer_dismissed = p.pi_offer_dismissed.unwrap_or(false);
         self.allow_experimental = p.allow_experimental.unwrap_or(false);
@@ -225,6 +228,7 @@ impl GhostApp {
             pip_auto_close: Some(self.pip_auto_close),
             auto_approve: Some(self.auto_approve),
             allow_shell_tools: Some(self.allow_shell_tools),
+            pi_access: Some(self.access),
             live_fps_limit: Some(self.live_fps_limit),
             pi_offer_dismissed: Some(self.pi_offer_dismissed),
             allow_experimental: Some(self.allow_experimental),

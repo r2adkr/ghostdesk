@@ -17,6 +17,8 @@ mod cleanup;
 mod control;
 mod mcp;
 mod toolbox;
+mod pluginbox;
+mod access;
 mod skillbox;
 mod cursor;
 mod icon;

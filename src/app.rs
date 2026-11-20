@@ -295,11 +295,13 @@ pub struct GhostApp {
     /// once with the permission bypass). Off refuses them. The password managers and GhostDesk itself
     /// stay refused either way.
     allow_shell_tools: bool,
+    access: crate::access::Access,
     live_fps_limit: u32,
     /// Run key-based AI agents through pi when it is installed.
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pi_note: Option<String>,
     toolbox: toolbox_ui::State,
+    more_views_open: bool,
     pi_offer_dismissed: bool,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
@@ -452,10 +454,12 @@ impl GhostApp {
             pip_auto_close: true,
             auto_approve: false,
             allow_shell_tools: true,
+            access: Default::default(),
             live_fps_limit: 60,
             pi_install: None,
             pi_note: None,
             toolbox: Default::default(),
+            more_views_open: false,
             pi_offer_dismissed: false,
             allow_experimental: false,
             tour: None,
@@ -736,6 +740,7 @@ impl eframe::App for GhostApp {
             }
         }
         crate::control::set_shell_tools_allowed(self.allow_shell_tools);
+        crate::access::set(self.access);
         crate::rfb::set_live_fps_limit(self.live_fps_limit);
         self.poll_route(&ctx);
         self.approval_window(&ctx);

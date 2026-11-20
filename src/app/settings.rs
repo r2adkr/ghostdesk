@@ -551,6 +551,50 @@ impl GhostApp {
             }
         }
 
+        self.access_section(ui);
+    }
+
+    /// What agents on the engine may do on this computer, one row per kind of access.
+    fn access_section(&mut self, ui: &mut egui::Ui) {
+        use crate::access::Rule;
+        ui.add_space(18.0);
+        theme::section(ui, tr("에이전트의 내 컴퓨터 접근"));
+        ui.add_space(4.0);
+        ui.label(theme::hint(tr("API 키 AI 에이전트가 파일·명령·도구를 쓰려 할 때 어떻게 할지 정해요. '권한 확인 건너뛰기'는 여기에 영향을 주지 않아요.")));
+        ui.add_space(6.0);
+        let rows: [(&str, &str, bool); 4] = [
+            ("작업 폴더 밖 파일 읽기", "에이전트 자기 폴더 밖의 파일을 읽으려 할 때", false),
+            ("작업 폴더 밖 파일 쓰기·수정", "에이전트 자기 폴더 밖의 파일을 바꾸려 할 때", true),
+            ("명령 실행", "에이전트가 터미널 명령을 실행하려 할 때", true),
+            ("도구 상자의 도구 사용", "연결된 외부 도구를 쓰려 할 때 (도구마다 한 번)", false),
+        ];
+        for (i, (label, tip, risky)) in rows.into_iter().enumerate() {
+            let rule = match i {
+                0 => &mut self.access.read,
+                1 => &mut self.access.write,
+                2 => &mut self.access.run,
+                _ => &mut self.access.tool,
+            };
+            ui.horizontal(|ui| {
+                ui.label(tr(label)).on_hover_text(tr(tip));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (r, name) in [(Rule::Deny, tr("막기")), (Rule::Allow, tr("항상 허용")), (Rule::Ask, tr("묻기"))] {
+                        if ui.add(egui::Button::selectable(*rule == r, name)).clicked() {
+                            *rule = r;
+                        }
+                    }
+                });
+            });
+            if *rule == Rule::Allow && risky {
+                ui.label(RichText::new(tr("묻지 않고 바로 실행돼요. 믿는 에이전트에만 켜세요")).size(12.0).color(theme::warn()));
+            }
+        }
+        if !self.allow_shell_tools {
+            ui.label(theme::hint(tr("'셸·터미널·시스템 도구 허용'이 꺼져 있어 명령은 항상 막혀요")));
+        }
+        ui.add_space(8.0);
+        ui.add(theme::switch(&mut self.access.plugins, tr("플러그인 설치 허용")))
+            .on_hover_text(tr("플러그인은 이 앱 안에서 코드를 실행해요. 켜도 설치할 때마다 내가 직접 확인해야 해요"));
     }
 
     /// Remote tab: ceiling for the live view's frame rate.
