@@ -593,6 +593,10 @@ pub(crate) async fn settle(ws: &Desk) {
     } else if let Some(e) = ws.as_electron() {
         e.inner().wait_ready(Duration::from_millis(1500)).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
+    } else if let Some(r) = ws.as_remote() {
+        // a remote screen says itself when the picture stopped changing: faster than a fixed guess when
+        // the answer is quick, and it keeps waiting through a slow link or a long redraw
+        r.quiet(r.settle_window(Duration::from_millis(90)), Duration::from_millis(900)).await;
     } else {
         tokio::time::sleep(Duration::from_millis(350)).await;
     }

@@ -1918,6 +1918,7 @@ dependencies = [
  "block2 0.6.2",
  "dirs",
  "eframe",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "image",

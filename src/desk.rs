@@ -131,6 +131,13 @@ impl Desk {
         }
     }
 
+    pub fn as_remote(&self) -> Option<&Arc<RfbDesk>> {
+        match self {
+            Desk::Remote(r) => Some(r),
+            _ => None,
+        }
+    }
+
     pub fn as_electron(&self) -> Option<&Arc<ElectronWorkspace>> {
         match self {
             Desk::Electron(e) => Some(e),

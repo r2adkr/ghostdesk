@@ -26,6 +26,8 @@ libc = "0.2"
 memmap2 = "0.9"
 # 호스트 모드: 공개키로 상대를 찾고, 직접 연결(NAT 통과)이 안 되면 중계 서버로 잇는다. 종단간 암호화
 iroh = "1.5"
+# VNC ZRLE 인코딩 압축 해제 (원격 화면 전송량을 크게 줄인다)
+flate2 = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

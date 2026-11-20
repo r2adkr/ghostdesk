@@ -15,10 +15,11 @@
 //!   libvncclient; `ReplyVersion::Apple889` replies 3.889).
 //! - Security types: None(1), VNC Authentication(2), Apple Remote Desktop(30).
 //!   Selection order: None if offered → ARD with username+password → VNC with a password.
-//! - Encodings: Raw(0), CopyRect(1), RRE(2), Hextile(5).
+//! - Encodings: ZRLE(16), Raw(0), CopyRect(1), RRE(2), Hextile(5).
 //!   Pseudo-encodings: DesktopSize(-223), LastRect(-224), Cursor(-239, optional),
 //!   ExtendedDesktopSize(-308, parsed only).
-//!   ZRLE(16)/Tight need zlib and aren't implemented.
+//!   ZRLE is zlib-compressed (one stream for the whole connection) and is what keeps the picture small over the
+//!   internet; Tight isn't implemented.
 //! - Pixel format: always requests 32bpp/depth 24/little-endian/true-colour (R<<16|G<<8|B) via
 //!   SetPixelFormat and keeps the internal framebuffer as RGBA8.
 //!
@@ -85,6 +86,7 @@ const ENC_RAW: i32 = 0;
 const ENC_COPYRECT: i32 = 1;
 const ENC_RRE: i32 = 2;
 const ENC_HEXTILE: i32 = 5;
+const ENC_ZRLE: i32 = 16;
 const ENC_DESKTOP_SIZE: i32 = -223;
 const ENC_LAST_RECT: i32 = -224;
 const ENC_CURSOR: i32 = -239;
@@ -302,6 +304,13 @@ pub struct RfbDesk {
     cursor: Mutex<Option<CursorShape>>,
     server_clipboard: Mutex<Option<String>>,
     last_request: Mutex<Instant>,
+    /// The whole picture was received at least once, so later screenshots can use the framebuffer as it is
+    /// (kept current by incremental updates) instead of asking the server for the entire screen again.
+    synced: AtomicBool,
+    /// When the last input went out and has not been answered by a picture yet.
+    input_at: Mutex<Option<Instant>>,
+    /// Smoothed time from an input to the next picture update (ms): the link's round trip plus the server's reaction.
+    lag_ms: AtomicU64,
 }
 
 /// Cleans up what people type as a VNC address: `vnc://host:5901/`, `host:5901`, `[fe80::1]:5900`, spaces.
@@ -523,7 +532,7 @@ impl RfbDesk {
         let mut msg = vec![0u8, 0, 0, 0];
         msg.extend_from_slice(&[32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
         // ── SetEncodings
-        let mut encs = vec![ENC_COPYRECT, ENC_HEXTILE, ENC_RRE, ENC_RAW, ENC_DESKTOP_SIZE, ENC_LAST_RECT];
+        let mut encs = vec![ENC_ZRLE, ENC_COPYRECT, ENC_HEXTILE, ENC_RRE, ENC_RAW, ENC_DESKTOP_SIZE, ENC_LAST_RECT];
         if opts.cursor_pseudo {
             encs.push(ENC_CURSOR);
         }
@@ -554,6 +563,9 @@ impl RfbDesk {
             cursor: Mutex::new(None),
             server_clipboard: Mutex::new(None),
             last_request: Mutex::new(Instant::now()),
+            synced: AtomicBool::new(false),
+            input_at: Mutex::new(None),
+            lag_ms: AtomicU64::new(0),
             opts,
         });
         let weak = Arc::downgrade(&desk);
@@ -656,6 +668,35 @@ impl RfbDesk {
         Ok(self.wait_coverage(timeout).await)
     }
 
+    /// Makes the framebuffer current before a screenshot. Once the whole picture has been received, incremental
+    /// updates keep it current, so nothing is asked for again: wait only until the changes caused by the last action
+    /// have arrived (no new update for a moment). Before that, or after a size change, ask for the whole screen.
+    async fn fresh_frame(&self) -> Result<()> {
+        if !self.synced.load(Ordering::SeqCst) {
+            let _ = self.refresh(Duration::from_millis(1500)).await?;
+            return Ok(());
+        }
+        self.quiet(self.settle_window(Duration::from_millis(60)), Duration::from_millis(700)).await;
+        Ok(())
+    }
+
+    /// Waits until no FramebufferUpdate has arrived for `quiet`, at most `max` (animations never go quiet).
+    pub async fn quiet(&self, quiet: Duration, max: Duration) {
+        let start = tokio::time::Instant::now();
+        let mut rx = self.seq_tx.subscribe();
+        rx.borrow_and_update();
+        loop {
+            let left = max.saturating_sub(start.elapsed());
+            if left.is_zero() || self.is_closed() {
+                return;
+            }
+            match tokio::time::timeout(quiet.min(left), rx.changed()).await {
+                Ok(Ok(())) => continue,
+                _ => return,
+            }
+        }
+    }
+
     async fn wait_coverage(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut rx = self.seq_tx.subscribe();
@@ -682,7 +723,7 @@ impl RfbDesk {
         if self.is_closed() {
             bail!("RFB 연결이 끊어졌습니다");
         }
-        let _ = self.refresh(Duration::from_millis(1500)).await?;
+        self.fresh_frame().await?;
         if self.fb_size().0 == 0 || self.fb_size().1 == 0 {
             bail!("원격 프레임버퍼 크기가 0 입니다");
         }
@@ -701,7 +742,7 @@ impl RfbDesk {
         if self.is_closed() {
             bail!("RFB 연결이 끊어졌습니다");
         }
-        let _ = self.refresh(Duration::from_millis(1500)).await?;
+        self.fresh_frame().await?;
         let (aw, ah) = self.size();
         let (fw, fh) = self.fb_size();
         if fw == 0 || fh == 0 {
@@ -790,11 +831,33 @@ impl RfbDesk {
         Ok(())
     }
 
+    fn mark_input(&self) {
+        let mut at = self.input_at.lock();
+        at.get_or_insert_with(Instant::now);
+    }
+
+    /// A picture update arrived: if an input was waiting for one, that is a sample of the link's lag.
+    fn note_update(&self) {
+        if let Some(t) = self.input_at.lock().take() {
+            let sample = (t.elapsed().as_millis() as u64).min(1500);
+            let old = self.lag_ms.load(Ordering::Relaxed);
+            self.lag_ms.store(if old == 0 { sample } else { (old * 3 + sample) / 4 }, Ordering::Relaxed);
+        }
+    }
+
+    /// How long to wait for a picture to stop changing: at least `base`, longer on a slow link (a quick wait would
+    /// return before the answer to the input has even arrived).
+    pub fn settle_window(&self, base: Duration) -> Duration {
+        let lag = Duration::from_millis(self.lag_ms.load(Ordering::Relaxed) * 3 / 2);
+        base.max(lag).min(Duration::from_millis(600))
+    }
+
     async fn send_pointer(&self) -> Result<()> {
         let (pos, mask) = {
             let st = self.input.lock();
             (st.mouse, st.buttons)
         };
+        self.mark_input();
         let (x, y) = self.to_fb(pos);
         let mut m = [5u8, mask, 0, 0, 0, 0];
         m[2..4].copy_from_slice(&x.to_be_bytes());
@@ -803,6 +866,7 @@ impl RfbDesk {
     }
 
     async fn send_key(&self, keysym: u32, down: bool) -> Result<()> {
+        self.mark_input();
         let mut m = [4u8, down as u8, 0, 0, 0, 0, 0, 0];
         m[4..8].copy_from_slice(&keysym.to_be_bytes());
         self.send(&m).await
@@ -1108,6 +1172,8 @@ async fn reader_loop(weak: Weak<RfbDesk>, mut rd: OwnedReadHalf) {
 
 async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()> {
     let mut hextile_buf = Vec::new();
+    // ZRLE rectangles of one connection share a single zlib stream
+    let mut zrle = Zrle::new();
     loop {
         let typ = match read_u8(rd).await {
             Ok(t) => t,
@@ -1173,6 +1239,18 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                             drop(fb);
                             area += w as u64 * h as u64;
                         }
+                        ENC_ZRLE => {
+                            me.fb.lock().check(x, y, w, h)?;
+                            let len = read_u32(rd).await? as usize;
+                            if len > 64 << 20 {
+                                bail!("ZRLE 데이터 길이 비정상: {len}");
+                            }
+                            let mut z = vec![0u8; len];
+                            rd.read_exact(&mut z).await?;
+                            let raw = zrle.inflate(&z, w as usize * h as usize * 4 + 4096)?;
+                            zrle_tiles(&mut me.fb.lock(), x, y, w, h, raw)?;
+                            area += w as u64 * h as u64;
+                        }
                         ENC_HEXTILE => {
                             me.fb.lock().check(x, y, w, h)?;
                             read_hextile(&me, rd, x, y, w, h, &mut hextile_buf).await?;
@@ -1226,13 +1304,19 @@ async fn reader_inner(weak: &Weak<RfbDesk>, rd: &mut OwnedReadHalf) -> Result<()
                         other => bail!("지원하지 않는 인코딩 {other} 수신 — 스트림을 해석할 수 없음"),
                     }
                 }
-                me.coverage.fetch_add(area, Ordering::SeqCst);
+                let covered = me.coverage.fetch_add(area, Ordering::SeqCst) + area;
+                let (fw, fh) = me.fb_size();
+                if covered >= fw as u64 * fh as u64 {
+                    me.synced.store(true, Ordering::SeqCst);
+                }
+                me.note_update();
                 me.seq_tx.send_modify(|s| *s += 1);
                 (me.on_frame)();
-                // next incremental request (at least 30 ms apart)
+                // next incremental request (at least 8 ms apart: it is the only thing that makes the server send
+                // more, so every ms spent here is added to the delay of the next picture)
                 let wait = {
                     let last = *me.last_request.lock();
-                    Duration::from_millis(30).saturating_sub(last.elapsed())
+                    Duration::from_millis(8).saturating_sub(last.elapsed())
                 };
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
@@ -1276,9 +1360,159 @@ impl RfbDesk {
         check_fb_dims(w, h)?;
         *self.fb.lock() = Framebuffer::new(w, h);
         self.coverage.store(0, Ordering::SeqCst);
+        self.synced.store(false, Ordering::SeqCst);
         self.note(format!("원격 화면 크기 변경: {w}x{h}"));
         Ok(())
     }
+}
+
+/// The zlib stream shared by all ZRLE rectangles of a connection.
+struct Zrle {
+    z: flate2::Decompress,
+    out: Vec<u8>,
+}
+
+impl Zrle {
+    fn new() -> Self {
+        Zrle { z: flate2::Decompress::new(true), out: Vec::new() }
+    }
+
+    /// Inflates one rectangle's data (the stream continues across rectangles). `limit` caps the output: a rectangle
+    /// cannot hold more than its pixels, so more is a broken or hostile stream.
+    fn inflate(&mut self, data: &[u8], limit: usize) -> Result<&[u8]> {
+        self.out.clear();
+        let before = self.z.total_in();
+        loop {
+            let consumed = (self.z.total_in() - before) as usize;
+            self.out.reserve(16 * 1024);
+            let out_before = self.out.len();
+            let status = self
+                .z
+                .decompress_vec(&data[consumed..], &mut self.out, flate2::FlushDecompress::Sync)
+                .map_err(|e| anyhow!("ZRLE zlib 오류: {e}"))?;
+            let now = (self.z.total_in() - before) as usize;
+            if status == flate2::Status::StreamEnd {
+                break;
+            }
+            // everything was read and the output buffer was not filled up: the flush is complete
+            if now >= data.len() && self.out.len() < self.out.capacity() {
+                break;
+            }
+            if now == consumed && self.out.len() == out_before {
+                bail!("ZRLE 압축 해제가 멈춤");
+            }
+            if self.out.len() > limit {
+                bail!("ZRLE 압축 해제 결과가 너무 큼");
+            }
+        }
+        Ok(&self.out)
+    }
+}
+
+/// Reads one ZRLE run length: 1 + the sum of bytes up to the first one below 255.
+fn zrle_run(d: &[u8], i: &mut usize) -> Result<usize> {
+    let mut n = 1usize;
+    loop {
+        let b = *d.get(*i).ok_or_else(|| anyhow!("ZRLE 데이터가 모자람"))?;
+        *i += 1;
+        n += b as usize;
+        if b != 255 {
+            return Ok(n);
+        }
+    }
+}
+
+/// Decodes the (already inflated) tiles of a ZRLE rectangle into the framebuffer. The pixel format is 32bpp with
+/// 24 significant bits, so a "CPIXEL" is the 3 low bytes: B, G, R.
+fn zrle_tiles(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, d: &[u8]) -> Result<()> {
+    let mut i = 0usize;
+    let need = |i: usize, n: usize| -> Result<()> {
+        if i + n > d.len() { bail!("ZRLE 데이터가 모자람") } else { Ok(()) }
+    };
+    let cpix = |i: &mut usize| -> Result<[u8; 4]> {
+        need(*i, 3)?;
+        let p = [d[*i + 2], d[*i + 1], d[*i], 255];
+        *i += 3;
+        Ok(p)
+    };
+    let mut ty = 0;
+    while ty < h {
+        let th = 64.min(h - ty);
+        let mut tx = 0;
+        while tx < w {
+            let tw = 64.min(w - tx);
+            let n = (tw * th) as usize;
+            need(i, 1)?;
+            let sub = d[i];
+            i += 1;
+            let rle = sub & 128 != 0;
+            let psize = (sub & 127) as usize;
+            if psize > 127 {
+                bail!("ZRLE 팔레트 크기 비정상");
+            }
+            let mut palette = Vec::with_capacity(psize);
+            for _ in 0..psize {
+                palette.push(cpix(&mut i)?);
+            }
+            // RGBA pixels of the tile, row by row
+            let mut px: Vec<[u8; 4]> = Vec::with_capacity(n);
+            match (rle, psize) {
+                (false, 0) => {
+                    for _ in 0..n {
+                        px.push(cpix(&mut i)?);
+                    }
+                }
+                (false, 1) => px.resize(n, palette[0]),
+                (false, 2..=16) => {
+                    let bits = if psize == 2 { 1 } else if psize <= 4 { 2 } else { 4 };
+                    for _ in 0..th {
+                        let mut left = tw;
+                        while left > 0 {
+                            need(i, 1)?;
+                            let byte = d[i];
+                            i += 1;
+                            let per = 8 / bits;
+                            for k in 0..per.min(left as usize) {
+                                let idx = ((byte >> (8 - bits * (k + 1))) & ((1u8 << bits) - 1)) as usize;
+                                px.push(*palette.get(idx).ok_or_else(|| anyhow!("ZRLE 팔레트 번호 비정상"))?);
+                            }
+                            left -= per.min(left as usize) as u32;
+                        }
+                    }
+                }
+                (true, 0) => {
+                    while px.len() < n {
+                        let c = cpix(&mut i)?;
+                        let run = zrle_run(d, &mut i)?;
+                        if px.len() + run > n { bail!("ZRLE 반복 길이 비정상"); }
+                        px.resize(px.len() + run, c);
+                    }
+                }
+                (true, 2..=127) => {
+                    while px.len() < n {
+                        need(i, 1)?;
+                        let b = d[i];
+                        i += 1;
+                        let c = *palette.get((b & 127) as usize).ok_or_else(|| anyhow!("ZRLE 팔레트 번호 비정상"))?;
+                        let run = if b & 128 != 0 { zrle_run(d, &mut i)? } else { 1 };
+                        if px.len() + run > n { bail!("ZRLE 반복 길이 비정상"); }
+                        px.resize(px.len() + run, c);
+                    }
+                }
+                _ => bail!("ZRLE 하위 인코딩 {sub} 은(는) 정의되지 않음"),
+            }
+            let stride = fb.w as usize * 4;
+            for row in 0..th as usize {
+                let dst0 = (y + ty) as usize * stride + (x + tx) as usize * 4 + row * stride;
+                for col in 0..tw as usize {
+                    fb.rgba[dst0 + col * 4..dst0 + col * 4 + 4].copy_from_slice(&px[row * tw as usize + col]);
+                }
+            }
+            tx += 64;
+        }
+        ty += 64;
+    }
+    Ok(())
 }
 
 async fn read_hextile<R: AsyncRead + Unpin>(
@@ -2118,7 +2352,7 @@ mod tests {
             input: Mutex::new(InputState::default()), closed: AtomicBool::new(false),
             seq_tx: watch::channel(0).0, coverage: AtomicU64::new(0), notes: Mutex::new(Vec::new()),
             on_frame: Arc::new(|| {}), reader: Mutex::new(None), cursor: Mutex::new(None),
-            server_clipboard: Mutex::new(None), last_request: Mutex::new(Instant::now()),
+            server_clipboard: Mutex::new(None), last_request: Mutex::new(Instant::now()), synced: AtomicBool::new(false), input_at: Mutex::new(None), lag_ms: AtomicU64::new(0),
         };
         desk.type_text("a\r\nb\rc\n가\t👋").await.unwrap();
         desk.shutdown().await;
@@ -2256,6 +2490,45 @@ mod tests {
         false
     }
 
+    /// A full-screen ZRLE update over a real socket: decoded correctly, and afterwards a screenshot uses the picture
+    /// it already has instead of asking the server for the whole screen again.
+    #[tokio::test]
+    async fn zrle_update_fills_the_screen_and_screenshots_do_not_refetch() {
+        use std::io::Write;
+        let (w, h) = (80u16, 70u16);
+        // two tile rows x two tile columns, each solid but different
+        let mut raw = Vec::new();
+        for c in [[0u8, 0, 255], [0, 255, 0], [255, 0, 0], [0, 255, 255]] {
+            raw.push(1);
+            raw.extend(c);
+        }
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).unwrap();
+        enc.flush().unwrap();
+        let z = enc.get_mut().clone();
+        let mut u = update_hdr(0, 0, w, h, ENC_ZRLE);
+        u.extend_from_slice(&(z.len() as u32).to_be_bytes());
+        u.extend_from_slice(&z);
+        let port = fake_server(w, h, u).await;
+        let mut o = RfbOptions::new("127.0.0.1", port);
+        o.connect_timeout = Duration::from_secs(5);
+        let d = RfbDesk::connect_with(o, Arc::new(|| {})).await.unwrap();
+        assert!(d.wait_coverage(Duration::from_secs(3)).await, "the whole screen arrived");
+        assert!(d.synced.load(Ordering::SeqCst));
+        let px = |x: u32, y: u32| {
+            let fb = d.fb.lock();
+            let i = (y as usize * fb.w as usize + x as usize) * 4;
+            [fb.rgba[i], fb.rgba[i + 1], fb.rgba[i + 2]]
+        };
+        assert_eq!((px(0, 0), px(79, 0), px(0, 69), px(79, 69)), ([255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]));
+        // the server never answers a second request (the fake only sent one update), so a screenshot that
+        // re-requested the whole screen would wait out the 1.5 s refresh; this one does not
+        let t = Instant::now();
+        let png = d.screenshot().await.unwrap();
+        assert!(png.len() > 50 && t.elapsed() < Duration::from_millis(1200), "{:?}", t.elapsed());
+        d.shutdown().await;
+    }
+
     #[tokio::test]
     async fn huge_cursor_closes_cleanly() {
         let port = fake_server(16, 16, update_hdr(0, 0, 65535, 65535, ENC_CURSOR)).await;
@@ -2377,6 +2650,87 @@ mod tests {
         assert_eq!(parse_version(b"RFB 003.889\n").unwrap(), (3, 889));
         assert_eq!(parse_version(b"RFB 003.008\n").unwrap(), (3, 8));
         assert!(parse_version(b"HTTP/1.1 200").is_err());
+    }
+}
+
+#[cfg(test)]
+mod zrle_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fb(w: u32, h: u32) -> Framebuffer {
+        Framebuffer::new(w, h)
+    }
+    fn px(f: &Framebuffer, x: u32, y: u32) -> [u8; 3] {
+        let i = (y as usize * f.w as usize + x as usize) * 4;
+        [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2]]
+    }
+
+    #[test]
+    fn every_tile_kind_decodes() {
+        // 4x2 rectangle. CPIXEL bytes are B,G,R.
+        let red = [0u8, 0, 255];
+        let blue = [255u8, 0, 0];
+        // solid
+        let mut f = fb(4, 2);
+        zrle_tiles(&mut f, 0, 0, 4, 2, &[vec![1u8], red.to_vec()].concat()).unwrap();
+        assert_eq!(px(&f, 3, 1), [255, 0, 0]);
+        // raw
+        let mut f = fb(4, 2);
+        let mut d = vec![0u8];
+        for i in 0..8u8 { d.extend([i, 0, 255 - i]); }
+        zrle_tiles(&mut f, 0, 0, 4, 2, &d).unwrap();
+        assert_eq!(px(&f, 1, 0), [254, 0, 1]);
+        // packed palette of 2: 1 bit per pixel, rows padded to a byte: 1010 / 0101
+        let mut f = fb(4, 2);
+        let d = [vec![2u8], red.to_vec(), blue.to_vec(), vec![0b1010_0000, 0b0101_0000]].concat();
+        zrle_tiles(&mut f, 0, 0, 4, 2, &d).unwrap();
+        assert_eq!((px(&f, 0, 0), px(&f, 1, 0), px(&f, 0, 1), px(&f, 1, 1)), ([0, 0, 255], [255, 0, 0], [255, 0, 0], [0, 0, 255]));
+        // plain RLE: red x5 (run byte 4), blue x3 (run byte 2)
+        let mut f = fb(4, 2);
+        let d = [vec![128u8], red.to_vec(), vec![4], blue.to_vec(), vec![2]].concat();
+        zrle_tiles(&mut f, 0, 0, 4, 2, &d).unwrap();
+        assert_eq!((px(&f, 0, 1), px(&f, 1, 1), px(&f, 3, 1)), ([255, 0, 0], [0, 0, 255], [0, 0, 255]));
+        // palette RLE: index 0 once, index 1 with a run of 7
+        let mut f = fb(4, 2);
+        let d = [vec![130u8], red.to_vec(), blue.to_vec(), vec![0, 128 | 1, 6]].concat();
+        zrle_tiles(&mut f, 0, 0, 4, 2, &d).unwrap();
+        assert_eq!((px(&f, 0, 0), px(&f, 1, 0), px(&f, 3, 1)), ([255, 0, 0], [0, 0, 255], [0, 0, 255]));
+        // a run past the tile, a missing palette entry and truncated data are errors, not panics
+        assert!(zrle_tiles(&mut fb(4, 2), 0, 0, 4, 2, &[vec![128u8], red.to_vec(), vec![200]].concat()).is_err());
+        assert!(zrle_tiles(&mut fb(4, 2), 0, 0, 4, 2, &[vec![130u8], red.to_vec(), blue.to_vec(), vec![5, 0]].concat()).is_err());
+        assert!(zrle_tiles(&mut fb(4, 2), 0, 0, 4, 2, &[0u8, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn tiles_cover_a_rectangle_larger_than_64() {
+        // 70x3: two tiles per row band (64 + 6 wide), each solid
+        let mut f = fb(70, 3);
+        let d = [vec![1u8, 0, 0, 255], vec![1u8, 0, 255, 0]].concat();
+        zrle_tiles(&mut f, 0, 0, 70, 3, &d).unwrap();
+        assert_eq!((px(&f, 63, 2), px(&f, 64, 0), px(&f, 69, 2)), ([255, 0, 0], [0, 255, 0], [0, 255, 0]));
+    }
+
+    #[test]
+    fn one_zlib_stream_continues_across_rectangles() {
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut rects = Vec::new();
+        for n in 0..3u8 {
+            // each rectangle: a solid 1-tile picture of a different colour, flushed so it can be read on its own
+            enc.write_all(&[1, n, n, n]).unwrap();
+            enc.flush().unwrap();
+            rects.push(std::mem::take(enc.get_mut()));
+        }
+        let mut z = Zrle::new();
+        for (n, r) in rects.iter().enumerate() {
+            let out = z.inflate(r, 1 << 16).unwrap().to_vec();
+            assert_eq!(out, vec![1, n as u8, n as u8, n as u8]);
+        }
+        // a rectangle that inflates to far more than its pixels is refused (zlib bomb)
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 4 << 20]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(Zrle::new().inflate(&bomb, 1 << 12).is_err());
     }
 }
 
