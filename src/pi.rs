@@ -248,10 +248,6 @@ pub fn file_tools(level: u8) -> &'static [&'static str] {
     }
 }
 
-/// The pi extension: registers GhostDesk's tools, forwards each call to GhostDesk and sets the system
-/// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
-/// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
-/// person for approval first.
 /// Short description of the skill in a folder (for searching).
 fn skill_desc(dir: &Path) -> String {
     let text = std::fs::read_to_string(dir.join("SKILL.md")).unwrap_or_default();
@@ -261,6 +257,10 @@ fn skill_desc(dir: &Path) -> String {
 /// Above this many skills the system prompt only counts them; the agent searches with read_skill.
 const SKILLS_LISTED: usize = 12;
 
+/// The pi extension: registers GhostDesk's tools, forwards each call to GhostDesk and sets the system
+/// prompt. `tools` is a list of `{ name, description, parameters }`. With `files` (the agent's own folder),
+/// pi's file tools work freely inside that folder; anything outside it, and every command, is sent to the
+/// person for approval first.
 pub fn extension_source(tools: &[Value], system: &str, files: Option<&Path>, mcp: bool, skills: &[(String, PathBuf)], plugins: bool) -> String {
     let mcp = mcp || plugins;
     let (top, hook) = match (files, mcp) {
@@ -289,6 +289,8 @@ async function allowed(ctx, tool, what) {{
   return v === "yes";
 }}
 const DENIED = {{ block: true, reason: "The human operator did not allow this. Do not retry it; continue without it or ask the human." }};
+// a search pattern or glob that climbs out of the folder (or starts at the root) reaches files `path` does not show
+const climbs = (v) => typeof v === "string" && (isAbsolute(v) || v.startsWith("~") || /(^|[\\/])\.\.([\\/]|$)/.test(v));
 "#,
                 work = Value::String(dir.display().to_string()),
             ),
@@ -308,8 +310,9 @@ const DENIED = {{ block: true, reason: "The human operator did not allow this. D
     }
     if (n === "bash" || n === "powershell") return (await allowed(ctx, n, String(event.input.command ?? ""))) ? undefined : DENIED;
     const p = event.input.path ?? event.input.file_path ?? ".";
-    if (inside(p)) return;
-    return (await allowed(ctx, n, real(p))) ? undefined : DENIED;
+    const reach = climbs(event.input.pattern) || climbs(event.input.glob);
+    if (inside(p) && !reach) return;
+    return (await allowed(ctx, n, reach ? real(p) + " (" + (event.input.pattern ?? event.input.glob) + ")" : real(p))) ? undefined : DENIED;
   });"#
                 .to_string(),
         ),
@@ -1121,12 +1124,14 @@ mod tests {
     fn extension_with_skills_is_valid_javascript() {
         let dir = std::env::temp_dir().join(format!("gd-ext-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let src = extension_source(&[], "s", None, true, &[("demo".into(), dir.clone())], true);
-        let f = dir.join("ext.mjs");
-        std::fs::write(&f, src).unwrap();
-        // skipped where node is missing
-        if let Ok(o) = std::process::Command::new("node").arg("--check").arg(&f).output() {
-            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        for (i, files) in [None, Some(dir.as_path())].into_iter().enumerate() {
+            let src = extension_source(&[], "s", files, true, &[("demo".into(), dir.clone())], true);
+            let f = dir.join(format!("ext{i}.mjs"));
+            std::fs::write(&f, src).unwrap();
+            // skipped where node is missing
+            if let Ok(o) = std::process::Command::new("node").arg("--check").arg(&f).output() {
+                assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
