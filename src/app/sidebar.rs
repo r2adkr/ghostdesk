@@ -72,14 +72,14 @@ impl GhostApp {
                 .on_hover_text(tr("AI 회사 · API 키 · 모델 고르기"))
                 .clicked()
             {
-                self.show_settings = true;
+                self.open_settings(settings::SettingsTab::General);
             }
             if self.auto_approve
                 && theme::nav_item(ui, false, icon::SHIELD_ALERT, tr("권한 확인 꺼짐"), Some(theme::warn()))
                     .on_hover_text(tr("외부 에이전트의 요청을 묻지 않고 허용하고 있어요. 눌러서 설정 열기"))
                     .clicked()
             {
-                self.open_settings(settings::SettingsTab::General);
+                self.open_settings(settings::SettingsTab::Permissions);
             }
             // green dot when connected, red when the control server failed
             if theme::nav_item(ui, false, icon::PLUG, tr("외부 연결"), self.connect_badge())

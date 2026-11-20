@@ -70,6 +70,8 @@ impl GhostApp {
         if self.ssh_editor.is_none() {
             self.settings_host(ui);
             self.share_connection_info(ui);
+            ui.add_space(14.0);
+            self.settings_live_fps(ui);
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);

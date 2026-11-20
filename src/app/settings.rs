@@ -398,9 +398,7 @@ impl GhostApp {
         let mut lang = self.lang;
         let perm_ok = self.permissions_ok(ctx);
         let mut tabs = vec![SettingsTab::General, SettingsTab::Ai, SettingsTab::Ssh];
-        if cfg!(target_os = "macos") {
-            tabs.push(SettingsTab::Permissions);
-        }
+        tabs.push(SettingsTab::Permissions);
         tabs.push(SettingsTab::About);
         let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(width);
@@ -441,10 +439,7 @@ impl GhostApp {
                                 SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
                                 SettingsTab::Ssh => self.settings_ssh(ui),
                                 SettingsTab::Ai => self.settings_ai(ui, body_w, LABEL, field),
-                                SettingsTab::Permissions => {
-                                    #[cfg(target_os = "macos")]
-                                    self.permission_rows(ui);
-                                }
+                                SettingsTab::Permissions => self.settings_permissions(ui),
                                 SettingsTab::About => self.settings_about(ui),
                             }
                         });
@@ -510,8 +505,15 @@ impl GhostApp {
         ui.add_space(4.0);
         ui.add(theme::switch(&mut self.allow_experimental, tr("실험적 기능 허용")));
         ui.label(theme::hint(tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요")));
+    }
 
-        ui.add_space(16.0);
+    /// Permissions tab: approval rules for outside agents (and the macOS permission list above them).
+    fn settings_permissions(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "macos")]
+        {
+            self.permission_rows(ui);
+            ui.add_space(18.0);
+        }
         theme::section(ui, tr("승인"));
         ui.add_space(4.0);
         ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기")));
@@ -544,9 +546,13 @@ impl GhostApp {
             ui.label(if self.allow_shell_tools && self.auto_approve { RichText::new(note).size(12.0).color(theme::warn()) } else { theme::hint(note) });
         }
 
-        // live view frame-rate ceiling
+    }
+
+    /// Remote tab: ceiling for the live view's frame rate.
+    pub(super) fn settings_live_fps(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, tr("화면 속도"));
+        ui.add_space(4.0);
         {
-            ui.add_space(8.0);
             ui.label(tr("원격 화면 최대 프레임 (fps)"));
             ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"));
             ui.label(theme::hint(tr("낮출수록 CPU와 네트워크를 덜 써요. 호스트 모드 연결은 최대 30fps까지만 올라가요")));
