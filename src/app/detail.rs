@@ -38,6 +38,8 @@ impl GhostApp {
     /// Right panel of the detail view: name/status → controls → (question / external notice) → log
     /// → instruction box at the bottom.
     pub(super) fn detail_side(&mut self, ui: &mut egui::Ui, idx: usize) -> bool {
+        let compact_now = self.compact_now;
+        let layout = &mut self.detail_layout;
         let a = &mut self.agents[idx];
         let st = a.shared.status();
         let mut remove = false;
@@ -46,6 +48,16 @@ impl GhostApp {
             theme::dot(ui, crate::cursor::agent_color(a.shared.id), 5.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(RichText::new(icon::ELLIPSIS).size(18.0).color(theme::body()), |ui| {
+                    // how much room the screen and the chat get (the screen stays visible in all three)
+                    if !compact_now {
+                        for (i, label) in [(0u8, tr("화면 크게")), (1, tr("반반")), (2, tr("채팅 크게"))] {
+                            if ui.selectable_label(*layout == i, label).clicked() {
+                                *layout = i;
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                    }
                     if ui
                         .button(RichText::new(tr("에이전트 제거")).color(theme::danger()))
                         .on_hover_text(tr("에이전트 화면을 닫아요 (작업공간 폴더는 남아요)"))
@@ -62,18 +74,6 @@ impl GhostApp {
                 });
             });
         });
-        // layout: how much room the screen and the chat get (the screen stays visible in all three)
-        if !self.compact_now {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (i, label) in [(0u8, tr("화면 크게")), (1, tr("반반")), (2, tr("채팅 크게"))] {
-                    if ui.add(egui::Button::selectable(self.detail_layout == i, label)).clicked() {
-                        self.detail_layout = i;
-                    }
-                }
-            });
-        }
-        let a = &mut self.agents[idx];
         let files = a.shared.received_files.lock().clone();
         if !files.is_empty() {
             theme::section(ui, tr("받은 파일"));
@@ -105,26 +105,24 @@ impl GhostApp {
         }
         // steps: how many moves since the last instruction (a bar when there's a step limit)
         let run = a.shared.run_steps.load(Ordering::Relaxed);
-        if run > 0 {
+        if run > 0 && a.max_steps > 0 {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if a.max_steps > 0 {
-                    ui.label(theme::hint(trf("단계 {} / {}", &[&run, &a.max_steps])));
-                    let w = ui.available_width().min(220.0);
-                    theme::progress(ui, egui::Id::unique(("steps", a.shared.id)), run as f32 / a.max_steps as f32, w);
-                } else {
-                    ui.label(theme::hint(trf("단계 {}", &[&run])));
-                }
+                ui.label(theme::hint(trf("단계 {} / {}", &[&run, &a.max_steps])));
+                let w = ui.available_width().min(220.0);
+                theme::progress(ui, egui::Id::unique(("steps", a.shared.id)), run as f32 / a.max_steps as f32, w);
             });
         }
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            if theme::secondary(ui, if paused { tr("재개") } else { tr("일시정지") }).clicked() {
-                a.shared.paused.store(!paused, Ordering::Relaxed);
-            }
-            if theme::secondary(ui, tr("중지")).on_hover_text(tr("지금 동작만 끝내고 멈춰요. 다시 지시하면 이어서 해요.")).clicked() {
-                a.shared.stop.store(true, Ordering::SeqCst);
-                a.shared.paused.store(false, Ordering::Relaxed);
+            if (is_working(&st) || paused) && !a.takeover {
+                if theme::secondary(ui, if paused { tr("재개") } else { tr("일시정지") }).clicked() {
+                    a.shared.paused.store(!paused, Ordering::Relaxed);
+                }
+                if theme::secondary(ui, tr("중지")).on_hover_text(tr("지금 동작만 끝내고 멈춰요. 다시 지시하면 이어서 해요.")).clicked() {
+                    a.shared.stop.store(true, Ordering::SeqCst);
+                    a.shared.paused.store(false, Ordering::Relaxed);
+                }
             }
             let workspace = a.shared.workspace();
             let has_screen = workspace.as_ref().is_none_or(|w| w.has_screen());
@@ -151,9 +149,9 @@ impl GhostApp {
             ui.add_space(2.0);
             let (body, choices) = split_choices(q);
             let mut picked = None;
-            theme::tinted(theme::warn()).show(ui, |ui| {
+            theme::soft_card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(tr("에이전트의 질문")).strong().color(theme::warn()));
+                ui.label(theme::hint(format!("{}  {}", icon::CIRCLE_HELP, tr("에이전트의 질문"))));
                 // cap the height so a long question doesn't push the answer box away
                 egui::ScrollArea::vertical().id_salt("question").max_height(160.0).show(ui, |ui| {
                     ui.label(body);
@@ -176,9 +174,9 @@ impl GhostApp {
         let external = a.shared.external.lock().clone();
         if let Some(client) = &external {
             ui.add_space(2.0);
-            theme::tinted(theme::info()).show(ui, |ui| {
+            theme::soft_card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(trf("{} 이(가) 조작하는 화면", &[&client])).strong().color(theme::info_text()));
+                ui.label(RichText::new(trf("{} 이(가) 조작하는 화면", &[&client])).strong().color(theme::text()));
                 ui.label(theme::hint(tr("지시는 그 AI 앱에서 해 주세요. 여기서는 지켜보거나 '직접 조작'으로 도울 수 있어요.")));
             });
         }
@@ -237,7 +235,7 @@ impl GhostApp {
                 };
                 let te = ui.add(
                     egui::TextEdit::multiline(&mut a.input)
-                        .desired_rows(3)
+                        .desired_rows(2)
                         .desired_width(f32::INFINITY)
                         .margin(Margin::symmetric(10, 8))
                         .hint_text(hint),
@@ -252,7 +250,7 @@ impl GhostApp {
                         let _ = a.tx.send(cmd);
                         a.input.clear();
                     }
-                    if !waiting
+                    if !waiting && is_working(&st) && !paused
                         && theme::secondary(ui, tr("다음 작업으로"))
                             .on_hover_text(tr("지금 일이 끝나면 이어서 할 일로 줄 세워 둬요. 멈춰 있을 때는 '보내기'로 먼저 다시 시작해 주세요."))
                             .clicked()
@@ -674,9 +672,9 @@ fn chat_log(ui: &mut egui::Ui, log: &[crate::agent::LogEntry], acting: bool, age
                 match split_plan(&l.text) {
                     Some((before, steps, after)) => {
                         if !before.is_empty() { ui.add(egui::Label::new(RichText::new(before).color(theme::text())).wrap()); }
-                        theme::tinted(theme::info()).show(ui, |ui| {
+                        theme::soft_card().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new(format!("{}  {}", icon::LIST_TODO, tr("계획"))).strong().color(theme::info_text()));
+                            ui.label(theme::hint(format!("{}  {}", icon::LIST_TODO, tr("계획"))));
                             for (k, step) in steps.iter().enumerate() {
                                 ui.horizontal_top(|ui| {
                                     ui.label(theme::hint(format!("{}", k + 1)));

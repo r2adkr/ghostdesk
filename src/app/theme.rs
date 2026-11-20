@@ -308,6 +308,15 @@ pub fn card_frame() -> egui::Frame {
         .inner_margin(Margin::same(16))
 }
 
+/// A quiet card for in-chat blocks (plans, questions): neutral fill, hairline border, no colored accent.
+pub fn soft_card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(raised())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(CARD_RADIUS)
+        .inner_margin(Margin::symmetric(12, 10))
+}
+
 /// Lightly tinted notice card (question, external agent, warning).
 pub fn tinted(color: Color32) -> egui::Frame {
     egui::Frame::new()
