@@ -6,7 +6,7 @@ your screen, so your mouse and keyboard stay yours. Every click and keystroke
 is mirrored live in the GhostDesk window, and you can take over a screen at any
 time for things only a person should do, like signing in or two-factor prompts.
 
-![An agent planning a trip in a hidden browser](assets/tour/3-work.jpg)
+![An agent reading a release checklist in a hidden browser](assets/readme/3-work.jpg)
 
 GhostDesk runs on macOS 13+ and Windows 10/11. It is written in Rust with
 [egui](https://github.com/emilk/egui). Windows-specific differences (available
@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.9.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.9.0/GhostDesk-Setup-0.9.0-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.12.2-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.12.2/GhostDesk-Setup-0.12.2-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.9.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.9.0/GhostDesk-0.9.0-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.12.2-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.12.2/GhostDesk-0.12.2-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
@@ -45,6 +45,8 @@ screen types, install location, building) are collected in the
   never replaced by an older one. If you drag it into /Applications instead,
   that copy just opens the one in `~/Applications`, which is the only copy
   that runs.
+
+Older builds and release notes are on the [releases page](https://github.com/r2adkr/ghostdesk/releases).
 
 When a new version is released, a notice shows up in the sidebar. **Update**
 downloads the build for your OS and CPU and swaps it in; **Restart** applies it.
@@ -78,7 +80,7 @@ screen. Then choose where the agent works: a website, a specific app, or a
 remote computer. **Auto** uses an app if the task names one and starts on the
 web otherwise.
 
-<p><img src="assets/tour/1-home.jpg" width="49%" alt="Home screen"> <img src="assets/tour/2-new-agent.jpg" width="49%" alt="New agent dialog"></p>
+<p><img src="assets/readme/1-home.jpg" width="49%" alt="Home screen"> <img src="assets/readme/2-new-agent.jpg" width="49%" alt="New agent dialog"></p>
 
 **From an AI app you already use.** The Claude app, Claude Code, Codex, Kimi
 Code, OpenCode and pi are connected automatically when GhostDesk starts. Ask
@@ -88,7 +90,7 @@ not on that list (Cursor, Gemini CLI, Windsurf, …) can be connected from
 **Connections → Other AI apps** by copying the MCP config or generating a
 connection kit.
 
-<p><img src="assets/tour/5-connect.jpg" width="49%" alt="Connections dialog"> <img src="assets/tour/4-settings.jpg" width="49%" alt="AI connections in Settings"></p>
+<p><img src="assets/readme/5-connect.jpg" width="49%" alt="Connections dialog"> <img src="assets/readme/4-settings.jpg" width="49%" alt="AI connections in Settings"></p>
 
 **Keyboard.** Press Cmd+K (Ctrl+K on Windows) to jump to a screen, an agent or an
 action. Cmd+1 to 4 switch between Home, All agents, Teams and Usage, Cmd+N
@@ -216,6 +218,15 @@ instead of `app_vdisplay` on Windows); agents pick the one that fits the task.
 To keep token use low, only actions that change the picture return a
 screenshot, a screenshot identical to the last one is left out, and tab lists
 are sent only when they change. Pass `screenshot: true` to see the screen.
+With `actions`, put `screenshot` either on the call (it covers the whole batch)
+or on individual steps (any `true` returns an image, all `false` return none).
+It has to be `true` or `false`; anything else is rejected with the position of
+the bad value.
+
+Numbers from `desk_browser` `read` stay valid while the page is the same. If a
+page swaps a control for an identical new one (search boxes often do this once
+you start typing), the number moves to the new control, as long as exactly one
+element matches.
 Screens opened by external agents are marked with a plug icon and show the
 virtual cursor. The control socket is
 `~/Library/Application Support/GhostDesk/control.sock` with mode 0600.
@@ -344,6 +355,11 @@ research`).
   there is no way to reopen a clone without approval.
 - In Electron screens, the agent's cmd+c/x/v are blocked. The system clipboard
   is yours.
+- In Windows app screens, some apps still write to the system clipboard on
+  their own (Character Map does when you pick a character). GhostDesk keeps a
+  copy of your clipboard in memory and puts it back right away when that
+  happens. The copy is never written to disk, logged or sent anywhere.
+  `desk_open` tells the agent about this when it opens a Windows app.
 
 ## Permissions (macOS)
 
@@ -621,7 +637,8 @@ cargo test
 | `src/control.rs`, `src/mcp.rs` | Control socket and MCP server for external agents |
 | `src/kit.rs` | Connection kit for unlisted apps (MCP config, skill, plugin; the skill is generated from the instructions and tool list in `mcp.rs`) |
 | `src/llm.rs` | Claude, OpenAI-compatible, Gemini and other AI APIs |
-| `assets/tour/` | App screenshots used by the guide and this README (the app captures its own window) |
+| `assets/tour/` | Screenshots for the first-run guide (the app captures its own window) |
+| `assets/readme/` | English screenshots for this README, captured the same way with the UI set to English |
 | `packaging/macos/` | App icon and the .dmg window (background, layout); `swift packaging/macos/make-art.swift` redraws the art |
 | `src/team.rs`, `src/app/teams.rs` | Teams: shared boards (goal, notes, claimable tasks) for agents working together, and their screen |
 | `src/licenses.rs`, `assets/third-party-licenses.json` | License page in Settings → About: GhostDesk's license and every open-source package built in |

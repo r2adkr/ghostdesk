@@ -92,7 +92,7 @@ impl GhostApp {
                         ui.horizontal(|ui| {
                             // every row as tall as one with a button, so the list has one rhythm
                             ui.set_min_height(32.0);
-                            ui.label(RichText::new(c.client.name()).strong().color(theme::text()));
+                            ui.label(RichText::new(tr(c.client.name())).strong().color(theme::text()));
                             let (txt, col) = match (&c.registered, c.installed) {
                                 (Some(_), _) if ok => (tr("연결됨"), theme::success()),
                                 (Some(_), _) => (tr("다른 경로로 연결됨"), theme::warn()),
@@ -253,7 +253,7 @@ pub(super) fn spawn_connect(rt: &Handle, st: Arc<parking_lot::Mutex<ConnectState
                 // each app row already shows success, so only report failures, with the reason
                 for (c, r) in res {
                     if let Err(e) = r {
-                        msgs.push(trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]));
+                        msgs.push(trf("{}: 실패 — {}", &[&tr(c.name()), &format!("{:#}", e)]));
                     }
                 }
             }
@@ -280,7 +280,7 @@ pub(super) fn run_client_action(rt: &Handle, st: Arc<parking_lot::Mutex<ConnectS
                 crate::install::unregister(c)
             };
             if let Err(e) = r {
-                msgs.push(trf("{}: 실패 — {}", &[&c.name(), &format!("{:#}", e)]));
+                msgs.push(trf("{}: 실패 — {}", &[&tr(c.name()), &format!("{:#}", e)]));
             }
         }
         let fresh = load_connect_status();

@@ -25,7 +25,7 @@ mod detail;
 mod fonts;
 mod host_settings;
 mod ai;
-mod i18n;
+pub(crate) mod i18n;
 mod labels;
 mod palette;
 mod pi_settings;
@@ -518,6 +518,8 @@ impl GhostApp {
             app.open_tour();
         }
         i18n::set(app.lang);
+        // the form was filled before the language was known
+        app.form.name = tr("에이전트 1").into();
         fonts::setup_fonts(&cc.egui_ctx, app.lang);
         // is the installed engine older than this GhostDesk expects? (runs `pi --help`, so off the UI thread)
         if app.tour_capture.is_none() {
@@ -1088,7 +1090,7 @@ impl GhostApp {
         }
         let running = self.pi_update.is_some();
         let outdated = crate::pi::OUTDATED.load(Ordering::Relaxed);
-        if self.pi_update_dismissed || !(outdated || running || self.pi_update_result.is_some()) {
+        if self.pi_update_dismissed || self.tour_capture.is_some() || !(outdated || running || self.pi_update_result.is_some()) {
             return;
         }
         let (mut later, mut start, mut close) = (false, false, false);

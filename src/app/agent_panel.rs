@@ -416,6 +416,8 @@ pub(super) fn chat_log(ui: &mut egui::Ui, log: &[crate::agent::LogEntry], acting
                     tr("생각").to_string()
                 } else if live {
                     run.iter().rev().find(|e| e.kind == LogKind::Action).map(|e| crate::llm::short(&e.text, 40)).unwrap_or_default()
+                } else if steps == 1 {
+                    tr("작업 1단계").to_string()
                 } else {
                     trf("작업 {}단계", &[&steps])
                 };

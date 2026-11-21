@@ -22,3 +22,6 @@ rm -rf "$HOME/.ghostdesk-tour-tmp"
   or changing AI app settings.
 - The app closes itself once every scene has been captured.
 - Text inside the screenshots is Korean (tour titles and descriptions follow the chosen UI language).
+
+The README uses English captures in `assets/readme/`. Take them the same way with `"lang":"en"` in the capture
+data folder's `prefs.json` and `GHOSTDESK_TOUR_CAPTURE` pointing at `assets/readme`.

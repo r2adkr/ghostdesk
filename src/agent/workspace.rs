@@ -404,11 +404,9 @@ async fn prepare_browser(
     .await?;
     shared.log(
         LogKind::Info,
-        format!(
+        crate::app::i18n::trf(
             "격리 브라우저 실행됨 ({}x{}, {})",
-            width,
-            height,
-            if headless { "headless — 화면에 표시되지 않음" } else { "창 표시 모드" }
+            &[&width, &height, &crate::app::i18n::tr(if headless { "headless — 화면에 표시되지 않음" } else { "창 표시 모드" })],
         ),
     );
     Ok(Desk::Browser(ws))

@@ -837,4 +837,9 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["설치된 AI 엔진(pi)이 이 GhostDesk 보다 오래된 버전이라 에이전트가 제대로 일하지 못할 수 있어요.", "The installed AI engine (pi) is older than this GhostDesk expects, so agents may not work properly.", "インストールされている AI エンジン (pi) がこの GhostDesk より古いため、エージェントが正しく動かないことがあります。", "已安装的 AI 引擎 (pi) 比此 GhostDesk 所需的版本旧，智能体可能无法正常工作。"],
     ["엔진 업데이트", "Update engine", "エンジンを更新", "更新引擎"],
     ["pi 를 최신 버전으로 바꿔요. 내 pi 확장·설정은 건드리지 않아요.", "Replaces pi with the latest version. Your own pi extensions and settings are left alone.", "pi を最新バージョンに置き換えます。あなたの pi 拡張や設定には触れません。", "将 pi 更新到最新版本，不会改动你自己的 pi 扩展和设置。"],
+    ["격리 브라우저 실행됨 ({}x{}, {})", "Isolated browser started ({}x{}, {})", "隔離ブラウザを起動しました ({}x{}, {})", "已启动隔离浏览器 ({}x{}, {})"],
+    ["headless — 화면에 표시되지 않음", "headless, not shown on your screen", "ヘッドレス・画面には表示されません", "无头模式，不在屏幕上显示"],
+    ["창 표시 모드", "window shown", "ウィンドウ表示", "显示窗口"],
+    ["Claude 앱", "Claude app", "Claude アプリ", "Claude 应用"],
+    ["작업 1단계", "1 step", "1 ステップの作業", "1 步操作"],
 ];
