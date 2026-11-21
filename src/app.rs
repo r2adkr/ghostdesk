@@ -289,6 +289,8 @@ pub struct GhostApp {
     setup_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     usage_saved: Instant,
     sidebar_open: bool,
+    /// The closed sidebar is peeking out over the page (pointer on the title bar's sidebar button, then on it).
+    sidebar_peek: bool,
     /// When each outside agent's screen was first seen closed (for the list grace period).
     closed_since: HashMap<u64, Instant>,
     pip_auto_open: bool,
@@ -462,6 +464,7 @@ impl GhostApp {
             setup_rx: None,
             usage_saved: Instant::now(),
             sidebar_open: true,
+            sidebar_peek: false,
             closed_since: HashMap::new(),
             pip_auto_open: false,
             pip_auto_close: true,
@@ -805,7 +808,7 @@ impl eframe::App for GhostApp {
             self.leave_wall(&ctx, View::Grid);
         }
         // the title bar must be placed before the side panels to span the full window width
-        let mut toggle_sidebar = false;
+        let mut bar = titlebar::Actions::default();
         if titlebar::visible(&ctx) {
             let cols = if self.view == View::Wall { titlebar::Columns::default() } else { self.title_cols };
             // the detail view has no heading of its own: name the agent and the page/window it is on up
@@ -826,10 +829,17 @@ impl eframe::App for GhostApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| toggle_sidebar |= titlebar::bar(ui, cols, self.sidebar_open, (&title.0, &title.1)));
+                .show(ui, |ui| bar = titlebar::bar(ui, cols, self.sidebar_open, (&title.0, &title.1)));
         }
-        if toggle_sidebar {
+        if bar.toggle {
             self.sidebar_open = !self.sidebar_open;
+            self.sidebar_peek = false;
+        }
+        if bar.new_agent {
+            self.open_wizard();
+        }
+        if bar.search {
+            self.open_palette();
         }
         if self.view == View::Wall {
             let fade = theme::appear(&ctx, egui::Id::unique("view_in"), self.view_key(), 0.2);
@@ -841,6 +851,7 @@ impl eframe::App for GhostApp {
                 });
         } else {
             self.main_layout(ui, &ctx);
+            self.sidebar_peek(&ctx, bar.toggle_hovered);
         }
         self.toast_area(&ctx);
         let update_shown = self.update_toast(&ctx);
@@ -904,6 +915,47 @@ impl GhostApp {
         self.notify(ctx, if pause { tr("모든 에이전트를 일시정지했어요") } else { tr("모든 에이전트를 다시 시작했어요") });
     }
 
+    /// The closed sidebar, floating over the page's left edge while the pointer is on the title bar's
+    /// sidebar button and then on the sidebar itself (as in Claude's window). It slides in and out.
+    fn sidebar_peek(&mut self, ctx: &egui::Context, button_hovered: bool) {
+        let blocked = self.sidebar_open
+            || self.show_settings
+            || self.wizard_open
+            || self.palette.is_some()
+            || self.tour.is_some()
+            || !self.approvals.is_empty()
+            || !titlebar::visible(ctx);
+        let screen = ctx.content_rect();
+        let w = panel_sizes(screen.width()).0;
+        // the strip from the window's top down its left edge, so moving from the button down into the
+        // sidebar never crosses a gap
+        let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x <= screen.left() + w && p.y >= screen.top());
+        self.sidebar_peek = !blocked && (button_hovered || (self.sidebar_peek && over));
+        let t = ctx.animate_bool_with_time(egui::Id::new("sidebar_peek"), self.sidebar_peek, 0.15);
+        if t <= 0.0 || blocked {
+            return;
+        }
+        let top = screen.top() + titlebar::HEIGHT;
+        egui::Area::new(egui::Id::new("sidebar_peek_area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(screen.left() - w * (1.0 - t), top))
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(t);
+                egui::Frame::new()
+                    .fill(theme::surface())
+                    .stroke(egui::Stroke::new(1.0, theme::border()))
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: theme::MODAL_RADIUS, sw: 0, se: theme::MODAL_RADIUS })
+                    .shadow(egui::Shadow { offset: [4, 0], blur: 24, spread: 0, color: egui::Color32::from_black_alpha(80) })
+                    .inner_margin(Margin { left: 10, right: 10, top: 6, bottom: 14 })
+                    .show(ui, |ui| {
+                        ui.set_width(w - 20.0);
+                        ui.set_height(screen.bottom() - top - 20.0);
+                        self.sidebar(ui);
+                    });
+            });
+    }
+
     /// Normal layout: left sidebar · (right panel in detail view) · center · modal windows.
     fn main_layout(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let ctx = ctx.clone();
@@ -923,8 +975,13 @@ impl GhostApp {
                     .frame(egui::Frame::new().fill(theme::surface()).inner_margin(Margin { left: 10, right: 10, top, bottom: 14 }))
                     .show(ui, |ui| self.sidebar(ui)),
             )
+        } else if titlebar::visible(&ctx) {
+            // hidden: the title bar holds the way back (and the most used actions), and the sidebar peeks out
+            // from its button (sidebar_peek)
+            None
         } else {
-            // hidden: a slim rail keeps the way back (and the two most used actions) out of the page's way
+            // hidden, with no title bar (full screen, Linux): a slim rail keeps the way back and the most used
+            // actions out of the page's way
             Some(
                 egui::Panel::left("rail")
                     .resizable(false)
@@ -934,8 +991,7 @@ impl GhostApp {
                         ui.spacing_mut().item_spacing.y = 6.0;
                         let held = ui.input(|i| i.modifiers.command);
                         let k = |key: &str| held.then(|| palette::cmd_key(key));
-                        // the title bar holds the sidebar button; without one (full screen, Linux) it is here
-                        if !titlebar::visible(&ctx) && theme::rail_button(ui, icon::PANEL_LEFT, k("B").as_deref(), &format!("{} ({})", tr("사이드바 열기"), palette::cmd_key("B"))).clicked() {
+                        if theme::rail_button(ui, icon::PANEL_LEFT, k("B").as_deref(), &format!("{} ({})", tr("사이드바 열기"), palette::cmd_key("B"))).clicked() {
                             self.sidebar_open = true;
                         }
                         if theme::rail_button(ui, icon::PLUS, k("N").as_deref(), &format!("{} ({})", tr("새 에이전트"), palette::cmd_key("N"))).clicked() {

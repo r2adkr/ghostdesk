@@ -220,6 +220,8 @@ impl GhostApp {
                 if let Some(cmd) = sent {
                     let _ = a.tx.send(cmd);
                 }
+                // breathing room under the input box, so it doesn't sit on the window's bottom edge
+                ui.add_space(GAP_L);
             }
         });
         let h = bottom.response.rect.height();

@@ -42,11 +42,22 @@ pub struct Columns {
     pub right: f32,
 }
 
-/// Draws the title bar. Call inside `Panel::top`. Returns true when the sidebar button was clicked
-/// (`sidebar_open` only picks its tooltip). `title` names what the center column shows, with a quieter
-/// detail after it (empty: none).
-pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &str)) -> bool {
-    let mut toggled = false;
+/// What was used in the title bar this frame.
+#[derive(Default)]
+pub struct Actions {
+    /// The sidebar button was clicked.
+    pub toggle: bool,
+    /// The pointer is on the sidebar button (the closed sidebar peeks out while it is).
+    pub toggle_hovered: bool,
+    pub new_agent: bool,
+    pub search: bool,
+}
+
+/// Draws the title bar. Call inside `Panel::top`. `title` names what the center column shows, with a
+/// quieter detail after it (empty: none). With the sidebar closed, its two most used actions (new agent,
+/// find) sit right after the sidebar button, as in Claude's and Codex's windows.
+pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &str)) -> Actions {
+    let mut out = Actions::default();
     let ctx = ui.ctx().clone();
     let rect = ui.max_rect();
     let p = ui.painter().clone();
@@ -99,28 +110,37 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &
     }
 
     // sidebar button right after the name: the same spot whether the sidebar is shown or hidden
-    {
-        let held = ctx.input(|i| i.modifiers.command);
-        let r = Rect::from_center_size(pos2(name_right + 28.0, cy), vec2(36.0, 24.0));
-        let resp = ui.interact(r, ui.scope_id().with("titlebar_sidebar"), Sense::click());
+    let held = ctx.input(|i| i.modifiers.command);
+    let button = |n: usize, glyph: &str, tip: String, key: &str| {
+        let r = Rect::from_center_size(pos2(name_right + 28.0 + 40.0 * n as f32, cy), vec2(36.0, 24.0));
+        let resp = ui.interact(r, ui.scope_id().with(("titlebar_button", n)), Sense::click());
         if resp.hovered() || resp.has_focus() {
             p.rect_filled(r, theme::RADIUS, theme::overlay_hover());
         }
         let color = if resp.hovered() { theme::text() } else { theme::body() };
         if held {
-            p.text(r.center(), egui::Align2::CENTER_CENTER, super::palette::cmd_key("B"), FontId::monospace(12.0), theme::muted());
+            p.text(r.center(), egui::Align2::CENTER_CENTER, super::palette::cmd_key(key), FontId::monospace(12.0), theme::muted());
         } else {
-            p.text(r.center(), egui::Align2::CENTER_CENTER, crate::icon::PANEL_LEFT, FontId::proportional(17.0), color);
+            p.text(r.center(), egui::Align2::CENTER_CENTER, glyph, FontId::proportional(17.0), color);
         }
-        let tip = format!("{} ({})", if sidebar_open { tr("사이드바 접기") } else { tr("사이드바 열기") }, super::palette::cmd_key("B"));
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip.clone()));
-        toggled = resp.on_hover_text(tip).clicked();
+        resp.on_hover_text(tip)
+    };
+    let with_key = |t: &str, k: &str| format!("{} ({})", t, super::palette::cmd_key(k));
+    let toggle = button(0, crate::icon::PANEL_LEFT, with_key(if sidebar_open { tr("사이드바 접기") } else { tr("사이드바 열기") }, "B"), "B");
+    out.toggle = toggle.clicked();
+    out.toggle_hovered = toggle.hovered();
+    let mut buttons_end = name_right + 46.0;
+    if !sidebar_open {
+        out.new_agent = button(1, crate::icon::PLUS, with_key(tr("새 에이전트"), "N"), "N").clicked();
+        out.search = button(2, crate::icon::SEARCH, with_key(tr("찾기"), "K"), "K").clicked();
+        buttons_end += 80.0;
     }
 
     // current view's title over the center column, aligned with its content (or after the sidebar
     // button when the sidebar is closed), cut short before the right panel / window buttons
     if !title.0.is_empty() {
-        let x = (rect.left() + cols.left + 16.0).max(name_right + 56.0);
+        let x = (rect.left() + cols.left + 16.0).max(buttons_end + 10.0);
         let end = rect.right() - cols.right.max(if mac { 0.0 } else { BUTTON_W * 3.0 }) - 16.0;
         if end - x > 40.0 {
             let font = FontId::proportional(13.0);
@@ -136,7 +156,7 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &
 
     // macOS draws the window buttons natively
     if mac {
-        return toggled;
+        return out;
     }
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
     let mut x = rect.right() - BUTTON_W;
@@ -152,7 +172,7 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &
         }
         x -= BUTTON_W;
     }
-    toggled
+    out
 }
 
 /// Title bar of a small fixed-size window (the installer): app name, drag to move, minimize and
