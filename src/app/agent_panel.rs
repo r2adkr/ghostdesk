@@ -30,6 +30,7 @@ impl GhostApp {
         let workspace = a.shared.workspace();
         let has_screen = workspace.as_ref().is_none_or(|w| w.has_screen());
         let mut remove = false;
+        let mut copied = false;
 
         // ── who: name, taking over, more ──────────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -55,6 +56,11 @@ impl GhostApp {
                             .clicked()
                     {
                         a.pip.visible = !a.pip.visible;
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  {}", icon::COPY, tr("대화 내용 복사"))).on_hover_text(tr("지시·답·동작·오류를 글로 복사해요 (문제를 알릴 때 붙여 넣기 좋아요)")).clicked() {
+                        ui.ctx().copy_text(log_as_text(&a.shared.log.lock()));
+                        copied = true;
                         ui.close();
                     }
                     if ui.button(RichText::new(tr("에이전트 제거")).color(theme::danger())).on_hover_text(tr("에이전트 화면을 닫아요 (작업공간 폴더는 남아요)")).clicked() {
@@ -221,7 +227,49 @@ impl GhostApp {
             ui.data_mut(|d| d.insert_temp(bottom_id, h));
             ui.ctx().request_repaint();
         }
+        if copied {
+            self.notify(ui.ctx(), tr("대화 내용을 복사했어요"));
+        }
         remove
+    }
+}
+
+/// The conversation as plain text for the clipboard: one entry per paragraph, the speaker in front.
+/// Thinking is left out (long and rarely what someone wants to paste).
+fn log_as_text(log: &[crate::agent::LogEntry]) -> String {
+    use crate::agent::LogKind;
+    log.iter()
+        .filter(|e| e.kind != LogKind::Thinking && !e.text.trim().is_empty())
+        .map(|e| {
+            let who = match e.kind {
+                LogKind::User => tr("나"),
+                LogKind::Assistant => tr("에이전트"),
+                LogKind::Action => tr("동작"),
+                LogKind::Error => tr("오류"),
+                LogKind::Info | LogKind::Thinking => tr("알림"),
+            };
+            format!("[{who}] {}", e.text.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("
+
+")
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use crate::agent::{LogEntry, LogKind};
+
+    #[test]
+    fn log_copies_as_text_without_thinking() {
+        let e = |kind, text: &str| LogEntry { kind, text: text.into(), secs: 0.0 };
+        let log = [e(LogKind::User, "찾아줘"), e(LogKind::Thinking, "음…"), e(LogKind::Action, " 클릭 "), e(LogKind::Error, "실패"), e(LogKind::Info, "")];
+        assert_eq!(log_as_text(&log), "[나] 찾아줘
+
+[동작] 클릭
+
+[오류] 실패");
     }
 }
 

@@ -599,7 +599,9 @@ pub fn nav_item_keys(ui: &mut egui::Ui, selected: bool, icon: &str, label: &str,
         elided = galley.elided;
         p.with_clip_rect(rect).galley(egui::pos2(text_left, rect.center().y - galley.size().y / 2.0), galley, fg);
         if let Some(c) = badge {
-            p.circle_filled(egui::pos2(rect.right() - 14.0 - key_w, rect.center().y), 3.5, c);
+            // on the same vertical line as the sidebar's icon buttons flush with the row's right edge (measured: their
+            // glyphs center 20pt in), so badges and icons line up
+            p.circle_filled(egui::pos2(rect.right() - 20.0 - key_w, rect.center().y), 3.5, c);
         }
         if let Some(k) = keys {
             p.text(egui::pos2(rect.right() - 10.0, rect.center().y), egui::Align2::RIGHT_CENTER, k, FontId::monospace(13.0), muted());

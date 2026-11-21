@@ -23,22 +23,20 @@ impl GhostApp {
         }
         // quick actions first: start something (wide button), find something and fold the sidebar (icons)
         let folds = !titlebar::visible(ui.ctx());
-        ui.horizontal(|ui| {
+        // icons flush with the right edge (in line with the row badges below), the wide button takes what is left;
+        // laid out right to left so the row is never wider than the panel, whatever size the icons are
+        // a fixed 32pt height: a bare right-to-left layout would take (and center in) all the height left
+        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 32.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let icons = if folds { 2.0 } else { 1.0 };
-            // the buttons are wider than their 32pt minimum, so leave them room (a row wider than the panel
-            // would make the panel grow on every frame)
-            let w = ui.available_width() - theme::KEY_BUTTON_W * icons - 6.0;
-            ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
-                    self.open_wizard();
-                }
-            });
+            if folds && theme::icon_button_keys(ui, icon::PANEL_LEFT, key("B").as_deref(), &format!("{} ({})", tr("사이드바 접기"), palette::cmd_key("B"))).clicked() {
+                self.sidebar_open = false;
+            }
             if theme::icon_button_keys(ui, icon::SEARCH, key("K").as_deref(), &format!("{} ({})", tr("찾기"), palette::cmd_key("K"))).clicked() {
                 self.open_palette();
             }
-            if folds && theme::icon_button_keys(ui, icon::PANEL_LEFT, key("B").as_deref(), &format!("{} ({})", tr("사이드바 접기"), palette::cmd_key("B"))).clicked() {
-                self.sidebar_open = false;
+            ui.add_space(4.0);
+            if theme::nav_item_keys(ui, false, icon::PLUS, tr("새 에이전트"), None, key("N").as_deref()).on_hover_text(palette::cmd_key("N")).clicked() {
+                self.open_wizard();
             }
         });
         ui.add_space(6.0);
@@ -73,14 +71,9 @@ impl GhostApp {
         }
         // lay out the pinned bottom rows first; the agent list gets whatever height is left
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.horizontal(|ui| {
+            // same shape as the top row: the icon flush right, Settings takes the rest
+            ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 32.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let w = ui.available_width() - theme::KEY_BUTTON_W - 6.0;
-                ui.allocate_ui_with_layout(Vec2::new(w, 32.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref()).clicked() {
-                        self.open_settings(settings::SettingsTab::General);
-                    }
-                });
                 // green dot when connected, red when the control server failed
                 let r = theme::icon_button(ui, icon::PLUG, tr("Claude 앱 · Claude Code · Codex 에서 GhostDesk 쓰기 (키 필요 없음)"));
                 if let Some(c) = self.connect_badge() {
@@ -88,6 +81,10 @@ impl GhostApp {
                 }
                 if r.on_hover_text(tr("외부 연결")).clicked() {
                     self.open_connect(ui.ctx());
+                }
+                ui.add_space(4.0);
+                if theme::nav_item_keys(ui, false, icon::SETTINGS, tr("설정"), None, key(",").as_deref()).clicked() {
+                    self.open_settings(settings::SettingsTab::General);
                 }
             });
             if self.auto_approve

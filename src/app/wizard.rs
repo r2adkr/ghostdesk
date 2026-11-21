@@ -405,6 +405,10 @@ impl GhostApp {
         self.agents.push(handle);
         self.form.name = trf("에이전트 {}", &[&self.next_id]);
         self.form.workspace = format!("ws-{}", self.next_id);
+        if self.tour_capture.is_none() {
+            remember_task(&mut self.recent_tasks, &self.form.task);
+            self.save_prefs();
+        }
         self.form.task.clear();
     }
 
@@ -666,13 +670,18 @@ impl GhostApp {
 
     /// Auto: previews where the current task will run (the same `auto_pick` is used at start).
     fn simple_auto(&mut self, ui: &mut egui::Ui) {
-        let line = match self.auto_pick() {
-            AutoPick::App { label, .. } => trf("→ '{}' 앱에서 일해요", &[&label]),
-            AutoPick::ChildSession { label } => trf("→ '{}' 앱은 별도 Windows 화면에서 실행해요. 실제 계정·데이터를 사용해요.", &[&label]),
-            AutoPick::Web if self.form.task.trim().is_empty() => tr("→ 할 일을 적으면 알맞은 곳을 골라요").to_string(),
-            AutoPick::Web => tr("→ 웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(),
+        // a drawn icon names the place; with no task yet it is guidance, so it stays muted
+        let (glyph, line, color) = match self.auto_pick() {
+            AutoPick::App { label, .. } => (icon::APP_WINDOW, trf("'{}' 앱에서 일해요", &[&label]), theme::text()),
+            AutoPick::ChildSession { label } => (icon::USER, trf("'{}' 앱은 별도 Windows 화면에서 실행해요. 실제 계정·데이터를 사용해요.", &[&label]), theme::text()),
+            AutoPick::Web if self.form.task.trim().is_empty() => (icon::STAR, tr("할 일을 적으면 알맞은 곳을 골라요").to_string(), theme::muted()),
+            AutoPick::Web => (icon::GLOBE, tr("웹사이트에서 일해요 (보이지 않는 브라우저)").to_string(), theme::text()),
         };
-        ui.label(RichText::new(line).color(theme::text()));
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(RichText::new(glyph).color(color));
+            ui.add(egui::Label::new(RichText::new(line).color(color)).wrap());
+        });
     }
 
     /// Auto mode's decision: the app if the task names an app on this computer, otherwise the web.
@@ -1549,5 +1558,32 @@ mod tests {
         assert_eq!(store_app("paint 앱으로 그려줘"), Some("그림판"));
         assert_eq!(store_app("Fix the paintball schedule"), None, "낱말 안의 일부는 아님");
         assert_eq!(store_app("오늘 날씨 찾아줘"), None);
+    }
+}
+
+/// Puts `task` first in the recent list (moving it up if it was already there), keeping `RECENT_TASKS`.
+fn remember_task(recent: &mut Vec<String>, task: &str) {
+    let task = task.trim();
+    if task.is_empty() {
+        return;
+    }
+    recent.retain(|t| t != task);
+    recent.insert(0, task.to_string());
+    recent.truncate(RECENT_TASKS);
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::*;
+
+    #[test]
+    fn recent_tasks_are_newest_first_unique_and_capped() {
+        let mut r = Vec::new();
+        for t in ["a", " b ", "", "a", "c", "d", "e", "f"] {
+            remember_task(&mut r, t);
+        }
+        assert_eq!(r, ["f", "e", "d", "c", "a"]);
+        remember_task(&mut r, "d");
+        assert_eq!(r, ["d", "f", "e", "c", "a"]);
     }
 }

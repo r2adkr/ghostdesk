@@ -102,11 +102,9 @@ pub fn install() -> Result<(), String> {
     let fail = |what: &str, out: std::process::Output| format!("{what}: {}", crate::llm::short(&installer_message(&out.stdout, &out.stderr), 300));
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "irm https://pi.dev/install.ps1 | iex"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| e.to_string())?;
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "irm https://pi.dev/install.ps1 | iex"]);
+        let out = run_with_timeout(c, UPDATE_TIMEOUT)?;
         return if out.status.success() { Ok(()) } else { Err(fail("설치에 실패했어요", out)) };
     }
     #[cfg(not(windows))]
@@ -132,7 +130,9 @@ pub fn install() -> Result<(), String> {
                 }
             }
         }
-        let out = sh(install_command()).map_err(|e| e.to_string())?;
+        let mut c = std::process::Command::new("/bin/sh");
+        c.env("PATH", installer_path()).args(["-c", install_command()]);
+        let out = run_with_timeout(c, UPDATE_TIMEOUT)?;
         if !out.status.success() {
             return Err(fail("설치에 실패했어요", out));
         }
@@ -149,6 +149,110 @@ pub fn find() -> Option<PathBuf> {
         return None;
     }
     crate::install::find_cli("pi")
+}
+
+/// Set when the installed pi turns out older than this GhostDesk expects (an option it doesn't know); the
+/// window then offers an update. Cleared after a successful update.
+pub static OUTDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn mark_outdated() {
+    OUTDATED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// At launch (blocking, so on a background thread): flags an installed pi that lacks an option GhostDesk
+/// passes, so the update is offered before an agent runs into it.
+pub fn check_outdated() {
+    if let Some(exe) = find() {
+        if !engine_has_option(&exe, &home_dir(), "--no-mcp") {
+            mark_outdated();
+        }
+    }
+}
+
+/// Brings pi up to date: `pi update --self` (pi only, never the person's own pi packages), or the installer
+/// when that isn't possible. Blocking; run it off the UI thread. Agents pick the new pi up the next time their
+/// engine starts.
+pub fn update() -> Result<(), String> {
+    // one at a time (a second press, or the toast of another window)
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("이미 엔진을 업데이트하는 중이에요".into());
+    }
+    let r = update_inner();
+    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    r
+}
+
+/// Whether the pi now on PATH is new enough (help read afresh).
+fn engine_current() -> bool {
+    forget_engine_help();
+    find().is_some_and(|exe| engine_has_option(&exe, &home_dir(), "--no-mcp"))
+}
+
+fn update_inner() -> Result<(), String> {
+    let exe = find().ok_or_else(|| "pi 를 찾지 못했어요".to_string())?;
+    let mut last_err = String::new();
+    // pi's own updater first; the installer when that is missing (older pi) or didn't help. Each is tried twice:
+    // on Windows a running agent's engine can hold a file for a moment (EBUSY), and a network hiccup passes.
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        let mut c = engine_command(&exe, &home_dir());
+        c.args(["update", "--self"]);
+        match run_with_timeout(c, UPDATE_TIMEOUT) {
+            Ok(o) if o.status.success() && engine_current() => return updated(),
+            Ok(o) if !o.status.success() => last_err = installer_message(&o.stdout, &o.stderr),
+            Ok(_) => {}
+            Err(e) => last_err = e,
+        }
+        match install() {
+            Ok(()) if engine_current() => return updated(),
+            Ok(()) => {
+                last_err = format!("설치는 끝났지만 {} 의 pi 가 여전히 이전 버전이에요 (다른 곳에 설치된 pi 가 먼저 쓰이고 있을 수 있어요)", exe.display())
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!("엔진 업데이트에 실패했어요: {}", crate::llm::short(&last_err, 300)))
+}
+
+fn updated() -> Result<(), String> {
+    OUTDATED.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// An update that takes longer than this is stuck (a prompt nobody can answer, a dead download).
+const UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Runs a command to the end, killing it after `limit`. Output is read on threads so a full pipe can't block it.
+fn run_with_timeout(mut c: std::process::Command, limit: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let read = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut v = vec![];
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{}분 넘게 끝나지 않아 중단했어요", limit.as_secs() / 60));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 /// How pi reaches an agent's AI: a provider it knows by name, or one GhostDesk describes to it (a custom
@@ -609,6 +713,35 @@ pub fn engine_command(exe: &Path, home: &Path) -> std::process::Command {
     c
 }
 
+/// Whether the installed pi lists `flag` in its `--help` (asked once per executable, then remembered).
+/// If the help can't be read, the flag is assumed supported, as before.
+static ENGINE_HELP: parking_lot::Mutex<Option<std::collections::HashMap<PathBuf, Option<String>>>> = parking_lot::Mutex::new(None);
+
+/// After an update the old help text no longer describes the installed pi.
+fn forget_engine_help() {
+    *ENGINE_HELP.lock() = None;
+}
+
+fn engine_has_option(exe: &Path, home: &Path, flag: &str) -> bool {
+    let mut cache = ENGINE_HELP.lock();
+    let help = cache.get_or_insert_with(Default::default).entry(exe.to_path_buf()).or_insert_with(|| {
+        let mut c = engine_command(exe, home);
+        c.arg("--help").stdin(Stdio::null()).stderr(Stdio::null());
+        c.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    });
+    help.as_deref().is_none_or(|h| help_lists(h, flag))
+}
+
+/// `flag` appears in pi's help as an option of its own (not as the start of a longer one).
+fn help_lists(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(i, _)| !help[i + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'))
+}
+
+/// pi stopped because it doesn't know an option GhostDesk passes: an older pi than this GhostDesk expects.
+fn outdated_engine(stderr: &str) -> bool {
+    stderr.contains("Unknown option")
+}
+
 fn base_command(exe: &Path, home: &Path, cwd: &Path, env_key: &str, api_key: &str) -> std::process::Command {
     let mut c = engine_command(exe, home);
     c.current_dir(cwd);
@@ -926,7 +1059,15 @@ async fn drive_agent(
         }
         if proc.is_none() {
             let mut c = base_command(exe, home, &spec.cwd, route.env_key, &key_for(&cfg.llm));
-            c.args(build_args(&route.provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp, &spec.skills, &spec.plugins));
+            let mut args = build_args(&route.provider, &cfg.llm.model, spec.extension, &cfg.llm.effort, &spec.tools, cfg.files, &spec.mcp, &spec.skills, &spec.plugins);
+            // pi releases without MCP support have nothing to switch off and reject the flag outright
+            // (runs pi --help once: a blocking call, kept off the async worker)
+            if !tokio::task::block_in_place(|| engine_has_option(exe, home, "--no-mcp")) {
+                // it still works without the flag, but it is an older pi: offer the update
+                args.retain(|a| a != "--no-mcp");
+                mark_outdated();
+            }
+            c.args(args);
             proc = Some(Proc::spawn(c)?);
         }
         let p = proc.as_mut().expect("just started");
@@ -948,6 +1089,10 @@ async fn drive_agent(
         if out.died {
             let why = p.err.lock().trim().to_string();
             shared.log(LogKind::Error, format!("AI 엔진이 예기치 않게 끝났습니다{}", if why.is_empty() { String::new() } else { format!(": {}", crate::llm::short(&why, 300)) }));
+            if outdated_engine(&why) {
+                mark_outdated();
+                shared.log(LogKind::Info, "설치된 AI 엔진(pi)이 이 GhostDesk 보다 오래된 버전이에요. 오른쪽 아래 알림에서 '엔진 업데이트'를 누른 뒤 다시 지시해 주세요.");
+            }
             proc = None;
             restarted = true;
         }
@@ -1093,6 +1238,23 @@ async fn drive(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod option_probe_tests {
+    use super::*;
+
+    #[test]
+    fn help_lists_only_whole_options() {
+        let old = "  --no-session   Don't save
+  --no-extensions, -ne  Disable
+";
+        assert!(help_lists(old, "--no-session") && help_lists(old, "--no-extensions"));
+        assert!(!help_lists(old, "--no-mcp"));
+        assert!(!help_lists("  --no-mcp-servers  x", "--no-mcp"), "a longer option is not the same one");
+        assert!(help_lists("  --no-mcp, -nm  x", "--no-mcp"));
+        assert!(outdated_engine("Error: Unknown option: --no-mcp") && !outdated_engine("rate limited"));
+    }
 }
 
 #[cfg(test)]
@@ -1270,5 +1432,32 @@ mod tests {
         assert_eq!((e["api"].as_str(), e["apiKey"].as_str()), (Some("openai-completions"), Some("$GHOSTDESK_API_KEY")));
         assert!(v["providers"].get("openai").is_none());
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_stuck_command_is_stopped_and_a_quick_one_keeps_its_output() {
+        let (quick, slow) = if cfg!(windows) {
+            let mut q = std::process::Command::new("cmd");
+            q.args(["/C", "echo hi"]);
+            let mut s = std::process::Command::new("powershell");
+            s.args(["-NoProfile", "-Command", "Start-Sleep 30"]);
+            (q, s)
+        } else {
+            let mut q = std::process::Command::new("/bin/sh");
+            q.args(["-c", "echo hi"]);
+            let mut s = std::process::Command::new("/bin/sh");
+            s.args(["-c", "sleep 30"]);
+            (q, s)
+        };
+        let o = run_with_timeout(quick, std::time::Duration::from_secs(20)).unwrap();
+        assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("hi"));
+        let t = std::time::Instant::now();
+        assert!(run_with_timeout(slow, std::time::Duration::from_secs(1)).is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(10));
     }
 }

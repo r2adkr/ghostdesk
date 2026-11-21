@@ -68,8 +68,8 @@ struct Asset {
     name: String,
     url: String,
     size: u64,
-    /// SHA256SUMS.txt of the same release (size check only if missing).
-    sums_url: Option<String>,
+    /// SHA256SUMS.txt of the same release. Required: a file without a published hash is never swapped in.
+    sums_url: String,
 }
 
 impl Release {
@@ -306,7 +306,7 @@ fn release_from_sums(tag: &str, sums: Option<&str>, suffixes: &[&str]) -> Option
     let names: Vec<&str> = sums.unwrap_or_default().lines().filter_map(|l| l.trim().split_once(char::is_whitespace).map(|(_, f)| f.trim().trim_start_matches('*'))).collect();
     let asset = suffixes.iter().find_map(|suf| {
         let name = names.iter().find(|n| n.ends_with(suf) && plain_file_name(n))?;
-        Some(Asset { name: name.to_string(), url: format!("{base}/{name}"), size: 0, sums_url: Some(format!("{base}/SHA256SUMS.txt")) })
+        Some(Asset { name: name.to_string(), url: format!("{base}/{name}"), size: 0, sums_url: format!("{base}/SHA256SUMS.txt") })
     });
     Some(Release { version, page: format!("https://github.com/{REPO}/releases/tag/{tag}"), asset })
 }
@@ -355,7 +355,7 @@ fn parse_release(v: &Value, current: &str, suffixes: &[&str]) -> Option<Release>
     let sums_url = assets.iter().find(|a| a["name"] == "SHA256SUMS.txt").and_then(url_of);
     let asset = suffixes.iter().find_map(|suf| {
         let a = assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suf)))?;
-        Some(Asset { name: a["name"].as_str()?.to_string(), url: url_of(a)?, size: a["size"].as_u64()?, sums_url: sums_url.clone() })
+        Some(Asset { name: a["name"].as_str()?.to_string(), url: url_of(a)?, size: a["size"].as_u64()?, sums_url: sums_url.clone()? })
     });
     let page = v["html_url"].as_str().filter(|u| u.starts_with(&format!("https://github.com/{REPO}/"))).map(str::to_string).unwrap_or_else(|| format!("https://github.com/{REPO}/releases/latest"));
     Some(Release { version, page, asset })
@@ -393,15 +393,10 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
 async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let me = target.to_path_buf();
-    anyhow::ensure!(trusted_download(&asset.url) && asset.sums_url.as_deref().is_none_or(trusted_download), "다운로드 주소가 이 프로젝트의 릴리스가 아닙니다");
+    anyhow::ensure!(trusted_download(&asset.url) && trusted_download(&asset.sums_url), "다운로드 주소가 이 프로젝트의 릴리스가 아닙니다");
     let http = client()?;
-    let expected = match &asset.sums_url {
-        Some(u) => {
-            let sums = http.get(u).send().await?.error_for_status()?.text().await?;
-            Some(sum_for(&sums, &asset.name).context("SHA256SUMS.txt 에 이 파일의 해시가 없습니다")?)
-        }
-        None => None,
-    };
+    let sums = http.get(&asset.sums_url).send().await?.error_for_status()?.text().await?;
+    let expected = sum_for(&sums, &asset.name).context("SHA256SUMS.txt 에 이 파일의 해시가 없습니다")?;
     // download into the same folder so a rename is enough to swap it in
     let staging = sibling(&me, &format!(".update-{}", std::process::id()));
     if let Some(dir) = me.parent() {
@@ -425,10 +420,8 @@ async fn install(asset: &Asset, target: &Path, progress: impl Fn(f32)) -> Result
         anyhow::ensure!(total == 0 || got == total, "내려받은 크기가 다릅니다 ({got} / {total} 바이트)");
         let (staging, me) = (staging.clone(), me.clone());
         tokio::task::spawn_blocking(move || -> Result<()> {
-            if let Some(want) = expected {
-                let got = crate::install::sha256_file(&staging)?;
-                anyhow::ensure!(got == want, "내려받은 파일의 해시가 릴리스와 다릅니다");
-            }
+            let got = crate::install::sha256_file(&staging)?;
+            anyhow::ensure!(got.eq_ignore_ascii_case(&expected), "내려받은 파일의 해시가 릴리스와 다릅니다");
             swap(&staging, &me)
         })
         .await?
@@ -543,7 +536,7 @@ mod tests {
         assert_eq!(r.version, "0.3.0");
         assert!(r.installable());
         let a = r.asset.unwrap();
-        assert_eq!((a.size, a.url.as_str(), a.sums_url.as_deref()), (123, "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/a.exe", Some("https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/SHA256SUMS.txt")));
+        assert_eq!((a.size, a.url.as_str(), a.sums_url.as_str()), (123, "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/a.exe", "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/SHA256SUMS.txt"));
         // OS without a downloadable file: notify only (opens the page)
         assert!(!parse_release(&v, "0.2.0", &[]).unwrap().installable());
         // same version, prereleases and drafts aren't announced
@@ -559,7 +552,7 @@ mod tests {
         let rel = |names: &[&str]| {
             json!({
                 "tag_name": "v0.3.0", "draft": false, "prerelease": false,
-                "assets": names.iter().map(|n| json!({"name": n, "size": 1, "browser_download_url": format!("https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/{n}")})).collect::<Vec<_>>()
+                "assets": names.iter().chain(&["SHA256SUMS.txt"]).map(|n| json!({"name": n, "size": 1, "browser_download_url": format!("https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/{n}")})).collect::<Vec<_>>()
             })
         };
         let arm = ["-macos-arm64.zip", "-macos-universal.zip"];
@@ -569,6 +562,8 @@ mod tests {
         assert_eq!(parse_release(&universal, "0.2.0", &arm).unwrap().asset.unwrap().name, "GhostDesk-0.3.0-macos-universal.zip");
         let win_only = rel(&["GhostDesk-0.3.0-windows-x64.exe"]);
         assert!(!parse_release(&win_only, "0.2.0", &arm).unwrap().installable(), "macOS 파일이 없으면 페이지만 연다");
+        let no_sums = json!({"tag_name": "v0.3.0", "assets": [{"name": "GhostDesk-0.3.0-macos-arm64.zip", "size": 1, "browser_download_url": "https://github.com/r2adkr/ghostdesk/releases/download/v0.3.0/GhostDesk-0.3.0-macos-arm64.zip"}]});
+        assert!(!parse_release(&no_sums, "0.2.0", &arm).unwrap().installable(), "해시 목록이 없는 릴리스는 앱 안에서 설치하지 않는다");
         // the list for the current platform isn't empty (supported OS and CPU)
         if cfg!(any(windows, target_os = "macos")) {
             assert!(!asset_suffixes().is_empty());

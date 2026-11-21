@@ -77,7 +77,7 @@ impl GhostApp {
                                 // quiet hint while typing; fades with focus so it doesn't crowd the idle card
                                 if focus > 0.01 {
                                     ui.add_space(4.0);
-                                    ui.label(theme::hint(tr("Enter 다음 · Shift+Enter 줄바꿈")).color(theme::muted().gamma_multiply(focus)));
+                                    ui.label(theme::hint(tr("Enter 시작 · Shift+Enter 줄바꿈")).color(theme::muted().gamma_multiply(focus)));
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.model_picker(ui));
                             });
@@ -90,8 +90,35 @@ impl GhostApp {
                             self.wizard_open = false;
                         }
                     }
-                    // examples for a first-time user: one click fills the box
-                    if self.form.task.trim().is_empty() {
+                    // tasks given before come back with one click; examples only until there are any
+                    if self.form.task.trim().is_empty() && !self.recent_tasks.is_empty() {
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.label(theme::hint(tr("최근에 맡긴 일")));
+                            // a quiet action at the far edge, apart from the label it acts on
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.link(theme::hint(tr("기록 지우기")).color(theme::info())).on_hover_text(tr("최근에 맡긴 일 목록을 이 컴퓨터에서 지워요")).clicked() {
+                                    self.recent_tasks.clear();
+                                    self.save_prefs();
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        let mut pick = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for task in &self.recent_tasks {
+                                // one line per chip: a long task is cut, the whole text is in the tooltip
+                                let first = task.lines().next().unwrap_or_default();
+                                if theme::secondary(ui, &crate::llm::short(first, 40)).on_hover_text(task).clicked() {
+                                    pick = Some(task.clone());
+                                }
+                            }
+                        });
+                        if let Some(task) = pick {
+                            self.form.task = task;
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
+                    } else if self.form.task.trim().is_empty() {
                         ui.add_space(14.0);
                         ui.label(theme::hint(tr("이런 일을 맡겨 볼 수 있어요")));
                         ui.add_space(4.0);

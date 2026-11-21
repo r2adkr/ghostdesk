@@ -38,7 +38,7 @@ pub(super) const PAGES: &[Page] = &[
         file: "1-home.jpg",
         image: include_bytes!("../../assets/tour/1-home.jpg"),
         title: "할 일을 적으면 시작해요",
-        body: "홈에서 할 일과 모델을 고른 뒤 다음을 누르세요. 작업 장소를 먼저 선택할 수도 있어요.",
+        body: "홈에서 할 일과 모델을 고른 뒤 시작하기를 누르세요. 작업 장소를 먼저 선택할 수도 있어요.",
     },
     Page {
         scene: Scene::NewAgent,

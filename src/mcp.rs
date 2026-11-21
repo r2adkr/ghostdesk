@@ -264,7 +264,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "duration": { "type": "number" },
                     "repeat": { "type": "integer" },
                     "region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
-                    "screenshot": { "type": "boolean", "description": "return a screenshot (pixel actions: true, element actions: false)" }
+                    "screenshot": { "type": "boolean", "description": "return a screenshot (pixel actions: true, element actions: false). With actions: set it here for the whole call; set on steps instead, any true → image, all false → none" }
                 },
                 "required": ["desk_id"]
             }
@@ -333,7 +333,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "response": { "type": "integer", "minimum": 0, "description": "native dialog: button index (from 0)" },
                     "accept": { "type": "boolean", "description": "javascript dialog: accept/cancel" },
                     "prompt_text": { "type": "string", "description": "javascript dialog: prompt answer" },
-                    "screenshot": { "type": "boolean", "description": "return a screenshot (reads: false, press/type: true)" }
+                    "screenshot": { "type": "boolean", "description": "return a screenshot (reads: false, press/type: true). With actions: set it here for the whole call; set on steps instead, any true → image, all false → none" }
                 },
                 "required": ["desk_id", "action"]
             }

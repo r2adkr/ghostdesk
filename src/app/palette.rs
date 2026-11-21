@@ -19,6 +19,7 @@ enum Do {
     Connect,
     ToggleSidebar,
     Tour,
+    PauseAll,
 }
 
 struct Item {
@@ -50,6 +51,10 @@ impl GhostApp {
             Item { icon: icon::PANEL_LEFT, label: tr("사이드바 접기/펴기").into(), keys: "B", run: Do::ToggleSidebar },
             Item { icon: icon::BOOK_OPEN, label: tr("사용 설명 다시 보기").into(), keys: "", run: Do::Tour },
         ];
+        if !self.agents.is_empty() {
+            let (glyph, label) = if self.any_running() { (icon::PAUSE, tr("모든 에이전트 일시정지")) } else { (icon::PLAY, tr("모든 에이전트 재개")) };
+            v.push(Item { icon: glyph, label: label.into(), keys: ".", run: Do::PauseAll });
+        }
         for (i, a) in self.agents.iter().enumerate() {
             v.push(Item { icon: icon::GHOST, label: a.shared.name.clone(), keys: "", run: Do::Agent(i) });
         }
@@ -145,6 +150,7 @@ impl GhostApp {
                 Do::Connect => self.open_connect(ctx),
                 Do::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
                 Do::Tour => self.open_tour(),
+                Do::PauseAll => self.toggle_pause_all(ctx),
             }
             return;
         }

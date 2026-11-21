@@ -52,6 +52,8 @@ pub(super) struct Prefs {
     allow_experimental: Option<bool>,
     /// Whether the first-launch guide was already seen.
     tour_seen: Option<bool>,
+    /// Tasks given most recently (newest first).
+    recent_tasks: Option<Vec<String>>,
     // ---- old format (read only) ----
     /// Current AI provider (`Provider::short_name`).
     #[serde(skip_serializing)]
@@ -196,6 +198,8 @@ impl GhostApp {
         self.pi_offer_dismissed = p.pi_offer_dismissed.unwrap_or(false);
         self.allow_experimental = p.allow_experimental.unwrap_or(false);
         self.tour_seen = p.tour_seen.unwrap_or(false);
+        self.recent_tasks = p.recent_tasks.unwrap_or_default();
+        self.recent_tasks.truncate(super::RECENT_TASKS);
         self.remember_keys = p.remember_keys.unwrap_or(CAN_REMEMBER_KEYS) && CAN_REMEMBER_KEYS;
     }
 
@@ -235,6 +239,7 @@ impl GhostApp {
             pi_offer_dismissed: Some(self.pi_offer_dismissed),
             allow_experimental: Some(self.allow_experimental),
             tour_seen: Some(self.tour_seen),
+            recent_tasks: Some(self.recent_tasks.clone()),
             other: self.prefs_other.clone(),
             ..Default::default()
         }

@@ -1246,7 +1246,8 @@ impl ControlServer {
             }
         };
         let text = if out.text.is_empty() { "OK".to_string() } else { out.text };
-        let reply = act_reply(&desk, text, out.image, want_shot).await?;
+        let settle = !read_only(input["action"].as_str().unwrap_or_default());
+        let reply = act_reply(&desk, text, out.image, want_shot, settle).await?;
         note_usage(&shared, &reply, p["screenshot"].is_null() && !want_shot);
         Ok(reply)
     }
@@ -1324,7 +1325,7 @@ impl ControlServer {
             }
             // give the screen a moment to react to the previous action (about as fast as a person pressing in
             // a row)
-            if n < steps.len() {
+            if n < steps.len() && !read_only(&name) {
                 tokio::time::sleep(Duration::from_millis(60)).await;
             }
         }
@@ -1337,7 +1338,8 @@ impl ControlServer {
         if !last_is_shot {
             image = None;
         }
-        act_reply(desk, lines.join("\n"), image, want_shot).await
+        let settle = !steps.last().and_then(|s| s["action"].as_str()).is_some_and(read_only);
+        act_reply(desk, lines.join("\n"), image, want_shot, settle).await
     }
 
     /// An MCP connection says it left a repeated screenshot out (see mcp.rs `trim_repeats`).
@@ -1457,6 +1459,14 @@ fn is_browser_action(name: &str, step: &Value) -> bool {
     }
 }
 
+/// Actions that only look (nothing on screen changes), so there is nothing to wait for after them.
+fn read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "screenshot" | "zoom" | "cursor_position" | "read" | "text" | "find" | "links" | "list" | "list_tabs" | "list_windows" | "ui_tree" | "menus" | "dialog" | "wait" | "wait_for"
+    )
+}
+
 /// Whether a call returns a screenshot when the agent didn't say. Pixel actions do (the agent works
 /// from the picture); page-element, navigation and read-only actions don't (they answer in text, and
 /// the agent asks with `screenshot: true` when it wants to see).
@@ -1471,6 +1481,12 @@ fn default_shot(tool: &str, input: &Value) -> bool {
         }
     };
     match input["actions"].as_array() {
+        // `screenshot` given on steps instead of on the call: any true (or a final look at the screen) means an
+        // image, all false means none. Agents put it in either place, and ignoring it cost them an extra call.
+        Some(steps) if steps.iter().any(|s| s["screenshot"].is_boolean()) => {
+            steps.iter().any(|s| s["screenshot"].as_bool() == Some(true))
+                || steps.last().and_then(|s| s["action"].as_str()).is_some_and(|a| a == "screenshot" || a == "zoom")
+        }
         Some(steps) => steps.iter().any(|s| one(tool, s)),
         None => one(tool, input),
     }
@@ -1503,10 +1519,13 @@ fn done_prefix(lines: &[String]) -> String {
 
 /// Action result: text, events, window/tab list, screen (captured fresh when `want_shot` and the
 /// action returned no screen).
-async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot: bool) -> Result<Value> {
+/// `settle`: the last action may have changed the screen, so give it a moment before the capture.
+async fn act_reply(desk: &Desk, text: String, image: Option<Vec<u8>>, want_shot: bool, settle: bool) -> Result<Value> {
     let mut image = image;
     if image.is_none() && want_shot && desk.has_screen() {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        if settle {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
         image = desk.screenshot().await.ok();
     }
     let notes = desk.take_notes();
@@ -2056,7 +2075,7 @@ fn kind_name(k: DeskKind) -> &'static str {
 }
 
 /// How to use Windows regular app screens (off-screen window + UI Automation).
-const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 창입니다 (사용자에게는 보이지 않습니다). 좌표는 스크린샷 픽셀입니다. 정확한 조작은 desk_app {action:ui_tree} 후 press/set_value/focus/menu 를 쓰세요. 단축키는 ctrl 기준입니다 (cmd 는 ctrl 로 바뀝니다).";
+const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 창입니다 (사용자에게는 보이지 않습니다). 좌표는 스크린샷 픽셀입니다. 정확한 조작은 desk_app {action:ui_tree} 후 press/set_value/focus/menu 를 쓰세요. 단축키는 ctrl 기준입니다 (cmd 는 ctrl 로 바뀝니다). 시스템 클립보드는 사용자와 같은 것을 씁니다: 앱이 자기 기능(복사 버튼 등)으로 클립보드를 바꾸면 GhostDesk 가 사용자의 원래 내용으로 곧바로 되돌리므로 그 내용에 기대지 마세요. 입력칸의 ctrl+c/x/v 는 내부 클립보드로 처리되어 그대로 쓸 수 있습니다.";
 
 /// Per-screen usage notes for external agents.
 pub fn guide(k: DeskKind) -> &'static str {
@@ -2442,6 +2461,32 @@ mod win_policy {
     #[cfg(test)]
     pub(super) fn system_root_for_test() -> String {
         system_root()
+    }
+}
+
+#[cfg(test)]
+mod shot_option_tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_on_steps_is_honored_when_the_call_has_none() {
+        let click = |shot: Option<bool>| {
+            let mut v = json!({ "action": "left_click", "coordinate": [1, 2] });
+            if let Some(s) = shot {
+                v["screenshot"] = json!(s);
+            }
+            v
+        };
+        // nothing said: a click changes the screen, so it is shown
+        assert!(default_shot("computer", &json!({ "actions": [click(None), click(None)] })));
+        // every step said false: no image
+        assert!(!default_shot("computer", &json!({ "actions": [click(Some(false)), click(Some(false))] })));
+        // one step said false, the others nothing: the steps that spoke decide
+        assert!(!default_shot("app", &json!({ "actions": [{ "action": "press", "label": "OK", "screenshot": false }, { "action": "ui_tree" }] })));
+        // any true: shown
+        assert!(default_shot("computer", &json!({ "actions": [click(Some(false)), click(Some(true))] })));
+        // ending with a screenshot is a request to see the screen
+        assert!(default_shot("computer", &json!({ "actions": [click(Some(false)), { "action": "screenshot" }] })));
     }
 }
 

@@ -190,14 +190,30 @@ async fn handle(incoming: iroh::endpoint::Incoming, token: &str, server: &Arc<cr
     // one connection carries a stream per `SessionDesk` connection (it reconnects on its own)
     loop {
         let Ok((send, recv)) = conn.accept_bi().await else { return Ok(()) };
-        let (server, token, log) = (server.clone(), token.to_string(), log.clone());
+        let (server, token, log, conn) = (server.clone(), token.to_string(), log.clone(), conn.clone());
         tokio::spawn(async move {
             if let Err(e) = handle_stream(send, recv, &token, &server, &log).await {
                 log(&format!("연결 종료: {e:#}"));
+                // a peer that could not prove the code gets no further tries on this connection
+                if e.downcast_ref::<Denied>().is_some() {
+                    // a moment first so the DENIED reply reaches the client (closing drops unsent data)
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    conn.close(1u32.into(), b"denied");
+                }
             }
         });
     }
 }
+
+/// The token on a stream was wrong (or missing): the whole connection is closed.
+#[derive(Debug)]
+struct Denied;
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("접속 코드의 암호가 맞지 않아 거절했습니다")
+    }
+}
+impl std::error::Error for Denied {}
 
 async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
@@ -206,11 +222,14 @@ async fn handle_stream(
     server: &crate::session::HostServer,
     log: &crate::session::LogFn,
 ) -> Result<()> {
-    let got = tokio::time::timeout(Duration::from_secs(10), read_token_line(&mut recv)).await.context("암호를 받지 못했습니다")??;
+    let got = match tokio::time::timeout(Duration::from_secs(10), read_token_line(&mut recv)).await {
+        Ok(Ok(got)) => got,
+        _ => return Err(Denied.into()),
+    };
     if !same_token(&got, token.as_bytes()) {
         let _ = send.write_all(b"DENIED\n").await;
         let _ = send.finish();
-        bail!("접속 코드의 암호가 맞지 않아 거절했습니다");
+        return Err(Denied.into());
     }
     send.write_all(b"OK\n").await?;
     log("클라이언트 접속");
@@ -439,7 +458,8 @@ mod tests {
 
         // a wrong token is refused up front
         let bad = encode_code(&endpoint.id().to_string(), &new_token());
-        assert!(connect(&bad).await.is_err());
+        let refused = connect(&bad).await.err().expect("wrong code must be refused");
+        assert!(format!("{refused:#}").contains("유효하지 않아요"), "the client hears DENIED, not a timeout: {refused:#}");
 
         let bridge = connect(&code).await.expect("connect");
         let sink: crate::browser::FrameSink = Arc::new(|_: &[u8]| {});

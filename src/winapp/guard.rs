@@ -15,9 +15,12 @@
 //! - If the app takes the foreground (keyboard focus), it's logged and handed back to the
 //!   previous window. While input is being sent, the foreground lock (LockSetForegroundWindow)
 //!   is held briefly so the app can't take it.
-//! - Writes by the app to the system clipboard (its own copy feature) are logged, without
-//!   reading the content. Mode A apps can't touch the clipboard at all under the Job's UI limits,
-//!   so this is effectively for mode B (attaching to a user's app).
+//! - Writes by the app to the system clipboard are undone: the user's clipboard is copied into
+//!   memory whenever the user changes it, and if the app overwrites or empties it while the agent
+//!   is working it, that copy is put back. The copy never leaves the process (not logged, saved or
+//!   sent) and is dropped with the screen. The Job's UI limits don't stop every app (measured:
+//!   Character Map changed the clipboard twice from one grid click), and mode B (attaching to a
+//!   user's app) has no Job limits at all.
 //! - Shell windows (taskbar, desktop) are never moved and never shown as views.
 
 use std::cell::RefCell;
@@ -300,6 +303,11 @@ struct Loop {
     last_pid_refresh: Instant,
     last_lock_try: Instant,
     clip_seq: u32,
+    /// The user's clipboard as last seen (memory only), put back if the app overwrites it.
+    clip_saved: Option<w32::ClipSnapshot>,
+    /// Message-only window that owns restored clipboard data.
+    clip_owner: Hwnd,
+    clip_restores: Vec<Instant>,
     vscreen: (i32, i32, i32, i32),
 }
 
@@ -328,6 +336,9 @@ fn run(s: Arc<Shared>) {
         last_pid_refresh: Instant::now() - Duration::from_secs(1),
         last_lock_try: Instant::now() - Duration::from_secs(1),
         clip_seq: w32::clipboard_sequence(),
+        clip_saved: w32::clipboard_snapshot(),
+        clip_owner: w32::message_window(),
+        clip_restores: vec![],
         vscreen: pw::virtual_screen(),
     };
     // foreground window at startup (handed back to if it isn't the app's)
@@ -372,6 +383,7 @@ fn run(s: Arc<Shared>) {
         lp.manage_lock();
         lp.check_clipboard();
     }
+    w32::destroy_window(lp.clip_owner);
     for (_, (a, b)) in lp.hooks.drain() {
         w32::unhook_win_event(a);
         w32::unhook_win_event(b);
@@ -695,12 +707,29 @@ impl Loop {
         }
         self.clip_seq = seq;
         let owner = w32::clipboard_owner();
-        if owner != 0 && self.is_ours(owner) {
-            self.s.clip_writes.fetch_add(1, Ordering::SeqCst);
-            self.record(
-                "앱이 자기 복사 기능으로 시스템 클립보드에 썼습니다 — 사용자의 클립보드 내용이 바뀌었을 수 있습니다 (GhostDesk 는 읽거나 쓰지 않음)"
-                    .into(),
-            );
+        // the app wrote (its window owns the clipboard), or it was emptied with no owner right after the agent's input
+        let agent_recent = self.s.lease_until.lock().is_some_and(|t| Instant::now() < t + Duration::from_millis(1500));
+        let by_app = (owner != 0 && self.is_ours(owner)) || (owner == 0 && agent_recent);
+        // in an app the user also uses (mode B), their own copy in it is theirs to keep
+        let users_own = self.s.mode == NativeMode::Attached && w32::ms_since_user_input() < 500 && !agent_recent;
+        if !by_app || users_own {
+            // the user's new content: this is what gets put back if the app touches it
+            if owner != self.clip_owner {
+                self.clip_saved = w32::clipboard_snapshot();
+            }
+            return;
+        }
+        self.s.clip_writes.fetch_add(1, Ordering::SeqCst);
+        // never fight an app that keeps writing: a few restores in a short while at most
+        self.clip_restores.retain(|t| t.elapsed() < Duration::from_secs(5));
+        let restored = self.clip_restores.len() < 6 && self.clip_saved.as_ref().is_some_and(|snap| w32::clipboard_restore(snap, self.clip_owner));
+        if restored {
+            self.clip_restores.push(Instant::now());
+            // our own write moved the sequence on again
+            self.clip_seq = w32::clipboard_sequence();
+            self.record("앱이 시스템 클립보드를 바꿔서 사용자의 원래 클립보드 내용으로 되돌렸습니다 (되돌릴 내용은 메모리에만 두고 기록·전송하지 않음)".into());
+        } else {
+            self.record("앱이 자기 복사 기능으로 시스템 클립보드에 썼고 원래 내용으로 되돌리지 못했습니다 — 사용자의 클립보드 내용이 바뀌었을 수 있습니다".into());
         }
     }
 }

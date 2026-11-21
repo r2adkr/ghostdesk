@@ -92,8 +92,14 @@ connection kit.
 
 **Keyboard.** Press Cmd+K (Ctrl+K on Windows) to jump to a screen, an agent or an
 action. Cmd+1 to 4 switch between Home, All agents, Teams and Usage, Cmd+N
-starts an agent, Cmd+B hides or shows the sidebar and Cmd+, opens Settings.
-Hold Cmd to see each shortcut next to its menu item.
+starts an agent, Cmd+B hides or shows the sidebar, Cmd+, opens Settings and
+Cmd+. pauses every agent at once (press it again to resume them; agents you
+have taken over are left alone). Hold Cmd to see each shortcut next to its menu item.
+
+**Recent tasks.** Home lists the last five tasks you gave; one click puts a task
+back in the composer. **Clear history** next to the list removes it from this
+computer. An agent's **⋯** menu has **Copy conversation**, which copies its
+instructions, replies, actions and errors as plain text for reporting a problem.
 
 **Usage tab.** Shows what agents used over the last 7, 30 or 90 days, by day and
 by agent. Agents inside GhostDesk report real token counts. Outside agents

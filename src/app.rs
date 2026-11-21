@@ -257,6 +257,8 @@ pub struct GhostApp {
     tour: Option<tour::Tour>,
     /// Whether the guide was finished or skipped (then it's not shown again).
     tour_seen: bool,
+    /// Tasks given most recently (newest first, at most `RECENT_TASKS`), offered again on Home.
+    recent_tasks: Vec<String>,
     /// Guide screenshot capture mode (`GHOSTDESK_TOUR_CAPTURE`).
     tour_capture: Option<tour::Capture>,
     /// macOS permission state (rechecked every second: `permissions`).
@@ -300,6 +302,12 @@ pub struct GhostApp {
     live_fps_limit: u32,
     /// Run key-based AI agents through pi when it is installed.
     pi_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// The engine update started from its toast, while it runs.
+    pi_update: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// How the last engine update ended (shown in the toast until it is closed).
+    pi_update_result: Option<Result<(), String>>,
+    /// The engine-update toast was closed with 'Later' (until the next launch).
+    pi_update_dismissed: bool,
     pi_note: Option<String>,
     toolbox: toolbox_ui::State,
     more_views_open: bool,
@@ -458,6 +466,9 @@ impl GhostApp {
             access: Default::default(),
             live_fps_limit: 60,
             pi_install: None,
+            pi_update: None,
+            pi_update_result: None,
+            pi_update_dismissed: false,
             pi_note: None,
             toolbox: Default::default(),
             more_views_open: false,
@@ -465,6 +476,7 @@ impl GhostApp {
             allow_experimental: false,
             tour: None,
             tour_seen: false,
+            recent_tasks: Vec::new(),
             tour_capture: tour::Capture::from_env(),
             #[cfg(target_os = "macos")]
             perm_cache: None,
@@ -507,6 +519,14 @@ impl GhostApp {
         }
         i18n::set(app.lang);
         fonts::setup_fonts(&cc.egui_ctx, app.lang);
+        // is the installed engine older than this GhostDesk expects? (runs `pi --help`, so off the UI thread)
+        if app.tour_capture.is_none() {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                crate::pi::check_outdated();
+                ctx.request_repaint();
+            });
+        }
         app
     }
 
@@ -792,7 +812,8 @@ impl eframe::App for GhostApp {
             self.main_layout(ui, &ctx);
         }
         self.toast_area(&ctx);
-        self.update_toast(&ctx);
+        let update_shown = self.update_toast(&ctx);
+        self.engine_toast(&ctx, update_shown);
         self.pip_windows(&ctx);
         titlebar::resize_edges(&ctx);
     }
@@ -800,7 +821,7 @@ impl eframe::App for GhostApp {
 
 impl GhostApp {
     /// App-wide shortcuts (⌘ on macOS, Ctrl elsewhere): K quick switcher, 1-4 switch views, N new agent,
-    /// comma Settings, B hide or show the sidebar. Ignored while a dialog is open so they never act behind it.
+    /// comma Settings, B hide or show the sidebar, period pause or resume every agent. Ignored while a dialog is open so they never act behind it.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
         let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, k));
@@ -830,7 +851,26 @@ impl GhostApp {
             self.sidebar_open = !self.sidebar_open;
         } else if pressed(Key::Comma) {
             self.open_settings(settings::SettingsTab::General);
+        } else if pressed(Key::Period) {
+            self.toggle_pause_all(ctx);
         }
+    }
+
+    /// Whether any agent is not paused. Agents under human takeover are already paused and are left alone.
+    fn any_running(&self) -> bool {
+        self.agents.iter().any(|a| !a.takeover && !a.shared.paused.load(Ordering::Relaxed))
+    }
+
+    /// One key for "stop everything for a moment": pauses every agent, or resumes them all when all are paused.
+    fn toggle_pause_all(&mut self, ctx: &egui::Context) {
+        if self.agents.is_empty() {
+            return;
+        }
+        let pause = self.any_running();
+        for a in self.agents.iter().filter(|a| !a.takeover) {
+            a.shared.paused.store(pause, Ordering::Relaxed);
+        }
+        self.notify(ctx, if pause { tr("모든 에이전트를 일시정지했어요") } else { tr("모든 에이전트를 다시 시작했어요") });
     }
 
     /// Normal layout: left sidebar · (right panel in detail view) · center · modal windows.
@@ -957,15 +997,16 @@ impl GhostApp {
     }
 
     /// Update notice as a toast at the bottom right. It stays until the person presses X (hidden for that version).
-    fn update_toast(&mut self, ctx: &egui::Context) {
+    /// Returns whether it is on screen (other toasts then stack above it).
+    fn update_toast(&mut self, ctx: &egui::Context) -> bool {
         use crate::update::State;
         let st = self.update.lock().clone();
         let r = match &st {
-            State::None => return,
+            State::None => return false,
             State::Available(r) | State::Downloading(r, _) | State::Ready(r) | State::Failed(r, _) => r.clone(),
         };
         if self.update_dismissed.as_deref() == Some(r.version.as_str()) {
-            return;
+            return false;
         }
         let mut close = false;
         egui::Area::new(egui::Id::new("update_toast"))
@@ -1028,6 +1069,91 @@ impl GhostApp {
             });
         if close {
             self.update_dismissed = Some(r.version.clone());
+        }
+        true
+    }
+
+    /// The installed AI engine (pi) is older than this GhostDesk expects: offer to update it, at the bottom right
+    /// (above the app's own update notice when that is showing). Nothing runs until the person presses Update.
+    fn engine_toast(&mut self, ctx: &egui::Context, above_update: bool) {
+        if let Some(rx) = &self.pi_update {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.pi_update = None;
+                    self.pi_update_result = Some(r);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(300)),
+                Err(_) => self.pi_update = None,
+            }
+        }
+        let running = self.pi_update.is_some();
+        let outdated = crate::pi::OUTDATED.load(Ordering::Relaxed);
+        if self.pi_update_dismissed || !(outdated || running || self.pi_update_result.is_some()) {
+            return;
+        }
+        let (mut later, mut start, mut close) = (false, false, false);
+        egui::Area::new(egui::Id::new("engine_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, if above_update { -150.0 } else { -16.0 }])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::card_hover())
+                    .stroke(Stroke::new(1.0, theme::border_hover()))
+                    .corner_radius(theme::CARD_RADIUS)
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .shadow(ui.style().visuals.popup_shadow)
+                    .show(ui, |ui| {
+                        ui.set_width(260.0);
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        match (&self.pi_update_result, running) {
+                            (_, true) => {
+                                ui.label(RichText::new(tr("AI 엔진 업데이트")).strong().color(theme::text()));
+                                ui.horizontal(|ui| {
+                                    theme::spinner(ui, 13.0, theme::muted());
+                                    ui.label(theme::hint(tr("최신 버전을 설치하는 중… 1~2분 걸릴 수 있어요")));
+                                });
+                            }
+                            (Some(Ok(())), _) => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("{}  {}", icon::CIRCLE_CHECK, tr("AI 엔진을 업데이트했어요"))).strong().color(theme::success()));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        close = theme::icon_button(ui, icon::X, tr("닫기")).clicked();
+                                    });
+                                });
+                                ui.label(theme::hint(tr("다음 지시부터 새 엔진으로 일해요")));
+                            }
+                            (failed, _) => {
+                                ui.label(RichText::new(tr("AI 엔진을 업데이트할까요?")).strong().color(theme::text()));
+                                if let Some(Err(e)) = failed {
+                                    ui.label(RichText::new(crate::llm::short(e, 140)).size(12.0).color(theme::warn())).on_hover_text(e.as_str());
+                                } else {
+                                    ui.label(theme::hint(tr("설치된 AI 엔진(pi)이 이 GhostDesk 보다 오래된 버전이라 에이전트가 제대로 일하지 못할 수 있어요.")));
+                                }
+                                ui.horizontal(|ui| {
+                                    start = theme::primary(ui, if failed.is_some() { tr("다시 시도") } else { tr("엔진 업데이트") })
+                                        .on_hover_text(tr("pi 를 최신 버전으로 바꿔요. 내 pi 확장·설정은 건드리지 않아요."))
+                                        .clicked();
+                                    later = ui.link(theme::hint(tr("나중에"))).on_hover_text(tr("다음에 켤 때 다시 알려 드려요")).clicked();
+                                });
+                            }
+                        }
+                    });
+            });
+        if start {
+            self.pi_update_result = None;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pi_update = Some(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::pi::update());
+                ctx.request_repaint();
+            });
+        }
+        if later {
+            self.pi_update_dismissed = true;
+        }
+        if close {
+            self.pi_update_result = None;
         }
     }
 
@@ -1136,6 +1262,8 @@ fn detail_panel_widths(layout: u8, room: f32, base: f32) -> (f32, f32) {
 
 /// How long a toast stays visible (seconds).
 const TOAST_SECS: f64 = 4.0;
+/// How many recent tasks Home offers again.
+const RECENT_TASKS: usize = 5;
 
 /// A value filled in the background (`None` = still checking).
 type Slot<T> = Arc<parking_lot::Mutex<Option<T>>>;

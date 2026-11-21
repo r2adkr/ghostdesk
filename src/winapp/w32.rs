@@ -125,6 +125,12 @@ extern "system" {
     fn UnhookWinEvent(hook: isize) -> i32;
     fn GetClipboardSequenceNumber() -> u32;
     fn GetClipboardOwner() -> HWND;
+    fn OpenClipboard(owner: HWND) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn EnumClipboardFormats(format: u32) -> u32;
+    fn GetClipboardData(format: u32) -> HANDLE;
+    fn SetClipboardData(format: u32, mem: HANDLE) -> HANDLE;
     fn IsWindowEnabled(hwnd: HWND) -> i32;
 }
 
@@ -142,6 +148,11 @@ extern "system" {
 #[link(name = "kernel32", kind = "raw-dylib")]
 extern "system" {
     fn GetTickCount() -> u32;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> HANDLE;
+    fn GlobalLock(mem: HANDLE) -> *mut core::ffi::c_void;
+    fn GlobalUnlock(mem: HANDLE) -> i32;
+    fn GlobalSize(mem: HANDLE) -> usize;
+    fn GlobalFree(mem: HANDLE) -> HANDLE;
 }
 
 /// Milliseconds since the user's last real keyboard or mouse input (posted messages don't count).
@@ -181,9 +192,120 @@ pub fn clipboard_sequence() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
-/// Window that last wrote to the clipboard (content is never read).
+/// Window that last wrote to the clipboard.
 pub fn clipboard_owner() -> Hwnd {
     unsafe { GetClipboardOwner() as Hwnd }
+}
+
+/// A copy of the clipboard kept in memory only, so it can be put back when a hidden app overwrites or empties it.
+/// Never logged, saved or sent anywhere; dropped with the app's screen.
+pub struct ClipSnapshot {
+    formats: Vec<(u32, Vec<u8>)>,
+}
+
+/// Formats held as GDI or private handles rather than global memory: they can't be copied byte for byte. The ones
+/// that matter have a memory twin Windows converts back from (CF_DIB for CF_BITMAP).
+fn handle_format(f: u32) -> bool {
+    matches!(f, 2 | 3 | 9 | 14 | 0x80 | 0x82 | 0x83 | 0x8E) || (0x200..=0x3FF).contains(&f)
+}
+
+/// Above this the snapshot isn't kept (a huge image); a write by the app is then only reported.
+const CLIP_SNAPSHOT_MAX: usize = 16 << 20;
+
+fn open_clipboard(owner: Hwnd) -> bool {
+    // another program may hold it for a moment
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(hw(owner)) } != 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+/// Copies every format on the clipboard. `None`: busy or too large (a restore is then not attempted).
+pub fn clipboard_snapshot() -> Option<ClipSnapshot> {
+    if !open_clipboard(0) {
+        return None;
+    }
+    let mut formats = vec![];
+    let mut total = 0usize;
+    let mut ok = true;
+    let mut f = 0;
+    unsafe {
+        loop {
+            f = EnumClipboardFormats(f);
+            if f == 0 {
+                break;
+            }
+            if handle_format(f) {
+                continue;
+            }
+            let h = GetClipboardData(f);
+            if h.is_null() {
+                continue;
+            }
+            let size = GlobalSize(h);
+            total += size;
+            if total > CLIP_SNAPSHOT_MAX {
+                ok = false;
+                break;
+            }
+            let p = GlobalLock(h) as *const u8;
+            if p.is_null() {
+                continue;
+            }
+            formats.push((f, std::slice::from_raw_parts(p, size).to_vec()));
+            GlobalUnlock(h);
+        }
+        CloseClipboard();
+    }
+    ok.then_some(ClipSnapshot { formats })
+}
+
+/// Puts a snapshot back. `owner` must be a window of this process (with no owner Windows refuses the data).
+pub fn clipboard_restore(snap: &ClipSnapshot, owner: Hwnd) -> bool {
+    if owner == 0 || !open_clipboard(owner) {
+        return false;
+    }
+    let mut all = true;
+    unsafe {
+        EmptyClipboard();
+        for (f, bytes) in &snap.formats {
+            const GMEM_MOVEABLE: u32 = 0x0002;
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
+            if h.is_null() {
+                all = false;
+                continue;
+            }
+            let p = GlobalLock(h) as *mut u8;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                GlobalUnlock(h);
+            }
+            // on success the clipboard owns the memory
+            if SetClipboardData(*f, h).is_null() {
+                GlobalFree(h);
+                all = false;
+            }
+        }
+        CloseClipboard();
+    }
+    all
+}
+
+/// A hidden message-only window owned by the calling thread (the owner of restored clipboard data).
+pub fn message_window() -> Hwnd {
+    let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        wm::CreateWindowExW(0, class.as_ptr(), std::ptr::null(), 0, 0, 0, 0, 0, -3isize as HWND, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) as Hwnd
+    }
+}
+
+pub fn destroy_window(h: Hwnd) {
+    if h != 0 {
+        unsafe { wm::DestroyWindow(hw(h)) };
+    }
 }
 
 // ---- kernel handles ----

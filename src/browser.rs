@@ -206,7 +206,8 @@ impl BrowserWorkspace {
         let mut cmd = Command::new(&opts.exe);
         cmd.arg(format!("--user-data-dir={}", opts.user_data_dir.display()))
             .arg("--remote-debugging-port=0")
-            .arg("--remote-allow-origins=*")
+            // no --remote-allow-origins: the CDP client sends no Origin header, and allowing every origin would let
+            // web pages in the user's own browser attach to this one (and its cloned logins)
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg(DISABLE_FEATURES)
