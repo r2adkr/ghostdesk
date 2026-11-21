@@ -169,6 +169,7 @@ pub fn card_hover() -> Color32 { pal().card_hover }
 pub fn raised() -> Color32 { pal().raised }
 pub fn border() -> Color32 { pal().border }
 pub fn border_hover() -> Color32 { pal().border_hover }
+pub fn rim() -> Color32 { pal().rim }
 pub fn text() -> Color32 { pal().text }
 pub fn body() -> Color32 { pal().body }
 pub fn muted() -> Color32 { pal().muted }
