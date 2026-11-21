@@ -1091,7 +1091,7 @@ async fn drive_agent(
             shared.log(LogKind::Error, format!("AI 엔진이 예기치 않게 끝났습니다{}", if why.is_empty() { String::new() } else { format!(": {}", crate::llm::short(&why, 300)) }));
             if outdated_engine(&why) {
                 mark_outdated();
-                shared.log(LogKind::Info, "설치된 AI 엔진(pi)이 이 GhostDesk 보다 오래된 버전이에요. 오른쪽 아래 알림에서 '엔진 업데이트'를 누른 뒤 다시 지시해 주세요.");
+                shared.log(LogKind::Info, "GhostDesk에서 사용하는 기능이 현재 설치되어 있는 AI 엔진(pi)의 버전에서 지원되지 않아요. 오른쪽 아래 알림에서 '엔진 업데이트'를 누른 뒤 다시 지시해 주세요.");
             }
             proc = None;
             restarted = true;

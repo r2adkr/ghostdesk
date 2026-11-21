@@ -1151,11 +1151,13 @@ impl GhostApp {
                                 ui.label(theme::hint(tr("다음 지시부터 새 엔진으로 일해요")));
                             }
                             (failed, _) => {
-                                ui.label(RichText::new(tr("AI 엔진을 업데이트할까요?")).strong().color(theme::text()));
                                 if let Some(Err(e)) = failed {
+                                    ui.label(RichText::new(tr("AI 엔진을 업데이트할까요?")).strong().color(theme::text()));
                                     ui.label(RichText::new(crate::llm::short(e, 140)).size(12.0).color(theme::warn())).on_hover_text(e.as_str());
                                 } else {
-                                    ui.label(theme::hint(tr("설치된 AI 엔진(pi)이 이 GhostDesk 보다 오래된 버전이라 에이전트가 제대로 일하지 못할 수 있어요.")));
+                                    // the reason first, then the question the buttons answer
+                                    ui.label(RichText::new(tr("GhostDesk에서 사용하는 기능이 현재 설치되어 있는 AI 엔진(pi)의 버전에서 지원되지 않아 에이전트가 제대로 작동하지 않을 수 있어요.")).color(theme::text()));
+                                    ui.label(RichText::new(tr("업데이트를 진행하시겠어요?")).strong().color(theme::text()));
                                 }
                                 ui.horizontal(|ui| {
                                     start = theme::primary(ui, if failed.is_some() { tr("다시 시도") } else { tr("엔진 업데이트") })
