@@ -34,12 +34,12 @@ impl GhostApp {
                 Err(TryRecvError::Disconnected) => ui_state.busy = None,
             }
         }
-        theme::section(ui, tr("이 컴퓨터를 호스트로"));
-        ui.label(theme::hint(tr("켜 두면 다른 곳의 GhostDesk 가 접속 코드로 이 컴퓨터의 화면을 쓸 수 있어요. VPN 이나 포트 설정은 필요 없어요.")));
-        ui.add_space(6.0);
+        super::settings::heading(ui, tr("이 컴퓨터를 호스트로"));
         let busy = ui_state.busy.is_some();
         let mut want = ui_state.busy.as_ref().map(|(t, _)| *t).unwrap_or(on);
-        let changed = ui.add_enabled(!busy, theme::switch(&mut want, tr("호스트 켜기 (로그인할 때 자동 시작)"))).changed();
+        let title = tr("호스트 켜기 (로그인할 때 자동 시작)");
+        let desc = tr("켜 두면 다른 곳의 GhostDesk 가 접속 코드로 이 컴퓨터의 화면을 쓸 수 있어요. VPN 이나 포트 설정은 필요 없어요.");
+        let changed = theme::setting_row(ui, title, desc, false, 36.0, |ui| ui.add_enabled(!busy, theme::switch(&mut want, title).text_hidden())).changed();
         if busy {
             ui.horizontal(|ui| {
                 theme::spinner(ui, 13.0, theme::muted());

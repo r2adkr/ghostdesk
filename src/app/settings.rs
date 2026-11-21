@@ -392,63 +392,78 @@ impl GhostApp {
         if !self.show_settings {
             return;
         }
-        let width = (ctx.content_rect().width() - 96.0).clamp(540.0, 760.0);
-        const NAV: f32 = 172.0;
-        const LABEL: f32 = 96.0;
-        let body_h = (ctx.content_rect().height() - 184.0).clamp(240.0, 504.0);
+        let width = (ctx.content_rect().width() - 96.0).clamp(560.0, 820.0);
+        const NAV: f32 = 200.0;
+        let body_h = (ctx.content_rect().height() - 200.0).clamp(240.0, 540.0);
         let mut close = false;
         let mut lang = self.lang;
         let perm_ok = self.permissions_ok(ctx);
         let mut tabs = vec![SettingsTab::General, SettingsTab::Ai, SettingsTab::Toolbox, SettingsTab::Ssh];
         tabs.push(SettingsTab::Permissions);
         tabs.push(SettingsTab::About);
-        let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame()).show(ctx, |ui| {
+        // as in Claude's and macOS settings: the page list on a panel of its own at the left, the page's
+        // title over its rows at the right
+        let m = egui::Modal::new(egui::Id::unique("settings")).frame(theme::modal_frame().inner_margin(0)).show(ctx, |ui| {
             ui.set_width(width);
-            close |= theme::modal_header(ui, tr("설정"));
-            if let Some(error) = &self.prefs_error {
-                ui.colored_label(theme::danger(), trf("설정 파일을 읽거나 저장하지 못했어요 ({})", &[error]));
-            }
-            ui.separator();
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 16, top: 16, bottom: 4 }).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                close |= theme::modal_header(ui, tr("설정"));
+                if let Some(error) = &self.prefs_error {
+                    ui.colored_label(theme::danger(), trf("설정 파일을 읽거나 저장하지 못했어요 ({})", &[error]));
+                    ui.add_space(8.0);
+                }
+            });
+            let line_y = ui.cursor().top();
+            ui.painter().hline(ui.min_rect().x_range(), line_y, egui::Stroke::new(1.0, theme::border()));
             ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                ui.allocate_ui_with_layout(Vec2::new(NAV, body_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(NAV);
-                    for &tab in &tabs {
-                        let glyph = match tab {
-                            SettingsTab::General => icon::SETTINGS,
-                            SettingsTab::Ai => icon::PLUG,
-                            SettingsTab::Ssh => icon::MONITOR,
-                            SettingsTab::Toolbox => icon::APP_WINDOW,
-                            SettingsTab::Permissions => icon::SHIELD_ALERT,
-                            SettingsTab::About => icon::BOOK_OPEN,
-                        };
-                        let badge = (tab == SettingsTab::Permissions && !perm_ok).then(theme::warn);
-                        if theme::nav_item(ui, self.settings_tab == tab, glyph, tr(tab.label()), badge).clicked() {
-                            self.settings_tab = tab;
-                            self.license_view = None;
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let r = theme::MODAL_RADIUS;
+                egui::Frame::new()
+                    .fill(theme::surface())
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: r, se: 0 })
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| ui.vertical(|ui| {
+                        ui.set_width(NAV - 24.0);
+                        ui.set_height(body_h + 16.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for &tab in &tabs {
+                            let glyph = match tab {
+                                SettingsTab::General => icon::SETTINGS,
+                                SettingsTab::Ai => icon::PLUG,
+                                SettingsTab::Ssh => icon::MONITOR,
+                                SettingsTab::Toolbox => icon::APP_WINDOW,
+                                SettingsTab::Permissions => icon::SHIELD_ALERT,
+                                SettingsTab::About => icon::BOOK_OPEN,
+                            };
+                            let badge = (tab == SettingsTab::Permissions && !perm_ok).then(theme::warn);
+                            if theme::nav_item(ui, self.settings_tab == tab, glyph, tr(tab.label()), badge).clicked() {
+                                self.settings_tab = tab;
+                                self.license_view = None;
+                            }
                         }
-                    }
-                });
-                ui.separator();
-                ui.vertical(|ui| {
+                    }));
+                egui::Frame::new().inner_margin(egui::Margin { left: 28, right: 20, top: 20, bottom: 12 }).show(ui, |ui| ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                     let body_w = ui.available_width();
-                    let field = body_w - LABEL - 14.0;
+                    ui.label(RichText::new(tr(self.settings_tab.label())).size(20.0).strong().color(theme::text()));
+                    ui.add_space(6.0);
                     ui.push_id(("settings_body", self.settings_tab as u8), |ui| {
-                        theme::modal_scroll(ui, body_h, |ui| {
-                            ui.set_width(body_w);
-                            ui.set_min_height(body_h);
+                        theme::modal_scroll(ui, body_h - 28.0, |ui| {
+                            // room for the scroll bar at the right
+                            ui.set_width(body_w - 12.0);
+                            ui.set_min_height(body_h - 28.0);
                             match self.settings_tab {
-                                SettingsTab::General => self.settings_general(ui, &mut lang, LABEL, field),
+                                SettingsTab::General => self.settings_general(ui, &mut lang),
                                 SettingsTab::Ssh => self.settings_ssh(ui),
                                 SettingsTab::Toolbox => self.settings_toolbox(ui),
-                                SettingsTab::Ai => self.settings_ai(ui, body_w, LABEL, field),
+                                SettingsTab::Ai => self.settings_ai(ui, body_w - 12.0),
                                 SettingsTab::Permissions => self.settings_permissions(ui),
                                 SettingsTab::About => self.settings_about(ui),
                             }
                         });
                     });
-                });
+                }));
             });
         });
         if lang != self.lang {
@@ -465,48 +480,33 @@ impl GhostApp {
     }
 
     /// General tab: language, display, work.
-    fn settings_general(&mut self, ui: &mut egui::Ui, lang: &mut Lang, label_w: f32, field: f32) {
-        egui::Grid::new("settings_lang").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
-            ui.label(tr("언어"));
+    fn settings_general(&mut self, ui: &mut egui::Ui, lang: &mut Lang) {
+        theme::setting_row(ui, tr("언어"), "", false, 180.0, |ui| {
             // language names always in their own language (findable even if you can't read the current one)
-            egui::ComboBox::from_id_salt("lang").icon(theme::combo_icon).width(field).selected_text(lang.native_name()).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("lang").icon(theme::combo_icon).width(180.0).selected_text(lang.native_name()).show_ui(ui, |ui| {
                 for l in Lang::ALL {
                     ui.selectable_value(lang, l, l.native_name());
                 }
             });
-            ui.end_row();
         });
 
-        ui.add_space(18.0);
-        theme::section(ui, tr("화면"));
-        ui.add_space(4.0);
-        ui.add(theme::switch(&mut self.show_cursor, tr("가상 마우스 보이기")))
-            .on_hover_text(tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
-        ui.add_space(6.0);
-        ui.add(theme::switch(&mut self.pip_auto_open, tr("에이전트 화면이 열리면 PiP 자동 표시")));
-        ui.add(theme::switch(&mut self.pip_auto_close, tr("에이전트 화면이 닫히면 PiP 자동 닫기")));
-        ui.add_space(6.0);
-        if theme::secondary(ui, tr("사용 설명 다시 보기")).clicked() {
+        group(ui, tr("화면"));
+        switch_row(ui, &mut self.show_cursor, tr("가상 마우스 보이기"), tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
+        switch_row(ui, &mut self.pip_auto_open, tr("에이전트 화면이 열리면 PiP 자동 표시"), "");
+        switch_row(ui, &mut self.pip_auto_close, tr("에이전트 화면이 닫히면 PiP 자동 닫기"), "");
+        let tour = theme::setting_row(ui, tr("사용 설명 다시 보기"), "", false, 96.0, |ui| theme::secondary(ui, tr("열기")).clicked());
+        if tour {
             self.show_settings = false;
             self.save_prefs();
             self.open_tour();
         }
 
-        ui.add_space(18.0);
-        theme::section(ui, tr("작업"));
-        ui.add_space(4.0);
-        ui.add(theme::switch(&mut self.keep_awake, tr("화면이 잠겨도 계속 작업")))
-            .on_hover_text(tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
+        group(ui, tr("작업"));
+        switch_row(ui, &mut self.keep_awake, tr("화면이 잠겨도 계속 작업"), tr("에이전트가 일하는 동안에는 컴퓨터가 잠자기에 들어가지 않게 해요. 화면은 꺼지거나 잠겨도 돼요."));
+        switch_row(ui, &mut self.auto_clean, tr("끝난 화면 자동 정리"), tr("외부 에이전트가 닫은 화면을 목록에서 지우고, 이름 없이 열린 임시 작업공간 폴더도 삭제해요. 이름을 정해 둔 작업공간과 로그인 복제본은 그대로 둬요."));
 
-        ui.add_space(8.0);
-        ui.add(theme::switch(&mut self.auto_clean, tr("끝난 화면 자동 정리")))
-            .on_hover_text(tr("외부 에이전트가 닫은 화면을 목록에서 지우고, 이름 없이 열린 임시 작업공간 폴더도 삭제해요. 이름을 정해 둔 작업공간과 로그인 복제본은 그대로 둬요."));
-
-        ui.add_space(18.0);
-        theme::section(ui, tr("실험적 기능"));
-        ui.add_space(4.0);
-        ui.add(theme::switch(&mut self.allow_experimental, tr("실험적 기능 허용")))
-            .on_hover_text(tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요"));
+        group(ui, tr("실험적 기능"));
+        switch_row(ui, &mut self.allow_experimental, tr("실험적 기능 허용"), tr("켜 두면 가상 디스플레이 등 실험적 기능의 추가 동의를 생략해요. 일반 권한 확인은 별도로 유지돼요"));
     }
 
     /// Permissions tab: approval rules for outside agents (and the macOS permission list above them).
@@ -516,43 +516,34 @@ impl GhostApp {
             self.permission_rows(ui);
             ui.add_space(18.0);
         }
-        theme::section(ui, tr("승인"));
-        ui.add_space(4.0);
-        // the warning stays visible while it's on; otherwise the explanation is a tooltip
+        heading(ui, tr("승인"));
+        // the warning is the description, in the warning color while it's on
         let warn = tr("외부 에이전트가 로그인 복제, 실행 중인 앱, 원격 접속을 묻지 않고 바로 시작해요. 믿는 에이전트만 연결했을 때 켜세요");
-        ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기"))).on_hover_text(warn);
-        if self.auto_approve {
-            ui.label(RichText::new(warn).size(12.0).color(theme::warn()));
-        }
+        let on = self.auto_approve;
+        theme::setting_row(ui, tr("권한 확인 건너뛰기"), warn, on, 36.0, |ui| ui.add(theme::switch(&mut self.auto_approve, tr("권한 확인 건너뛰기")).text_hidden()));
 
         // the shell and system-tool refusals of the app modes
-        {
-            ui.add_space(8.0);
-            let shell_switch = ui.add(theme::switch(&mut self.allow_shell_tools, tr("셸·터미널·시스템 도구 허용")));
-            let off = if cfg!(windows) {
-                tr("끄면 터미널, PowerShell, 레지스트리 편집기 같은 도구는 외부 에이전트가 열 수 없어요")
+        let off = if cfg!(windows) {
+            tr("끄면 터미널, PowerShell, 레지스트리 편집기 같은 도구는 외부 에이전트가 열 수 없어요")
+        } else {
+            tr("끄면 터미널, 스크립트 편집기, 시스템 설정 같은 도구는 외부 에이전트가 열 수 없어요")
+        };
+        let note = if !self.allow_shell_tools {
+            off
+        } else if self.auto_approve {
+            if cfg!(windows) {
+                tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
             } else {
-                tr("끄면 터미널, 스크립트 편집기, 시스템 설정 같은 도구는 외부 에이전트가 열 수 없어요")
-            };
-            let note = if !self.allow_shell_tools {
-                off
-            } else if self.auto_approve {
-                if cfg!(windows) {
-                    tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
-                } else {
-                    tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자는 항상 막혀요")
-                }
-            } else if cfg!(windows) {
-                tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
-            } else {
-                tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자는 항상 막혀요")
-            };
-            if self.allow_shell_tools && self.auto_approve {
-                ui.label(RichText::new(note).size(12.0).color(theme::warn()));
-            } else {
-                shell_switch.on_hover_text(note);
+                tr("지금은 '권한 확인 건너뛰기' 때문에 묻지 않고 바로 열려요. 암호 관리자는 항상 막혀요")
             }
-        }
+        } else if cfg!(windows) {
+            tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자와 GhostDesk 자신은 항상 막혀요")
+        } else {
+            tr("외부 에이전트가 이런 도구를 열려고 하면 그때마다 물어봐요. 암호 관리자는 항상 막혀요")
+        };
+        let risky = self.allow_shell_tools && self.auto_approve;
+        let title = tr("셸·터미널·시스템 도구 허용");
+        theme::setting_row(ui, title, note, risky, 36.0, |ui| ui.add(theme::switch(&mut self.allow_shell_tools, title).text_hidden()));
 
         self.access_section(ui);
     }
@@ -560,17 +551,15 @@ impl GhostApp {
     /// What agents on the engine may do on this computer, one row per kind of access.
     fn access_section(&mut self, ui: &mut egui::Ui) {
         use crate::access::Rule;
-        ui.add_space(18.0);
-        theme::section(ui, tr("에이전트의 내 컴퓨터 접근"));
-        ui.add_space(4.0);
+        group(ui, tr("에이전트의 내 컴퓨터 접근"));
         ui.label(theme::hint(tr("API 키 AI 에이전트가 파일·명령·도구를 쓰려 할 때 어떻게 할지 정해요. '권한 확인 건너뛰기'는 여기에 영향을 주지 않아요.")));
-        ui.add_space(6.0);
         let rows: [(&str, &str, bool); 4] = [
             ("작업 폴더 밖 파일 읽기", "에이전트 자기 폴더 밖의 파일을 읽으려 할 때", false),
             ("작업 폴더 밖 파일 쓰기·수정", "에이전트 자기 폴더 밖의 파일을 바꾸려 할 때", true),
             ("명령 실행", "에이전트가 터미널 명령을 실행하려 할 때", true),
             ("도구 상자의 도구 사용", "연결된 외부 도구를 쓰려 할 때 (도구마다 한 번)", false),
         ];
+        let shell_off = !self.allow_shell_tools;
         for (i, (label, tip, risky)) in rows.into_iter().enumerate() {
             let rule = match i {
                 0 => &mut self.access.read,
@@ -578,45 +567,42 @@ impl GhostApp {
                 2 => &mut self.access.run,
                 _ => &mut self.access.tool,
             };
-            ui.horizontal(|ui| {
-                ui.label(tr(label)).on_hover_text(tr(tip));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (r, name) in [(Rule::Deny, tr("막기")), (Rule::Allow, tr("항상 허용")), (Rule::Ask, tr("묻기"))] {
-                        if ui.add(egui::Button::selectable(*rule == r, name)).clicked() {
-                            *rule = r;
-                        }
+            let (desc, warn) = if i == 2 && shell_off {
+                (tr("'셸·터미널·시스템 도구 허용'이 꺼져 있어 명령은 항상 막혀요"), false)
+            } else if *rule == Rule::Allow && risky {
+                (tr("묻지 않고 바로 실행돼요. 믿는 에이전트에만 켜세요"), true)
+            } else {
+                (tr(tip), false)
+            };
+            theme::setting_row(ui, tr(label), desc, warn, 240.0, |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (r, name) in [(Rule::Deny, tr("막기")), (Rule::Allow, tr("항상 허용")), (Rule::Ask, tr("묻기"))] {
+                    if ui.add(egui::Button::selectable(*rule == r, name)).clicked() {
+                        *rule = r;
                     }
-                });
+                }
             });
-            if *rule == Rule::Allow && risky {
-                ui.label(RichText::new(tr("묻지 않고 바로 실행돼요. 믿는 에이전트에만 켜세요")).size(12.0).color(theme::warn()));
-            }
         }
-        if !self.allow_shell_tools {
-            ui.label(theme::hint(tr("'셸·터미널·시스템 도구 허용'이 꺼져 있어 명령은 항상 막혀요")));
-        }
-        ui.add_space(8.0);
-        ui.add(theme::switch(&mut self.access.plugins, tr("플러그인 설치 허용")))
-            .on_hover_text(tr("플러그인은 이 앱 안에서 코드를 실행해요. 켜도 설치할 때마다 내가 직접 확인해야 해요"));
+        switch_row(ui, &mut self.access.plugins, tr("플러그인 설치 허용"), tr("플러그인은 이 앱 안에서 코드를 실행해요. 켜도 설치할 때마다 내가 직접 확인해야 해요"));
     }
 
     /// Remote tab: ceiling for the live view's frame rate.
     pub(super) fn settings_live_fps(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, tr("화면 속도"));
-        ui.add_space(4.0);
-        {
-            ui.label(tr("원격 화면 최대 프레임 (fps)"));
-            ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"))
-                .on_hover_text(tr("낮출수록 CPU와 네트워크를 덜 써요. 이 값이 호스트 모드를 포함한 모든 원격 화면의 상한이에요"));
-            if self.live_fps_limit > 30 {
-                ui.label(RichText::new(tr("30fps보다 높으면 CPU와 네트워크를 많이 써서 오히려 끊기거나 컴퓨터가 느려질 수 있어요. 느려지면 낮추세요")).size(12.0).color(theme::warn()));
-            }
-        }
+        group(ui, tr("화면 속도"));
+        let high = self.live_fps_limit > 30;
+        let desc = if high {
+            tr("30fps보다 높으면 CPU와 네트워크를 많이 써서 오히려 끊기거나 컴퓨터가 느려질 수 있어요. 느려지면 낮추세요")
+        } else {
+            tr("낮출수록 CPU와 네트워크를 덜 써요. 이 값이 호스트 모드를 포함한 모든 원격 화면의 상한이에요")
+        };
+        theme::setting_row(ui, tr("원격 화면 최대 프레임 (fps)"), desc, high, 220.0, |ui| {
+            ui.add(egui::Slider::new(&mut self.live_fps_limit, 1..=120).suffix(" fps"));
+        });
     }
 
     /// AI tab: connections (keys) and the AI/model in use.
-    fn settings_ai(&mut self, ui: &mut egui::Ui, width: f32, label_w: f32, field: f32) {
-        theme::section(ui, tr("AI 연결"));
+    fn settings_ai(&mut self, ui: &mut egui::Ui, width: f32) {
+        heading(ui, tr("AI 연결"));
         ui.add_space(4.0);
         self.conn_cards(ui, width);
         self.add_conn_button(ui);
@@ -632,8 +618,7 @@ impl GhostApp {
         }
         ui.add_space(4.0);
         if prefs::CAN_REMEMBER_KEYS {
-            ui.add(theme::switch(&mut self.remember_keys, tr("키를 이 PC 에 기억하기")))
-                .on_hover_text(tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
+            switch_row(ui, &mut self.remember_keys, tr("키를 이 PC 에 기억하기"), tr("Windows 계정으로 암호화해 저장해요. 다른 계정이나 다른 PC 에서는 풀 수 없어요."));
         }
 
         self.pi_section(ui);
@@ -641,27 +626,22 @@ impl GhostApp {
         if self.ai.is_empty() {
             return;
         }
-        ui.add_space(18.0);
-        theme::section(ui, tr("지금 쓰는 AI"));
-        ui.add_space(4.0);
-        egui::Grid::new("settings_ai").num_columns(2).min_col_width(label_w).spacing([14.0, 10.0]).show(ui, |ui| {
-            ui.label(tr("AI"));
-            let title = self.cur().map(AiConn::title).unwrap_or_default();
-            egui::ComboBox::from_id_salt("current_ai").icon(theme::combo_icon).width(field).selected_text(title).show_ui(ui, |ui| {
+        group(ui, tr("지금 쓰는 AI"));
+        const W: f32 = 280.0;
+        let title = self.cur().map(AiConn::title).unwrap_or_default();
+        theme::setting_row(ui, tr("AI"), "", false, W, |ui| {
+            egui::ComboBox::from_id_salt("current_ai").icon(theme::combo_icon).width(W).selected_text(title).show_ui(ui, |ui| {
                 for c in &self.ai {
                     ui.selectable_value(&mut self.ai_current, c.id, c.title());
                 }
             });
-            ui.end_row();
-            ui.label(tr("모델"));
-            self.model_field(ui, field);
-            ui.end_row();
-            if self.cur().is_some_and(|c| c.provider.supports_effort()) {
-                ui.label(tr("생각 깊이"));
-                self.effort_slider(ui, field);
-                ui.end_row();
-            }
         });
+        theme::setting_row(ui, tr("모델"), "", false, W, |ui| ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.model_field(ui, W - 10.0)));
+        if self.cur().is_some_and(|c| c.provider.supports_effort()) {
+            theme::setting_row(ui, tr("생각 깊이"), tr("높을수록 꼼꼼하지만 느리고 비용이 더 듭니다"), false, W, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.effort_slider(ui, W))
+            });
+        }
     }
 
     /// About tab: version, release notes, license, token usage so far.
@@ -1044,4 +1024,21 @@ impl SettingsTab {
             Self::About => "정보",
         }
     }
+}
+
+/// A titled group of settings rows.
+pub(super) fn group(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(24.0);
+    heading(ui, title);
+}
+
+/// The title of a page's first group (right under the page title).
+pub(super) fn heading(ui: &mut egui::Ui, title: &str) {
+    ui.label(RichText::new(title).size(13.0).strong().color(theme::body()));
+    ui.add_space(2.0);
+}
+
+/// A settings row with a switch at the right.
+fn switch_row(ui: &mut egui::Ui, on: &mut bool, title: &str, desc: &str) -> egui::Response {
+    theme::setting_row(ui, title, desc, false, 36.0, |ui| ui.add(theme::switch(on, title).text_hidden()))
 }

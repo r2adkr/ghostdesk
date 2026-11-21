@@ -231,6 +231,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["1. 메뉴 막대의 빠른 사용자 전환(제어 센터)에서 '{}' 를 고르고 위 암호로 로그인해요.", "1. In fast user switching (Control Center), choose '{}' and log in with the password above.", "1. 高速ユーザ切り替え（コントロールセンター）で「{}」を選び、上のパスワードでログインします。", "1. 在快速用户切换（控制中心）中选择“{}”，并用上面的密码登录。"],
     ["2. 처음 나오는 설정 화면은 건너뛰어도 돼요.", "2. You can skip the setup screens that appear first.", "2. 最初に表示される設定画面はスキップして構いません。", "2. 首先出现的设置界面可以跳过。"],
     ["3. 설정 안내의 LaunchAgent 와 권한 단계를 한 번 마치고, 다시 내 계정으로 돌아와요. 이 계정에서는 로그아웃하지 마세요.", "3. Finish the LaunchAgent and permission steps in the setup guide once, then switch back to your account. Don't log out of this one.", "3. 設定ガイドの LaunchAgent と権限の手順を一度完了し、自分のアカウントに戻ります。このアカウントからはログアウトしないでください。", "3. 完成设置指南中的 LaunchAgent 和权限步骤一次，然后切换回自己的账户。不要在此账户中注销。"],
+    ["열기", "Open", "開く", "打开"],
     ["설정 안내 열기", "Open setup guide", "設定ガイドを開く", "打开设置指南"],
     ["계정 이름은 영문 소문자·숫자·'.'·'_'·'-' 만 쓸 수 있어요", "Account names can only use lowercase letters, digits, '.', '_' and '-'", "アカウント名には英小文字・数字・「.」「_」「-」のみ使えます", "账户名只能使用小写字母、数字以及“.”“_”“-”"],
     ["화면·에이전트·동작 찾기", "Find a screen, agent or action", "画面・エージェント・操作を探す", "查找屏幕、智能体或操作"],

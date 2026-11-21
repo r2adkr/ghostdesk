@@ -353,6 +353,33 @@ pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(muted()).strong());
 }
 
+/// One settings row, as in macOS and Claude settings: title with a description under it on the left, the
+/// control (`add`, `ctrl_w` wide) at the right, centered on the text, and a divider below. `warn` shows the
+/// description in the warning color.
+pub fn setting_row<R>(ui: &mut egui::Ui, title: &str, desc: &str, warn: bool, ctrl_w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    const PAD: f32 = 12.0;
+    let w = ui.available_width();
+    let text_w = (w - ctrl_w - 24.0).max(120.0);
+    let wrapped = |t: &str, size: f32, color: Color32| ui.painter().layout(t.to_owned(), FontId::proportional(size), color, text_w);
+    let title_g = wrapped(title, 14.0, text());
+    let desc_g = (!desc.is_empty()).then(|| wrapped(desc, 12.0, if warn { self::warn() } else { muted() }));
+    let text_h = title_g.size().y + desc_g.as_ref().map_or(0.0, |g| 3.0 + g.size().y);
+    // as tall as a row of buttons at least, the text centered in it
+    let inner_h = text_h.max(28.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, inner_h + 2.0 * PAD), egui::Sense::hover());
+    let mut y = rect.top() + PAD + (inner_h - text_h) / 2.0;
+    let p = ui.painter();
+    let title_h = title_g.size().y;
+    p.galley(egui::pos2(rect.left(), y), title_g, text());
+    y += title_h + 3.0;
+    if let Some(g) = desc_g {
+        p.galley(egui::pos2(rect.left(), y), g, muted());
+    }
+    p.hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, pal().rim));
+    let ctrl = egui::Rect::from_min_max(egui::pos2(rect.left() + text_w + 24.0, rect.top()), rect.max);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(ctrl).layout(egui::Layout::right_to_left(egui::Align::Center)), add).inner
+}
+
 /// Dimmed secondary text.
 pub fn hint(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).size(12.0).color(muted())
@@ -500,20 +527,31 @@ pub fn toggle(ui: &mut egui::Ui, on: bool, label: &str, color: Color32) -> Respo
 /// On/off switch, in place of a check box. Use as `ui.add(theme::switch(&mut on, "text"))`; works
 /// with `add_enabled` too.
 pub fn switch(on: &mut bool, text: impl Into<String>) -> Switch<'_> {
-    Switch { on, text: text.into() }
+    Switch { on, text: text.into(), show_text: true }
+}
+
+impl Switch<'_> {
+    /// Only the track: the text still names the switch for screen readers (a settings row shows it as its title).
+    pub fn text_hidden(mut self) -> Self {
+        self.show_text = false;
+        self
+    }
 }
 
 pub struct Switch<'a> {
     on: &'a mut bool,
     text: String,
+    show_text: bool,
 }
 
 impl egui::Widget for Switch<'_> {
     fn ui(self, ui: &mut egui::Ui) -> Response {
         let enabled = ui.is_enabled();
         let track = Vec2::new(30.0, 17.0);
-        let galley = ui.painter().layout_no_wrap(self.text.clone(), FontId::proportional(14.0), if enabled { text() } else { muted() });
-        let size = Vec2::new(track.x + 8.0 + galley.size().x, ui.spacing().interact_size.y.max(galley.size().y));
+        let shown = if self.show_text { self.text.clone() } else { String::new() };
+        let galley = ui.painter().layout_no_wrap(shown, FontId::proportional(14.0), if enabled { text() } else { muted() });
+        let gap = if galley.is_empty() { 0.0 } else { 8.0 };
+        let size = Vec2::new(track.x + gap + galley.size().x, ui.spacing().interact_size.y.max(galley.size().y));
         let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
         if resp.clicked() {
             *self.on = !*self.on;

@@ -71,19 +71,19 @@ impl GhostApp {
         if self.ssh_editor.is_none() {
             self.settings_host(ui);
             self.share_connection_info(ui);
-            ui.add_space(14.0);
             self.settings_live_fps(ui);
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
         }
         let title = match &self.ssh_editor {
             None => tr("저장된 SSH 연결"),
             Some(editor) if editor.original.is_some() => tr("SSH 연결 편집"),
             Some(_) => tr("SSH 연결 추가"),
         };
-        theme::section(ui, title);
-        ui.add_space(6.0);
+        if self.ssh_editor.is_none() {
+            super::settings::group(ui, title);
+        } else {
+            super::settings::heading(ui, title);
+        }
+        ui.add_space(4.0);
         let Some(editor) = &mut self.ssh_editor else {
             if theme::primary(ui, tr("SSH 연결 추가")).clicked() {
                 self.ssh_editor = Some(Editor::default());
