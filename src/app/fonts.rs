@@ -94,6 +94,19 @@ pub(super) fn lang_font_candidates(lang: Lang) -> Vec<std::path::PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
 }
 
+/// Which face of a font collection to use. Windows' Japanese collections hold a document face first
+/// and a UI face after it; the document faces (Yu Gothic Medium: a 0.5 em line gap and a short ascent)
+/// sit about a third of the font size higher than Hangul, Latin and the icons, so Japanese text looked
+/// raised in every row. The UI faces have the same line metrics as Malgun Gothic.
+fn face_index(path: &std::path::Path) -> u32 {
+    match path.file_name().and_then(|n| n.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("yugothm.ttc") => 1,  // Yu Gothic UI
+        Some("meiryo.ttc") => 2,   // Meiryo UI
+        Some("msgothic.ttc") => 1, // MS UI Gothic
+        _ => 0,
+    }
+}
+
 /// Memory-maps a font file.
 ///
 /// Reading it whole would put the macOS Korean font (a multi-weight .ttc, about 55 MB) straight
@@ -121,10 +134,12 @@ pub(super) fn setup_fonts(ctx: &egui::Context, lang: Lang) {
     let mut fonts = egui::FontDefinitions::default();
     // earlier entries win: (Japanese/Chinese font) → Korean font → egui defaults. The same Han
     // characters look different in Japanese and Chinese, so that language's font goes first.
-    let first = |c: Vec<std::path::PathBuf>| c.into_iter().find_map(|p| map_font(&p));
-    for (name, bytes) in [("lang", first(lang_font_candidates(lang))), ("korean", first(font_candidates()))].into_iter().rev() {
-        let Some(bytes) = bytes else { continue };
-        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
+    let first = |c: Vec<std::path::PathBuf>| c.into_iter().find_map(|p| map_font(&p).map(|b| (b, face_index(&p))));
+    for (name, font) in [("lang", first(lang_font_candidates(lang))), ("korean", first(font_candidates()))].into_iter().rev() {
+        let Some((bytes, index)) = font else { continue };
+        let mut data = egui::FontData::from_static(bytes);
+        data.index = index;
+        fonts.font_data.insert(name.into(), Arc::new(data));
         // proportional text puts the system font (Malgun Gothic, Apple SD Gothic Neo, …) first so Latin
         // and Hangul match; monospace keeps its font and only falls back for Hangul and Han.
         fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, name.into());
