@@ -1712,6 +1712,31 @@ mod win_tests {
         remove_dir_all_retry(&dir).unwrap();
     }
 
+    /// A search box that a page swaps for an identical new node once typed into (as Wikipedia's does) keeps
+    /// the number the agent read it under.
+    #[tokio::test]
+    async fn real_browser_ref_survives_a_replaced_search_box() {
+        let Some(exe) = ["chrome.exe", "msedge.exe"].iter().find_map(|e| crate::platform::win::app_path(e)) else { return };
+        let dir = std::env::temp_dir().join(format!("ghostdesk-ref-test-{}", std::process::id()));
+        let _ = remove_dir_all_retry(&dir);
+        let page = r#"data:text/html,<a href='x'>Home</a><form onsubmit='window.sent=this.q.value;return false'><input name=q placeholder=Search oninput='if(!window.swapped){window.swapped=1;const n=this.cloneNode();n.value=this.value;n.oninput=null;n.removeAttribute("data-gdref");this.replaceWith(n)}'></form><input name=other placeholder=Other>"#;
+        let ws = BrowserWorkspace::launch(LaunchOptions {
+            exe, user_data_dir: dir.clone(), profile_dir: None, width: 640, height: 400, headless: true, start_url: page.into(),
+        }, Arc::new(|_| {})).await.unwrap();
+        let desk = crate::desk::Desk::Browser(ws.clone());
+        let run = |v: Value| { let desk = desk.clone(); async move { crate::agent::exec_desk_tool(&desk, "browser_control", &v).await } };
+        run(json!({"action":"wait_for", "text": "Home"})).await.unwrap();
+        let read = run(json!({"action":"read"})).await.unwrap().text;
+        let line = read.lines().find(|l| l.trim_start().starts_with('[') && l.contains("Search")).unwrap_or_else(|| panic!("{read}"));
+        let n: u64 = line.trim_start().trim_start_matches('[').split(']').next().unwrap().parse().unwrap();
+        run(json!({"action":"fill", "ref": n, "value": "한글"})).await.unwrap();
+        assert_eq!(ws.eval("window.swapped").await.unwrap(), 1, "the page did not replace its box");
+        run(json!({"action":"fill", "ref": n, "value": "한글 검색", "submit": true})).await.unwrap();
+        assert_eq!(ws.eval("window.sent").await.unwrap(), "한글 검색");
+        ws.shutdown().await;
+        remove_dir_all_retry(&dir).unwrap();
+    }
+
     /// If the executable exits right away leaving nothing behind (e.g. it only handed the command
     /// line to a browser using the same workspace), report it immediately instead of waiting 40 s.
     #[tokio::test]

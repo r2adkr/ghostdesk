@@ -825,6 +825,19 @@ fn trim_repeats(desk_id: &str, r: &mut Value, keep_shot: bool) -> bool {
     dropped
 }
 
+/// `screenshot` is a boolean, on the call or on steps of `actions` (any true → image, all false → none). Anything
+/// else used to be ignored without a word, so the agent got an image it said it didn't want and tried again.
+fn check_screenshot_option(args: &Value) -> Result<()> {
+    let bad = |v: &Value| !v.is_null() && !v.is_boolean();
+    if bad(&args["screenshot"]) {
+        bail!("screenshot 은 true 또는 false 여야 합니다 (받은 값: {}). 호출 전체에 주거나 actions 의 각 단계에 주세요.", args["screenshot"]);
+    }
+    if let Some(i) = args["actions"].as_array().and_then(|a| a.iter().position(|s| bad(&s["screenshot"]))) {
+        bail!("actions 의 {}번째 단계의 screenshot 은 true 또는 false 여야 합니다 (받은 값: {}).", i + 1, args["actions"][i]["screenshot"]);
+    }
+    Ok(())
+}
+
 /// Control server response → MCP content blocks.
 fn to_content(r: &Value, head: Option<String>) -> Vec<Value> {
     let mut c = Vec::new();
@@ -881,6 +894,7 @@ async fn call_tool(conn: &Conn, name: &str, args: &Value, patient: bool) -> Resu
             to_content(&r, Some(format!("desk_id: {} ({})", r["desk_id"].as_str().unwrap_or(""), r["kind"].as_str().unwrap_or(""))))
         }
         "desk_action" | "desk_browser" | "desk_app" | "desk_remote" => {
+            check_screenshot_option(&args)?;
             let mut input = args.clone();
             if let Some(o) = input.as_object_mut() {
                 o.remove("desk_id");
@@ -1914,5 +1928,19 @@ mod tests {
         let cap = if cfg!(windows) { 3_700 } else { 3_300 };
         assert!(tools < cap, "tool definitions grew to ~{tools} tokens");
         assert!(ins < 700, "instructions grew to ~{ins} tokens");
+    }
+}
+
+#[cfg(test)]
+mod screenshot_option_tests {
+    use super::*;
+
+    #[test]
+    fn only_booleans_are_accepted_wherever_screenshot_is_given() {
+        assert!(check_screenshot_option(&json!({"action": "click", "screenshot": false})).is_ok());
+        assert!(check_screenshot_option(&json!({"actions": [{"action": "click", "screenshot": false}]})).is_ok());
+        assert!(check_screenshot_option(&json!({"action": "click", "screenshot": "false"})).is_err());
+        let e = check_screenshot_option(&json!({"actions": [{"action": "click"}, {"action": "read", "screenshot": 0}]})).unwrap_err();
+        assert!(e.to_string().contains("2번째"), "{e}");
     }
 }

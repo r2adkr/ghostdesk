@@ -83,9 +83,13 @@ const HELPERS: &str = r#"
     return out;
   };
   // numbers elements 1..n and returns them (marks them so later calls can find them again)
+  // what an element is, apart from the node itself: pages that re-render a control (a search box that
+  // turns into a live-search widget once typed into) swap the node for an identical one, which loses the mark
+  gd.sig = (el) => [el.tagName, el.type || '', el.getAttribute('role') || '', el.name || '', el.id || '', gd.label(el)].join('\u0001');
   gd.number = (els) => {
     document.querySelectorAll('[data-gdref]').forEach((e) => e.removeAttribute('data-gdref'));
-    els.forEach((e, i) => e.setAttribute('data-gdref', String(i + 1)));
+    gd.sigs = {};
+    els.forEach((e, i) => { e.setAttribute('data-gdref', String(i + 1)); gd.sigs[i + 1] = gd.sig(e); });
   };
   gd.interactive = (all) => {
     const seen = new Set();
@@ -100,7 +104,17 @@ const HELPERS: &str = r#"
     }
     return out;
   };
-  gd.find = (ref) => document.querySelector('[data-gdref="' + ref + '"]');
+  gd.find = (ref) => {
+    const el = document.querySelector('[data-gdref="' + ref + '"]');
+    if (el) return el;
+    // the marked node was replaced: take the one element that is the same control (never a guess between several)
+    const want = gd.sigs && gd.sigs[ref];
+    if (!want) return null;
+    const same = Array.from(document.querySelectorAll(SEL)).filter((e) => !e.hasAttribute('data-gdref') && gd.visible(e) && gd.sig(e) === want);
+    if (same.length !== 1) return null;
+    same[0].setAttribute('data-gdref', String(ref));
+    return same[0];
+  };
   window.__gd = gd;
   return gd;
 })()
