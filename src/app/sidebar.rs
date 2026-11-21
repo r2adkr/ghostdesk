@@ -46,12 +46,16 @@ impl GhostApp {
         if theme::nav_item_keys(ui, self.view == View::Grid, icon::LAYOUT_GRID, tr("모든 에이전트"), None, key("2").as_deref()).clicked() {
             self.view = View::Grid;
         }
-        // teams and usage are the less used views: folded away unless one is open or a team is active
+        // teams and usage are the less used views, folded under "More". Opening one (a shortcut, the palette)
+        // unfolds it; folded while one is open, "More" stands for it (selected), and carries a team's green dot
         let active = self.teams_ui_active();
         let in_more = matches!(self.view, View::Teams | View::Usage);
-        let more_open = self.more_views_open || in_more || active;
-        if !more_open {
-            if theme::nav_item(ui, false, icon::ELLIPSIS, tr("더 보기"), None).on_hover_text(tr("팀 · 사용량")).clicked() {
+        if in_more && self.more_views_view != Some(self.view) {
+            self.more_views_open = true;
+        }
+        self.more_views_view = in_more.then_some(self.view);
+        if !self.more_views_open {
+            if theme::nav_item(ui, in_more, icon::ELLIPSIS, tr("더 보기"), active.then(theme::success)).on_hover_text(tr("팀 · 사용량")).clicked() {
                 self.more_views_open = true;
             }
         } else {
@@ -67,6 +71,9 @@ impl GhostApp {
                 .clicked()
             {
                 self.view = View::Usage;
+            }
+            if theme::nav_item(ui, false, icon::CHEVRON_UP, tr("접기"), None).on_hover_text(tr("팀 · 사용량 접기")).clicked() {
+                self.more_views_open = false;
             }
         }
         // lay out the pinned bottom rows first; the agent list gets whatever height is left

@@ -313,6 +313,8 @@ pub struct GhostApp {
     pi_note: Option<String>,
     toolbox: toolbox_ui::State,
     more_views_open: bool,
+    /// The Teams/Usage view the sidebar last saw open, so opening another one unfolds "More" once.
+    more_views_view: Option<View>,
     pi_offer_dismissed: bool,
     /// Consent once to experimental features, independently of ordinary permissions.
     allow_experimental: bool,
@@ -474,6 +476,7 @@ impl GhostApp {
             pi_note: None,
             toolbox: Default::default(),
             more_views_open: false,
+            more_views_view: None,
             pi_offer_dismissed: false,
             allow_experimental: false,
             tour: None,

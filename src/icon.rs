@@ -18,6 +18,7 @@ pub const ARROW_RIGHT: &str = "\u{e049}";
 pub const ARROW_UP: &str = "\u{e04a}";
 pub const BOOK_OPEN: &str = "\u{e05f}";
 pub const CHEVRON_DOWN: &str = "\u{e06d}";
+pub const CHEVRON_UP: &str = "\u{e070}";
 pub const CIRCLE_CHECK: &str = "\u{e226}";
 pub const CIRCLE_HELP: &str = "\u{e082}";
 pub const CHART_COLUMN: &str = "\u{e2a3}";
