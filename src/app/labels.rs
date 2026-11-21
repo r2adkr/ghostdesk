@@ -81,6 +81,7 @@ pub(super) const AGENT_REASONS: &[&str] = &[
     "원격 데스크톱 접속 중",
     "프로필 복제 중",
     "브라우저 실행 중",
+    "응답 길이 제한 — 이어서 진행하려면 지시를 입력하세요",
 ];
 
 /// Turns an error into a short, readable message. The full text is shown on hover.

@@ -29,6 +29,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use eframe::egui;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use crate::app::i18n::{tr, trf};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{mpsc, oneshot, watch},
@@ -538,10 +539,10 @@ impl ControlServer {
                 let target = t.team_snapshot(team()?)?;
                 self.ask(
                     conn,
-                    "팀 삭제 요청",
-                    format!(
-                        "{client} 이(가) 팀 '{}' 을(를) 지우려고 합니다.\n메모 {}개와 할 일 {}개가 함께 사라집니다.",
-                        target.name, target.notes.len(), target.tasks.len()
+                    tr("팀 삭제 요청"),
+                    trf(
+                        "{} 이(가) 팀 '{}' 을(를) 지우려고 합니다.\n메모 {}개와 할 일 {}개가 함께 사라집니다.",
+                        &[&client, &target.name, &target.notes.len(), &target.tasks.len()],
                     ),
                 )
                 .await?;
@@ -694,12 +695,10 @@ impl ControlServer {
                     let prof = profile_choice(&browser, p["browser_profile"].as_str())?;
                     self.ask(
                         conn,
-                        "내 브라우저 로그인 사용 요청",
-                        format!(
-                            "{client} 이(가) {} 의 '{}' 프로필(로그인·쿠키)을 복제한 격리 브라우저를 열려고 합니다.\n복제본은 {} 의 GhostDesk 작업공간 '{workspace}' 에만 저장됩니다.",
-                            browser.name,
-                            prof.name,
-                            text::THIS_COMPUTER
+                        tr("내 브라우저 로그인 사용 요청"),
+                        trf(
+                            "{} 이(가) {} 의 '{}' 프로필(로그인·쿠키)을 복제한 격리 브라우저를 열려고 합니다.\n복제본은 {} 의 GhostDesk 작업공간 '{}' 에만 저장됩니다.",
+                            &[&client, &browser.name, &prof.name, &tr(text::THIS_COMPUTER), &workspace],
                         ),
                     )
                     .await?;
@@ -740,10 +739,10 @@ impl ControlServer {
                 if !crate::agent_account::exists(&account) {
                     self.ask(
                         conn,
-                        "에이전트 전용 계정 만들기",
-                        format!(
-                            "{client} 이(가) 별도 계정 세션을 쓰려는데 '{account}' 계정이 없습니다.\n허용하면 이 Mac 에 표준(관리자 아님) 사용자 '{account}' 를 만듭니다. \
-                             macOS 가 관리자 암호를 물어보고, GhostDesk 는 그 암호를 보지 못합니다. 새 계정의 암호는 만든 직후 한 번만 보여 드려요."
+                        tr("에이전트 전용 계정 만들기"),
+                        trf(
+                            "{} 이(가) 별도 계정 세션을 쓰려는데 '{}' 계정이 없습니다.\n허용하면 이 Mac 에 표준(관리자 아님) 사용자 '{}' 를 만듭니다. macOS 가 관리자 암호를 물어보고, GhostDesk 는 그 암호를 보지 못합니다. 새 계정의 암호는 만든 직후 한 번만 보여 드려요.",
+                            &[&client, &account, &account],
                         ),
                     )
                     .await?;
@@ -758,15 +757,14 @@ impl ControlServer {
                 #[cfg(windows)]
                 self.ask(
                     conn,
-                    "자식 세션(PiP) 사용 요청",
-                    format!(
-                        "{client} 이(가) 이 PC 의 Windows 자식 세션(같은 계정의 별도 화면)을 열어 조작하려고 합니다.
-                         내 마우스·키보드와는 분리되지만, 같은 Windows 계정이라 사용자의 파일·앱·로그인을 그대로 사용합니다.{}",
-                        match (routed_to_session, p["app"].as_str()) {
-                            (true, Some(app)) => format!("\n'{app}' 은(는) 숨김 앱 모드로 열 수 없는 앱(Store 앱·콘솔 프로그램 등)이라 이 세션 안에서 엽니다."),
-                            (false, Some(app)) if !app.trim().is_empty() => format!("\n세션 안에서 '{app}' 을(를) 엽니다."),
+                    tr("자식 세션(PiP) 사용 요청"),
+                    trf(
+                        "{} 이(가) 이 PC 의 Windows 자식 세션(같은 계정의 별도 화면)을 열어 조작하려고 합니다.\n내 마우스·키보드와는 분리되지만, 같은 Windows 계정이라 사용자의 파일·앱·로그인을 그대로 사용합니다.{}",
+                        &[&client, &match (routed_to_session, p["app"].as_str()) {
+                            (true, Some(app)) => format!("\n{}", trf("'{}' 은(는) 숨김 앱 모드로 열 수 없는 앱(Store 앱·콘솔 프로그램 등)이라 이 세션 안에서 엽니다.", &[&app])),
+                            (false, Some(app)) if !app.trim().is_empty() => format!("\n{}", trf("세션 안에서 '{}' 을(를) 엽니다.", &[&app])),
                             _ => String::new(),
-                        }
+                        }],
                     ),
                 )
                 .await?;
@@ -777,8 +775,8 @@ impl ControlServer {
                 crate::host::parse_code(&code)?;
                 self.ask(
                     conn,
-                    "호스트 컴퓨터 접속 요청",
-                    format!("{client} 이(가) 접속 코드로 다른 컴퓨터(호스트)의 화면과 마우스·키보드를 조작하려고 합니다. 호스트 컴퓨터의 실제 화면이므로, 그 컴퓨터를 쓰는 사람이 있다면 방해가 됩니다. 내가 준 코드가 맞을 때만 허용하세요."),
+                    tr("호스트 컴퓨터 접속 요청"),
+                    trf("{} 이(가) 접속 코드로 다른 컴퓨터(호스트)의 화면과 마우스·키보드를 조작하려고 합니다. 호스트 컴퓨터의 실제 화면이므로, 그 컴퓨터를 쓰는 사람이 있다면 방해가 됩니다. 내가 준 코드가 맞을 때만 허용하세요.", &[&client]),
                 )
                 .await?;
                 DeskTarget::Host { code }
@@ -793,15 +791,14 @@ impl ControlServer {
                 let dedicated = p["dedicated_machine"].as_bool().unwrap_or(false);
                 let ssh = p.get("ssh").filter(|v| !v.is_null()).map(|v| serde_json::from_value::<crate::ssh::SshOptions>(v.clone())).transpose()?;
                 if let Some(options) = &ssh { options.validate()?; }
-                let mut detail = format!("{client} 이(가) {host}:{port} 원격 데스크톱(VNC)에 접속하려고 합니다.");
-                if let Some(options) = &ssh { detail.push_str(&format!("\nSSH: {} — remote commands and requested file receipt", options.endpoint())); }
+                let mut detail = trf("{} 이(가) {}:{} 원격 데스크톱(VNC)에 접속하려고 합니다.", &[&client, &host, &port]);
+                if let Some(options) = &ssh { detail.push_str(&format!("\n{}", trf("SSH: {} — 원격 명령 실행과 요청한 파일 받기", &[&options.endpoint()]))); }
                 #[cfg(target_os = "macos")]
                 if dedicated {
-                    detail.push_str(
-                        "\n\n\u{e193} 에이전트가 '이 대상은 에이전트 전용 Mac/VM 이다'라고 주장합니다. 허용하면 macOS 화면 공유 보호가 해제되어, \
-                         대상이 다른 사람이 쓰는 Mac 이라면 그 Mac 의 화면이 다른 계정으로 전환될 수 있습니다. \
-                         대상이 정말 에이전트 전용 머신일 때만 허용하세요.",
-                    );
+                    detail.push_str(&format!(
+                        "\n\n\u{e193} {}",
+                        tr("에이전트가 '이 대상은 에이전트 전용 Mac/VM 이다'라고 주장합니다. 허용하면 macOS 화면 공유 보호가 해제되어, 대상이 다른 사람이 쓰는 Mac 이라면 그 Mac 의 화면이 다른 계정으로 전환될 수 있습니다. 대상이 정말 에이전트 전용 머신일 때만 허용하세요.")
+                    ));
                 }
                 // outside macOS: this computer's own VNC server may be the user's real screen. Check before asking
                 // a person: refuse without asking unless the agent claimed a dedicated machine, and if it did,
@@ -818,23 +815,26 @@ impl ControlServer {
                         bail!("{}", agent::local_vnc_refusal(&host, port));
                     }
                     if local {
+                        let pc = tr(text::THIS_COMPUTER);
                         detail.push_str(&format!(
-                            "\n\n\u{e193} 주의: {host}:{port} 은(는) {pc} 자신의 VNC 서버입니다. 이 서버가 지금 보고 계신 화면을 내보내고 있다면, \
-                             허용하는 순간 에이전트가 사용자의 실제 화면·마우스·키보드를 직접 조작합니다. \
-                             WSL·Hyper-V 가상 머신처럼 {pc} 주소로 전달되는 별도 데스크톱이 확실할 때만 허용하세요.",
-                            pc = text::THIS_COMPUTER
+                            "\n\n\u{e193} {}",
+                            trf(
+                                "주의: {}:{} 은(는) {} 자신의 VNC 서버입니다. 이 서버가 지금 보고 계신 화면을 내보내고 있다면, 허용하는 순간 에이전트가 사용자의 실제 화면·마우스·키보드를 직접 조작합니다. WSL·Hyper-V 가상 머신처럼 {} 주소로 전달되는 별도 데스크톱이 확실할 때만 허용하세요.",
+                                &[&host, &port, &pc, &pc],
+                            )
                         ));
                     }
                     if dedicated {
                         detail.push_str(&format!(
-                            "\n\n\u{e193} 에이전트가 '이 대상은 에이전트 전용 머신/VM 이다'라고 주장합니다. 허용하면 '{pc} 자신의 VNC 서버' 보호와 \
-                             macOS 화면 공유 보호가 해제됩니다. 대상이 Mac 이라면, 다른 사람이 쓰는 Mac 일 때 그 Mac 의 화면이 다른 계정으로 \
-                             전환될 수 있습니다. 대상이 정말 에이전트 전용 머신일 때만 허용하세요.",
-                            pc = text::THIS_COMPUTER
+                            "\n\n\u{e193} {}",
+                            trf(
+                                "에이전트가 '이 대상은 에이전트 전용 머신/VM 이다'라고 주장합니다. 허용하면 '{} 자신의 VNC 서버' 보호와 macOS 화면 공유 보호가 해제됩니다. 대상이 Mac 이라면, 다른 사람이 쓰는 Mac 일 때 그 Mac 의 화면이 다른 계정으로 전환될 수 있습니다. 대상이 정말 에이전트 전용 머신일 때만 허용하세요.",
+                                &[&tr(text::THIS_COMPUTER)],
+                            )
                         ));
                     }
                 }
-                self.ask(conn, "원격 데스크톱 접속 요청", detail).await?;
+                self.ask(conn, tr("원격 데스크톱 접속 요청"), detail).await?;
                 DeskTarget::Remote(RemoteTarget {
                     host,
                     port,
@@ -847,7 +847,7 @@ impl ControlServer {
             "ssh" => {
                 let options: crate::ssh::SshOptions = serde_json::from_value(p.clone())?;
                 options.validate()?;
-                self.ask(conn, "SSH 원격 작업 접속 요청", format!("{client}: {}\nRemote command execution and requested result file receipt using SSH key/agent authentication", options.endpoint())).await?;
+                self.ask(conn, tr("SSH 원격 작업 접속 요청"), format!("{client}: {}\n{}", options.endpoint(), tr("SSH 키·에이전트 인증으로 원격 명령을 실행하고 요청한 결과 파일을 받습니다"))).await?;
                 DeskTarget::Ssh(options)
             }
             other => bail!("kind 는 browser / app / session / remote / ssh 중 하나여야 합니다 (받은 값: {other})"),
@@ -872,7 +872,7 @@ impl ControlServer {
         shared.team_member_id.store(conn.id, Ordering::Relaxed);
         // the caller keeps its call alive with progress notices, so waiting in line may take long (turns.rs)
         shared.queue_patient.store(p["patient"].as_bool().unwrap_or(false), Ordering::Relaxed);
-        shared.log(LogKind::Info, format!("{client} 이(가) 이 화면을 만들었습니다 (MCP)"));
+        shared.log(LogKind::Info, trf("{} 이(가) 이 화면을 만들었습니다 (MCP)", &[&client]));
         let _ = self.events.send(ControlEvent::Register(shared.clone()));
         self.ctx.request_repaint();
 
@@ -918,11 +918,11 @@ impl ControlServer {
             if let Some(d) = d {
                 d.shutdown().await;
             }
-            shared.log(LogKind::Info, "요청한 에이전트의 연결이 끊겨 화면을 닫았습니다");
+            shared.log(LogKind::Info, tr("요청한 에이전트의 연결이 끊겨 화면을 닫았습니다"));
             shared.set_status(AgentStatus::Idle("닫힘".into()));
             bail!("요청한 에이전트의 연결이 끊겨 화면을 닫았습니다");
         }
-        shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+        shared.set_status(AgentStatus::Idle(trf("{} 연결됨", &[&client])));
         crate::usage::global().screen(&client);
         let reservation = reservation.keep();
         self.desks.lock().insert(desk_id.clone(), DeskEntry { shared: shared.clone(), conn: conn.id, shared_access, reservation, named: p["workspace"].is_string(), params: p.clone() });
@@ -1008,7 +1008,7 @@ impl ControlServer {
         #[cfg(not(any(windows, target_os = "macos")))]
         let is_tool = false;
         if is_tool {
-            self.ask(conn, "셸·시스템 도구 실행 요청", tool_request_text(client, &r.name, &r.path.display().to_string())).await?;
+            self.ask(conn, tr("셸·시스템 도구 실행 요청"), tool_request_text(client, &r.name, &r.path.display().to_string())).await?;
         }
         // GhostDesk itself: driving the current window could click its own approval dialogs or change
         // settings, keys and connections, so it's only opened as a freshly launched test instance with
@@ -1020,11 +1020,10 @@ impl ControlServer {
             let data = crate::platform::paths::data_root().join("nested").join(profiles::slug(workspace));
             self.ask(
                 conn,
-                "GhostDesk 시험용 인스턴스 실행 요청",
-                format!(
-                    "{client} 이(가) GhostDesk 를 하나 더, 보이지 않는 창으로 띄워 조작하려고 합니다.\n경로: {}\n새 GhostDesk 는 빈 데이터 폴더({})를 써서 이 창의 설정·API 키·외부 연결·승인과 섞이지 않고, 다른 AI 앱에 자동으로 연결하지도 않습니다.",
-                    r.path.display(),
-                    data.display()
+                tr("GhostDesk 시험용 인스턴스 실행 요청"),
+                trf(
+                    "{} 이(가) GhostDesk 를 하나 더, 보이지 않는 창으로 띄워 조작하려고 합니다.\n경로: {}\n새 GhostDesk 는 빈 데이터 폴더({})를 써서 이 창의 설정·API 키·외부 연결·승인과 섞이지 않고, 다른 AI 앱에 자동으로 연결하지도 않습니다.",
+                    &[&client, &r.path.display(), &data.display()],
                 ),
             )
             .await?;
@@ -1067,13 +1066,10 @@ impl ControlServer {
                 let shown = if cfg!(windows) { &e.exe } else { &e.bundle };
                 self.ask(
                     conn,
-                    "내 앱 로그인 사용 요청",
-                    format!(
-                        "{client} 이(가) {} 의 데이터({})를 복제한 숨김 인스턴스를 열려고 합니다.\n{APP_ID_LABEL}: {}\n경로: {}\n로그인 정보·쿠키가 작업공간 '{workspace}' 으로 복사됩니다.",
-                        e.name,
-                        src.display(),
-                        e.bundle_id,
-                        shown.display()
+                    tr("내 앱 로그인 사용 요청"),
+                    trf(
+                        "{} 이(가) {} 의 데이터({})를 복제한 숨김 인스턴스를 열려고 합니다.\n{}: {}\n경로: {}\n로그인 정보·쿠키가 작업공간 '{}' 으로 복사됩니다.",
+                        &[&client, &e.name, &src.display(), &tr(APP_ID_LABEL), &e.bundle_id, &shown.display(), &workspace],
                     ),
                 )
                 .await?;
@@ -1108,17 +1104,16 @@ impl ControlServer {
             // still needs the ordinary real-account permission, independently of that setting.
             self.ask(
                 conn,
-                if attach { "실행 중인 내 앱 사용 요청" } else { "내 앱 실행 요청" },
-                format!("{client}: {}\n{APP_ID_LABEL}: {bid}\n경로: {path}\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터를 사용합니다.{}", r.name,
-                    if attach { "\n실행 중인 창을 가상 디스플레이로 옮깁니다." } else { "" }),
+                tr(if attach { "실행 중인 내 앱 사용 요청" } else { "내 앱 실행 요청" }),
+                trf("{}: {}\n{}: {}\n경로: {}\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터를 사용합니다.{}", &[&client, &r.name, &tr(APP_ID_LABEL), &bid, &path,
+                    &if attach { format!("\n{}", tr("실행 중인 창을 가상 디스플레이로 옮깁니다.")) } else { String::new() }]),
             ).await?;
             self.ask_with(
                 conn,
-                "가상 디스플레이 사용 요청 (실험)",
-                format!(
-                    "{client} 이(가) '{}' 을(를) 가상 모니터 위에서 실행해 조작하려고 합니다.\n번들 id: {bid}\n경로: {path}\n가상 모니터가 디스플레이 배치의 가장 바깥에 잠시 추가됩니다. 그동안 마우스 커서가 그쪽으로 넘어갈 수 있고, 설정에 따라 Dock·메뉴 막대가 그 화면에도 보일 수 있습니다. 작업이 끝나면 가상 모니터는 제거됩니다.\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터를 그대로 사용합니다.{}",
-                    r.name,
-                    if attach { "\n실행 중인 앱을 쓰므로 작업하는 동안 그 앱 창이 가상 모니터로 옮겨집니다." } else { "" }
+                tr("가상 디스플레이 사용 요청 (실험)"),
+                trf(
+                    "{} 이(가) '{}' 을(를) 가상 모니터 위에서 실행해 조작하려고 합니다.\n번들 id: {}\n경로: {}\n가상 모니터가 디스플레이 배치의 가장 바깥에 잠시 추가됩니다. 그동안 마우스 커서가 그쪽으로 넘어갈 수 있고, 설정에 따라 Dock·메뉴 막대가 그 화면에도 보일 수 있습니다. 작업이 끝나면 가상 모니터는 제거됩니다.\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터를 그대로 사용합니다.{}",
+                    &[&client, &r.name, &bid, &path, &if attach { format!("\n{}", tr("실행 중인 앱을 쓰므로 작업하는 동안 그 앱 창이 가상 모니터로 옮겨집니다.")) } else { String::new() }],
                 ),
                 true,
             )
@@ -1135,21 +1130,21 @@ impl ControlServer {
         if attach {
             self.ask(
                 conn,
-                "실행 중인 내 앱 사용 요청",
-                format!(
-                    "{client} 이(가) 지금 실행 중인 '{}' 을(를) 조작하려고 합니다.\n{APP_ID_LABEL}: {bid}\n경로: {path}\n작업하는 동안 그 앱 창이 화면에서 숨겨지고, 끝나면 원래대로 돌아옵니다.",
-                    r.name
+                tr("실행 중인 내 앱 사용 요청"),
+                trf(
+                    "{} 이(가) 지금 실행 중인 '{}' 을(를) 조작하려고 합니다.\n{}: {}\n경로: {}\n작업하는 동안 그 앱 창이 화면에서 숨겨지고, 끝나면 원래대로 돌아옵니다.",
+                    &[&client, &r.name, &tr(APP_ID_LABEL), &bid, &path],
                 ),
             )
             .await?;
         } else {
             self.ask(
                 conn,
-                if current_session { "현재 계정 로그인 사용 요청" } else { "내 앱 실행 요청" },
-                format!(
-                    "{client} 이(가) {NATIVE_APP_WORD} '{}' 을(를) 보이지 않는 창으로 실행해 조작하려고 합니다.\n{APP_ID_LABEL}: {bid}\n경로: {path}\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터(로그인, 파일, 메시지 등)를 그대로 사용합니다.{}",
-                    r.name,
-                    if current_session { "\n현재 Windows 계정의 원본 프로필을 숨은 데스크톱에서 사용합니다. 복제본이 아니며 변경은 실제 계정에 반영됩니다. 같은 앱은 트레이까지 완전히 종료하세요. 숨은 실행에 실패하면 화면 밖 창으로 전환하지 않습니다." } else { "" }
+                tr(if current_session { "현재 계정 로그인 사용 요청" } else { "내 앱 실행 요청" }),
+                trf(
+                    "{} 이(가) {} '{}' 을(를) 보이지 않는 창으로 실행해 조작하려고 합니다.\n{}: {}\n경로: {}\n이 앱은 격리되지 않으며 사용자의 실제 계정·데이터(로그인, 파일, 메시지 등)를 그대로 사용합니다.{}",
+                    &[&client, &tr(NATIVE_APP_WORD), &r.name, &tr(APP_ID_LABEL), &bid, &path,
+                      &if current_session { format!("\n{}", tr("현재 Windows 계정의 원본 프로필을 숨은 데스크톱에서 사용합니다. 복제본이 아니며 변경은 실제 계정에 반영됩니다. 같은 앱은 트레이까지 완전히 종료하세요. 숨은 실행에 실패하면 화면 밖 창으로 전환하지 않습니다.")) } else { String::new() }],
                 ),
             )
             .await?;
@@ -1168,12 +1163,12 @@ impl ControlServer {
         self.ensure_not_removed(&id, &shared)?;
         // if the user pressed Stop, refuse this action (one refusal clears it)
         if shared.stop.swap(false, Ordering::SeqCst) {
-            shared.log(LogKind::Info, "사용자가 '중지'를 눌러 외부 에이전트의 동작을 거부했습니다");
+            shared.log(LogKind::Info, tr("사용자가 '중지'를 눌러 외부 에이전트의 동작을 거부했습니다"));
             bail!("사용자가 GhostDesk 창에서 '중지'를 눌렀습니다. 동작을 멈추고 사용자에게 다음 지시를 확인하세요.");
         }
         // while paused or taken over, wait until released (so user and agent input don't mix)
         if shared.paused.load(Ordering::SeqCst) {
-            shared.log(LogKind::Info, "사용자가 직접 조작 중이라 외부 에이전트의 동작을 기다리게 합니다");
+            shared.log(LogKind::Info, tr("사용자가 직접 조작 중이라 외부 에이전트의 동작을 기다리게 합니다"));
             let deadline = Instant::now() + PAUSE_WAIT;
             while shared.paused.load(Ordering::SeqCst) {
                 if conn.is_closed() {
@@ -1236,12 +1231,12 @@ impl ControlServer {
             agent::exec_desk_tool(&desk, &name, input).await
         };
         let client = shared.external.lock().clone().unwrap_or_default();
-        shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+        shared.set_status(AgentStatus::Idle(trf("{} 연결됨", &[&client])));
         shared.ctx.request_repaint();
         let out = match result {
             Ok(o) => o,
             Err(e) => {
-                shared.log(LogKind::Error, format!("{name} 실패: {e:#}"));
+                shared.log(LogKind::Error, trf("{} 실패: {}", &[&name, &format!("{e:#}")]));
                 return Err(e);
             }
         };
@@ -1270,7 +1265,7 @@ impl ControlServer {
                 None => bail!("{}{n}번째 항목에 action 이 없습니다", done_prefix(&lines)),
             };
             if shared.stop.swap(false, Ordering::SeqCst) {
-                shared.log(LogKind::Info, "사용자가 '중지'를 눌러 외부 에이전트의 동작을 멈췄습니다");
+                shared.log(LogKind::Info, tr("사용자가 '중지'를 눌러 외부 에이전트의 동작을 멈췄습니다"));
                 bail!("{}사용자가 GhostDesk 창에서 '중지'를 눌러 {n}번째 동작부터 실행하지 않았습니다. 사용자에게 다음 지시를 확인하세요.", done_prefix(&lines));
             }
             if shared.paused.load(Ordering::SeqCst) {
@@ -1317,9 +1312,9 @@ impl ControlServer {
                     }
                 }
                 Err(e) => {
-                    shared.log(LogKind::Error, format!("{name} 실패: {e:#}"));
+                    shared.log(LogKind::Error, trf("{} 실패: {}", &[&name, &format!("{e:#}")]));
                     let client = shared.external.lock().clone().unwrap_or_default();
-                    shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+                    shared.set_status(AgentStatus::Idle(trf("{} 연결됨", &[&client])));
                     bail!("{}{n}번째 동작({name})이 실패해 거기서 멈췄습니다: {e:#}", done_prefix(&lines));
                 }
             }
@@ -1330,7 +1325,7 @@ impl ControlServer {
             }
         }
         let client = shared.external.lock().clone().unwrap_or_default();
-        shared.set_status(AgentStatus::Idle(format!("{client} 연결됨")));
+        shared.set_status(AgentStatus::Idle(trf("{} 연결됨", &[&client])));
         shared.ctx.request_repaint();
         // the screen at the end of the bundle matters, so capture a fresh one unless the last action was
         // a screenshot, even if there were screenshots midway
@@ -1704,9 +1699,9 @@ const DENIED_WHY: &str = "암호 관리자는 항상 차단되고, 터미널·�
 
 /// The approval text for a shell or system tool.
 fn tool_request_text(client: &str, name: &str, path: &str) -> String {
-    format!(
-        "{client} 이(가) 셸·터미널·시스템 도구 '{name}' 을(를) 열려고 합니다.\n경로: {path}\n이런 도구는 명령을 실행하거나 시스템 설정을 바꿀 수 있어 \
-         컴퓨터를 직접 조작하는 것과 같습니다. 믿을 수 있는 작업일 때만 허용하세요."
+    trf(
+        "{} 이(가) 셸·터미널·시스템 도구 '{}' 을(를) 열려고 합니다.\n경로: {}\n이런 도구는 명령을 실행하거나 시스템 설정을 바꿀 수 있어 컴퓨터를 직접 조작하는 것과 같습니다. 믿을 수 있는 작업일 때만 허용하세요.",
+        &[&client, &name, &path],
     )
 }
 
@@ -1753,7 +1748,7 @@ impl ControlServer {
     async fn vet_session_app(&self, app: &str, client: &str, conn: &Conn) -> Result<()> {
         let check = session_launch_policy(app).await?;
         if let Some(name) = &check.tool {
-            self.ask(conn, "셸·시스템 도구 실행 요청", tool_request_text(client, name, app)).await?;
+            self.ask(conn, tr("셸·시스템 도구 실행 요청"), tool_request_text(client, name, app)).await?;
         }
         if check.admin && !crate::winapp::self_elevated() {
             return Err(self.request_elevated_restart(conn, app, client).await);
@@ -1775,12 +1770,11 @@ impl ControlServer {
     /// GhostDesk as administrator; if they agree and accept Windows' prompt (UAC), the window restarts
     /// and the agent retries. The error returned says how it went.
     async fn request_elevated_restart(&self, conn: &Conn, app: &str, client: &str) -> anyhow::Error {
-        let detail = format!(
-            "{client} 이(가) 열려는 '{app}' 은(는) 관리자 권한이 필요한 앱입니다. 일반 권한의 GhostDesk 는 이런 앱을 조작할 수 없습니다.\n\
-             허용하면 GhostDesk 를 관리자 권한으로 다시 시작합니다. Windows 의 사용자 계정 컨트롤(UAC) 창이 뜨면 '예' 를 누르세요. \
-             다시 시작하면 지금 열려 있는 화면이 모두 닫히고, 에이전트가 처음부터 다시 연결해야 합니다."
+        let detail = trf(
+            "{} 이(가) 열려는 '{}' 은(는) 관리자 권한이 필요한 앱입니다. 일반 권한의 GhostDesk 는 이런 앱을 조작할 수 없습니다.\n허용하면 GhostDesk 를 관리자 권한으로 다시 시작합니다. Windows 의 사용자 계정 컨트롤(UAC) 창이 뜨면 '예' 를 누르세요. 다시 시작하면 지금 열려 있는 화면이 모두 닫히고, 에이전트가 처음부터 다시 연결해야 합니다.",
+            &[&client, &app],
         );
-        if let Err(e) = self.ask_manual(conn, "관리자 권한으로 다시 시작 요청", detail).await {
+        if let Err(e) = self.ask_manual(conn, tr("관리자 권한으로 다시 시작 요청"), detail).await {
             return e;
         }
         let (tx, rx) = oneshot::channel();

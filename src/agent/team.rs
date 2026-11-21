@@ -28,7 +28,7 @@ impl Membership {
         let id = shared.id | (1 << 63);
         team.store.join(team.id, id, &shared.name, &team.role)?;
         shared.team_member_id.store(id, Ordering::Relaxed);
-        shared.log(LogKind::Info, "팀 작업판에 연결했습니다");
+        shared.log(LogKind::Info, crate::app::i18n::tr("팀 작업판에 연결했습니다"));
         Ok(Self { team: team.clone(), shared: Arc::clone(shared), id })
     }
 

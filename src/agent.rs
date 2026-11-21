@@ -26,6 +26,8 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::app::i18n::{tr, trf};
+
 use crate::{
     desk::Desk,
     llm::{short, Llm},
@@ -438,7 +440,7 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
             let next = shared.queue.lock().pop_front();
             if let Some(t) = next {
                 remember(&mut instructions, &t);
-                shared.log(LogKind::User, format!("{} 대기열의 다음 작업: {t}", crate::icon::LIST_TODO));
+                shared.log(LogKind::User, format!("{} {}", crate::icon::LIST_TODO, trf("대기열의 다음 작업: {}", &[&t])));
                 pending.push(json!({ "type": "text", "text": format!("이전 작업이 끝났습니다. 다음 작업을 이어서 하세요: {t}") }));
                 pending.push(screenshot_context(&ws, &mut seen).await);
                 steps_since_input = 0;
@@ -451,10 +453,10 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
                 pending.push(json!({"type":"text","text":"GhostDesk released your file claims while work was interrupted. Before writing again, read the team board, reclaim the needed files, and reread their current contents."}));
             }
             if stopped {
-                shared.log(LogKind::Info, "사용자가 중지했습니다. 지시를 입력하면 이어서 진행합니다.");
+                shared.log(LogKind::Info, tr("사용자가 중지했습니다. 지시를 입력하면 이어서 진행합니다."));
                 wait_reason = "중지됨 — 지시를 입력하면 이어서 진행".into();
             } else if limit_hit {
-                wait_reason = format!("최대 단계({})에 도달 — 계속하려면 지시를 입력", cfg.max_steps);
+                wait_reason = trf("최대 단계({})에 도달 — 계속하려면 지시를 입력", &[&cfg.max_steps]);
             }
             // (on failure the error path already set wait_reason)
             shared.set_status(AgentStatus::Idle(wait_reason.clone()));
@@ -500,8 +502,8 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         if !messages.is_empty() && (too_big || std::mem::take(&mut too_long)) {
             // when the history gets too big (request size cap, per-turn token growth), start a new segment
             // carrying only the original task, a summary of recent actions and the current screen
-            let why = if too_big { format!("약 {:.1} MB 로 커져", (msg_bytes + user_len) as f64 / 1e6) } else { "길어져".into() };
-            shared.log(LogKind::Info, format!("대화 기록이 {why} 새 대화 구간을 시작합니다 (원래 작업·최근 동작 요약·현재 화면만 이어감)"));
+            let why = if too_big { trf("약 {} MB 로 커져", &[&format!("{:.1}", (msg_bytes + user_len) as f64 / 1e6)]) } else { tr("길어져").into() };
+            shared.log(LogKind::Info, trf("대화 기록이 {} 새 대화 구간을 시작합니다 (원래 작업·최근 동작 요약·현재 화면만 이어감)", &[&why]));
             seen = Seen::default();
             let last = user_msg["content"].as_array().cloned().unwrap_or_default();
             let summary = {
@@ -540,7 +542,7 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
                         pending = c;
                     }
                 }
-                shared.log(LogKind::Error, format!("AI API 오류: {e:#}"));
+                shared.log(LogKind::Error, trf("AI API 오류: {}", &[&format!("{e:#}")]));
                 wait_reason = "오류 — 지시를 입력하면 다시 시도".into();
                 llm_failed = true;
                 continue;
@@ -594,14 +596,14 @@ async fn run_inner(shared: &Arc<AgentShared>, cfg: &AgentConfig, rx: &mut mpsc::
         let stop = resp["stop_reason"].as_str().unwrap_or("");
         if stop == "refusal" {
             let cat = resp["stop_details"]["category"].as_str().unwrap_or("unknown");
-            shared.log(LogKind::Error, format!("모델이 요청을 거절했습니다 (category: {cat})"));
+            shared.log(LogKind::Error, trf("모델이 요청을 거절했습니다 (category: {})", &[&cat]));
             wait_reason = "모델 거절 — 다른 지시를 입력하세요".into();
             // not a normal finish, so wait for instructions instead of moving to the next queued task
             llm_failed = true;
             continue;
         }
         if stop == "max_tokens" && tool_uses.is_empty() {
-            shared.log(LogKind::Info, "응답이 max_tokens 에서 잘렸습니다");
+            shared.log(LogKind::Info, tr("응답이 max_tokens 에서 잘렸습니다"));
             wait_reason = "응답 길이 제한 — 이어서 진행하려면 지시를 입력하세요".into();
             llm_failed = true;
             continue;

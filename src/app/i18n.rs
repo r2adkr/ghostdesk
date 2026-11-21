@@ -75,11 +75,11 @@ pub fn tr(ko: &str) -> &str {
 }
 
 /// Text with values: fills the translation's `{}` placeholders with `args` in order.
-pub fn trf(ko: &str, args: &[&dyn Display]) -> String {
+pub fn trf(ko: &str, args: &[&(dyn Display + Sync)]) -> String {
     fill(tr(ko), args)
 }
 
-fn fill(pattern: &str, args: &[&dyn Display]) -> String {
+fn fill(pattern: &str, args: &[&(dyn Display + Sync)]) -> String {
     let mut out = String::with_capacity(pattern.len() + 16);
     let mut rest = pattern;
     let mut args = args.iter();
@@ -133,6 +133,12 @@ mod tests {
         const SOURCES: &[(&str, &str)] = &[
             ("app.rs", include_str!("../app.rs")),
             ("account.rs", include_str!("account.rs")),
+            ("agent_panel.rs", include_str!("agent_panel.rs")),
+            ("host_settings.rs", include_str!("host_settings.rs")),
+            ("pi_settings.rs", include_str!("pi_settings.rs")),
+            ("route.rs", include_str!("route.rs")),
+            ("saved_remotes.rs", include_str!("saved_remotes.rs")),
+            ("toolbox_ui.rs", include_str!("toolbox_ui.rs")),
             ("ai.rs", include_str!("ai.rs")),
             ("connect.rs", include_str!("connect.rs")),
             ("detail.rs", include_str!("detail.rs")),
@@ -175,6 +181,57 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "번역이 없는 글 {}개:\n{}", missing.len(), missing.join("\n"));
+    }
+
+    /// Text the agent, the control server and the engine put in the window (agent log, status, approval
+    /// dialogs, notices) goes through `tr`/`trf` where it is made; every such call's text must be in the table.
+    #[test]
+    fn agent_side_text_is_translated() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("agent.rs", include_str!("../agent.rs")),
+            ("agent/team.rs", include_str!("../agent/team.rs")),
+            ("agent/tools.rs", include_str!("../agent/tools.rs")),
+            ("agent/workspace.rs", include_str!("../agent/workspace.rs")),
+            ("control.rs", include_str!("../control.rs")),
+            ("pi.rs", include_str!("../pi.rs")),
+        ];
+        let mut missing = Vec::new();
+        for (file, src) in SOURCES {
+            let src = src.split("mod tests {").next().unwrap_or(src);
+            // the text of each tr("…") / trf("…") call (both branches of tr(if c { "a" } else { "b" }))
+            for (i, _) in src.match_indices("tr(") {
+                let prev = src[..i].chars().last();
+                if prev.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = src[i + 3..].trim_start();
+                let take = if rest.starts_with('"') { 1 } else if rest.starts_with("if ") { 2 } else { 0 };
+                for s in korean_literals(rest).into_iter().take(take) {
+                    if !INDEX.contains_key(s.as_str()) {
+                        missing.push(format!("{file}: {s}"));
+                    }
+                }
+            }
+            for (i, _) in src.match_indices("trf(") {
+                let rest = src[i + 4..].trim_start();
+                if rest.starts_with('"') {
+                    for s in korean_literals(rest).into_iter().take(1) {
+                        if !INDEX.contains_key(s.as_str()) {
+                            missing.push(format!("{file}: {s}"));
+                        }
+                    }
+                }
+            }
+        }
+        // reasons the engine hands back, shown as a notice (translated there)
+        for s in ["API 키가 없어 기본 방식으로 실행해요", "주소가 없어 기본 방식으로 실행해요", "이 모델을 고급 엔진에 알리지 못해서 기본 방식으로 실행해요"] {
+            if !INDEX.contains_key(s) {
+                missing.push(format!("pi notice: {s}"));
+            }
+        }
+        assert!(missing.is_empty(), "번역이 없는 글 {}개:
+{}", missing.len(), missing.join("
+"));
     }
 
     /// Strings never shown in the UI, only compared verbatim.

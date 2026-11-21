@@ -257,7 +257,7 @@ fn log_as_text(log: &[crate::agent::LogEntry]) -> String {
 }
 
 #[cfg(test)]
-mod copy_tests {
+mod tests {
     use super::*;
     use crate::agent::{LogEntry, LogKind};
 

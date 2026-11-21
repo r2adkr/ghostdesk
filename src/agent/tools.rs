@@ -77,7 +77,7 @@ pub(crate) async fn exec_remote_tool(shared: &Arc<AgentShared>, input: &Value) -
             let path = input["remote_path"].as_str().ok_or_else(|| anyhow!("remote_path is required"))?;
             let file = ssh.receive(path, &shared.workspace_name, &shared.stop).await?;
             let result = json!({"local_path":file.path,"size":file.size,"remote_path":path});
-            shared.log(LogKind::Info, format!("Received: {} ({} bytes)", file.path.display(), file.size));
+            shared.log(LogKind::Info, crate::app::i18n::trf("받은 파일: {} ({} 바이트)", &[&file.path.display(), &file.size]));
             shared.received_files.lock().push(file);
             shared.ctx.request_repaint();
             result
@@ -159,7 +159,7 @@ pub(crate) async fn execute_batch(
                 result["content"] = json!(c);
             }
             Err(e) => {
-                shared.log(LogKind::Error, format!("{name} 실패: {e:#}"));
+                shared.log(LogKind::Error, crate::app::i18n::trf("{} 실패: {}", &[&name, &format!("{e:#}")]));
                 result["is_error"] = json!(true);
                 result["content"] = json!(format!("Error: {e:#}"));
                 // A losing claim must not be followed by work from the same batch.

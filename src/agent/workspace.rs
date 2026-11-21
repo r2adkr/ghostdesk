@@ -3,6 +3,8 @@
 
 use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
 
+use crate::app::i18n::{tr, trf};
+
 use anyhow::{anyhow, bail, Context, Result};
 
 use super::{AgentShared, AgentStatus, DeskTarget, LogKind, ProfileSource, RemoteTarget};
@@ -60,13 +62,13 @@ pub(crate) async fn prepare_workspace_with(
             Ok(Desk::VDisplay(ws))
         }
         DeskTarget::Host { code } => {
-            shared.set_status(AgentStatus::Preparing("호스트 컴퓨터에 연결 중".into()));
+            shared.set_status(AgentStatus::Preparing(tr("호스트 컴퓨터에 연결 중").into()));
             let bridge = crate::host::connect(code).await?;
             let sh = shared.clone();
             let d = crate::session::SessionDesk::connect_target(bridge.target.clone(), None, "호스트 컴퓨터", Arc::new(move |b: &[u8]| sh.push_frame(b)), Default::default()).await?;
             d.keep_alive(Box::new(bridge));
             let (w, h) = d.size();
-            shared.log(LogKind::Info, format!("호스트 컴퓨터에 연결했습니다 ({w}x{h})"));
+            shared.log(LogKind::Info, trf("호스트 컴퓨터에 연결했습니다 ({}x{})", &[&w, &h]));
             Ok(Desk::Session(d))
         }
         DeskTarget::Session { account } => {
@@ -74,19 +76,19 @@ pub(crate) async fn prepare_workspace_with(
             let turn = take_session_turn(shared, account).await?;
             if cfg!(windows) {
                 // the child session signs in as this account again; Windows may ask for the password
-                shared.set_status(AgentStatus::Preparing("자식 세션에 로그인하는 중 · 'Windows 보안' 창이 뜨면 계정 암호를 넣으세요".into()));
+                shared.set_status(AgentStatus::Preparing(tr("자식 세션에 로그인하는 중 · 'Windows 보안' 창이 뜨면 계정 암호를 넣으세요").into()));
                 shared.log(
                     LogKind::Info,
-                    "자식 세션은 지금 계정으로 한 번 더 로그인합니다. 'Windows 보안' 창이 뜨면 PIN 이 아니라 계정 암호를 넣고, '내 자격 증명 기억' 을 체크하면 다음부터 묻지 않습니다",
+                    tr("자식 세션은 지금 계정으로 한 번 더 로그인합니다. 'Windows 보안' 창이 뜨면 PIN 이 아니라 계정 암호를 넣고, '내 자격 증명 기억' 을 체크하면 다음부터 묻지 않습니다"),
                 );
             } else {
-                shared.set_status(AgentStatus::Preparing(format!("'{account}' 세션에 연결 중")));
+                shared.set_status(AgentStatus::Preparing(trf("'{}' 세션에 연결 중", &[&account])));
             }
             let sh = shared.clone();
             let d = crate::session::SessionDesk::connect(account, Arc::new(move |b: &[u8]| sh.push_frame(b))).await?;
             d.hold(turn);
             let (w, h) = d.size();
-            shared.log(LogKind::Info, format!("전용 계정 '{account}' 의 별도 세션에 연결했습니다 ({w}x{h})"));
+            shared.log(LogKind::Info, trf("전용 계정 '{}' 의 별도 세션에 연결했습니다 ({}x{})", &[&account, &w, &h]));
             Ok(Desk::Session(d))
         }
     }
@@ -100,7 +102,7 @@ async fn take_session_turn(shared: &Arc<AgentShared>, account: &str) -> Result<c
     let (key, what) = if cfg!(windows) {
         (crate::turns::CHILD_SESSION.to_string(), "자식 세션".to_string())
     } else {
-        (crate::turns::account_key(account), format!("'{account}' 세션"))
+        (crate::turns::account_key(account), crate::app::i18n::trf("'{}' 세션", &[&account]))
     };
     let external = shared.external.lock().clone();
     let who = match &external {
@@ -113,8 +115,8 @@ async fn take_session_turn(shared: &Arc<AgentShared>, account: &str) -> Result<c
     let max_wait = external.is_some().then(|| Duration::from_secs(if patient { 600 } else { 55 }));
     let sh = shared.clone();
     let on_wait = move |owner: &str, place: usize| {
-        sh.set_status(AgentStatus::Preparing(format!("{what} 차례를 기다리는 중 · 지금 {owner} 사용 중 · 대기 {place}번째")));
-        sh.log(LogKind::Info, format!("{what} 은(는) 한 번에 한 에이전트만 쓸 수 있어 {owner} 이(가) 끝나기를 기다립니다"));
+        sh.set_status(AgentStatus::Preparing(trf("{} 차례를 기다리는 중 · 지금 {} 사용 중 · 대기 {}번째", &[&tr(&what), &owner, &place])));
+        sh.log(LogKind::Info, trf("{} 은(는) 한 번에 한 에이전트만 쓸 수 있어 {} 이(가) 끝나기를 기다립니다", &[&tr(&what), &owner]));
     };
     let sh = shared.clone();
     let cancelled = move || sh.stop.load(Ordering::SeqCst) || sh.removed.load(Ordering::SeqCst);
@@ -142,33 +144,33 @@ async fn prepare_electron(
     let mut o = ElectronLaunch::new(app.clone(), workspace, width, height);
     o.profile = profile.clone();
     if let ElectronProfile::Clone { source, .. } = profile {
-        shared.log(LogKind::Info, format!("{} 데이터({})를 작업공간으로 복제합니다", app.name, source.display()));
+        shared.log(LogKind::Info, trf("{} 데이터({})를 작업공간으로 복제합니다", &[&app.name, &source.display()]));
     }
     let sh = shared.clone();
     o.progress = Some(Arc::new(move |files, bytes| {
-        sh.set_status(AgentStatus::Preparing(format!("앱 데이터 복제 중 ({files}개, {:.0} MB)", bytes as f64 / 1e6)));
+        sh.set_status(AgentStatus::Preparing(trf("앱 데이터 복제 중 ({}개, {} MB)", &[&files, &format!("{:.0}", bytes as f64 / 1e6)])));
     }));
-    shared.set_status(AgentStatus::Preparing(format!("{} 숨김 실행 중", app.name)));
+    shared.set_status(AgentStatus::Preparing(trf("{} 숨김 실행 중", &[&app.name])));
     let sh = shared.clone();
     let ws = electron::launch(o, Arc::new(move |b: &[u8]| sh.push_frame(b))).await?;
     shared.log(
         LogKind::Info,
-        format!("{} 를 화면에 보이지 않게 실행했습니다 ({width}x{height}, pid {})", app.name, ws.main_pid),
+        trf("{} 를 화면에 보이지 않게 실행했습니다 ({}x{}, pid {})", &[&app.name, &width, &height, &ws.main_pid]),
     );
     Ok(Desk::Electron(ws))
 }
 
 async fn prepare_native(shared: &Arc<AgentShared>, opts: &crate::native::NativeOptions) -> Result<Desk> {
-    shared.set_status(AgentStatus::Preparing(format!("{} 준비 중", opts.app)));
+    shared.set_status(AgentStatus::Preparing(trf("{} 준비 중", &[&opts.app])));
     let sh = shared.clone();
     let ws = crate::native::NativeAppWorkspace::launch(opts.clone(), Arc::new(move |b: &[u8]| sh.push_frame(b))).await?;
     let mode = match ws.mode() {
-        crate::native::NativeMode::Launched => "숨김 인스턴스를 새로 실행",
-        crate::native::NativeMode::Attached => "사용 중인 앱에 연결 (작업 중 앱 창이 숨겨짐)",
+        crate::native::NativeMode::Launched => tr("숨김 인스턴스를 새로 실행"),
+        crate::native::NativeMode::Attached => tr("사용 중인 앱에 연결 (작업 중 앱 창이 숨겨짐)"),
     };
     shared.log(LogKind::Info, format!("{}: {mode} (pid {})", ws.app_name(), ws.pid()));
     for e in ws.exposure_report() {
-        shared.log(LogKind::Error, format!("화면 노출 감지: {e}"));
+        shared.log(LogKind::Error, trf("화면 노출 감지: {}", &[&e]));
     }
     Ok(Desk::Native(ws))
 }
@@ -218,7 +220,7 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
     shared.set_status(AgentStatus::Preparing("원격 데스크톱 확인 중".into()));
     let g = rfb::probe(&t.host, t.port, rfb::ReplyVersion::Auto, Duration::from_secs(6)).await?;
     let types: Vec<&str> = g.security_types.iter().map(|x| rfb::security_type_name(*x)).collect();
-    shared.log(LogKind::Info, format!("{}:{} — {} / 보안 방식: {}", t.host, t.port, g.server_version, types.join(", ")));
+    shared.log(LogKind::Info, trf("{}:{} — {} / 보안 방식: {}", &[&t.host, &t.port, &g.server_version, &types.join(", ")]));
     let apple = g.server_version.contains("003.889");
     // this Mac's own Screen Sharing (Apple server) is always refused, confirmation or not. That's a
     // macOS-only rule: on other OSes an Apple server on loopback is just a tunnel to another Mac.
@@ -270,7 +272,7 @@ async fn prepare_remote(shared: &Arc<AgentShared>, t: &RemoteTarget, local_ok: b
     let (fw, fh) = desk.fb_size();
     shared.log(
         LogKind::Info,
-        format!("원격 데스크톱 접속됨: '{}' ({fw}x{fh}, 에이전트 좌표 {:?})", desk.desktop_name(), desk.size()),
+        trf("원격 데스크톱 접속됨: '{}' ({}x{}, 에이전트 좌표 {})", &[&desk.desktop_name(), &fw, &fh, &format!("{:?}", desk.size())]),
     );
     // live screen: event-driven, pushed to the UI as soon as the framebuffer changes (coalesced to the user's fps limit)
     let (sh, weak) = (shared.clone(), Arc::downgrade(&desk));
@@ -355,15 +357,12 @@ async fn prepare_browser(
                 shared.set_status(AgentStatus::Preparing("프로필 복제 중".into()));
                 shared.log(
                     LogKind::Info,
-                    format!("{} / {} 프로필을 작업공간 '{}' 으로 복제합니다", browser.name, profile_dir, workspace),
+                    trf("{} / {} 프로필을 작업공간 '{}' 으로 복제합니다", &[&browser.name, &profile_dir, &workspace]),
                 );
                 let (src, pd, dst, sh) = (browser.data_dir.clone(), profile_dir.clone(), dir.clone(), shared.clone());
                 let st = tokio::task::spawn_blocking(move || {
                     profiles::clone_profile(&src, &pd, &dst, &|files, bytes| {
-                        sh.set_status(AgentStatus::Preparing(format!(
-                            "프로필 복제 중 ({files}개, {:.0} MB)",
-                            bytes as f64 / 1e6
-                        )));
+                        sh.set_status(AgentStatus::Preparing(trf("프로필 복제 중 ({}개, {} MB)", &[&files, &format!("{:.0}", bytes as f64 / 1e6)])));
                     })
                 })
                 .await??;
@@ -372,15 +371,10 @@ async fn prepare_browser(
                 crate::platform::fsx::remove_file_retry(&cloning_mark).context("프로필 복제 완료 표시를 갱신하지 못했습니다")?;
                 shared.log(
                     LogKind::Info,
-                    format!(
-                        "복제 완료: 파일 {}개, {:.1} MB (잠김 등으로 건너뜀 {}개)",
-                        st.files,
-                        st.bytes as f64 / 1e6,
-                        st.skipped
-                    ),
+                    trf("복제 완료: 파일 {}개, {} MB (잠김 등으로 건너뜀 {}개)", &[&st.files, &format!("{:.1}", st.bytes as f64 / 1e6), &st.skipped]),
                 );
             } else {
-                shared.log(LogKind::Info, format!("기존 작업공간 '{}' 재사용", workspace));
+                shared.log(LogKind::Info, trf("기존 작업공간 '{}' 재사용", &[&workspace]));
             }
             (browser.exe.clone(), Some(profile_dir.clone()))
         }

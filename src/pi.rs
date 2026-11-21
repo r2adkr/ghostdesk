@@ -20,6 +20,8 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::app::i18n::{tr, trf};
+
 use crate::{
     agent::{AgentCmd, AgentConfig, AgentShared, AgentStatus, LogKind, Membership, ToolBridge},
     desk::Desk,
@@ -940,7 +942,7 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
     // a model pi's catalog doesn't list (new, local, custom address) is described to it instead of refused
     let listed = route.custom.is_none() && model_known(&exe, &home, &route.provider, route.env_key, &cfg.llm).await;
     if let Err(e) = register_model(&home, &route, &cfg.llm, listed) {
-        shared.log(LogKind::Error, format!("모델 정보를 저장하지 못했어요: {e}"));
+        shared.log(LogKind::Error, trf("모델 정보를 저장하지 못했어요: {}", &[&e]));
         return Ok(Some("이 모델을 고급 엔진에 알리지 못해서 기본 방식으로 실행해요"));
     }
     // per process and agent, so two GhostDesk windows never share (or delete) each other's file
@@ -1088,10 +1090,10 @@ async fn drive_agent(
         }
         if out.died {
             let why = p.err.lock().trim().to_string();
-            shared.log(LogKind::Error, format!("AI 엔진이 예기치 않게 끝났습니다{}", if why.is_empty() { String::new() } else { format!(": {}", crate::llm::short(&why, 300)) }));
+            shared.log(LogKind::Error, format!("{}{}", tr("AI 엔진이 예기치 않게 끝났습니다"), if why.is_empty() { String::new() } else { format!(": {}", crate::llm::short(&why, 300)) }));
             if outdated_engine(&why) {
                 mark_outdated();
-                shared.log(LogKind::Info, "GhostDesk에서 사용하는 기능이 현재 설치되어 있는 AI 엔진(pi)의 버전에서 지원되지 않아요. 오른쪽 아래 알림에서 '엔진 업데이트'를 누른 뒤 다시 지시해 주세요.");
+                shared.log(LogKind::Info, tr("GhostDesk에서 사용하는 기능이 현재 설치되어 있는 AI 엔진(pi)의 버전에서 지원되지 않아요. 오른쪽 아래 알림에서 '엔진 업데이트'를 누른 뒤 다시 지시해 주세요."));
             }
             proc = None;
             restarted = true;
@@ -1102,7 +1104,7 @@ async fn drive_agent(
             m.finish_turn();
         }
         wait_reason = if out.stopped {
-            shared.log(LogKind::Info, "사용자가 중지했습니다. 지시를 입력하면 이어서 진행합니다.");
+            shared.log(LogKind::Info, tr("사용자가 중지했습니다. 지시를 입력하면 이어서 진행합니다."));
             "중지됨 — 지시를 입력하면 이어서 진행".into()
         } else if out.limit_hit {
             format!("최대 단계({})에 도달 — 계속하려면 지시를 입력", cfg.max_steps)
@@ -1144,7 +1146,7 @@ async fn drive(
                             shared.log(LogKind::Assistant, text);
                         }
                         if let Some(e) = error {
-                            shared.log(LogKind::Error, format!("AI API 오류: {e}"));
+                            shared.log(LogKind::Error, trf("AI API 오류: {}", &[&e]));
                             out.failed = true;
                         }
                     }
@@ -1183,18 +1185,19 @@ async fn drive(
                             "write" | "edit" => ("에이전트가 내 컴퓨터의 파일을 바꾸려고 해요", "파일"),
                             _ => ("에이전트가 내 컴퓨터의 파일을 읽으려고 해요", "파일"),
                         };
+                        let (title, kind) = (tr(title), tr(kind));
                         // the person's permission settings decide first; only "ask" shows the window
                         let allowed = match crate::access::decide(crate::access::kind_of(&tool), crate::control::shell_tools_allowed()) {
                             crate::access::Rule::Allow => {
-                                shared.log(LogKind::Info, format!("설정에 따라 허용: {kind} {}", crate::llm::short(&what, 200)));
+                                shared.log(LogKind::Info, trf("설정에 따라 허용: {} {}", &[&kind, &crate::llm::short(&what, 200)]));
                                 true
                             }
                             crate::access::Rule::Deny => {
-                                shared.log(LogKind::Info, format!("설정에 따라 막음: {kind} {}", crate::llm::short(&what, 200)));
+                                shared.log(LogKind::Info, trf("설정에 따라 막음: {} {}", &[&kind, &crate::llm::short(&what, 200)]));
                                 false
                             }
                             crate::access::Rule::Ask => {
-                                shared.log(LogKind::Info, format!("허락을 기다리는 중: {kind} {}", crate::llm::short(&what, 200)));
+                                shared.log(LogKind::Info, trf("허락을 기다리는 중: {} {}", &[&kind, &crate::llm::short(&what, 200)]));
                                 tokio::select! {
                                     a = crate::control::ask_person(title, format!("{}\n\n{kind}: {what}", shared.name)) => a,
                                     _ = shared.wait_for_stop() => false,
@@ -1207,7 +1210,7 @@ async fn drive(
                         p.send(json!({ "type": "extension_ui_response", "id": ui_id, "cancelled": true }));
                     }
                     Some(Event::Rejected(why)) => {
-                        shared.log(LogKind::Error, format!("AI API 오류: {why}"));
+                        shared.log(LogKind::Error, trf("AI API 오류: {}", &[&why]));
                         out.failed = true;
                         break;
                     }
