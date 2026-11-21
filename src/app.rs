@@ -261,6 +261,8 @@ pub struct GhostApp {
     recent_tasks: Vec<String>,
     /// Guide screenshot capture mode (`GHOSTDESK_TOUR_CAPTURE`).
     tour_capture: Option<tour::Capture>,
+    /// Started by an agent's connection and not yet tucked into the taskbar (Windows, `--background`).
+    park_pending: bool,
     /// macOS permission state (rechecked every second: `permissions`).
     #[cfg(target_os = "macos")]
     perm_cache: Option<(std::time::Instant, crate::macos::TccStatus)>,
@@ -478,6 +480,7 @@ impl GhostApp {
             tour_seen: false,
             recent_tasks: Vec::new(),
             tour_capture: tour::Capture::from_env(),
+            park_pending: cfg!(windows) && std::env::args().skip(1).any(|a| a == "--background"),
             #[cfg(target_os = "macos")]
             perm_cache: None,
             perm_notice_hidden: false,
@@ -521,6 +524,11 @@ impl GhostApp {
         // the form was filled before the language was known
         app.form.name = tr("에이전트 1").into();
         fonts::setup_fonts(&cc.egui_ctx, app.lang);
+        // started by an agent's connection: hide the window from the first moment (see park_background_window)
+        #[cfg(windows)]
+        if app.park_pending {
+            park_background_window();
+        }
         // is the installed engine older than this GhostDesk expects? (runs `pi --help`, so off the UI thread)
         if app.tour_capture.is_none() {
             let ctx = cc.egui_ctx.clone();
@@ -711,6 +719,11 @@ impl eframe::App for GhostApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
+        #[cfg(windows)]
+        if self.park_pending {
+            self.park_pending = !park_background_window();
+            ctx.request_repaint();
+        }
         // handle external agent events
         while let Ok(ev) = self.control_rx.try_recv() {
             match ev {
@@ -1230,6 +1243,54 @@ type Approval = (String, String, Option<tokio::sync::oneshot::Sender<bool>>);
 fn approval_show_mode(minimized: bool) -> i32 {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SW_SHOWNA};
     if minimized { SW_SHOWNOACTIVATE } else { SW_SHOWNA }
+}
+
+/// Started by an agent's connection (`--background`): keep the window out of the person's way, in the taskbar,
+/// instead of opening over what they're doing. eframe shows the window itself after the first frame, and that
+/// show undoes an earlier minimize; window styles (a transparent window) are reset by it too. So the window is
+/// cloaked by DWM (never drawn, whatever its style) until eframe has shown it, then minimized without
+/// activating, given a centered restore position and uncloaked. Called from `new` (before any frame) and every
+/// frame until it returns true.
+#[cfg(windows)]
+fn park_background_window() -> bool {
+    use crate::platform::win;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, GetWindowPlacement, SetWindowPlacement, SM_CXSCREEN, SM_CYSCREEN, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT,
+    };
+    let me = std::process::id();
+    let Some(w) = win::top_level_hwnds()
+        .into_iter()
+        .filter(|h| win::window_pid(*h) == me)
+        .map(win::window_info)
+        .find(|w| w.title == "GhostDesk")
+    else {
+        return false;
+    };
+    let h = w.hwnd as _;
+    let cloak = |on: i32| unsafe {
+        let _ = DwmSetWindowAttribute(h, DWMWA_CLOAK as u32, &on as *const i32 as *const _, 4);
+    };
+    if !w.visible {
+        cloak(1);
+        return false;
+    }
+    unsafe {
+        let mut p: WINDOWPLACEMENT = std::mem::zeroed();
+        p.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(h, &mut p) != 0 {
+            let r = p.rcNormalPosition;
+            let (ww, wh) = (r.right - r.left, r.bottom - r.top);
+            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let (x, y) = (((sw - ww) / 2).max(0), ((sh - wh) / 2).max(0));
+            p.rcNormalPosition = RECT { left: x, top: y, right: x + ww, bottom: y + wh };
+            p.showCmd = SW_SHOWMINNOACTIVE as u32;
+            SetWindowPlacement(h, &p);
+        }
+    }
+    cloak(0);
+    true
 }
 
 #[cfg(windows)]

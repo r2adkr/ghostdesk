@@ -505,12 +505,15 @@ pub fn window_pid(hwnd: HWND) -> u32 {
 pub fn window_info(hwnd: HWND) -> TopWindow {
     use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, IsIconic,
+        GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, InternalGetWindowText, IsIconic,
         IsWindowVisible, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
     };
     unsafe {
         let mut title = [0u16; 256];
-        let tn = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        // InternalGetWindowText reads the stored title without sending WM_GETTEXT: GetWindowTextW waits on the
+        // owning thread, so one hung program anywhere froze whoever listed windows (the first frame of a
+        // GhostDesk started by an agent never came)
+        let tn = InternalGetWindowText(hwnd, title.as_mut_ptr(), title.len() as i32);
         let mut class = [0u16; 128];
         let cn = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
         let mut r: RECT = std::mem::zeroed();

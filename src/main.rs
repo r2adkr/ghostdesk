@@ -163,6 +163,7 @@ fn main() -> anyhow::Result<()> {
         .with_min_inner_size([900.0, 600.0]);
     #[cfg(windows)]
     if background {
+        // minimized into the taskbar on the first frame (app.rs `park_background_window`)
         viewport = viewport.with_active(false);
     }
     // Windows: the app draws its own title bar instead of the native frame (app/titlebar.rs). The
