@@ -43,12 +43,74 @@ fn installer_path() -> String {
     let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
     let cur = std::env::var("PATH").unwrap_or_default();
     let own = standalone_node_bin().display().to_string();
-    format!("/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{cur}:{own}")
+    // our own Node.js first: it only exists because the one on the computer was missing or too old
+    format!("{own}:/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{cur}")
 }
 
-/// Where the Node.js GhostDesk installs itself (when the computer has none and Homebrew can't provide it).
+/// PATH for the installer (Windows): our own Node.js first, then pi's own folder (otherwise the installer ends
+/// by asking, with no one to answer, whether to add it to PATH), then the inherited and the user's current PATH.
+#[cfg(windows)]
+fn installer_path() -> std::ffi::OsString {
+    let rest = crate::install::cli_path_env(&standalone_node_bin().join("node.exe"));
+    let pi_bin = dirs::home_dir().unwrap_or_default().join(".pi").join("agent").join("bin");
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&rest).collect();
+    dirs.insert(1.min(dirs.len()), pi_bin);
+    std::env::join_paths(dirs).unwrap_or(rest)
+}
+
+/// Where the Node.js GhostDesk installs itself (when the computer has none, or one too old for pi, and
+/// Homebrew can't provide it). On Windows it is the folder pi's own installer uses, so the pi it installs
+/// keeps running on this Node.js even when an older one comes first on PATH.
 pub fn standalone_node_bin() -> PathBuf {
-    crate::platform::paths::data_root().join("node").join("current").join("bin")
+    if cfg!(windows) {
+        dirs::data_local_dir().unwrap_or_else(crate::platform::paths::data_root).join("pi-node").join("current")
+    } else {
+        crate::platform::paths::data_root().join("node").join("current").join("bin")
+    }
+}
+
+/// Downloads Node.js 22 from nodejs.org (checked against its published hash) into `GD_NODE_DIR`, as pi's
+/// own installer does in a terminal (it only asks there, so it fails when GhostDesk runs it).
+#[cfg(windows)]
+const NODE_STANDALONE: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+$a = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+$base = 'https://nodejs.org/dist/latest-v22.x'
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "gd-node-$PID"
+Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $tmp | Out-Null
+try {
+  $sums = (Invoke-WebRequest -UseBasicParsing "$base/SHASUMS256.txt").Content
+  $line = $sums -split '\r?\n' | Where-Object { $_ -match "\s(node-v\S+-win-$a\.zip)$" } | Select-Object -First 1
+  if (-not $line) { throw "error: no Node.js build for win-$a" }
+  $hash, $f = -split $line
+  $zip = Join-Path $tmp $f
+  Invoke-WebRequest -UseBasicParsing "$base/$f" -OutFile $zip
+  if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $hash) { throw 'error: Node.js download checksum mismatch' }
+  & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $tmp
+  if ($LASTEXITCODE -ne 0) { throw 'error: Node.js extraction failed' }
+  $dest = $env:GD_NODE_DIR
+  New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+  Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+  Move-Item (Join-Path $tmp ($f -replace '\.zip$', '')) $dest
+} finally {
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#;
+
+/// Whether `node` 22.19 or newer is available (Windows).
+#[cfg(windows)]
+fn node_ok() -> bool {
+    let mut c = std::process::Command::new("node");
+    c.env("PATH", installer_path())
+        .args(["-e", "const [a,b]=process.versions.node.split('.').map(Number);process.exit(a>22||(a===22&&b>=19)?0:1)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::platform::proc::hide_console(&mut c);
+    c.status().is_ok_and(|s| s.success())
 }
 
 /// Downloads Node.js 22 from nodejs.org (checked against its published hash) into GhostDesk's own folder.
@@ -104,9 +166,24 @@ pub fn install() -> Result<(), String> {
     let fail = |what: &str, out: std::process::Output| format!("{what}: {}", crate::llm::short(&installer_message(&out.stdout, &out.stderr), 300));
     #[cfg(windows)]
     {
-        let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "irm https://pi.dev/install.ps1 | iex"]);
-        let out = run_with_timeout(c, UPDATE_TIMEOUT)?;
+        let ps = |script: &str| {
+            let mut c = std::process::Command::new("powershell");
+            c.env("PATH", installer_path()).args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
+            crate::platform::proc::hide_console(&mut c);
+            c
+        };
+        if !node_ok() {
+            let mut c = ps(NODE_STANDALONE);
+            c.env("GD_NODE_DIR", standalone_node_bin());
+            let out = run_with_timeout(c, UPDATE_TIMEOUT)?;
+            if !out.status.success() {
+                return Err(fail("Node.js 설치에 실패했어요", out));
+            }
+            if !node_ok() {
+                return Err("Node.js 를 설치했지만 쓸 수 없어요. nodejs.org 에서 22.19 이상을 설치한 뒤 다시 눌러 주세요".into());
+            }
+        }
+        let out = run_with_timeout(ps("irm https://pi.dev/install.ps1 | iex"), UPDATE_TIMEOUT)?;
         return if out.status.success() { Ok(()) } else { Err(fail("설치에 실패했어요", out)) };
     }
     #[cfg(not(windows))]
@@ -711,6 +788,14 @@ pub fn build_args(provider: &str, model: &str, extension: &Path, effort: &str, t
 /// A pi command in the private config folder (no key, no session).
 pub fn engine_command(exe: &Path, home: &Path) -> std::process::Command {
     let mut c = crate::install::cli_command(exe);
+    // the Node.js GhostDesk installed for pi wins over an older one on PATH
+    let own = standalone_node_bin();
+    if own.is_dir() {
+        let cur = c.get_envs().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).and_then(|(_, v)| v.map(|v| v.to_os_string())).unwrap_or_default();
+        if let Ok(p) = std::env::join_paths(std::iter::once(own).chain(std::env::split_paths(&cur))) {
+            c.env("PATH", p);
+        }
+    }
     c.env("PI_CODING_AGENT_DIR", home).env("PI_SKIP_VERSION_CHECK", "1").env("PI_TELEMETRY", "0").stdin(Stdio::null());
     c
 }

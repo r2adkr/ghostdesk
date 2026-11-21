@@ -1170,7 +1170,7 @@ fn oem_to_string(b: &[u8]) -> Option<String> {
 /// `#!/usr/bin/env node`, can't find node and fails, so the CLI's own folder (nvm and friends keep
 /// node next to it) and common install locations are prepended.
 #[cfg(not(windows))]
-fn cli_path_env(cli: &Path) -> OsString {
+pub(crate) fn cli_path_env(cli: &Path) -> OsString {
     let b = bases();
     let h = b.home.clone();
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -1203,7 +1203,7 @@ fn cli_path_env(cli: &Path) -> OsString {
 /// started is found, and so it works even when an MCP host launched GhostDesk with a trimmed
 /// environment). Unix fixed folders (/usr/bin, …) mean nothing on Windows.
 #[cfg(windows)]
-fn cli_path_env(cli: &Path) -> OsString {
+pub(crate) fn cli_path_env(cli: &Path) -> OsString {
     let b = bases();
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = cli.parent() {
