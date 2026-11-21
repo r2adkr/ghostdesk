@@ -42,12 +42,18 @@ impl GhostApp {
 
     pub(super) fn welcome(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width().min(800.0);
+        // the page is centered vertically (a touch above the middle, like an optical center) using
+        // its height from the last frame; when it is taller than the pane it starts at the top and scrolls
+        let page_h = ui.available_height();
+        let h_id = egui::Id::unique("home_content_h");
+        let last_h = ui.data(|d| d.get_temp::<f32>(h_id));
         egui::ScrollArea::vertical().id_salt("home").auto_shrink([false, false]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(width);
-                    // with nothing else on the page the composer sits a little above the middle, not under the title bar
-                    ui.add_space(if self.agents.is_empty() { (ui.ctx().content_rect().height() * 0.12).clamp(24.0, 120.0) } else { 24.0 });
+                    let top_space = last_h.map_or(24.0, |h| ((page_h - h) * 0.42).max(24.0));
+                    ui.add_space(top_space);
+                    let content_top = ui.cursor().top();
                     ui.heading(RichText::new(tr("어떤 일을 맡길까요?")).size(28.0).strong());
                     ui.add_space(16.0);
                     let id = egui::Id::unique("welcome_composer");
@@ -165,6 +171,11 @@ impl GhostApp {
                                 self.view = View::Detail;
                             }
                         }
+                    }
+                    let h = ui.cursor().top() - content_top + 24.0;
+                    if last_h.is_none_or(|l| (l - h).abs() > 0.5) {
+                        ui.data_mut(|d| d.insert_temp(h_id, h));
+                        ui.ctx().request_repaint();
                     }
                 });
             });

@@ -784,7 +784,7 @@ pub fn shimmer(ui: &mut egui::Ui, text: &str, size: f32) -> Response {
         job.append(ch.encode_utf8(&mut buf), 0.0, fmt);
     }
     ui.ctx().request_repaint_after(TICK);
-    ui.add(egui::Label::new(job).selectable(false))
+    ui.add(egui::Label::new(job).selectable(false).truncate())
 }
 
 /// Thin progress bar (0..=1). Changes animate smoothly.

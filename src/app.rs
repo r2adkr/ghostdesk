@@ -805,12 +805,25 @@ impl eframe::App for GhostApp {
         let mut toggle_sidebar = false;
         if titlebar::visible(&ctx) {
             let cols = if self.view == View::Wall { titlebar::Columns::default() } else { self.title_cols };
+            // the detail view has no heading of its own: name the agent and the page/window it is on up
+            // here (Claude/Codex style)
+            let title = match (self.view, self.selected) {
+                (View::Detail, Some(i)) if i < self.agents.len() => {
+                    let a = &self.agents[i].shared;
+                    let page = a.workspace().and_then(|w| {
+                        let (views, active) = w.views();
+                        views.into_iter().find(|t| Some(&t.id) == active.as_ref()).map(|t| t.title).filter(|t| !t.is_empty())
+                    });
+                    (a.name.clone(), page.unwrap_or_default())
+                }
+                _ => Default::default(),
+            };
             egui::Panel::top("titlebar")
                 .exact_size(titlebar::HEIGHT)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::NONE)
-                .show(ui, |ui| toggle_sidebar |= titlebar::bar(ui, cols, self.sidebar_open));
+                .show(ui, |ui| toggle_sidebar |= titlebar::bar(ui, cols, self.sidebar_open, (&title.0, &title.1)));
         }
         if toggle_sidebar {
             self.sidebar_open = !self.sidebar_open;

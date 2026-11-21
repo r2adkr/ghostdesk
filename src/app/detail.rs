@@ -403,6 +403,8 @@ impl GhostApp {
         let size = Vec2::new(sw as f32 * scale, sh as f32 * scale);
         let sense = if a.takeover { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
         let pad = ((avail.x - size.x) / 2.0).max(0.0);
+        // centered both ways: a wide screen in a tall pane sits in the middle, not at the top
+        ui.add_space(((avail.y - size.y) / 2.0).max(0.0));
         let resp = ui
             .horizontal(|ui| {
                 ui.add_space(pad);

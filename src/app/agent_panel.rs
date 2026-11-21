@@ -95,7 +95,7 @@ impl GhostApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP_M;
             let controls = (is_working(&st) || paused) && !a.takeover;
-            let controls_w = if controls { 72.0 } else { 0.0 };
+            let controls_w = if controls { 96.0 } else { 0.0 };
             ui.allocate_ui_with_layout(Vec2::new((ui.available_width() - controls_w).max(60.0), 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if working {
                     theme::spinner(ui, 14.0, theme::text());

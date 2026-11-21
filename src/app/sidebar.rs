@@ -94,7 +94,10 @@ impl GhostApp {
             {
                 self.open_settings(settings::SettingsTab::Permissions);
             }
-            ui.add_space(4.0);
+            // a footer of its own, set apart from the scrolling list (as in Claude and Codex)
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
             // Right below the menu: agent list and notices. Notices go in this top-down layout
             // because in the bottom-up one the card border would stretch to fill the remaining height.
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {

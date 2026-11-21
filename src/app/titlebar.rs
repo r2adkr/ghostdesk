@@ -43,8 +43,9 @@ pub struct Columns {
 }
 
 /// Draws the title bar. Call inside `Panel::top`. Returns true when the sidebar button was clicked
-/// (`sidebar_open` only picks its tooltip).
-pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool) -> bool {
+/// (`sidebar_open` only picks its tooltip). `title` names what the center column shows, with a quieter
+/// detail after it (empty: none).
+pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool, title: (&str, &str)) -> bool {
     let mut toggled = false;
     let ctx = ui.ctx().clone();
     let rect = ui.max_rect();
@@ -114,6 +115,23 @@ pub fn bar(ui: &mut egui::Ui, cols: Columns, sidebar_open: bool) -> bool {
         let tip = format!("{} ({})", if sidebar_open { tr("사이드바 접기") } else { tr("사이드바 열기") }, super::palette::cmd_key("B"));
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip.clone()));
         toggled = resp.on_hover_text(tip).clicked();
+    }
+
+    // current view's title over the center column, aligned with its content (or after the sidebar
+    // button when the sidebar is closed), cut short before the right panel / window buttons
+    if !title.0.is_empty() {
+        let x = (rect.left() + cols.left + 16.0).max(name_right + 56.0);
+        let end = rect.right() - cols.right.max(if mac { 0.0 } else { BUTTON_W * 3.0 }) - 16.0;
+        if end - x > 40.0 {
+            let font = FontId::proportional(13.0);
+            let mut job = egui::text::LayoutJob::simple_singleline(title.0.to_owned(), font.clone(), fg);
+            if !title.1.is_empty() {
+                job.append(&format!("   {}", title.1), 0.0, egui::TextFormat::simple(font, theme::muted()));
+            }
+            job.wrap = egui::text::TextWrapping::truncate_at_width(end - x);
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            p.galley(pos2(x, cy - g.size().y / 2.0), g, fg);
+        }
     }
 
     // macOS draws the window buttons natively
