@@ -99,6 +99,9 @@ struct State {
     next_dialog_id: u64,
     /// "session/frame" of every frame that is loading right now (Page.frameStartedLoading … frameStoppedLoading).
     loading: HashSet<String>,
+    /// Main frame of each session (Page.frameNavigated without a parent); a page's main frame is its target id
+    /// until then.
+    main_frames: HashMap<String, String>,
     /// Counts navigations (a frame starting to load, or the address changing within the page), so a caller can
     /// tell whether one began after a given moment.
     nav_seq: u64,
@@ -552,6 +555,13 @@ impl BrowserWorkspace {
                     let mut st = self.state.lock();
                     st.loading.insert(format!("{session}/{frame}"));
                     st.nav_seq += 1;
+                }
+            }
+            "Page.frameNavigated" => {
+                if let (Some(session), Some(frame)) = (ev.session_id.as_deref(), ev.params["frame"]["id"].as_str()) {
+                    if ev.params["frame"]["parentId"].is_null() {
+                        self.state.lock().main_frames.insert(session.to_string(), frame.to_string());
+                    }
                 }
             }
             "Page.frameStoppedLoading" | "Page.frameDetached" => {
@@ -1253,18 +1263,32 @@ impl BrowserWorkspace {
         self.state.lock().nav_seq
     }
 
-    /// Whether the active tab has a frame that is still loading.
+    /// Whether the page of the active tab (its main frame; a slow ad frame doesn't count) is still loading.
     fn is_loading(&self) -> bool {
         let st = self.state.lock();
-        let Some(prefix) = st.active.as_ref().and_then(|a| st.sessions.get(a)).map(|s| format!("{s}/")) else { return false };
-        st.loading.iter().any(|k| k.starts_with(&prefix))
+        let Some(target) = st.active.as_ref() else { return false };
+        let Some(session) = st.sessions.get(target) else { return false };
+        let frame = st.main_frames.get(session).unwrap_or(target);
+        st.loading.contains(&format!("{session}/{frame}"))
     }
 
-    /// Waits while the active tab is loading a page (at most `max`); returns at once when it is not.
+    /// Whether a page is still on its way: loading, and what is on screen is the page it replaces or a new one
+    /// that has not been parsed yet (a new document that is readable is good enough, however long its images take).
+    async fn page_arriving(&self) -> bool {
+        if !self.is_loading() {
+            return false;
+        }
+        match self.eval("document.readyState + (window.__gd ? ':old' : ':new')").await {
+            Ok(Value::String(s)) => !(s.ends_with(":new") && !s.starts_with("loading")),
+            _ => true,
+        }
+    }
+
+    /// Waits while a page is arriving in the active tab (at most `max`); returns at once when none is.
     pub async fn wait_not_loading(&self, max: Duration) {
         let start = Instant::now();
-        while self.is_loading() && start.elapsed() < max {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        while start.elapsed() < max && self.page_arriving().await {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1275,7 +1299,7 @@ impl BrowserWorkspace {
         let start = Instant::now();
         let mut started = false;
         loop {
-            let (seq, loading) = (self.nav_mark(), self.is_loading());
+            let (seq, loading) = (self.nav_mark(), self.page_arriving().await);
             started |= seq > since;
             if started && !loading {
                 break;
@@ -2352,8 +2376,8 @@ mod element_tests {
                         format!("<title>Results</title><h1>Results page</h1><p>{path}</p><a href='/'>Back home</a>")
                     } else {
                         "<title>Home</title><a href='/x'>Home link</a>\
-                         <form action='/search'><input name=q placeholder='Search Wikipedia' \
-                           oninput='if(!window.swapped){window.swapped=1;const n=this.cloneNode();n.value=this.value;n.oninput=null;n.setAttribute(\"role\",\"combobox\");n.placeholder=\"Search\";this.replaceWith(n)}'>\
+                         <form action='/search'><input id=searchInput name=q placeholder='Search Wikipedia' \
+                           oninput='if(!window.swapped){window.swapped=1;const n=this.cloneNode();n.value=this.value;n.oninput=null;n.setAttribute(\"role\",\"combobox\");n.placeholder=\"Search\";n.removeAttribute(\"id\");this.replaceWith(n)}'>\
                          <button>Go</button></form><input name=other placeholder=Other>"
                             .to_string()
                     };
@@ -2397,7 +2421,7 @@ mod element_tests {
         assert_eq!(number_of(&again, "Search"), search, "{again}");
         assert_eq!(number_of(&again, "Other"), other, "{again}");
         // a number just read stays good when the page swaps the box once more behind the read
-        ws.eval("(()=>{const o=document.querySelector('[name=q]');const n=o.cloneNode();n.value=o.value;n.placeholder='Search again';o.replaceWith(n)})()").await.unwrap();
+        ws.eval("(()=>{const o=document.querySelector('[name=q]');const n=o.cloneNode();n.value=o.value;n.placeholder='Search again';n.removeAttribute('role');o.replaceWith(n)})()").await.unwrap();
         run(json!({"action":"fill", "ref": search, "value": "한글 검색"})).await.unwrap();
         assert_eq!(ws.eval("document.querySelector('[name=q]').value").await.unwrap(), "한글 검색");
 
@@ -2422,6 +2446,38 @@ mod element_tests {
         assert!(back.contains("페이지가 바뀌었어요") && back.contains("Home"), "{back}");
 
         assert!(run(json!({"action":"click", "ref": 1, "wait_nav": "soon"})).await.is_err());
+        ws.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live check against Wikipedia (network; run by hand: cargo test wikipedia_live -- --ignored --nocapture).
+    #[tokio::test]
+    #[ignore]
+    async fn wikipedia_live() {
+        let Some(exe) = chrome() else { return };
+        let dir = std::env::temp_dir().join(format!("ghostdesk-wiki-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = BrowserWorkspace::launch(
+            LaunchOptions { exe, user_data_dir: dir.clone(), profile_dir: None, width: std::env::var("W").ok().and_then(|w| w.parse().ok()).unwrap_or(1000), height: 700, headless: true, start_url: "https://ko.wikipedia.org/".into() },
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        let desk = crate::desk::Desk::Browser(ws.clone());
+        let run = |v: Value| { let desk = desk.clone(); async move { crate::agent::exec_desk_tool(&desk, "browser_control", &v).await } };
+        run(json!({"action":"wait_for", "text": "위키백과"})).await.unwrap();
+        for (round, gap) in [0u64, 100, 300, 600, 1000, 2500].into_iter().enumerate() {
+            run(json!({"action":"navigate", "url": "https://ko.wikipedia.org/"})).await.unwrap();
+            let read = run(json!({"action":"read"})).await.unwrap().text;
+            let n = number_of(&read, "위키백과 검색");
+            let f = run(json!({"action":"fill", "ref": n, "value": "한글"})).await.map(|o| o.text);
+            let read = run(json!({"action":"read"})).await.unwrap().text;
+            let n2 = number_of(&read, "위키백과 검색");
+            tokio::time::sleep(Duration::from_millis(gap)).await;
+            let r = run(json!({"action":"fill", "ref": n2, "value": "한글 문자", "submit": true})).await.map(|o| o.text.lines().last().unwrap_or("").chars().take(60).collect::<String>());
+            eprintln!("round {round} gap {gap}: n={n} n2={n2} first={:?} submit={r:?}", f.as_ref().map(|x| x.chars().take(40).collect::<String>()));
+            assert!(f.is_ok() && r.is_ok() && n == n2, "round {round}");
+        }
         ws.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

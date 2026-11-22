@@ -90,13 +90,21 @@ const HELPERS: &str = r#"
   gd.sig = (el) => [el.tagName, el.type || '', el.getAttribute('role') || '', el.name || '', el.id || '', gd.label(el)].join('\u0001');
   // the looser form: without label and role, which live widgets rewrite while they are used
   gd.loose = (el) => [el.tagName, el.type || '', el.name || '', el.id || ''].join('\u0001');
+  // for form fields only, which a page re-draws freely (Wikipedia's search box loses its id and gains a role):
+  // what kind of field, and where it sat
+  gd.coarse = (el) => [el.tagName, el.type || '', el.name || ''].join('\u0001');
+  gd.kind = (el) => [el.tagName, el.type || ''].join('\u0001');
+  gd.isField = (el) => /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable;
+  gd.center = (el) => { const r = el.getBoundingClientRect(); return [r.left + scrollX + r.width / 2, r.top + scrollY + r.height / 2]; };
+  // [key of the reg entry, key of an element, fields only within this many px of where it sat (0 = anywhere)]
+  gd.tiers = [['sig', gd.sig, 0], ['loose', gd.loose, 0], ['coarse', gd.coarse, 120], ['kind', gd.kind, 80]];
   gd.reg = {};
   gd.refs = new WeakMap();
   gd.next = 1;
   gd.live = (ref) => { const r = gd.reg[ref]; const n = r && r.node.deref(); return n && n.isConnected ? n : null; };
   gd.bind = (el, ref) => {
     const r = el.getBoundingClientRect();
-    gd.reg[ref] = { sig: gd.sig(el), loose: gd.loose(el), x: r.left + scrollX + r.width / 2, y: r.top + scrollY + r.height / 2, node: new WeakRef(el) };
+    gd.reg[ref] = { sig: gd.sig(el), loose: gd.loose(el), coarse: gd.coarse(el), kind: gd.kind(el), x: r.left + scrollX + r.width / 2, y: r.top + scrollY + r.height / 2, node: new WeakRef(el) };
     gd.refs.set(el, ref);
     el.setAttribute('data-gdref', String(ref));
   };
@@ -108,12 +116,14 @@ const HELPERS: &str = r#"
     // element and exactly one gone one fit (never a guess between several)
     const gone = Object.keys(gd.reg).map(Number).filter((r) => !claimed.has(r) && !gd.live(r));
     if (gone.length) {
-      const keys = { sig: els.map((e, i) => (out[i] ? null : gd.sig(e))), loose: els.map((e, i) => (out[i] ? null : gd.loose(e))) };
-      for (const k of ['sig', 'loose']) {
+      const at = els.map((e, i) => (out[i] ? null : gd.center(e)));
+      for (const [k, key, within] of gd.tiers) {
+        const keys = els.map((e, i) => (out[i] || (within && !gd.isField(e)) ? null : key(e)));
         els.forEach((e, i) => {
-          if (out[i]) return;
-          const same = els.filter((_, j) => !out[j] && keys[k][j] === keys[k][i]).length;
-          const olds = gone.filter((r) => !claimed.has(r) && gd.reg[r][k] === keys[k][i]);
+          if (out[i] || keys[i] === null) return;
+          const mine = keys[i];
+          const olds = gone.filter((r) => !claimed.has(r) && gd.reg[r][k] === mine && (!within || Math.hypot(gd.reg[r].x - at[i][0], gd.reg[r].y - at[i][1]) < within));
+          const same = keys.filter((x, j) => x === mine && !out[j]).length;
           if (same === 1 && olds.length === 1) { out[i] = olds[0]; claimed.add(olds[0]); }
         });
       }
@@ -147,15 +157,13 @@ const HELPERS: &str = r#"
     // the numbered node was replaced: take the control that is the same one (never a guess between several)
     const cands = Array.from(document.querySelectorAll(SEL)).filter((e) => gd.visible(e) && !(gd.refs.has(e) && gd.live(gd.refs.get(e)) === e));
     let el = null;
-    const one = cands.filter((e) => gd.sig(e) === want.sig);
-    if (one.length === 1) el = one[0];
-    if (!el) {
-      const alike = cands.filter((e) => gd.loose(e) === want.loose);
-      if (alike.length === 1) el = alike[0];
-      else if (alike.length > 1) {
+    for (const [k, key, within] of gd.tiers) {
+      const alike = cands.filter((e) => key(e) === want[k] && (!within || (gd.isField(e) && Math.hypot(gd.center(e)[0] - want.x, gd.center(e)[1] - want.y) < within)));
+      if (alike.length === 1) { el = alike[0]; break; }
+      if (alike.length > 1) {
         // several alike: the one that sits where it sat, when that is clear
-        const d = alike.map((e) => { const r = e.getBoundingClientRect(); return [Math.hypot(r.left + scrollX + r.width / 2 - want.x, r.top + scrollY + r.height / 2 - want.y), e]; }).sort((a, b) => a[0] - b[0]);
-        if (d[0][0] < 40 && d[1][0] > d[0][0] + 60) el = d[0][1];
+        const d = alike.map((e) => [Math.hypot(gd.center(e)[0] - want.x, gd.center(e)[1] - want.y), e]).sort((x, y) => x[0] - y[0]);
+        if (d[0][0] < 40 && d[1][0] > d[0][0] + 60) { el = d[0][1]; break; }
       }
     }
     if (!el) return null;
