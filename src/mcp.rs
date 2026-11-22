@@ -183,7 +183,7 @@ fn server_instructions_for(pl: &Plat) -> String {
          If a mode fails or is denied, tell the user briefly and retry with a better-fitting mode (never re-request the same approval). Flow: desk_open → actions → report → desk_close. \
          Save tokens: on the web use desk_browser read → click/fill(ref=n), which is text only; take screenshots only when layout or images matter.{app_cost} \
          Always speak to the user (questions, confirmations, errors, reports) in the language of their latest message, even if this text, tool results or page content are in another language. \
-         Batch steps with actions and use zoom for a region. An unchanged screen isn't re-sent. The user watches live: confirm irreversible steps (sending, paying, deleting) first. \
+         Batch steps with actions; zoom a region. An unchanged screen isn't re-sent. The user watches live: confirm irreversible steps (sending, paying, deleting) first. \
          session (child or separate-account session) is single: one agent at a time. If it is busy, try web/app modes first, else retry later. \
          Teams: when given a team name or told to work with other agents, team(join, role), read the goal/tasks/notes, take tasks with team_task claim → done(result), share findings with team(note); team(read) before and after the work. \
          Before editing files of a shared repo, claim them with team(claim_files, paths) and check it succeeded (avoid or coordinate on paths others hold; reserve both paths when renaming); release_files when done. \
@@ -198,7 +198,7 @@ pub(crate) fn tools() -> Value {
 fn tools_for(pl: &Plat) -> Value {
     let apps = pl.local_apps;
     let child_type_hint = if pl.child_session {
-        " In Windows child sessions, check the field's focus and selection in a screenshot before typing long text in the next call; don't bundle it with focus-changing keys or clicks."
+        " In Windows child sessions, check focus and selection in a screenshot before typing long text; don't bundle it with focus-changing keys or clicks."
     } else { "" };
     let modes = modes(pl);
     let names: Vec<&str> = modes.iter().map(|(n, _)| *n).collect();
@@ -207,7 +207,7 @@ fn tools_for(pl: &Plat) -> Value {
         "Drive app elements. {apps}: action=find(query) | press|click(id|label) | set_value(id|label,text) | focus | select | choose(option) | read | ui_tree(max_depth) | list_windows | switch_window(index) | menus | menu(path:'File > New'). \
          label (the element's name) works without an id; ids come from ui_tree/find and last until the next lookup. \
          Electron apps: menus via action=list|click(source=app|context, path='File > New'); elements inside the window via desk_browser. \
-         Dialogs: dialog lists them; respond_dialog(source, id, native: response=button index, javascript: accept+prompt_text). Confirm irreversible answers are allowed first."
+         Dialogs: dialog lists them; respond_dialog(source, id, native: response=button index, javascript: accept+prompt_text). Confirm irreversible answers first."
     );
     let app_desc = if cfg!(windows) {
         format!("{app_desc} mode=app: launch(app) opens another app on the same screen; move between apps with list_windows/switch_window.")
@@ -216,7 +216,7 @@ fn tools_for(pl: &Plat) -> Value {
         format!("{app_desc} Menus the app draws itself (Qt etc.) open off-screen as a pop-up window that becomes the current view: screenshot it, press items by id, Escape closes it.")
     } else { app_desc };
     let app_desc = if pl.child_session {
-        format!("{app_desc} Windows child sessions support the same actions except menus, plus action=launch(app: name, .exe path or AppUserModelID) which opens any app inside the session (Store apps, console programs, anything desk_open mode=app refuses). Look up again after changing windows or focus; for long text set_value then read to check. Operate app menus by screen or keyboard.")
+        format!("{app_desc} Windows child sessions support the same actions except menus, plus action=launch(app: name, .exe path or AppUserModelID), which opens any app in the session (Store apps, console programs, what mode=app refuses). Look up again after changing windows or focus. Operate menus by screen or keyboard.")
     } else { app_desc };
     let mut t = json!([
         {
@@ -249,7 +249,7 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "desk_action",
-            "description": format!("Pixel actions (computer-use style). action: screenshot | left_click|right_click|middle_click|double_click|triple_click(coordinate) | left_click_drag(start_coordinate→coordinate) | mouse_move | left_mouse_down|left_mouse_up | scroll(scroll_direction, scroll_amount) | type(text) | key(text:'{}+a'|'ctrl+shift+t', repeat) | hold_key(text,duration) | wait(duration) | wait_change(duration: until the screen changes) | fill_at(coordinate, text, submit: replace a field's content) | zoom(region:[x0,y0,x1,y1]) | cursor_position. \
+            "description": format!("Pixel actions. action: screenshot | left_click|right_click|middle_click|double_click|triple_click(coordinate) | left_click_drag(start_coordinate→coordinate) | mouse_move | left_mouse_down|left_mouse_up | scroll(scroll_direction, scroll_amount) | type(text) | key(text:'{}+a'|'ctrl+shift+t', repeat) | hold_key(text,duration) | wait(duration) | wait_change(duration: until the screen changes) | fill_at(coordinate, text, submit: replace a field's content) | zoom(region:[x0,y0,x1,y1]) | cursor_position. \
                  actions=[{{\"action\":\"left_click\",\"coordinate\":[400,300]}},{{\"action\":\"type\",\"text\":\"hello\"}}] runs up to 50 steps in order and returns one screenshot at the end (stops at a failure). Split the bundle where you must look before deciding.{child_type_hint}", pl.primary_mod),
             "inputSchema": {
                 "type": "object",
@@ -277,10 +277,10 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "desk_browser",
-            "description": "Read and drive web pages by element number, without screenshots (far cheaper than images). read returns a numbered list [n]; click/fill/select take ref=n or label=name. A number keeps meaning the same element until the page changes (re-read keeps it). click/fill(submit) wait for the page they open (wait_nav secs, 10; 0=off). \
+            "description": "Read and drive web pages by element number, without screenshots. read returns a numbered list [n]; click/fill/select take ref=n or label=name. A number stays with its element across re-reads. click/fill(submit) wait for the page they open (wait_nav, 10s). \
                  action: read(scope=page) | text(selector, max_chars) | find(query) | links | click | double_click | fill(value, submit) | select(option) | scroll_to | wait_for(text, gone, timeout) | navigate(url) | back | forward | reload | new_tab(url) | switch_tab(index) | close_tab(index) | list_tabs | dialog | respond_dialog. \
-                 No screenshot unless screenshot=true. actions=[{action:'navigate',url},{action:'wait_for',text:'Search'},{action:'read'}] runs a bundle (pixel actions may be mixed in). Also reads/drives elements inside Electron apps. \
-                 Dialogs are never auto-accepted: read the id with dialog, then respond_dialog with explicit accept. If one interrupted typing, don't repeat the input; confirm irreversible answers (delete, pay) are allowed.",
+                 No screenshot unless screenshot=true. actions=[{action:'navigate',url},{action:'wait_for',text:'Search'},{action:'read'}] runs a bundle (pixel actions may be mixed in). \
+                 Dialogs are never auto-accepted: read the id with dialog, then respond_dialog with explicit accept. If one interrupted typing, don't repeat the input. Confirm irreversible answers first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -307,7 +307,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "text": { "type": "string", "description": "wait_for: text to wait for" },
                     "gone": { "type": "boolean", "description": "wait_for: wait until it is gone" },
                     "timeout": { "type": "number", "description": "wait_for: max seconds (10)" },
-                    "wait_nav": { "type": "number", "description": "click/fill: max seconds to wait for the page it opens (10; 0=don't)" },
+                    "wait_nav": { "type": "number", "description": "click/fill: seconds to wait for the page it opens (10; 0=off)" },
                     "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: id from dialog" },
                     "accept": { "type": "boolean", "description": "respond_dialog: true=accept, false=cancel (required)" },
                     "prompt_text": { "type": "string", "description": "respond_dialog: prompt answer" },
