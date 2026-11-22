@@ -323,13 +323,27 @@ pub(crate) async fn exec_computer(
                 b.hash(&mut h);
                 h.finish()
             };
-            let before = digest(&ws.screenshot().await?);
+            // A window that is still loading can answer a screenshot slowly or not at all. The wait must not run
+            // past what the agent asked for (its client gives up on a call that takes too long and drops the
+            // connection), so every look is cut off at the deadline and the wait ends with a plain answer.
+            let deadline = started + limit;
+            let look = |left: Duration| async move { tokio::time::timeout(left.max(Duration::from_millis(500)), ws.screenshot()).await };
+            let Ok(first) = look(limit).await else {
+                return ok("화면을 읽지 못했어요 (프로그램이 아직 응답하지 않는 것 같아요). 잠시 뒤 다시 확인해 보세요");
+            };
+            let before = digest(&first?);
             loop {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                if digest(&ws.screenshot().await?) != before {
-                    // let an animation settle before the agent looks
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    return ok(format!("화면이 바뀌었어요 ({:.1}초)", started.elapsed().as_secs_f64()));
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match look(left).await {
+                    Ok(shot) => {
+                        if digest(&shot?) != before {
+                            // let an animation settle before the agent looks
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            return ok(format!("화면이 바뀌었어요 ({:.1}초)", started.elapsed().as_secs_f64()));
+                        }
+                    }
+                    Err(_) => return ok(format!("{:.0}초 동안 화면이 바뀌지 않았어요 (마지막 몇 초는 프로그램이 화면 읽기에 응답하지 않았어요)", limit.as_secs_f64())),
                 }
                 if started.elapsed() >= limit {
                     return ok(format!("{:.0}초 동안 화면이 바뀌지 않았어요", limit.as_secs_f64()));

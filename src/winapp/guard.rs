@@ -36,6 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 use super::w32::{self, Handle, Hwnd};
 use crate::native::NativeMode;
 use crate::platform::win::{self as pw, TopWindow};
+use crate::popup;
 
 const SCAN_EVERY: Duration = Duration::from_millis(8);
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
@@ -47,8 +48,8 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const QS_ALLINPUT: u32 = 0x04FF;
 const PM_REMOVE: u32 = 0x0001;
 
-/// Helper window classes left out of app window lists and exposure checks (IME, tooltips,
-/// drop-down lists, menus, shadows).
+/// Helper window classes left out of app window lists (IME, tooltips, drop-down lists, menus,
+/// shadows). The exposure check in `visit` still moves them off the user's screen.
 pub fn is_helper_class(class: &str) -> bool {
     matches!(
         class,
@@ -60,6 +61,31 @@ pub fn is_helper_class(class: &str) -> bool {
     ) || class.starts_with("MSCTFIME")
         || class.starts_with("GDI+ Hook Window")
         || class.starts_with(".NET-BroadcastEventWindow")
+}
+
+/// What pop-up detection needs to know about a window (style bits and owner come from the window
+/// itself; they read as 0 when the window is already gone, which classifies as an ordinary
+/// window).
+pub fn popup_probe(w: &TopWindow) -> popup::Probe {
+    let (l, t, r, b) = w.rect;
+    popup::Probe {
+        class: w.class.clone(),
+        title_empty: w.title.is_empty(),
+        w: r - l,
+        h: b - t,
+        style: w32::style(w.hwnd),
+        ex_style: w32::ex_style(w.hwnd),
+        owned: w32::owner(w.hwnd) != 0,
+        // helper, shell and Chromium host windows can look like owned frameless tool windows
+        helper: is_helper_class(&w.class)
+            || is_shell_class(&w.class)
+            || (w.class == "Chrome_WidgetWin_0" && w.title.is_empty()),
+    }
+}
+
+/// Which kind of pop-up (or helper) window this is; `Kind::None` for ordinary windows.
+pub fn popup_kind(w: &TopWindow) -> popup::Kind {
+    popup::classify(&popup_probe(w))
 }
 
 /// Window classes of the Windows shell (taskbar, secondary taskbars, desktop).
@@ -527,7 +553,13 @@ impl Loop {
             let unowned = w32::owner(h) == 0;
             let wants = (unowned || ex & w32::WS_EX_APPWINDOW != 0) && (w.visible || reveal_cand);
             if wants && (ex & w32::WS_EX_TOOLWINDOW == 0 || ex & w32::WS_EX_APPWINDOW != 0) {
-                self.start_restyle(h, ex, w.visible);
+                // a menu or pop-up panel the toolkit manages itself must not be hidden and shown again
+                // (Qt and Chromium close a pop-up that loses its visibility)
+                if popup_kind(w).is_transient() {
+                    self.restyle_done.lock().insert(h);
+                } else {
+                    self.start_restyle(h, ex, w.visible);
+                }
             } else if wants {
                 self.restyle_done.lock().insert(h);
             }

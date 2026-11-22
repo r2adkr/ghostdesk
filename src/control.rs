@@ -283,6 +283,10 @@ pub struct ControlServer {
     ctx: egui::Context,
     next_id: AtomicU64,
     next_conn: AtomicU64,
+    /// Connections whose peer has gone away (the agent's MCP process restarted or gave up on a slow call) but
+    /// whose last request is still running. Their screens go to the next connection that uses them instead
+    /// of showing up as "another agent's".
+    gone: Mutex<HashSet<u64>>,
     /// Tag that changes with every GUI run (so a desk_id from before a restart doesn't point at a new
     /// screen).
     instance: String,
@@ -300,6 +304,7 @@ impl ControlServer {
             ctx,
             next_id: AtomicU64::new(101),
             next_conn: AtomicU64::new(1),
+            gone: Mutex::new(HashSet::new()),
             instance: instance_tag(),
             // tests never read or write the user's saved teams
             teams: Arc::new(if cfg!(test) { crate::team::TeamStore::in_memory() } else { crate::team::TeamStore::load() }),
@@ -347,6 +352,7 @@ impl ControlServer {
         // being handled, ending any approval or pause wait
         let (closed_tx, closed_rx) = watch::channel(false);
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+        let me = self.clone();
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(rd).lines();
             while let Ok(Some(l)) = lines.next_line().await {
@@ -354,6 +360,8 @@ impl ControlServer {
                     break;
                 }
             }
+            // before anyone can see `closed`: a screen of this connection may be taken over from now on
+            me.gone.lock().insert(conn_id);
             closed_tx.send_replace(true);
         });
         let conn = Conn { id: conn_id, closed: closed_rx };
@@ -382,7 +390,23 @@ impl ControlServer {
         self.teams.leave_all(conn_id);
         self.ctx.request_repaint();
         self.close_conn_desks(conn_id).await;
+        self.gone.lock().remove(&conn_id);
         Ok(())
+    }
+
+    /// May `conn` use this screen? Its own and shared ones, and one whose creating connection is gone: that is
+    /// the same agent coming back on a new connection (a timed-out call makes the client restart its MCP
+    /// process), so the screen is handed over rather than left stranded until the old request ends.
+    fn claim(&self, e: &mut DeskEntry, conn: &Conn) -> bool {
+        if e.conn == conn.id || e.shared_access {
+            return true;
+        }
+        if !self.gone.lock().contains(&e.conn) {
+            return false;
+        }
+        e.shared.log(LogKind::Info, "끊긴 연결의 화면을 다시 연결된 외부 에이전트가 이어받았습니다".to_string());
+        e.conn = conn.id;
+        true
     }
 
     async fn dispatch(&self, method: &str, p: &Value, conn: &Conn) -> Result<Value> {
@@ -466,9 +490,9 @@ impl ControlServer {
         let id = p["desk_id"].as_str().ok_or_else(|| anyhow!("desk_id 가 필요합니다"))?.to_string();
         self.prune_removed();
         let shared = {
-            let desks = self.desks.lock();
-            let e = desks.get(&id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다 (desk_list 로 확인)"))?;
-            if e.conn != conn.id && !e.shared_access {
+            let mut desks = self.desks.lock();
+            let e = desks.get_mut(&id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다 (desk_list 로 확인)"))?;
+            if !self.claim(e, conn) {
                 bail!("화면 {id} 는 다른 에이전트(연결)가 연 화면이라 조작할 수 없습니다. desk_open 으로 새 화면을 여세요");
             }
             e.shared.clone()
@@ -501,6 +525,8 @@ impl ControlServer {
             let Some(d) = s.workspace() else { continue };
             let (w, h) = d.size();
             let mine = e.conn == conn.id;
+            // the creating connection is gone: this one may take the screen over by using it
+            let orphan = !mine && self.gone.lock().contains(&e.conn);
             out.push(json!({
                 "desk_id": id,
                 "name": s.name,
@@ -509,7 +535,7 @@ impl ControlServer {
                 "closed": d.is_closed(),
                 "mine": mine,
                 "shared": e.shared_access,
-                "controllable": mine || e.shared_access,
+                "controllable": mine || e.shared_access || orphan,
                 "views": d.views_text(),
             }));
         }
@@ -1341,7 +1367,7 @@ impl ControlServer {
     /// An MCP connection says it left a repeated screenshot out (see mcp.rs `trim_repeats`).
     fn usage_note(&self, p: &Value, conn: &Conn) -> Result<Value> {
         let id = p["desk_id"].as_str().unwrap_or_default();
-        let client = self.desks.lock().get(id).filter(|e| e.conn == conn.id || e.shared_access).and_then(|e| e.shared.external.lock().clone());
+        let client = self.desks.lock().get_mut(id).and_then(|e| if self.claim(e, conn) { e.shared.external.lock().clone() } else { None });
         if let Some(client) = client {
             crate::usage::global().shot(&client, false);
         }
@@ -1358,9 +1384,9 @@ impl ControlServer {
     async fn upgrade(&self, p: &Value, conn: &Conn) -> Result<Value> {
         let id = p["upgrade_desk"].as_str().expect("checked by dispatch").to_string();
         let old = {
-            let desks = self.desks.lock();
-            let e = desks.get(&id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다"))?;
-            if e.conn != conn.id && !e.shared_access {
+            let mut desks = self.desks.lock();
+            let e = desks.get_mut(&id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다"))?;
+            if !self.claim(e, conn) {
                 bail!("화면 {id} 는 다른 에이전트(연결)가 연 화면이라 바꿀 수 없습니다");
             }
             (e.params.clone(), e.shared.workspace_name.clone())
@@ -1432,8 +1458,8 @@ impl ControlServer {
         let id = p["desk_id"].as_str().ok_or_else(|| anyhow!("desk_id 가 필요합니다"))?;
         let e = {
             let mut desks = self.desks.lock();
-            let e = desks.get(id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다"))?;
-            if e.conn != conn.id && !e.shared_access {
+            let e = desks.get_mut(id).ok_or_else(|| anyhow!("화면 {id} 를 찾을 수 없습니다"))?;
+            if !self.claim(e, conn) {
                 bail!("화면 {id} 는 다른 에이전트(연결)가 연 화면이라 닫을 수 없습니다");
             }
             desks.remove(id).expect("방금 확인한 항목")
@@ -2081,7 +2107,7 @@ fn kind_name(k: DeskKind) -> &'static str {
 }
 
 /// How to use Windows regular app screens (off-screen window + UI Automation).
-const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 창입니다 (사용자에게는 보이지 않습니다). 좌표는 스크린샷 픽셀입니다. 정확한 조작은 desk_app {action:ui_tree} 후 press/set_value/focus/menu 를 쓰세요. 단축키는 ctrl 기준입니다 (cmd 는 ctrl 로 바뀝니다). 시스템 클립보드는 사용자와 같은 것을 씁니다: 앱이 자기 기능(복사 버튼 등)으로 클립보드를 바꾸면 GhostDesk 가 사용자의 원래 내용으로 곧바로 되돌리므로 그 내용에 기대지 마세요. 입력칸의 ctrl+c/x/v 는 내부 클립보드로 처리되어 그대로 쓸 수 있습니다.";
+const NATIVE_GUIDE_WINDOWS: &str = "사용자 화면 밖에 띄운 Windows 앱 창입니다 (사용자에게는 보이지 않습니다). 좌표는 스크린샷 픽셀입니다. 정확한 조작은 desk_app {action:ui_tree} 후 press/set_value/focus/menu 를 쓰세요. 앱이 직접 그리는 메뉴(Qt 등)는 막대 이름을 클릭하면 팝업 창으로 전환되어 스크린샷·ui_tree 로 항목을 고를 수 있고, Escape 로 닫습니다. 단축키는 ctrl 기준입니다 (cmd 는 ctrl 로 바뀝니다). 시스템 클립보드는 사용자와 같은 것을 씁니다: 앱이 자기 기능(복사 버튼 등)으로 클립보드를 바꾸면 GhostDesk 가 사용자의 원래 내용으로 곧바로 되돌리므로 그 내용에 기대지 마세요. 입력칸의 ctrl+c/x/v 는 내부 클립보드로 처리되어 그대로 쓸 수 있습니다.";
 
 /// Per-screen usage notes for external agents.
 pub fn guide(k: DeskKind) -> &'static str {
@@ -2793,6 +2819,32 @@ mod tests {
         srv.close_conn_desks(a.id).await;
         assert!(srv.desks.lock().is_empty());
         assert!(srv.reserved.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn desk_of_a_dropped_connection_goes_to_the_agent_that_comes_back() {
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let srv = ControlServer::new(ev_tx, egui::Context::default());
+        let (_t1, old) = conn(1);
+        let (_t2, back) = conn(2);
+        let (_t3, other) = conn(3);
+        let sh = AgentShared::new(1, "d-1".into(), "mcp_d-1".into(), srv.ctx.clone());
+        srv.reserved.lock().insert(reservation_key("mcp_d-1"));
+        srv.desks.lock().insert(
+            "d-1".into(),
+            DeskEntry { shared: sh, conn: old.id, shared_access: false, reservation: reservation_key("mcp_d-1"), named: false, params: json!({}) },
+        );
+        // while the first connection is alive nobody else gets in
+        assert!(srv.get(&json!({ "desk_id": "d-1" }), &back).err().unwrap().to_string().contains("다른 에이전트"));
+        // its peer goes away while the last request is still running (the client gave up and restarted)
+        srv.gone.lock().insert(old.id);
+        // the first one that uses it takes it; the next newcomer is a stranger again
+        let _ = srv.get(&json!({ "desk_id": "d-1" }), &back);
+        assert_eq!(srv.desks.lock()["d-1"].conn, back.id);
+        assert!(srv.get(&json!({ "desk_id": "d-1" }), &other).err().unwrap().to_string().contains("다른 에이전트"));
+        // the old connection finishing its request no longer closes what moved on
+        srv.close_conn_desks(old.id).await;
+        assert!(srv.desks.lock().contains_key("d-1"));
     }
 
     #[test]

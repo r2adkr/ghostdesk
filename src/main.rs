@@ -30,6 +30,7 @@ mod electron;
 mod macos;
 mod native;
 mod platform;
+mod popup;
 #[cfg(windows)]
 mod winapp;
 // macOS: dedicated account session; Windows: child session (PiP). Same helper RPC.

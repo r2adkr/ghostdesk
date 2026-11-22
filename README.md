@@ -460,7 +460,7 @@ macOS.
 |---|---|---|---|
 | Website | Headless browser cloned from a Chrome, Edge (incl. Beta/Dev/Canary), Brave, Whale, Vivaldi or Chromium profile; input only through CDP | Optionally clones your logins. Quit the source browser first: while it runs the cookie file is locked and the clone fails, naming the process that holds it | None |
 | Electron apps (VS Code, Cursor, …) | A separate instance placed off-screen, without a taskbar button or focus; input only through CDP. In-app drag and drop stays inside the page. Console windows the app opens are hidden, and it is killed as soon as any window shows up on screen | Optionally clones app data (quit the app first) | None |
-| Other Win32 apps (KakaoTalk, Character Map, …) | Window kept off-screen and captured with PrintWindow. Clicks and keys are sent as messages to that window only, elements are driven through UI Automation, and Ctrl shortcuts run as menu accelerators. Newly launched apps are kept off the system clipboard with a Job object | Same app. Using your running app requires consent (it is moved off-screen while in use and restored afterwards) | None |
+| Other Win32 apps (KakaoTalk, Character Map, …) | Window kept off-screen and captured with PrintWindow. Clicks and keys are sent as messages to that window only, elements are driven through UI Automation, and Ctrl shortcuts run as menu accelerators. Pop-up menus the app draws itself (Qt, Chromium) become the current window. Newly launched apps are kept off the system clipboard with a Job object | Same app. Using your running app requires consent (it is moved off-screen while in use and restored afterwards) | None |
 | Remote computer | VNC (RFB), for a dedicated PC or VM | That computer's | None. A VNC server on this PC requires the "dedicated machine" confirmation, and external requests show a warning in the approval dialog |
 
 - **Child session (PiP):** drives a whole separate Windows session on the same
@@ -511,9 +511,9 @@ macOS.
   the new Notepad, Calculator and Paint on Windows 11), console programs, apps
   that need elevation, system tools such as Explorer, Control Panel and Task
   Manager, right-click, opening combo boxes or date pickers (including F4; use
-  `app_control`'s choose), dragging anywhere other than scroll bars and
-  sliders, Ctrl shortcuts without a menu accelerator, and menus or shortcuts on
-  a window behind a modal dialog. Copy and paste go through GhostDesk's
+  `app_control`'s choose), hover-only submenus, dragging anywhere other than
+  scroll bars and sliders, Ctrl shortcuts without a menu accelerator, and menus
+  or shortcuts on a window behind a modal dialog. Copy and paste go through GhostDesk's
   internal clipboard and never touch the system clipboard.
 - A window used through **Attach to my running app** (requires consent) is
   restored to its original position and state afterwards, including snap

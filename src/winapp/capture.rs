@@ -48,7 +48,7 @@ pub fn crop_bgra(buf: &[u8], stride_px: usize, x: usize, y: usize, w: usize, h: 
 }
 
 /// Renders the whole window with PrintWindow into a BGRA buffer: `(buffer, width, height)`.
-fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
+fn print_window_bgra(h: Hwnd, flags: u32) -> Result<(Vec<u8>, usize, usize)> {
     let (l, t, r, b) = w32::window_rect(h);
     let (ww, wh) = ((r - l).max(0) as usize, (b - t).max(0) as usize);
     if ww == 0 || wh == 0 || ww > 16384 || wh > 16384 {
@@ -74,7 +74,7 @@ fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
             bail!("캡처용 비트맵을 만들지 못했습니다");
         }
         let old = SelectObject(mem, dib as _);
-        let ok = w32::print_window(h, mem as _, PW_RENDERFULLCONTENT);
+        let ok = w32::print_window(h, mem as _, flags);
         GdiFlush();
         let buf = std::slice::from_raw_parts(bits as *const u8, ww * wh * 4).to_vec();
         SelectObject(mem, old);
@@ -89,6 +89,12 @@ fn print_window_bgra(h: Hwnd) -> Result<(Vec<u8>, usize, usize)> {
 
 /// Captures the window's client area (long edge ≤ `max_long_edge`, 0 = original pixels).
 pub fn capture_client(h: Hwnd, max_long_edge: u32) -> Result<Shot> {
+    capture_client_with(h, max_long_edge, PW_RENDERFULLCONTENT)
+}
+
+/// Like [`capture_client`] with explicit PrintWindow flags (0 = plain WM_PRINT-style rendering,
+/// which some pop-ups draw when PW_RENDERFULLCONTENT gives a blank image).
+pub fn capture_client_with(h: Hwnd, max_long_edge: u32, flags: u32) -> Result<Shot> {
     if !w32::is_window(h) {
         bail!("창이 닫혔습니다");
     }
@@ -102,7 +108,7 @@ pub fn capture_client(h: Hwnd, max_long_edge: u32) -> Result<Shot> {
     if cw <= 0 || ch <= 0 {
         bail!("창의 내용 영역이 비어 있습니다");
     }
-    let (buf, ww, wh) = print_window_bgra(h)?;
+    let (buf, ww, wh) = print_window_bgra(h, flags)?;
     let (l, t, _, _) = w32::window_rect(h);
     let (ox, oy) = w32::client_origin(h);
     let x = (ox - l).clamp(0, ww as i32) as usize;

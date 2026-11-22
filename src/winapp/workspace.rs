@@ -30,6 +30,7 @@ use crate::browser::{FrameSink, MouseButton};
 use crate::desk::ViewInfo;
 use crate::native::{NativeHost, NativeMode, NativeOptions};
 use crate::platform::win as pw;
+use crate::popup::{self, Cause};
 
 #[derive(Clone, Debug)]
 struct WinEntry {
@@ -41,6 +42,8 @@ struct WinEntry {
     enabled: bool,
     /// The app the window belongs to (several can share the screen).
     app: String,
+    /// Menu or pop-up panel (`Kind::None` for ordinary windows).
+    kind: popup::Kind,
 }
 
 struct Down {
@@ -73,6 +76,29 @@ struct State {
     more_apps: usize,
     /// The last window told it is the active one (see `capture_current`).
     woken: Option<Hwnd>,
+    /// Which window the agent came from when a pop-up became the current one.
+    popups: popup::Tracker,
+}
+
+thread_local! {
+    /// Set while the live view loop runs on this thread: its window refreshes must never move the
+    /// agent to a pop-up behind its back.
+    static BACKGROUND_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks window refreshes on this thread as background ones for as long as it lives.
+struct BackgroundScope(bool);
+
+impl BackgroundScope {
+    fn enter() -> Self {
+        BackgroundScope(BACKGROUND_REFRESH.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for BackgroundScope {
+    fn drop(&mut self) {
+        BACKGROUND_REFRESH.with(|c| c.set(self.0));
+    }
 }
 
 struct Inner {
@@ -404,18 +430,29 @@ impl NativeAppWorkspace {
             .iter()
             .map(|w| ViewInfo {
                 id: w.hwnd.to_string(),
-                title: match (w.title.is_empty(), st.more_apps > 0 && !w.app.is_empty()) {
-                    (true, _) => "(제목 없음)".into(),
-                    (false, true) if !w.title.contains(&w.app) => format!("{} · {}", w.app, w.title),
-                    _ => w.title.clone(),
+                title: if w.kind.is_popup() {
+                    match st.windows.iter().find(|o| o.hwnd == w.owner && !o.title.is_empty()) {
+                        Some(o) => format!("(팝업) {}", o.title),
+                        None => "(팝업)".into(),
+                    }
+                } else {
+                    match (w.title.is_empty(), st.more_apps > 0 && !w.app.is_empty()) {
+                        (true, _) => "(제목 없음)".into(),
+                        (false, true) if !w.title.contains(&w.app) => format!("{} · {}", w.app, w.title),
+                        _ => w.title.clone(),
+                    }
                 },
-                detail: format!(
-                    "{} {}x{} (화면 밖 창){}",
-                    w.class,
-                    w.size.0,
-                    w.size.1,
-                    if w.enabled { "" } else { ", 대화상자가 열려 있어 비활성" }
-                ),
+                detail: if w.kind.is_popup() {
+                    format!("팝업({}) {}x{} (화면 밖 창)", w.kind.label_ko(), w.size.0, w.size.1)
+                } else {
+                    format!(
+                        "{} {}x{} (화면 밖 창){}",
+                        w.class,
+                        w.size.0,
+                        w.size.1,
+                        if w.enabled { "" } else { ", 대화상자가 열려 있어 비활성" }
+                    )
+                },
             })
             .collect();
         (v, st.current.map(|c| c.to_string()))
@@ -764,14 +801,38 @@ impl Inner {
     }
 
     /// Refreshes the window list. When a new window appears, leaves a note and switches to it (modal
-    /// dialogs first).
+    /// dialogs first). A menu or pop-up panel that opens becomes the current window only on the
+    /// agent's own refreshes (not the live view's), and the agent returns to the window it came
+    /// from when it closes.
     fn refresh_windows(&self, announce: bool) {
+        let cause = if BACKGROUND_REFRESH.with(|c| c.get()) { Cause::Background } else { Cause::Agent };
+        self.refresh_windows_with(announce, cause);
+    }
+
+    fn refresh_windows_with(&self, announce: bool, cause: Cause) {
         let pids = self.pids();
         let mut names = std::mem::take(&mut self.state.lock().names);
-        let list: Vec<WinEntry> = pw::windows_of(&pids)
-            .into_iter()
-            .filter(guard::is_view_window)
-            .map(|w| WinEntry {
+        let mut list: Vec<WinEntry> = Vec::new();
+        for w in pw::windows_of(&pids) {
+            // only visible windows can be views or pop-ups (skips the style lookups for the rest)
+            let kind = if w.visible { guard::popup_kind(&w) } else { popup::Kind::None };
+            let keep = match kind {
+                popup::Kind::Tip | popup::Kind::Shadow | popup::Kind::Combo => false,
+                popup::Kind::Menu | popup::Kind::Popup => {
+                    let (mw, mh) = popup::min_size(kind);
+                    w.visible
+                        && !w.minimized
+                        && !w.cloaked
+                        && w.alpha != Some(0)
+                        && w.rect.2 - w.rect.0 >= mw
+                        && w.rect.3 - w.rect.1 >= mh
+                }
+                popup::Kind::None => guard::is_view_window(&w),
+            };
+            if !keep {
+                continue;
+            }
+            list.push(WinEntry {
                 app: names
                     .entry(w.pid)
                     .or_insert_with(|| pw::process_path(w.pid).map(|p| launch::display_name(&p)).unwrap_or_default())
@@ -782,14 +843,16 @@ impl Inner {
                 owner: w32::owner(w.hwnd),
                 size: (w.rect.2 - w.rect.0, w.rect.3 - w.rect.1),
                 enabled: w32::is_enabled(w.hwnd),
-            })
-            .collect();
-        let mut st = self.state.lock();
+                kind,
+            });
+        }
+        let mut guard_st = self.state.lock();
+        let st = &mut *guard_st;
         st.names = names;
         let had_any = !st.windows.is_empty();
         let mut switch_to = None;
         if announce && had_any {
-            for w in &list {
+            for w in list.iter().filter(|w| !w.kind.is_popup()) {
                 if !st.windows.iter().any(|o| o.hwnd == w.hwnd) {
                     st.notes.push(format!("새 창이 열려 그 창으로 전환했습니다: '{}' ({})", w.title, w.class));
                     if w.enabled && (switch_to.is_none() || w.owner != 0) {
@@ -800,13 +863,28 @@ impl Inner {
             let closed: Vec<String> = st
                 .windows
                 .iter()
-                .filter(|w| !list.iter().any(|n| n.hwnd == w.hwnd))
+                .filter(|w| !w.kind.is_popup() && !list.iter().any(|n| n.hwnd == w.hwnd))
                 .map(|w| format!("창이 닫혔습니다: '{}'", w.title))
                 .collect();
             st.notes.extend(closed);
         }
+        // pop-ups: adopt a new one (agent refreshes only), or go back when the current one closed
+        let entries = |v: &[WinEntry]| v.iter().map(|w| popup::Entry { hwnd: w.hwnd, kind: w.kind }).collect::<Vec<_>>();
+        let (prev_e, now_e) = (entries(&st.windows), entries(&list));
+        let cause = if announce && had_any { cause } else { Cause::Background };
+        let plan = st.popups.update(&prev_e, &now_e, st.current, cause, switch_to);
+        let title_of = |h: Option<Hwnd>| h.and_then(|h| list.iter().find(|w| w.hwnd == h)).map(|w| w.title.clone()).unwrap_or_default();
+        let base_title = title_of(st.popups.base().or(st.current));
+        for h in &plan.opened {
+            if let Some(w) = list.iter().find(|w| w.hwnd == *h) {
+                st.notes.push(popup::note_open(w.kind, &w.class, w.size.0, w.size.1, &base_title));
+            }
+        }
+        if plan.closed_current {
+            st.notes.push(popup::note_closed(&title_of(plan.switch_to), plan.restored));
+        }
         st.windows = list;
-        if let Some(w) = switch_to {
+        if let Some(w) = plan.switch_to {
             st.current = Some(w);
             st.geom = None;
         }
@@ -832,17 +910,25 @@ impl Inner {
         self.refresh_windows(true);
         let mut st = self.state.lock();
         let active = st.windows.first().and_then(|w| w32::thread_focus(w32::thread_pid(w.hwnd).0)).map(|(a, _)| a);
-        let pick = st
-            .windows
+        // pop-ups only when nothing else is open (they are switched to when they open, not picked here)
+        let normal: Vec<&WinEntry> = st.windows.iter().filter(|w| !w.kind.is_popup()).collect();
+        let pool: Vec<&WinEntry> = if normal.is_empty() { st.windows.iter().collect() } else { normal };
+        let pick = pool
             .iter()
             .find(|w| Some(w.hwnd) == active && w.enabled)
-            .or_else(|| st.windows.iter().find(|w| w.enabled && w.owner != 0))
-            .or_else(|| st.windows.iter().find(|w| w.enabled && w.owner == 0))
-            .or_else(|| st.windows.first())
-            .cloned();
+            .or_else(|| pool.iter().find(|w| w.enabled && w.owner != 0))
+            .or_else(|| pool.iter().find(|w| w.enabled && w.owner == 0))
+            .or_else(|| pool.first())
+            .map(|w| (*w).clone());
         st.current = pick.as_ref().map(|w| w.hwnd);
         st.geom = None;
         pick
+    }
+
+    /// Whether the current window is a menu or pop-up panel.
+    fn current_is_popup(&self) -> bool {
+        let st = self.state.lock();
+        st.current.and_then(|c| st.windows.iter().find(|w| w.hwnd == c)).is_some_and(|w| w.kind.is_popup())
     }
 
     fn current_window(&self) -> Result<WinEntry> {
@@ -877,13 +963,31 @@ impl Inner {
         self.guard_exposure();
         // pick up windows opened since the last action (a dropdown, a test window) even without a live view
         self.refresh_windows(true);
-        let (img, geom) = self.capture_current(self.opts.max_long_edge)?;
+        let (mut img, geom) = self.capture_current(self.opts.max_long_edge)?;
+        if capture::is_blank(&img) && self.current_is_popup() {
+            // some pop-ups only paint with plain PrintWindow flags
+            if let Some(retry) = self.retry_popup_capture(&img, geom) {
+                img = retry;
+            }
+        }
         if capture::is_blank(&img) {
-            self.note("스크린샷이 한 가지 색으로만 보입니다 — 앱이 아직 그리는 중이거나 화면 밖에서 그리기를 멈추는 창일 수 있습니다");
+            if self.current_is_popup() {
+                self.note("팝업 화면이 비어 있습니다 — ui_tree 로 항목 이름을 읽고 press / choose 를 쓰세요");
+            } else {
+                self.note("스크린샷이 한 가지 색으로만 보입니다 — 앱이 아직 그리는 중이거나 화면 밖에서 그리기를 멈추는 창일 수 있습니다");
+            }
         }
         *self.size.lock() = (geom.shot_w, geom.shot_h);
         self.state.lock().geom = Some(geom);
         capture::encode_png(&img)
+    }
+
+    /// Second capture of a blank pop-up with PrintWindow flags 0. The result only counts when it
+    /// is not blank and has the same size as the first image (the coordinate system stays).
+    fn retry_popup_capture(&self, first: &image::RgbImage, geom: Geom) -> Option<image::RgbImage> {
+        let _dpi = w32::DpiScope::for_window(geom.hwnd);
+        let shot = capture::capture_client_with(geom.hwnd, self.opts.max_long_edge, 0).ok()?;
+        (shot.img.dimensions() == first.dimensions() && !capture::is_blank(&shot.img)).then_some(shot.img)
     }
 
     fn geom(&self) -> Result<Geom> {
@@ -925,6 +1029,8 @@ impl Inner {
         let w = st.windows.get(index).cloned().ok_or_else(|| anyhow!("창 번호 {index} 가 없습니다 (창 {}개)", st.windows.len()))?;
         st.current = Some(w.hwnd);
         st.geom = None;
+        // the agent chose: a pop-up left open is not switched back to by itself
+        st.popups.manual_switch();
         Ok(format!("창 [{index}] '{}' 로 전환했습니다", w.title))
     }
 
@@ -1002,6 +1108,9 @@ impl Inner {
         if let Some(r) = self.click_block_reason(target) {
             bail!("{r}");
         }
+        if let Some(r) = self.popup_click_block(g.hwnd, p) {
+            bail!("{r}");
+        }
         self.lease();
         self.activate(g.hwnd);
         input::post_click(target, pt, count, input::mk_flags(mods));
@@ -1021,6 +1130,40 @@ impl Inner {
         ))
     }
 
+    /// A pixel click into a pop-up can hit an item the safety rules refuse (Help, Copy / Cut / Paste
+    /// that would use the system clipboard). The pop-up's own element tree names the item under the
+    /// point; reading it is bounded (few elements, shallow, skipped when the app hangs). If it can't
+    /// be read, a launched app is let through (the guard undoes clipboard writes) and an attached
+    /// user app is not.
+    fn popup_click_block(&self, popup: Hwnd, client_pt: (i32, i32)) -> Option<String> {
+        if !self.current_is_popup() || w32::is_hung(popup) {
+            return None;
+        }
+        let (ox, oy) = w32::client_origin(popup);
+        let sp = (ox + client_pt.0, oy + client_pt.1);
+        match uia::snapshot(popup, 8, 150, |_| true) {
+            Ok(nodes) => {
+                let items: Vec<(String, (i32, i32, i32, i32))> = nodes
+                    .iter()
+                    .filter(|(_, n)| n.rect.2 > n.rect.0 && n.rect.3 > n.rect.1)
+                    .map(|(_, n)| (n.name.split('\t').next().unwrap_or("").trim().to_string(), n.rect))
+                    .collect();
+                let name = popup::item_at(&items, sp)?;
+                if menu::is_help_title(name) {
+                    Some(format!("'{name}' — {}", menu::R_HELP))
+                } else if menu::is_clipboard_title(name) {
+                    Some(format!("'{name}' — {}", menu::R_CLIPBOARD))
+                } else {
+                    None
+                }
+            }
+            Err(_) if self.mode == NativeMode::Attached => Some(
+                "팝업 항목 이름을 확인하지 못해 클릭하지 않았습니다 (사용자 클립보드 보호). ui_tree 로 항목을 읽고 press 를 쓰세요".into(),
+            ),
+            Err(_) => None,
+        }
+    }
+
     /// Checks whether a new window (dialog) appeared after an action.
     fn after_action(&self) {
         self.guard_exposure();
@@ -1037,8 +1180,12 @@ impl Inner {
             if !g.contains_shot(x, y) {
                 bail!("좌표 ({x:.0},{y:.0}) 가 창 밖입니다");
             }
-            let (target, pt) = input::hit(g.hwnd, g.to_client(x, y));
+            let p = g.to_client(x, y);
+            let (target, pt) = input::hit(g.hwnd, p);
             if let Some(r) = self.click_block_reason(target) {
+                bail!("{r}");
+            }
+            if let Some(r) = self.popup_click_block(g.hwnd, p) {
                 bail!("{r}");
             }
             self.lease();
@@ -1374,6 +1521,11 @@ impl Inner {
                 self.settle(1000);
                 return Ok(format!("{combo} → 앱에 Ctrl 키 상태와 함께 보냈습니다 (반영은 스크린샷으로 확인하세요)"));
             }
+            // nothing was sent: say why, so the agent goes straight to the button instead of retrying the key
+            bail!(
+                "{combo}: 이 창의 입력 스레드에 연결하지 못해 Ctrl 키 상태를 앱에 전달할 수 없었습니다 (아무것도 보내지 않음). 이 단축키를 가진 메뉴 항목도 없습니다 — \
+                 같은 기능의 단추(예: 실행·보내기)를 app_control press 로 누르거나 menus / menu {{path}} 로 실행하세요."
+            );
         }
         bail!(
             "{combo}: 백그라운드 창에 보낸 Ctrl/Alt 키 메시지는 앱이 인식하지 못합니다 (키 상태가 바뀌지 않음). 이 단축키를 가진 메뉴 항목도 없습니다 — \
@@ -1535,7 +1687,9 @@ impl Inner {
             bail!("먼저 ui_tree 를 호출하세요");
         }
         if st.ui_for != st.current {
-            bail!("창이 바뀌었습니다 — ui_tree 를 다시 호출하세요");
+            // numbers belong to the window they were read from; say which one is current so the agent re-reads it
+            let now = st.current.and_then(|c| st.windows.iter().find(|w| w.hwnd == c)).map(|w| format!(" (지금 창: '{}')", w.title)).unwrap_or_default();
+            bail!("창이 바뀌어 id {} 번은 더 이상 유효하지 않습니다{now} — 아무것도 하지 않았습니다. ui_tree 를 다시 호출해 새 번호를 받으세요", input["id"]);
         }
         st.ui_ids
             .get(id.wrapping_sub(1))
@@ -1621,13 +1775,14 @@ impl Inner {
                 let several = st.more_apps > 0;
                 for (i, w) in st.windows.iter().enumerate() {
                     s.push_str(&format!(
-                        "{} [{i}] {}'{}' {} {}x{}{}\n",
+                        "{} [{i}] {}'{}' {} {}x{}{}{}\n",
                         if Some(w.hwnd) == st.current { "▶" } else { " " },
                         if several && !w.app.is_empty() { format!("{} · ", w.app) } else { String::new() },
                         w.title,
                         w.class,
                         w.size.0,
                         w.size.1,
+                        if w.kind.is_popup() { format!(" (팝업 {}: 열려 있는 동안만 있음)", w.kind.label_ko()) } else { String::new() },
                         if w.enabled { "" } else { " (비활성: 대화상자가 열려 있음)" }
                     ));
                 }
@@ -1819,7 +1974,9 @@ impl Inner {
         if n.ctype == uia::CT_COMBOBOX {
             bail!("{} 는 콤보 상자입니다. 펼치면 목록이 사용자 화면에 그려지므로 누르지 않았습니다 — choose {{id, option}} 을 쓰세요.", describe(n));
         }
-        if n.ctype == uia::CT_MENUITEM {
+        // items of a menu that is open as its own (off-screen) window are fine; the Help and clipboard
+        // names were refused above
+        if n.ctype == uia::CT_MENUITEM && !self.current_is_popup() {
             bail!("메뉴 항목은 app_control menu {{path}} 로 실행하세요 (펼쳐진 메뉴는 사용자 화면에 그려집니다)");
         }
         let lname = nm.to_lowercase();
@@ -1886,6 +2043,15 @@ impl Inner {
     }
 
     fn choose(&self, n: &uia::Node, option: &str) -> Result<String> {
+        if self.current_is_popup() {
+            // a pop-up's items are picked by name, so the Help and clipboard rules apply to the title
+            if menu::is_help_title(option) {
+                bail!("'{option}' — {}", menu::R_HELP);
+            }
+            if menu::is_clipboard_title(option) {
+                bail!("'{option}' — {}", menu::R_CLIPBOARD);
+            }
+        }
         let want = menu::norm(option);
         let cls = if n.hwnd != 0 { w32::class_name(n.hwnd).to_lowercase() } else { String::new() };
         if n.hwnd != 0 && cls.contains("combobox") {
@@ -1965,7 +2131,7 @@ impl Inner {
                 return Ok("이 창에는 메뉴 막대가 없습니다 (단추·입력 칸은 app_control ui_tree 로 찾으세요)".into());
             }
             return Ok(format!(
-                "메뉴 막대(UI Automation): {} — 이 앱의 메뉴는 펼쳐야만 하위 항목이 보이는데, 펼치면 사용자 화면에 그려지므로 하위 항목은 실행할 수 없습니다.",
+                "메뉴 막대(UI Automation): {} — 하위 항목은 막대 이름을 스크린샷에서 클릭해 연 뒤(팝업 창으로 전환됨) 클릭하거나 ui_tree 후 press 로 고르세요.",
                 items.iter().map(|(n, e)| if *e { n.clone() } else { format!("{n} [비활성]") }).collect::<Vec<_>>().join(" · ")
             ));
         };
@@ -2039,7 +2205,7 @@ impl Inner {
         // same checks as other input (reclaimed by the user, current window disabled)
         let top = self.key_top()?;
         let Some((owner, bar)) = menu::menu_owner(top) else {
-            bail!("이 창에는 (Win32) 메뉴 막대가 없습니다. app_control menus 로 확인하세요.");
+            bail!("이 창에는 (Win32) 메뉴 막대가 없습니다. 메뉴 막대가 창 안에 그려지는 앱(Qt 등)이면 스크린샷에서 메뉴 이름을 클릭하세요 — 열린 메뉴는 팝업 창으로 전환됩니다. app_control menus 로 막대 항목 이름을 볼 수 있습니다.");
         };
         if !menu::owner_usable(owner) {
             bail!("메뉴 '{path}': {}", menu::R_MODAL);
@@ -2318,6 +2484,8 @@ async fn live_loop(weak: std::sync::Weak<Inner>, fps: f64) {
         // shutdown doesn't block a tokio worker)
         let _ = exec(&desk, move || {
             let i = inner;
+            // its window refreshes never move the agent to a pop-up
+            let _bg = BackgroundScope::enter();
             if i.process_gone() {
                 i.closed.store(true, Ordering::SeqCst);
                 return;

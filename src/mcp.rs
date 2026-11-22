@@ -212,6 +212,9 @@ fn tools_for(pl: &Plat) -> Value {
     let app_desc = if cfg!(windows) {
         format!("{app_desc} mode=app: launch(app) opens another app on the same screen; move between apps with list_windows/switch_window.")
     } else { app_desc };
+    let app_desc = if cfg!(windows) && !pl.child_session {
+        format!("{app_desc} Menus the app draws itself (Qt etc.) open off-screen as a pop-up window that becomes the current view: screenshot it, press items by id, Escape closes it.")
+    } else { app_desc };
     let app_desc = if pl.child_session {
         format!("{app_desc} Windows child sessions support the same actions except menus, plus action=launch(app: name, .exe path or AppUserModelID) which opens any app inside the session (Store apps, console programs, anything desk_open mode=app refuses). Look up again after changing windows or focus; for long text set_value then read to check. Operate app menus by screen or keyboard.")
     } else { app_desc };
@@ -1062,11 +1065,14 @@ where
         // spawn while holding the lock, so the task can't finish and fail to remove its entry before it's
         // registered
         let mut guard = inflight.lock();
-        // a client that asks for progress keeps a long call alive while it receives it
+        // a client that asks for progress keeps a long call alive while it receives it: any call may take long
+        // (a wait, a wait_change on a loading window, a slow page), and one the client gives up on drops the
+        // connection
         let progress_token = msg["params"]["_meta"]["progressToken"].clone();
-        let patient = !progress_token.is_null() && name == "desk_open";
+        let wants_progress = !progress_token.is_null();
+        let patient = wants_progress && name == "desk_open";
         let handle = tasks.spawn(async move {
-            let ticker = patient.then(|| {
+            let ticker = wants_progress.then(|| {
                 let out = out.clone();
                 tokio::spawn(async move {
                     let mut n = 0u64;
@@ -1074,7 +1080,7 @@ where
                         tokio::time::sleep(Duration::from_secs(15)).await;
                         n += 1;
                         let note = json!({ "jsonrpc": "2.0", "method": "notifications/progress",
-                            "params": { "progressToken": progress_token, "progress": n, "message": "waiting for the screen" } });
+                            "params": { "progressToken": progress_token, "progress": n, "message": "still working" } });
                         if out.send(format!("{note}\n")).is_err() {
                             break;
                         }
