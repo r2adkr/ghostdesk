@@ -5,6 +5,8 @@
 //! the system's own administrator prompt. GhostDesk never sees or asks for the administrator's password: macOS
 //! shows its usual dialog. The new account's password is shown once so the person can log in to it (one login
 //! through fast user switching starts its session).
+// Most of this is macOS-only; its helpers are still compiled (and tested) everywhere.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use anyhow::{bail, Result};
 

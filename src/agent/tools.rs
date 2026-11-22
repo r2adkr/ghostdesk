@@ -472,6 +472,15 @@ async fn app_dispatch(desk: &Desk, input: &Value) -> Result<Outcome> {
     let ws = desk
         .as_native()
         .ok_or_else(|| anyhow!("app_control 은 {apps} 작업공간에서만 쓸 수 있습니다"))?;
+    // another app on the same hidden screen: the same refusals as opening a screen (shells and system tools
+    // still need a person's yes, which only the external-agent path can ask for)
+    #[cfg(windows)]
+    if input["action"].as_str() == Some("launch") {
+        let check = crate::control::session_launch_policy(input["app"].as_str().unwrap_or("")).await?;
+        if check.tool.is_some() {
+            anyhow::bail!("셸·시스템 도구는 앱 화면에 추가로 띄울 수 없습니다");
+        }
+    }
     ok(ws.app_control(input).await?)
 }
 

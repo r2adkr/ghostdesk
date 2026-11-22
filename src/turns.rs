@@ -107,6 +107,7 @@ impl Turns {
     }
 
     /// Takes the turn on `key` for `who`, waiting in line if someone has it.
+    #[cfg(test)]
     ///
     /// `max_wait`: give up after this long (None waits until `cancelled`). `on_wait(owner, place)`
     /// is called whenever the wait changes, for a status line. `cancelled` is polled about once a

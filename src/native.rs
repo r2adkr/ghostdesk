@@ -226,8 +226,13 @@ pub fn app_control_tool() -> serde_json::Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "menus", "menu", "read"]
+                    "enum": if cfg!(windows) {
+                        serde_json::json!(["launch", "list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "menus", "menu", "read"])
+                    } else {
+                        serde_json::json!(["list_windows", "switch_window", "ui_tree", "press", "set_value", "focus", "select", "choose", "menus", "menu", "read"])
+                    }
                 },
+                "app": { "type": "string", "description": "launch (Windows): app name, .exe path or Start menu shortcut" },
                 "index": { "type": "integer", "description": "switch_window: window index from list_windows" },
                 "id": { "type": "integer", "description": "element id from the latest ui_tree" },
                 "text": { "type": "string", "description": "set_value: new value" },

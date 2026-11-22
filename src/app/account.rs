@@ -63,7 +63,7 @@ impl GhostApp {
             }
         }
         let name = prompt.name.clone();
-        let modal = egui::Modal::new(egui::Id::new("agent_account")).frame(theme::modal_frame()).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("agent_account")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(520.0);
             keep &= !theme::modal_header(ui, tr("에이전트 전용 계정"));
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -203,7 +203,7 @@ impl GhostApp {
         }
         prompt.browser = prompt.browser.min(self.browsers.len().saturating_sub(1));
         let account = prompt.account.clone();
-        let modal = egui::Modal::new(egui::Id::new("agent_import")).frame(theme::modal_frame()).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("agent_import")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(520.0);
             keep &= !theme::modal_header(ui, tr("브라우저 로그인 가져오기"));
             ui.spacing_mut().item_spacing.y = 8.0;

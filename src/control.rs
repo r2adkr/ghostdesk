@@ -175,6 +175,7 @@ pub enum ControlEvent {
     RestartElevated { reply: oneshot::Sender<std::result::Result<(), String>> },
     /// The dedicated agent account was just created (an agent asked for the session and the person allowed it):
     /// the window shows its one-time password and the steps left.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AccountCreated { name: String, password: String },
 }
 
@@ -1709,7 +1710,7 @@ fn tool_request_text(client: &str, name: &str, path: &str) -> String {
 #[cfg(windows)]
 pub(crate) struct LaunchCheck {
     /// Display name, if it is a shell or system tool (needs a person's yes).
-    tool: Option<String>,
+    pub(crate) tool: Option<String>,
     /// The app insists on administrator rights.
     admin: bool,
 }
@@ -1758,11 +1759,22 @@ impl ControlServer {
 
     /// `desk_app launch` (alone or inside a bundle) on a child session goes through the same checks.
     async fn vet_launch(&self, shared: &Arc<AgentShared>, desk: &Desk, tool: &str, step: &Value, conn: &Conn) -> Result<()> {
-        if tool != "app" || step["action"].as_str() != Some("launch") || desk.as_session().is_none() {
+        if tool != "app" || step["action"].as_str() != Some("launch") {
             return Ok(());
         }
         let client = shared.external.lock().clone().unwrap_or_else(|| "외부 에이전트".to_string());
-        self.vet_session_app(step["app"].as_str().unwrap_or(""), &client, conn).await
+        let app = step["app"].as_str().unwrap_or("");
+        if desk.as_session().is_some() {
+            return self.vet_session_app(app, &client, conn).await;
+        }
+        // another app on a hidden app screen: the same refusals, and a person's yes for a shell or system tool
+        if desk.as_native().is_some() {
+            let check = session_launch_policy(app).await?;
+            if let Some(name) = &check.tool {
+                self.ask(conn, tr("셸·시스템 도구 실행 요청"), tool_request_text(&client, name, app)).await?;
+            }
+        }
+        Ok(())
     }
 
     /// An app needs administrator rights, which a normal window can't drive (UIPI). Asks the person
@@ -2500,6 +2512,7 @@ mod shot_option_tests {
         assert!(is_browser_action("double_click", &json!({ "ref": 3 })) && !is_browser_action("double_click", &json!({ "coordinate": [1, 2] })));
     }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

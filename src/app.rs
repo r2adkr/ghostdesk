@@ -95,9 +95,10 @@ struct AgentHandle {
     input_tx: mpsc::UnboundedSender<TakeoverInput>,
     texture: Option<egui::TextureHandle>,
     tex_seq: u64,
-    /// Virtual mouse display state (detail view / grid tile).
+    /// Virtual mouse display state (detail view / grid tile / PiP window).
     cursor_view: crate::cursor::CursorView,
     tile_cursor_view: crate::cursor::CursorView,
+    pip_cursor_view: crate::cursor::CursorView,
     input: String,
     url_input: String,
     takeover: bool,
@@ -122,6 +123,7 @@ impl AgentHandle {
             tex_seq: 0,
             cursor_view: Default::default(),
             tile_cursor_view: Default::default(),
+            pip_cursor_view: Default::default(),
             input: String::new(),
             url_input: String::new(),
             takeover: false,
@@ -295,6 +297,7 @@ pub struct GhostApp {
     closed_since: HashMap<u64, Instant>,
     pip_auto_open: bool,
     pip_auto_close: bool,
+    pip_show_cursor: bool,
     /// Permission bypass: approve external agents' sensitive requests (login cloning, running apps,
     /// remote access, …) without asking. Hard refusals in `control.rs` still apply.
     auto_approve: bool,
@@ -468,6 +471,7 @@ impl GhostApp {
             closed_since: HashMap::new(),
             pip_auto_open: false,
             pip_auto_close: true,
+            pip_show_cursor: true,
             auto_approve: false,
             allow_shell_tools: true,
             access: Default::default(),
@@ -931,12 +935,12 @@ impl GhostApp {
         // sidebar never crosses a gap
         let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x <= screen.left() + w && p.y >= screen.top());
         self.sidebar_peek = !blocked && (button_hovered || (self.sidebar_peek && over));
-        let t = ctx.animate_bool_with_time(egui::Id::new("sidebar_peek"), self.sidebar_peek, 0.15);
+        let t = ctx.animate_bool_with_time(egui::Id::unique("sidebar_peek"), self.sidebar_peek, 0.15);
         if t <= 0.0 || blocked {
             return;
         }
         let top = screen.top() + titlebar::HEIGHT;
-        egui::Area::new(egui::Id::new("sidebar_peek_area"))
+        egui::Area::new(egui::Id::unique("sidebar_peek_area"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(screen.left() - w * (1.0 - t), top))
             .interactable(true)
@@ -1096,7 +1100,7 @@ impl GhostApp {
             return false;
         }
         let mut close = false;
-        egui::Area::new(egui::Id::new("update_toast"))
+        egui::Area::new(egui::Id::unique("update_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
@@ -1121,7 +1125,7 @@ impl GhostApp {
                                     theme::spinner(ui, 13.0, theme::muted());
                                     ui.label(theme::hint(trf("내려받는 중… {}%", &[&((f * 100.0) as u32)])));
                                 });
-                                theme::progress(ui, egui::Id::new("update_progress"), *f, ui.available_width());
+                                theme::progress(ui, egui::Id::unique("update_progress"), *f, ui.available_width());
                             }
                             State::Ready(_) => {
                                 if theme::primary(ui, tr("다시 시작해서 적용"))
@@ -1179,7 +1183,7 @@ impl GhostApp {
             return;
         }
         let (mut later, mut start, mut close) = (false, false, false);
-        egui::Area::new(egui::Id::new("engine_toast"))
+        egui::Area::new(egui::Id::unique("engine_toast"))
             .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, if above_update { -150.0 } else { -16.0 }])
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {

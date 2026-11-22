@@ -276,7 +276,7 @@ impl GhostApp {
         let Some(mut prompt) = self.save_prompt.take() else { return };
         let mut keep = true;
         let mut save = false;
-        egui::Modal::new(egui::Id::new("save_remote")).frame(theme::modal_frame()).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("save_remote")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(420.0);
             keep &= !theme::modal_header(ui, tr("이 연결 정보를 저장할까요?"));
             ui.spacing_mut().item_spacing.y = 8.0;

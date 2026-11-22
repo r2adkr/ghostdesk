@@ -280,6 +280,7 @@ pub(super) const TABLE: &[[&str; 4]] = &[
     ["건너뛰기", "Skip", "スキップ", "跳过"],
     ["Enter 시작 · Shift+Enter 줄바꿈", "Enter to start · Shift+Enter for a new line", "Enter で開始 · Shift+Enter で改行", "Enter 开始 · Shift+Enter 换行"],
     ["에이전트 화면이 열리면 PiP 자동 표시", "Open PiP when an agent screen opens", "エージェント画面が開いたら PiP を表示", "智能体屏幕打开时自动显示画中画"],
+    ["PiP 에도 가상 마우스 보이기", "Show the virtual mouse in PiP too", "PiP にも仮想マウスを表示", "画中画中也显示虚拟鼠标"],
     ["에이전트 화면이 닫히면 PiP 자동 닫기", "Close PiP when an agent screen closes", "エージェント画面が閉じたら PiP を閉じる", "智能体屏幕关闭时自动关闭画中画"],
     ["팀에서 에이전트와 목표·할 일·메모를 공유해요", "Share goals, tasks, and notes with team agents", "チームのエージェントと目標・タスク・メモを共有します", "与团队智能体共享目标、任务和笔记"],
     ["팀 에이전트를 시작하거나, 참여 요청을 연결된 외부 AI 앱에 붙여넣으세요", "Start a team agent or paste the join request into a connected external AI app", "チームエージェントを開始するか、接続済みの外部 AI アプリに参加の依頼文を貼り付けてください", "启动团队智能体，或将加入请求粘贴到已连接的外部 AI 应用"],

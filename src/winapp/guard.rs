@@ -92,6 +92,8 @@ pub fn is_view_window(w: &TopWindow) -> bool {
         && b - t >= 30
         && !is_helper_class(&w.class)
         && !is_shell_window(w)
+        // Chromium's untitled host window (an embedded WebView2 makes one): never shows content of its own
+        && !(w.class == "Chrome_WidgetWin_0" && w.title.is_empty())
 }
 
 /// Candidate main window left invisible by the hidden launch (to be shown off-screen).

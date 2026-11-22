@@ -30,7 +30,6 @@ pub(super) struct State {
     skills_loaded: bool,
     candidates: Vec<Candidate>,
     import_path: String,
-    importing: bool,
     skill_confirm: Option<(Candidate, usize, u64)>,
     skill_note: Option<String>,
     /// "Import all" waiting for a go-ahead: each skill with its size.
@@ -756,7 +755,7 @@ impl GhostApp {
                 ui.add(egui::Label::new(theme::hint(summary)).truncate());
             }
         });
-        let resp = ui.interact(header.response.rect, ui.id().with("found_header"), egui::Sense::click());
+        let resp = ui.interact(header.response.rect, ui.scope_id().with("found_header"), egui::Sense::click());
         if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             self.toolbox.found_open = !self.toolbox.found_open;
         }

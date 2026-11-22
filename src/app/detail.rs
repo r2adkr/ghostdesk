@@ -151,8 +151,8 @@ impl GhostApp {
         });
 
         // with answer buttons showing, the input box stays hidden until "직접 입력" is pressed
-        let typing_id = egui::Id::new(("typing_answer", a.shared.id));
-        let input_id = egui::Id::new(("composer_input", a.shared.id));
+        let typing_id = egui::Id::unique(("typing_answer", a.shared.id));
+        let input_id = egui::Id::unique(("composer_input", a.shared.id));
         let choices_pending = matches!(&st, AgentStatus::WaitingUser(q) if !split_choices(q).1.is_empty());
         if !choices_pending {
             ui.data_mut(|d| d.insert_temp(typing_id, false));

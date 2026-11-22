@@ -59,8 +59,9 @@ const ENV_WINDOWS: &str = r#"Environment
 /// `app_control` tool description (Windows).
 pub const APP_CONTROL_DESCRIPTION: &str = "Semantic control of the Windows desktop app window you are operating. The app runs off-screen (outside every monitor), so clicks and keys are window messages; use this tool for menus, for elements a click cannot reach, to set or read text exactly, and to pick combo-box options without opening the drop-down.\n\
 Actions:\n\
-- list_windows: list the app's windows (index, title, disabled while a dialog is open).\n\
-- switch_window {index}: operate another window (dialogs are switched to automatically).\n\
+- launch {app}: open another app (name, .exe path or Start menu shortcut) on this same hidden screen and switch to its window, so several apps can stay open side by side. Shells, password managers and apps that need administrator rights are refused.\n\
+- list_windows: list the windows of every app on this screen (index, app, title, disabled while a dialog is open).\n\
+- switch_window {index}: operate another window, also of another app (dialogs are switched to automatically).\n\
 - ui_tree {max_depth?}: numbered list of UI Automation elements of the current window: id, type (Button, Edit, CheckBox, ComboBox, ListItem, ...), name, value (truncated), frame [x,y,w,h] in SCREENSHOT pixels, checked/selected/disabled/focused. Ids stay valid until the next ui_tree call.\n\
 - press {id}: click a button / check box / radio button (window message), or Invoke / Toggle / Select / Expand an element.\n\
 - set_value {id, text}: replace the text of an edit box (verified by re-reading).\n\

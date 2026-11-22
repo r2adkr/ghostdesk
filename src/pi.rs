@@ -29,6 +29,7 @@ use crate::{
 };
 
 /// One-line installer shown to the user before it runs (it also installs Node.js when missing).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn install_command() -> &'static str {
     if cfg!(windows) {
         "powershell -c \"irm https://pi.dev/install.ps1 | iex\""
@@ -279,11 +280,9 @@ fn update_inner() -> Result<(), String> {
         }
         let mut c = engine_command(&exe, &home_dir());
         c.args(["update", "--self"]);
-        match run_with_timeout(c, UPDATE_TIMEOUT) {
-            Ok(o) if o.status.success() && engine_current() => return updated(),
-            Ok(o) if !o.status.success() => last_err = installer_message(&o.stdout, &o.stderr),
-            Ok(_) => {}
-            Err(e) => last_err = e,
+        // its error is not kept: the installer below always runs next and says what went wrong
+        if run_with_timeout(c, UPDATE_TIMEOUT).is_ok_and(|o| o.status.success()) && engine_current() {
+            return updated();
         }
         match install() {
             Ok(()) if engine_current() => return updated(),
@@ -1062,11 +1061,43 @@ pub async fn run(job: Job<'_>, rx: &mut mpsc::UnboundedReceiver<AgentCmd>) -> Re
             dir.display()
         ));
     }
+    if let Some(order) = tool_order(!mcp.is_empty(), work.is_some().then_some(cfg.files)) {
+        system.push_str(&order);
+    }
     std::fs::write(&extension.0, extension_source(&tool_defs(tools), &system, work.as_deref(), !mcp.is_empty(), &skills.iter().map(|k| (k.name.clone(), k.path.clone())).collect::<Vec<_>>(), !plugins.is_empty()))?;
     let names: Vec<String> = tool_defs(tools).iter().filter_map(|t| t["name"].as_str().map(String::from)).collect();
     let cwd = work.clone().unwrap_or_else(|| home.clone());
     let spec = Spec { extension: &extension.0, tools: names, cwd, mcp, skills: skills.iter().map(|k| k.path.clone()).collect(), plugins };
     drive_agent(shared, cfg, ws, &exe, &home, &spec, &route, membership, rx).await.map(|_| None)
+}
+
+/// The order to reach for tools in, when the agent has more than the screen: the screen is slow, costs a
+/// screenshot per look and can misclick, so a connected service's own tools come first, then commands and files,
+/// and the screen only for what really needs the app's or site's own interface. `files` is the file-tool level
+/// (None: no work folder).
+fn tool_order(mcp: bool, files: Option<u8>) -> Option<String> {
+    let run = files.is_some_and(|f| f >= 2);
+    if !mcp && !run {
+        return None;
+    }
+    let shell = if cfg!(windows) { "powershell" } else { "bash" };
+    let mut steps = vec![];
+    if mcp {
+        steps.push("a tool from the tool box, when one fits the service or app (search with tool_search first; an official integration beats driving its UI)".to_string());
+    }
+    if run {
+        steps.push(format!("{shell} and the file tools, when the work can be done with commands, scripts, files or a command-line tool (converting, renaming, querying, installing, reading logs, calling an API)"));
+    }
+    steps.push("the screen (mouse, keyboard, screenshots), only for what needs the app's or website's own interface, when the steps above cannot do it, or when the human asked to see it done on screen".into());
+    let list: Vec<String> = steps.iter().enumerate().map(|(i, s)| format!("
+{}. {s}", i + 1)).collect();
+    Some(format!(
+        "
+
+Choosing tools: the screen is the slowest and least reliable way to work. For each step, use the first of these that can do it:{}
+Go back to the screen whenever the result has to be checked or finished there.",
+        list.concat()
+    ))
 }
 
 /// How to start the process: the extension, the names of GhostDesk's tools and the working folder.
@@ -1348,6 +1379,18 @@ mod option_probe_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_order_puts_the_screen_last_and_only_lists_what_the_agent_has() {
+        assert_eq!(tool_order(false, None), None);
+        assert_eq!(tool_order(false, Some(1)), None);
+        let all = tool_order(true, Some(2)).unwrap();
+        let (mcp, run, screen) = (all.find("tool box").unwrap(), all.find("file tools").unwrap(), all.find("the screen (").unwrap());
+        assert!(mcp < run && run < screen, "{all}");
+        let only_mcp = tool_order(true, Some(1)).unwrap();
+        assert!(only_mcp.contains("tool box") && !only_mcp.contains("file tools"), "{only_mcp}");
+        assert!(tool_order(false, Some(2)).unwrap().contains(if cfg!(windows) { "powershell" } else { "bash" }));
+    }
 
     #[test]
     fn args_isolate_pi_and_keep_the_key_out() {

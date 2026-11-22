@@ -370,14 +370,6 @@ impl GhostApp {
         });
     }
 
-    fn key_storage_note(&self) -> &'static str {
-        if self.remember_keys {
-            tr("키는 Windows 계정으로 암호화해 이 PC 에만 저장해요")
-        } else {
-            tr("키는 이 PC 에 저장되지 않아요")
-        }
-    }
-
     // ---- settings window ----
 
     /// Opens Settings on a given tab.
@@ -494,6 +486,7 @@ impl GhostApp {
         switch_row(ui, &mut self.show_cursor, tr("가상 마우스 보이기"), tr("에이전트가 어디를 누르는지 화면에 보여 줍니다 (내가 직접 조작할 때는 주황색)"));
         switch_row(ui, &mut self.pip_auto_open, tr("에이전트 화면이 열리면 PiP 자동 표시"), "");
         switch_row(ui, &mut self.pip_auto_close, tr("에이전트 화면이 닫히면 PiP 자동 닫기"), "");
+        switch_row(ui, &mut self.pip_show_cursor, tr("PiP 에도 가상 마우스 보이기"), "");
         let tour = theme::setting_row(ui, tr("사용 설명 다시 보기"), "", false, 96.0, |ui| theme::secondary(ui, tr("열기")).clicked());
         if tour {
             self.show_settings = false;

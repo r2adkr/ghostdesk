@@ -633,7 +633,7 @@ async fn charmap_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) -
         log.check(&format!("charmap-refuse-key-{k}"), r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
     }
     let r = ws.key("ctrl+s", 1).await;
-    log.check("charmap-ctrl-s-without-menu-errors", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
+    log.check("charmap-ctrl-s-without-menu-sent", r.is_ok(), format!("{r:?} {:?}", ws.take_notes()));
     let m = ws.app_control(&json!({"action": "menus"})).await?;
     log.check("charmap-menus-none", m.contains("메뉴 막대가 없습니다"), m);
     let r = ws.drag((grid.rect[0] + 10.0, grid.rect[1] + 10.0), (grid.rect[0] + 60.0, grid.rect[1] + 40.0), 0).await;
@@ -782,6 +782,16 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     let v = read_value(ws, &edit).await?;
     log.check("target-type-multiline", v.contains("가나다 abc") && v.contains("둘째 줄"), format!("{v:?} {:?}", ws.take_notes()));
 
+    // Ctrl and Shift reach the app as held keys: Ctrl+Home goes to the very start (Home alone only to the line's
+    // start), Shift+End then selects the first line
+    ws.key("ctrl+Home", 1).await?;
+    ws.key("shift+End", 1).await?;
+    let tree = ws.app_control(&json!({"action": "ui_tree"})).await?;
+    let id = parse_tree(&tree).into_iter().find(|e| e.ty == "Edit" || e.ty == "Document").map(|e| e.id).unwrap_or(0);
+    let raw = ws.app_control(&json!({"action": "read", "id": id})).await.unwrap_or_default();
+    let sel = raw.lines().find(|l| l.starts_with("selected text:")).unwrap_or("").to_string();
+    log.check("target-ctrl-and-shift-held", sel.contains("가나다 abc") && !sel.contains("둘째"), format!("{sel:?} {:?}", ws.take_notes()));
+
     // in a plain edit box (no drag and drop), dragging selects text
     let from = (edit.rect[0] + 3.0, edit.rect[1] + 6.0);
     let to = (edit.rect[0] + edit.rect[2] * 0.6, edit.rect[1] + 6.0);
@@ -801,8 +811,9 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     log.check("target-ctrl-s-menu-accelerator", title == "저장됨 2", format!("제목 '{title}' {n1:?} {n2:?}"));
     let r = ws.key("ctrl+d", 1).await;
     log.check("target-disabled-accelerator", r.as_ref().err().map(|e| e.to_string().contains("비활성")).unwrap_or(false), format!("{:?}", r.err().map(|e| e.to_string())));
+    // a shortcut no menu has goes to the app with Ctrl held (the app decides what it does)
     let r = ws.key("ctrl+q", 1).await;
-    log.check("target-unknown-shortcut-errors", r.is_err(), format!("{:?}", r.err().map(|e| e.to_string())));
+    log.check("target-unknown-shortcut-sent", r.is_ok() && ws.take_notes().iter().any(|n| n.contains("Ctrl 키 상태")), format!("{r:?}"));
 
     // in an edit box Ctrl+C goes to the internal clipboard, not the app's Edit > Copy (system
     // clipboard)
@@ -903,6 +914,16 @@ async fn target_steps(log: &mut TestLog, out: &Path, ws: &NativeAppWorkspace) ->
     step("Mode A: 메시지 상자 확인 끝");
     modal_alt_mnemonic(log, ws).await?;
     step("Mode A: 질문 상자 끝");
+    // another app on the same screen: it opens in the same Job, both apps are in the window list, and switching
+    // goes back and forth (closing the screen closes it too)
+    let r = ws.app_control(&json!({"action": "launch", "app": "charmap"})).await;
+    let list = ws.app_control(&json!({"action": "list_windows"})).await.unwrap_or_default();
+    let mine = list.lines().position(|l| l.contains("GhostDeskWinAppTestTarget"));
+    log.check("target-launch-second-app", r.is_ok() && list.lines().count() >= 2 && mine.is_some() && list.contains(" · "), format!("{r:?} | {}", list.replace('\n', " | ")));
+    if let Some(i) = mine {
+        ws.app_control(&json!({"action": "switch_window", "index": i})).await?;
+        log.check("target-switch-back-from-second-app", current_title(ws).contains("·") || ws.views().1.is_some(), current_title(ws));
+    }
     // make unsaved changes (for the shutdown test)
     let _ = ws.screenshot().await?;
     ws.click(Some(edit.center()), MouseButton::Left, 1, 0).await?;

@@ -39,6 +39,8 @@ struct WinEntry {
     owner: Hwnd,
     size: (i32, i32),
     enabled: bool,
+    /// The app the window belongs to (several can share the screen).
+    app: String,
 }
 
 struct Down {
@@ -65,6 +67,12 @@ struct State {
     /// Last clicked control (keyboard target candidate).
     last_target: Option<Hwnd>,
     reclaim_noted: bool,
+    /// App names by process (for window lists once more than one app is open).
+    names: std::collections::HashMap<u32, String>,
+    /// Apps opened with `launch` besides the first.
+    more_apps: usize,
+    /// The last window told it is the active one (see `capture_current`).
+    woken: Option<Hwnd>,
 }
 
 struct Inner {
@@ -146,13 +154,16 @@ impl NativeAppWorkspace {
         let attaching = opts.attach_pid.is_some();
         let key = verdict_key(&opts.app);
         let cached = offscreen_verdicts().lock().get(&key).cloned();
+        // an app with an embedded WebView2 (Roblox Studio) stops presenting its 3D view and web pages on a hidden
+        // desktop without failing in a way the launch checks can see, so it goes straight to the off-screen host
+        let webview = opts.host == NativeHost::Auto && super::apps::resolve_app_query(&opts.app).is_some_and(|e| launch::embeds_webview2(&e));
         let want_hidden = !attaching
             && match opts.host {
                 NativeHost::Offscreen => false,
                 NativeHost::Hidden | NativeHost::CurrentSession => true,
-                NativeHost::Auto => cached.is_none(),
+                NativeHost::Auto => cached.is_none() && !webview,
             };
-        let mut fallback_note = None;
+        let mut fallback_note = webview.then(|| "웹 화면(WebView2)을 내장한 앱이라 숨은 데스크톱 대신 사용자 데스크톱의 화면 밖 창으로 띄웠습니다".to_string());
         if want_hidden {
             match DeskHost::create() {
                 Ok(host) => match Self::launch_on(opts.clone(), sink.clone(), Some(Arc::new(host))).await {
@@ -393,7 +404,11 @@ impl NativeAppWorkspace {
             .iter()
             .map(|w| ViewInfo {
                 id: w.hwnd.to_string(),
-                title: if w.title.is_empty() { "(제목 없음)".into() } else { w.title.clone() },
+                title: match (w.title.is_empty(), st.more_apps > 0 && !w.app.is_empty()) {
+                    (true, _) => "(제목 없음)".into(),
+                    (false, true) if !w.title.contains(&w.app) => format!("{} · {}", w.app, w.title),
+                    _ => w.title.clone(),
+                },
                 detail: format!(
                     "{} {}x{} (화면 밖 창){}",
                     w.class,
@@ -545,7 +560,7 @@ fn start_app(o: &NativeOptions, desk: Option<&DeskHost>) -> Result<Started> {
                 }
             }
         }
-        let (proc_, thread) = launch::spawn_suspended(&exe, &args, &o.open_files, Some(&d.desktop), launch::job_ui_limits_for(&exe))?;
+        let (proc_, thread) = launch::spawn_suspended(&exe, &args, &o.open_files, Some(&d.desktop), launch::job_ui_limits_for(&exe), None)?;
         let guard = Guard::start(NativeMode::Launched, vec![proc_.pid], proc_.job.clone());
         std::thread::sleep(Duration::from_millis(40));
         launch::resume(&thread);
@@ -594,6 +609,21 @@ impl Inner {
     }
 
     /// Before sending input: briefly lock so the app can't take the foreground.
+    /// Tells a window it is the active one, as a click on a real screen would, for apps that stop drawing while
+    /// they aren't (Roblox Studio and its play-test windows). Only for apps this screen launched, never a window of
+    /// the user's own app.
+    fn activate(&self, top: Hwnd) {
+        self.state.lock().woken = Some(top);
+        // a popup (dropdown list, menu) told it is active stops taking its clicks
+        if self.mode != NativeMode::Launched || w32::style(top) & w32::WS_CAPTION != w32::WS_CAPTION {
+            return;
+        }
+        const WM_ACTIVATE: u32 = 0x0006;
+        const WM_ACTIVATEAPP: u32 = 0x001C;
+        w32::post(top, WM_ACTIVATEAPP, 1, 0);
+        w32::post(top, WM_ACTIVATE, 1, 0);
+    }
+
     fn lease(&self) {
         // apps on a hidden desktop can't take the user's foreground (it isn't the input desktop)
         if self.desk.is_some() {
@@ -737,10 +767,15 @@ impl Inner {
     /// dialogs first).
     fn refresh_windows(&self, announce: bool) {
         let pids = self.pids();
+        let mut names = std::mem::take(&mut self.state.lock().names);
         let list: Vec<WinEntry> = pw::windows_of(&pids)
             .into_iter()
             .filter(guard::is_view_window)
             .map(|w| WinEntry {
+                app: names
+                    .entry(w.pid)
+                    .or_insert_with(|| pw::process_path(w.pid).map(|p| launch::display_name(&p)).unwrap_or_default())
+                    .clone(),
                 hwnd: w.hwnd,
                 title: w.title.clone(),
                 class: w.class.clone(),
@@ -750,6 +785,7 @@ impl Inner {
             })
             .collect();
         let mut st = self.state.lock();
+        st.names = names;
         let had_any = !st.windows.is_empty();
         let mut switch_to = None;
         if announce && had_any {
@@ -815,6 +851,10 @@ impl Inner {
 
     fn capture_current(&self, max_long_edge: u32) -> Result<(image::RgbImage, Geom)> {
         let w = self.current_window()?;
+        // once per window that becomes the current one (every frame would keep pulling the keyboard focus back)
+        if self.state.lock().woken != Some(w.hwnd) {
+            self.activate(w.hwnd);
+        }
         let _dpi = w32::DpiScope::for_window(w.hwnd);
         let shot = match capture::capture_client(w.hwnd, max_long_edge) {
             Ok(s) => s,
@@ -835,6 +875,8 @@ impl Inner {
 
     fn screenshot_png(&self) -> Result<Vec<u8>> {
         self.guard_exposure();
+        // pick up windows opened since the last action (a dropdown, a test window) even without a live view
+        self.refresh_windows(true);
         let (img, geom) = self.capture_current(self.opts.max_long_edge)?;
         if capture::is_blank(&img) {
             self.note("스크린샷이 한 가지 색으로만 보입니다 — 앱이 아직 그리는 중이거나 화면 밖에서 그리기를 멈추는 창일 수 있습니다");
@@ -961,6 +1003,7 @@ impl Inner {
             bail!("{r}");
         }
         self.lease();
+        self.activate(g.hwnd);
         input::post_click(target, pt, count, input::mk_flags(mods));
         self.state.lock().last_target = Some(target);
         self.settle(800);
@@ -999,6 +1042,7 @@ impl Inner {
                 bail!("{r}");
             }
             self.lease();
+            self.activate(g.hwnd);
             input::post_move(target, pt, mk);
             input::post_button(target, pt, true, mk);
             let mut st = self.state.lock();
@@ -1062,6 +1106,7 @@ impl Inner {
             bail!("{}", drag_refusal(&w32::class_name(target)));
         }
         self.lease();
+        self.activate(g.hwnd);
         input::post_move(target, pt, mk);
         input::post_button(target, pt, true, mk);
         let steps = 12;
@@ -1245,6 +1290,12 @@ impl Inner {
                     self.settle(500);
                     return Ok(Some(format!("{combo} → 대화상자의 이전 컨트롤로 이동")));
                 }
+                // Shift+key (selection with arrows and the like): the app has to see Shift down
+                if shift && hold.is_zero() && (0..repeat).all(|_| input::post_with_mods(target, vk, false, true)) {
+                    self.settle(800);
+                    self.after_action();
+                    return Ok(None);
+                }
                 for _ in 0..repeat {
                     input::post_key(target, vk, false);
                     if !hold.is_zero() {
@@ -1315,6 +1366,14 @@ impl Inner {
                 "{combo}: 이 창에서 '{ch}' 니모닉을 가진 단추를 찾지 못했습니다. Alt+글자를 키 메시지로 보내면 메뉴가 사용자 화면에 열릴 수 있어 보내지 않았습니다 — \
                  메뉴는 app_control menus / menu, 단추는 app_control press 를 쓰세요."
             );
+        }
+        // no menu item has it: press it with Ctrl (and Shift) held in the app's own key state
+        if a.ctrl && !a.alt {
+            self.lease();
+            if input::post_with_mods(target, a.vk, true, a.shift) {
+                self.settle(1000);
+                return Ok(format!("{combo} → 앱에 Ctrl 키 상태와 함께 보냈습니다 (반영은 스크린샷으로 확인하세요)"));
+            }
         }
         bail!(
             "{combo}: 백그라운드 창에 보낸 Ctrl/Alt 키 메시지는 앱이 인식하지 못합니다 (키 상태가 바뀌지 않음). 이 단축키를 가진 메뉴 항목도 없습니다 — \
@@ -1484,6 +1543,60 @@ impl Inner {
             .ok_or_else(|| anyhow!("id {id} 가 없습니다 (최근 ui_tree 기준 1..{})", st.ui_ids.len()))
     }
 
+    /// Opens another app on the same screen: in the same Job (so it is watched, kept off the user's screen and
+    /// closed with the rest) and, for a hidden desktop, on that desktop. Its first window becomes the current one.
+    /// The caller has already applied the launch policy.
+    fn launch_more(&self, app: &str) -> Result<String> {
+        if self.mode != NativeMode::Launched {
+            bail!("사용자 앱에 연결한 화면에는 다른 앱을 띄울 수 없습니다");
+        }
+        let job = self.proc_.job.clone().ok_or_else(|| anyhow!("이 화면에는 다른 앱을 함께 띄울 수 없습니다 (작업 묶음 없음)"))?;
+        let exe = super::apps::resolve_app_query(app)
+            .ok_or_else(|| anyhow!("앱을 찾지 못했습니다: '{app}' — 실행 파일(.exe) 경로, 시작 메뉴 바로 가기(.lnk), 설치된 앱 이름 중 하나를 쓰세요"))?;
+        launch::preflight(&exe)?;
+        if launch::requires_admin(&exe) {
+            bail!("{} 은(는) 관리자 권한이 필요한 앱이라 이 화면에서 열 수 없습니다", exe.display());
+        }
+        // the Job's limits were set for the first app (Chromium-family browsers run without UI limits)
+        let first = super::apps::resolve_app_query(&self.opts.app);
+        if first.is_some_and(|f| launch::job_ui_limits_for(&f) != launch::job_ui_limits_for(&exe)) {
+            bail!("{} 은(는) 지금 화면의 앱과 실행 조건이 달라 함께 띄울 수 없습니다 — desk_open 으로 따로 여세요", launch::display_name(&exe));
+        }
+        let name = launch::display_name(&exe);
+        let mut args = vec![];
+        if self.desk.is_some() && hdesk::is_chromium_family(&exe) {
+            args.extend(hdesk::CHROMIUM_HIDDEN_ARGS.iter().map(|a| a.to_string()));
+        }
+        self.refresh_windows(false);
+        let before: Vec<Hwnd> = self.state.lock().windows.iter().map(|w| w.hwnd).collect();
+        let (p, thread) = launch::spawn_suspended(&exe, &args, &[], self.desk.as_ref().map(|d| &d.desktop), 0, Some(&job))?;
+        if self.desk.is_none() {
+            if let Some(g) = self.guard.lock().as_ref() {
+                g.reveal_for(Duration::from_secs(20));
+                g.lease(Duration::from_secs(12));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        launch::resume(&thread);
+        drop(thread);
+        eprintln!("[ghostdesk] Windows 앱 추가 실행: {name} pid={} ({})", p.pid, exe.display());
+        self.state.lock().more_apps += 1;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(250));
+            self.refresh_windows(true);
+            let st = self.state.lock();
+            if let Some(w) = st.windows.iter().find(|w| !before.contains(&w.hwnd)) {
+                return Ok(format!("'{name}' 을(를) 열고 그 창('{}')으로 전환했습니다. 앱 사이는 list_windows 와 switch_window 로 오가세요.", w.title));
+            }
+            // gone without a window (a single-instance app handing off to a copy already running elsewhere)
+            if !p.alive() && start.elapsed() > Duration::from_secs(3) {
+                break;
+            }
+        }
+        bail!("'{name}' 을(를) 실행했지만 창이 뜨지 않았습니다 (이미 실행 중인 앱은 새 창을 사용자 화면의 기존 앱에 열 수 있습니다)")
+    }
+
     fn app_control(&self, input: &Value) -> Result<String> {
         uia::com_init();
         let action = input["action"].as_str().unwrap_or_default();
@@ -1499,15 +1612,18 @@ impl Inner {
             self.key_top()?;
         }
         match action {
+            "launch" => self.launch_more(input["app"].as_str().unwrap_or("")),
             "list_windows" => {
                 self.refresh_windows(true);
                 self.ensure_current();
                 let st = self.state.lock();
                 let mut s = String::new();
+                let several = st.more_apps > 0;
                 for (i, w) in st.windows.iter().enumerate() {
                     s.push_str(&format!(
-                        "{} [{i}] '{}' {} {}x{}{}\n",
+                        "{} [{i}] {}'{}' {} {}x{}{}\n",
                         if Some(w.hwnd) == st.current { "▶" } else { " " },
+                        if several && !w.app.is_empty() { format!("{} · ", w.app) } else { String::new() },
                         w.title,
                         w.class,
                         w.size.0,

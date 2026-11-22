@@ -263,13 +263,38 @@ pub fn command_line(exe: &Path, args: &[String], files: &[PathBuf]) -> String {
 /// Launches hidden (SW_HIDE) and suspended in a new Job. Nothing runs until the returned thread
 /// handle is passed to [`resume`].
 pub fn spawn_suspended_hidden(exe: &Path, args: &[String], files: &[PathBuf]) -> Result<(Proc, Handle)> {
-    spawn_suspended(exe, args, files, None, job_ui_limits_for(exe))
+    spawn_suspended(exe, args, files, None, job_ui_limits_for(exe), None)
 }
 
 /// Job UI limits for an executable: 0 for Chromium-based ones, whose renderers don't start under
 /// any UI limit.
+/// The app embeds WebView2 (Roblox Studio, …): it starts Chromium processes of its own.
+pub fn embeds_webview2(exe: &Path) -> bool {
+    exe.parent().is_some_and(|d| d.join("WebView2Loader.dll").is_file())
+}
+
+/// This process's environment plus the Chromium switches that keep an unseen WebView2 painting and its pages
+/// running (without them a start page drawn in WebView2 never finishes loading off the user's screen), as a
+/// CreateProcess environment block.
+fn webview2_env() -> Vec<u16> {
+    const KEY: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+    let mut vars: Vec<(String, String)> =
+        std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
+    let mut extra = super::hdesk::CHROMIUM_HIDDEN_ARGS.join(" ");
+    if let Some(i) = vars.iter().position(|(k, _)| k.eq_ignore_ascii_case(KEY)) {
+        extra = format!("{} {extra}", vars.remove(i).1);
+    }
+    vars.push((KEY.into(), extra));
+    vars.sort_by_key(|(k, _)| k.to_uppercase());
+    let mut block: Vec<u16> = vars.iter().flat_map(|(k, v)| format!("{k}={v} ").encode_utf16().collect::<Vec<_>>()).collect();
+    block.push(0);
+    block
+}
+
 pub fn job_ui_limits_for(exe: &Path) -> u32 {
-    if super::hdesk::is_chromium_family(exe) {
+    // an app with an embedded WebView2 starts Chromium processes in the Job too, and those die under these limits
+    // just like a browser's
+    if super::hdesk::is_chromium_family(exe) || embeds_webview2(exe) {
         0
     } else {
         JOB_UI_LIMITS
@@ -286,6 +311,8 @@ pub fn spawn_suspended(
     files: &[PathBuf],
     desktop: Option<&super::hdesk::HiddenDesktop>,
     ui_limits: u32,
+    // put it in this Job (another app on the same screen) instead of a new one
+    join: Option<&Arc<Handle>>,
 ) -> Result<(Proc, Handle)> {
     // console-subsystem executables (only the self-test target gets through) run without a console
     // window
@@ -305,6 +332,7 @@ pub fn spawn_suspended(
         si.lpDesktop = p.as_mut_ptr();
         si.wShowWindow = 1; // SW_SHOWNORMAL
     }
+    let env = embeds_webview2(exe).then(webview2_env);
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
@@ -315,7 +343,7 @@ pub fn spawn_suspended(
             0,
             // no CREATE_DEFAULT_ERROR_MODE, so the app inherits the quiet error mode set above
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | console_flags,
-            std::ptr::null(),
+            env.as_ref().map_or(std::ptr::null(), |e| e.as_ptr() as *const core::ffi::c_void),
             cwd.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
             &si,
             &mut pi,
@@ -334,6 +362,13 @@ pub fn spawn_suspended(
     }
     let process = Handle(pi.hProcess);
     let thread = Handle(pi.hThread);
+    if let Some(j) = join {
+        if unsafe { AssignProcessToJobObject(j.0, process.0) } == 0 {
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(process.0, 1) };
+            bail!("{} 을(를) 이 작업 화면에 넣지 못해 실행하지 않았습니다", exe.display());
+        }
+        return Ok((Proc { pid: pi.dwProcessId, process, job: Some(j.clone()) }, thread));
+    }
     let job = new_job(ui_limits);
     let assigned = match &job {
         Some(j) => unsafe { AssignProcessToJobObject(j.0, process.0) != 0 },

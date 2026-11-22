@@ -84,7 +84,7 @@ impl GhostApp {
         if enter {
             run = shown.get(pal.sel).map(|it| it.run.clone());
         }
-        let modal = egui::Modal::new(egui::Id::new("palette")).frame(theme::modal_frame()).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("palette")).frame(theme::modal_frame()).show(ctx, |ui| {
             ui.set_width(520.0);
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut pal.query)

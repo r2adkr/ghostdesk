@@ -156,6 +156,46 @@ pub fn post_key(target: Hwnd, vk: u32, up: bool) {
     w32::post(target, if up { w32::WM_KEYUP } else { w32::WM_KEYDOWN }, vk as usize, l);
 }
 
+/// Presses `vk` with Ctrl and/or Shift held, as a background window sees it. Apps read modifiers with
+/// `GetKeyState`, which posted key messages don't change, so for the moment of the key this thread joins the
+/// target thread's input state, sets the modifiers there and puts the old state back afterwards (the same thing
+/// AutoHotkey's ControlSend does). The user's own keyboard state is a different input queue and is not touched.
+/// `false` when the thread can't be joined (then nothing was sent).
+pub fn post_with_mods(target: Hwnd, vk: u32, ctrl: bool, shift: bool) -> bool {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
+    let (tid, _) = w32::thread_pid(target);
+    let me = unsafe { GetCurrentThreadId() };
+    if tid == 0 || tid == me || unsafe { AttachThreadInput(me, tid, 1) } == 0 {
+        return false;
+    }
+    let mut old = [0u8; 256];
+    unsafe { GetKeyboardState(old.as_mut_ptr()) };
+    let mut held = old;
+    for (on, keys) in [(ctrl, [0x11, 0xA2]), (shift, [0x10, 0xA0])] {
+        for k in keys {
+            held[k] = if on { 0x80 } else { 0 };
+        }
+    }
+    unsafe { SetKeyboardState(held.as_ptr()) };
+    // A message sent to the thread is handled before its posted ones, so the second empty send only returns once
+    // the posted key has been handled (while the modifiers are still down).
+    let drain = || {
+        for _ in 0..2 {
+            w32::send_timeout(target, windows_sys::Win32::UI::WindowsAndMessaging::WM_NULL, 0, 0, 1000);
+        }
+    };
+    post_key(target, vk, false);
+    drain();
+    post_key(target, vk, true);
+    drain();
+    unsafe {
+        SetKeyboardState(old.as_ptr());
+        AttachThreadInput(me, tid, 0);
+    }
+    true
+}
+
 /// Strips control characters that must not be typed (\x03, \x16 and \x18 are copy, paste and
 /// cut in edit controls) and turns \r\n and \r into \n.
 ///

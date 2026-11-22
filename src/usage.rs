@@ -65,10 +65,6 @@ impl Counts {
     pub fn saved_tokens(&self) -> u64 {
         self.shots_saved * IMAGE_TOKENS
     }
-
-    pub fn is_empty(&self) -> bool {
-        *self == Counts::default()
-    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -175,16 +171,6 @@ impl Usage {
     /// A copy of the days from `from` ("YYYY-MM-DD", inclusive) on.
     pub fn since(&self, from: &str) -> BTreeMap<String, BTreeMap<String, Counts>> {
         self.data.lock().days.range(from.to_string()..).map(|(k, v)| (k.clone(), v.clone())).collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.lock().days.is_empty()
-    }
-
-    /// Deletes all history.
-    pub fn clear(&self) {
-        self.data.lock().days.clear();
-        *self.dirty.lock() = true;
     }
 
     /// Writes the file if something changed since the last write.

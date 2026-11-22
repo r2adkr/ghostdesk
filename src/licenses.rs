@@ -16,8 +16,6 @@ use serde::{Deserialize, Serialize};
 
 /// GhostDesk's own license (Apache License 2.0)
 pub const OWN: &str = include_str!("../LICENSE");
-/// SPDX id of GhostDesk's license
-pub const OWN_SPDX: &str = "Apache-2.0";
 /// Name shown on the License page
 pub const OWN_NAME: &str = "Apache License 2.0";
 pub const OWN_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
@@ -99,7 +97,7 @@ mod tests {
     fn own_license_is_apache_2() {
         assert!(OWN.trim_start().starts_with("Apache License"));
         assert!(OWN.contains("Version 2.0, January 2004") && OWN.contains("END OF TERMS AND CONDITIONS"));
-        assert_eq!(env!("CARGO_PKG_LICENSE"), OWN_SPDX);
+        assert_eq!(env!("CARGO_PKG_LICENSE"), "Apache-2.0");
     }
 
     #[test]

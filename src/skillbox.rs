@@ -103,10 +103,6 @@ pub fn list() -> Vec<Skill> {
         .collect()
 }
 
-pub fn active() -> Vec<PathBuf> {
-    list().into_iter().filter(|s| s.enabled).map(|s| s.path).collect()
-}
-
 pub fn set_enabled(skill: &Skill, on: bool) -> std::io::Result<()> {
     let marker = skill.path.join(".disabled");
     if on {

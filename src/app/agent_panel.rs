@@ -147,8 +147,8 @@ impl GhostApp {
 
         // ── the pinned bottom: question, queue, input. Its height of the last frame is reserved, so the
         //    conversation shrinks first and the input never leaves the panel ─────────────
-        let typing_id = egui::Id::new(("typing_answer", a.shared.id));
-        let input_id = egui::Id::new(("composer_input", a.shared.id));
+        let typing_id = egui::Id::unique(("typing_answer", a.shared.id));
+        let input_id = egui::Id::unique(("composer_input", a.shared.id));
         let choices_pending = matches!(&st, AgentStatus::WaitingUser(q) if !split_choices(q).1.is_empty());
         if !choices_pending {
             ui.data_mut(|d| d.insert_temp(typing_id, false));
@@ -424,7 +424,7 @@ pub(super) fn chat_log(ui: &mut egui::Ui, log: &[crate::agent::LogEntry], acting
                     trf("작업 {}단계", &[&steps])
                 };
                 egui::CollapsingHeader::new(RichText::new(head).size(13.0).color(theme::muted()))
-                    .id_salt(egui::Id::new(("chat_run", agent, start)))
+                    .id_salt(egui::Id::unique(("chat_run", agent, start)))
                     .default_open(false)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;

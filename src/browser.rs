@@ -1110,11 +1110,36 @@ impl BrowserWorkspace {
 
     pub async fn key(&self, combo: &str, repeat: u32) -> Result<()> {
         let c = keys::parse_combo(combo)?;
+        if let Some(cmd) = browser_shortcut(&c) {
+            for _ in 0..repeat.clamp(1, 100) {
+                self.run_shortcut(cmd).await?;
+            }
+            return Ok(());
+        }
         for _ in 0..repeat.clamp(1, 100) {
             self.combo_down(&c).await?;
             self.combo_up(&c).await?;
         }
         Ok(())
+    }
+
+    /// Does what the browser itself would do for a shortcut that never reaches the page.
+    async fn run_shortcut(&self, cmd: Shortcut) -> Result<()> {
+        let (tabs, active) = self.tabs();
+        let n = tabs.len().max(1);
+        let cur = tabs.iter().position(|t| Some(&t.target_id) == active.as_ref()).unwrap_or(0);
+        match cmd {
+            Shortcut::NewTab => self.new_tab("").await,
+            Shortcut::CloseTab if tabs.len() <= 1 => bail!("마지막 탭은 닫지 않았습니다 (작업 화면이 닫힙니다)"),
+            Shortcut::CloseTab => self.close_tab(cur).await,
+            Shortcut::NextTab => self.switch_tab((cur + 1) % n).await,
+            Shortcut::PrevTab => self.switch_tab((cur + n - 1) % n).await,
+            Shortcut::Tab(i) => self.switch_tab(i.min(n - 1)).await,
+            Shortcut::LastTab => self.switch_tab(n - 1).await,
+            Shortcut::Back => self.history_go(-1).await,
+            Shortcut::Forward => self.history_go(1).await,
+            Shortcut::Reload => self.reload().await,
+        }
     }
 
     pub async fn hold_key(&self, combo: &str, secs: f64) -> Result<()> {
@@ -1557,6 +1582,47 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Record for tests to find the main process pid launched by spawn() (user-data-dir → pid).
+
+/// A browser-window shortcut. Key events sent over CDP only reach the page, so these do nothing
+/// unless they are carried out here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shortcut {
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    Tab(usize),
+    LastTab,
+    Back,
+    Forward,
+    Reload,
+}
+
+fn browser_shortcut(c: &keys::Combo) -> Option<Shortcut> {
+    use keys::MOD_SHIFT;
+    // the command key on macOS, Ctrl elsewhere
+    let primary = if cfg!(target_os = "macos") { MOD_META } else { MOD_CTRL };
+    let m = c.mods;
+    let only = |want: i64| m == want;
+    Some(match c.main.key_code {
+        0x54 if only(primary) => Shortcut::NewTab,                                  // T
+        0x57 | 0x73 if only(primary) => Shortcut::CloseTab,                         // W, F4
+        0x09 if only(MOD_CTRL) => Shortcut::NextTab,                                // Tab
+        0x09 if only(MOD_CTRL | MOD_SHIFT) => Shortcut::PrevTab,
+        0x22 if only(MOD_CTRL) => Shortcut::NextTab,                                // PageDown
+        0x21 if only(MOD_CTRL) => Shortcut::PrevTab,                                // PageUp
+        0x31..=0x38 if only(primary) => Shortcut::Tab((c.main.key_code - 0x31) as usize), // 1-8
+        0x39 if only(primary) => Shortcut::LastTab,                                 // 9
+        0x25 if only(MOD_ALT) || only(primary) && cfg!(target_os = "macos") => Shortcut::Back, // Left
+        0x27 if only(MOD_ALT) || only(primary) && cfg!(target_os = "macos") => Shortcut::Forward,
+        0xDB if only(primary) && cfg!(target_os = "macos") => Shortcut::Back,      // [
+        0xDD if only(primary) && cfg!(target_os = "macos") => Shortcut::Forward,   // ]
+        0x74 if m == 0 => Shortcut::Reload,                                         // F5
+        0x52 if only(primary) => Shortcut::Reload,                                  // R
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests_support {
     use std::path::{Path, PathBuf};
@@ -2156,5 +2222,28 @@ mod tests {
         }
         assert!(gone, "abort 뒤에도 브라우저 프로세스가 남아 있음: {ids:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn browser_window_shortcuts_are_recognized() {
+        let sc = |k: &str| browser_shortcut(&keys::parse_combo(k).unwrap());
+        let p = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+        assert_eq!(sc(&format!("{p}+t")), Some(Shortcut::NewTab));
+        assert_eq!(sc(&format!("{p}+w")), Some(Shortcut::CloseTab));
+        assert_eq!(sc("ctrl+tab"), Some(Shortcut::NextTab));
+        assert_eq!(sc("ctrl+shift+tab"), Some(Shortcut::PrevTab));
+        assert_eq!(sc(&format!("{p}+3")), Some(Shortcut::Tab(2)));
+        assert_eq!(sc(&format!("{p}+9")), Some(Shortcut::LastTab));
+        assert_eq!(sc("alt+left"), Some(Shortcut::Back));
+        assert_eq!(sc("F5"), Some(Shortcut::Reload));
+        // page shortcuts still go to the page
+        for k in [format!("{p}+c"), format!("{p}+a"), "tab".into(), "shift+tab".into(), "ctrl+shift+t".into(), "left".into()] {
+            assert_eq!(sc(&k), None, "{k}");
+        }
     }
 }

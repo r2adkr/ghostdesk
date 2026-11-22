@@ -27,6 +27,7 @@ impl GhostApp {
     /// window, hovering reveals a close button, and the edges resize it.
     pub(super) fn pip_windows(&mut self, ctx: &egui::Context) {
         let mut open = None;
+        let show_cursor = self.pip_show_cursor;
         for (i, a) in self.agents.iter_mut().enumerate() {
             if !self.pip_auto_open && !a.pip.visible {
                 a.pip.auto_open_eligible = false;
@@ -42,7 +43,9 @@ impl GhostApp {
                 // A closed workspace can stop producing frames before it requests another repaint.
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
             }
-            let (sw, sh) = workspace.map(|w| w.size()).unwrap_or((1280, 800));
+            let (sw, sh) = workspace.as_ref().map(|w| w.size()).unwrap_or((1280, 800));
+            let mouse = workspace.as_ref().filter(|_| show_cursor).map(|w| w.mouse_pos());
+            let (shared, cursor_view, color) = (a.shared.clone(), &mut a.pip_cursor_view, crate::cursor::agent_color(a.shared.id));
             let aspect = sh as f32 / sw.max(1) as f32;
             let tex = a.texture.as_ref().map(|t| t.id());
             let name = a.shared.name.clone();
@@ -77,6 +80,12 @@ impl GhostApp {
                     match tex {
                         Some(t) => {
                             p.image(t, img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            if let Some(pos) = mouse {
+                                let again = crate::cursor::paint(p, img, img.width() / sw.max(1) as f32, &mut shared.cursor.lock(), cursor_view, pos, color, None, true);
+                                if again {
+                                    pctx.request_repaint_after(std::time::Duration::from_millis(16));
+                                }
+                            }
                         }
                         None => {
                             theme::paint_spinner(p, area.center() - Vec2::new(0.0, 12.0), 20.0, Color32::from_gray(160), ui.input(|i| i.time));
