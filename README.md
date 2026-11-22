@@ -25,7 +25,7 @@ screen types, install location, building) are collected in the
 
 ## Download
 
-- **Windows x64:** [GhostDesk-Setup-0.14.2-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.14.2/GhostDesk-Setup-0.14.2-windows-x64.exe)
+- **Windows x64:** [GhostDesk-Setup-0.15.0-windows-x64.exe](https://github.com/r2adkr/ghostdesk/releases/download/v0.15.0/GhostDesk-Setup-0.15.0-windows-x64.exe)
 
   Run the setup and click **Install**. It installs for your user only (no admin
   rights) to `%LOCALAPPDATA%\Programs\GhostDesk`, adds a Start menu shortcut
@@ -36,7 +36,7 @@ screen types, install location, building) are collected in the
   version older than the installer through the in-app update, the next launch
   adds the Start menu shortcut and the uninstaller entry by itself.
 
-- **macOS (Apple Silicon, Intel):** [GhostDesk-0.14.2-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.14.2/GhostDesk-0.14.2-macos-universal.dmg)
+- **macOS (Apple Silicon, Intel):** [GhostDesk-0.15.0-macos-universal.dmg](https://github.com/r2adkr/ghostdesk/releases/download/v0.15.0/GhostDesk-0.15.0-macos-universal.dmg)
 
   Open the disk image and double-click GhostDesk.app: it installs itself to
   `~/Applications/GhostDesk.app` and reopens from there. The app is not
