@@ -38,6 +38,10 @@ impl Geom {
     pub fn to_client(&self, x: f64, y: f64) -> (i32, i32) {
         ((x * self.sx()).floor() as i32, (y * self.sy()).floor() as i32)
     }
+    /// Whether this coordinate system is still the window's: same window, same client size.
+    pub fn is_current(&self, hwnd: Hwnd, client_w: u32, client_h: u32) -> bool {
+        self.hwnd == hwnd && self.client_w == client_w && self.client_h == client_h
+    }
     pub fn contains_shot(&self, x: f64, y: f64) -> bool {
         x >= 0.0 && y >= 0.0 && x < self.shot_w as f64 && y < self.shot_h as f64
     }
@@ -321,6 +325,8 @@ mod tests {
         assert!(!g.contains_shot(1000.0, 10.0));
         // client origin (5000, 3000), screen rect (5100,3050)-(5300,3150) → screenshot [50,25,100,50]
         assert_eq!(g.rect_to_shot((5000, 3000), (5100, 3050, 5300, 3150)), [50, 25, 100, 50]);
+        // a window resized since the capture is no longer the same coordinate system
+        assert!(g.is_current(1, 2000, 1000) && !g.is_current(1, 2000, 700) && !g.is_current(2, 2000, 1000));
         assert_eq!(wheel_notches(300.0), 3);
         assert_eq!(wheel_notches(-100.0), -1);
         assert_eq!(wheel_notches(30.0), 1);

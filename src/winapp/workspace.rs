@@ -1696,8 +1696,26 @@ impl Inner {
         }
     }
 
+    /// The coordinate system for a tree read now: the one of the last screenshot while the window still has the
+    /// size it had then; if the window has been resized since (a dialog folding its advanced view), a new capture
+    /// first, so the frames, the size shown and the size later reported all come from the same moment.
+    fn fresh_geom(&self) -> Result<Geom> {
+        let w = self.current_window()?;
+        let (cw, ch) = {
+            let _dpi = w32::DpiScope::for_window(w.hwnd);
+            w32::client_size(w.hwnd)
+        };
+        if let Some(g) = self.state.lock().geom {
+            if g.is_current(w.hwnd, cw.max(0) as u32, ch.max(0) as u32) {
+                return Ok(g);
+            }
+        }
+        self.screenshot_png()?;
+        self.state.lock().geom.ok_or_else(|| anyhow!("좌표계를 만들지 못했습니다"))
+    }
+
     fn ui_tree(&self, max_depth: usize, max_nodes: usize) -> Result<String> {
-        let g = self.geom()?;
+        let g = self.fresh_geom()?;
         let w = self.current_window()?;
         let _dpi = w32::DpiScope::for_window(w.hwnd);
         let origin = w32::client_origin(w.hwnd);
