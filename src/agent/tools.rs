@@ -563,11 +563,11 @@ pub(crate) async fn exec_desk_tool(desk: &Desk, name: &str, input: &Value) -> Re
                 "links" => return ok(ws.dom_links(input["max_items"].as_u64().unwrap_or(40).clamp(5, 200) as usize).await?),
                 "click" | "double_click" => {
                     let (r, l) = (&element_ref(input), element_label(input));
-                    return ok(ws.dom_click(r, l, input["action"] == "double_click").await?);
+                    return ok(ws.dom_click(r, l, input["action"] == "double_click", crate::browser_dom::nav_wait(input)?).await?);
                 }
                 "fill" => {
                     let value = input["value"].as_str().ok_or_else(|| anyhow!("value 가 필요합니다"))?;
-                    return ok(ws.dom_fill(&element_ref(input), element_label(input), value, input["submit"].as_bool().unwrap_or(false)).await?);
+                    return ok(ws.dom_fill(&element_ref(input), element_label(input), value, input["submit"].as_bool().unwrap_or(false), crate::browser_dom::nav_wait(input)?).await?);
                 }
                 "select" => {
                     let option = input["option"].as_str().ok_or_else(|| anyhow!("option 이 필요합니다"))?;

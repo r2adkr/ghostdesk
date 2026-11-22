@@ -97,6 +97,11 @@ struct State {
     no_intercept: HashSet<String>,
     dialogs: HashMap<String, Value>,
     next_dialog_id: u64,
+    /// "session/frame" of every frame that is loading right now (Page.frameStartedLoading … frameStoppedLoading).
+    loading: HashSet<String>,
+    /// Counts navigations (a frame starting to load, or the address changing within the page), so a caller can
+    /// tell whether one began after a given moment.
+    nav_seq: u64,
 }
 
 /// An intercepted HTML5 drag (Input.dragIntercepted).
@@ -521,6 +526,8 @@ impl BrowserWorkspace {
                     let mut st = self.state.lock();
                     st.sessions.retain(|_, s| s != sid);
                     st.dialogs.remove(sid);
+                    let prefix = format!("{sid}/");
+                    st.loading.retain(|k| !k.starts_with(&prefix));
                     if st.drag.as_ref().is_some_and(|d| d.session == sid) {
                         st.drag = None;
                     }
@@ -540,6 +547,19 @@ impl BrowserWorkspace {
                 drop(state);
                 self.dialog_changed.notify_waiters();
             }
+            "Page.frameStartedLoading" => {
+                if let (Some(session), Some(frame)) = (ev.session_id.as_deref(), ev.params["frameId"].as_str()) {
+                    let mut st = self.state.lock();
+                    st.loading.insert(format!("{session}/{frame}"));
+                    st.nav_seq += 1;
+                }
+            }
+            "Page.frameStoppedLoading" | "Page.frameDetached" => {
+                if let (Some(session), Some(frame)) = (ev.session_id.as_deref(), ev.params["frameId"].as_str()) {
+                    self.state.lock().loading.remove(&format!("{session}/{frame}"));
+                }
+            }
+            "Page.navigatedWithinDocument" => self.state.lock().nav_seq += 1,
             "Page.javascriptDialogClosed" => {
                 if let Some(session) = ev.session_id { self.state.lock().dialogs.remove(&session); }
             }
@@ -1226,6 +1246,53 @@ impl BrowserWorkspace {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// How many navigations have started so far (see `settle_after`).
+    pub fn nav_mark(&self) -> u64 {
+        self.state.lock().nav_seq
+    }
+
+    /// Whether the active tab has a frame that is still loading.
+    fn is_loading(&self) -> bool {
+        let st = self.state.lock();
+        let Some(prefix) = st.active.as_ref().and_then(|a| st.sessions.get(a)).map(|s| format!("{s}/")) else { return false };
+        st.loading.iter().any(|k| k.starts_with(&prefix))
+    }
+
+    /// Waits while the active tab is loading a page (at most `max`); returns at once when it is not.
+    pub async fn wait_not_loading(&self, max: Duration) {
+        let start = Instant::now();
+        while self.is_loading() && start.elapsed() < max {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// After an action that may leave the page (a click, Enter in a form): if a navigation began since `since`
+    /// (from `nav_mark`) — or begins within a short grace period — waits until the new page has loaded, at most
+    /// `max`. Returns what happened for the agent to read: `None` when the page did not change.
+    pub async fn settle_after(&self, since: u64, grace: Duration, max: Duration) -> Option<String> {
+        let start = Instant::now();
+        let mut started = false;
+        loop {
+            let (seq, loading) = (self.nav_mark(), self.is_loading());
+            started |= seq > since;
+            if started && !loading {
+                break;
+            }
+            if !started && start.elapsed() >= grace {
+                return None;
+            }
+            if start.elapsed() >= max {
+                return Some(format!("페이지가 {}초 안에 다 열리지 않았어요 (아직 불러오는 중이면 wait_for 로 기다리세요)", max.as_secs_f64()));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // loaded; the document may still be settling (readyState), and scripts get a moment to draw
+        self.wait_ready(max.saturating_sub(start.elapsed()).max(Duration::from_millis(500))).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let page = self.eval("document.title + ' — ' + location.href").await.ok().and_then(|v| v.as_str().map(String::from));
+        Some(format!("페이지가 바뀌었어요{}", page.map(|p| format!(": {p}")).unwrap_or_default()))
     }
 
     pub async fn history_go(&self, delta: i64) -> Result<()> {
@@ -2245,5 +2312,117 @@ mod shortcut_tests {
         for k in [format!("{p}+c"), format!("{p}+a"), "tab".into(), "shift+tab".into(), "ctrl+shift+t".into(), "left".into()] {
             assert_eq!(sc(&k), None, "{k}");
         }
+    }
+}
+
+/// Reading and driving a real page by element numbers across re-draws and page loads. Needs an installed Chrome
+/// (it is skipped where there is none).
+#[cfg(test)]
+mod element_tests {
+    use super::*;
+
+    fn chrome() -> Option<PathBuf> {
+        #[cfg(windows)]
+        return ["chrome.exe", "msedge.exe"].iter().find_map(|e| crate::platform::win::app_path(e));
+        #[cfg(target_os = "macos")]
+        return ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return None;
+    }
+
+    /// A page with a search form whose box the page swaps for another node while it is used (as Wikipedia's does,
+    /// with a new label and role), and a results page that takes a moment to arrive.
+    async fn serve() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let body = if path.starts_with("/search") {
+                        tokio::time::sleep(Duration::from_millis(900)).await;
+                        format!("<title>Results</title><h1>Results page</h1><p>{path}</p><a href='/'>Back home</a>")
+                    } else {
+                        "<title>Home</title><a href='/x'>Home link</a>\
+                         <form action='/search'><input name=q placeholder='Search Wikipedia' \
+                           oninput='if(!window.swapped){window.swapped=1;const n=this.cloneNode();n.value=this.value;n.oninput=null;n.setAttribute(\"role\",\"combobox\");n.placeholder=\"Search\";this.replaceWith(n)}'>\
+                         <button>Go</button></form><input name=other placeholder=Other>"
+                            .to_string()
+                    };
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    fn number_of(read: &str, name: &str) -> u64 {
+        let line = read.lines().find(|l| l.trim_start().starts_with('[') && l.contains(name)).unwrap_or_else(|| panic!("no '{name}' in:\n{read}"));
+        line.trim_start().trim_start_matches('[').split(']').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn element_numbers_hold_and_submits_wait_for_the_page_that_opens() {
+        let Some(exe) = chrome() else { return };
+        let port = serve().await;
+        let dir = std::env::temp_dir().join(format!("ghostdesk-nav-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = BrowserWorkspace::launch(
+            LaunchOptions { exe, user_data_dir: dir.clone(), profile_dir: None, width: 800, height: 500, headless: true, start_url: format!("http://127.0.0.1:{port}/") },
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        let desk = crate::desk::Desk::Browser(ws.clone());
+        let run = |v: Value| { let desk = desk.clone(); async move { crate::agent::exec_desk_tool(&desk, "browser_control", &v).await } };
+        run(json!({"action":"wait_for", "text": "Home link"})).await.unwrap();
+
+        let read = run(json!({"action":"read"})).await.unwrap().text;
+        let (search, other) = (number_of(&read, "Search Wikipedia"), number_of(&read, "Other"));
+
+        // typing makes the page swap the box (new label, new role): the number still reaches it
+        run(json!({"action":"fill", "ref": search, "value": "한글"})).await.unwrap();
+        assert_eq!(ws.eval("window.swapped").await.unwrap(), 1, "the page did not replace its box");
+        // reading again keeps every number; the swapped box is the same element under the same number
+        let again = run(json!({"action":"read"})).await.unwrap().text;
+        assert_eq!(number_of(&again, "Search"), search, "{again}");
+        assert_eq!(number_of(&again, "Other"), other, "{again}");
+        // a number just read stays good when the page swaps the box once more behind the read
+        ws.eval("(()=>{const o=document.querySelector('[name=q]');const n=o.cloneNode();n.value=o.value;n.placeholder='Search again';o.replaceWith(n)})()").await.unwrap();
+        run(json!({"action":"fill", "ref": search, "value": "한글 검색"})).await.unwrap();
+        assert_eq!(ws.eval("document.querySelector('[name=q]').value").await.unwrap(), "한글 검색");
+
+        // Enter submits to a page that takes a moment: the same call waits for it, and says so
+        let submitted = run(json!({"action":"fill", "ref": search, "value": "한글 검색", "submit": true})).await.unwrap().text;
+        assert!(submitted.contains("페이지가 바뀌었어요") && submitted.contains("Results"), "{submitted}");
+        // so the next read in the same bundle is about the new page
+        let text = run(json!({"action":"text"})).await.unwrap().text;
+        assert!(text.contains("Results page"), "{text}");
+
+        // wait_nav = 0 does not wait: the old page is still there right after Enter
+        run(json!({"action":"navigate", "url": format!("http://127.0.0.1:{port}/")})).await.unwrap();
+        let read = run(json!({"action":"read"})).await.unwrap().text;
+        let go = number_of(&read, "Go");
+        let quick = run(json!({"action":"click", "ref": go, "wait_nav": 0})).await.unwrap().text;
+        assert!(!quick.contains("페이지가 바뀌었어요"), "{quick}");
+        // but any later action on the page waits out the load instead of failing halfway
+        let text = run(json!({"action":"text"})).await.unwrap().text;
+        assert!(text.contains("Results page"), "{text}");
+        // a click that opens a page waits as well
+        let back = run(json!({"action":"click", "label": "Back home"})).await.unwrap().text;
+        assert!(back.contains("페이지가 바뀌었어요") && back.contains("Home"), "{back}");
+
+        assert!(run(json!({"action":"click", "ref": 1, "wait_nav": "soon"})).await.is_err());
+        ws.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

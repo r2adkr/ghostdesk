@@ -274,7 +274,7 @@ fn tools_for(pl: &Plat) -> Value {
         },
         {
             "name": "desk_browser",
-            "description": "Read and drive web pages by element number, without screenshots (far cheaper than images). read returns a numbered list [n]; click/fill/select take ref=n or label=name. Numbers stay valid until the next read/find. \
+            "description": "Read and drive web pages by element number, without screenshots (far cheaper than images). read returns a numbered list [n]; click/fill/select take ref=n or label=name. A number keeps meaning the same element until the page changes (re-read keeps it). click/fill(submit) wait for the page they open (wait_nav secs, 10; 0=off). \
                  action: read(scope=page) | text(selector, max_chars) | find(query) | links | click | double_click | fill(value, submit) | select(option) | scroll_to | wait_for(text, gone, timeout) | navigate(url) | back | forward | reload | new_tab(url) | switch_tab(index) | close_tab(index) | list_tabs | dialog | respond_dialog. \
                  No screenshot unless screenshot=true. actions=[{action:'navigate',url},{action:'wait_for',text:'Search'},{action:'read'}] runs a bundle (pixel actions may be mixed in). Also reads/drives elements inside Electron apps. \
                  Dialogs are never auto-accepted: read the id with dialog, then respond_dialog with explicit accept. If one interrupted typing, don't repeat the input; confirm irreversible answers (delete, pay) are allowed.",
@@ -304,6 +304,7 @@ fn tools_for(pl: &Plat) -> Value {
                     "text": { "type": "string", "description": "wait_for: text to wait for" },
                     "gone": { "type": "boolean", "description": "wait_for: wait until it is gone" },
                     "timeout": { "type": "number", "description": "wait_for: max seconds (10)" },
+                    "wait_nav": { "type": "number", "description": "click/fill: max seconds to wait for the page it opens (10; 0=don't)" },
                     "id": { "type": "integer", "minimum": 1, "description": "respond_dialog: id from dialog" },
                     "accept": { "type": "boolean", "description": "respond_dialog: true=accept, false=cancel (required)" },
                     "prompt_text": { "type": "string", "description": "respond_dialog: prompt answer" },
