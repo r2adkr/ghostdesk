@@ -3,8 +3,8 @@
 //! here. Only key-based agents use them.
 use std::path::{Path, PathBuf};
 
-const MAX_FILES: usize = 400;
-const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Above this the go-ahead says the skill is big; there is no hard limit (real skills ship image sets and binaries).
+pub const LARGE: u64 = 50 * 1024 * 1024;
 
 pub fn dir() -> PathBuf {
     crate::platform::paths::data_root().join("skills")
@@ -152,24 +152,16 @@ pub fn inspect(src: &Path) -> Result<(Candidate, usize, u64), String> {
         files += 1;
         bytes += len;
     })?;
-    if files > MAX_FILES || bytes > MAX_BYTES {
-        return Err("스킬이 너무 커요 (파일 400개, 8MB 까지)".into());
-    }
     Ok((Candidate { name, description, path: src.to_path_buf() }, files, bytes))
 }
 
-/// Visits regular files below `root`; symlinks and `.git` are ignored.
+/// Visits regular files below `root`; symlinks, `.git` and dependency/cache folders are ignored.
 fn walk(root: &Path, f: &mut dyn FnMut(&Path, u64)) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
-    let mut seen = 0usize;
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
-            seen += 1;
-            if seen > MAX_FILES * 4 {
-                return Err("스킬이 너무 커요 (파일 400개, 8MB 까지)".into());
-            }
             let Ok(t) = e.file_type() else { continue };
-            if t.is_symlink() || e.file_name() == ".git" {
+            if t.is_symlink() || matches!(e.file_name().to_str(), Some(".git" | "node_modules" | "__pycache__" | ".venv")) {
                 continue;
             }
             if t.is_dir() {

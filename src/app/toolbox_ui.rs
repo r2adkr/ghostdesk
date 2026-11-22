@@ -33,7 +33,8 @@ pub(super) struct State {
     importing: bool,
     skill_confirm: Option<(Candidate, usize, u64)>,
     skill_note: Option<String>,
-    import_all: bool,
+    /// "Import all" waiting for a go-ahead: each skill with its size.
+    import_all: Option<Vec<(String, u64)>>,
     /// Tools found in other apps (and which are ticked), read when the tab opens.
     found: Vec<toolbox::Found>,
     found_loaded: bool,
@@ -128,6 +129,11 @@ fn item_row<R>(
     }
     let trail = Rect::from_min_max(pos2(rect.right() - trail_w, rect.top()), rect.max);
     ui.scope_builder(egui::UiBuilder::new().max_rect(trail).layout(egui::Layout::right_to_left(egui::Align::Center)), add).inner
+}
+
+/// Bytes as KB or MB.
+fn size_text(b: u64) -> String {
+    if b >= 1024 * 1024 { format!("{:.1}MB", b as f64 / 1048576.0) } else { format!("{}KB", b.div_ceil(1024)) }
 }
 
 /// The "…" menu at the end of a row.
@@ -515,7 +521,10 @@ impl GhostApp {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(trf("'{}' 스킬을 가져올까요?", &[&c.name])).strong());
             ui.label(theme::hint(crate::llm::short(&c.description, 160)));
-            ui.label(theme::hint(trf("파일 {}개 · {}KB. 스킬에 든 스크립트는 에이전트가 실행하려 할 때 내게 허락을 물어요.", &[&files, &(bytes / 1024)])));
+            ui.label(theme::hint(trf("파일 {}개 · {}. 스킬에 든 스크립트는 에이전트가 실행하려 할 때 내게 허락을 물어요.", &[&files, &size_text(bytes)])));
+            if bytes > skillbox::LARGE {
+                ui.label(RichText::new(trf("용량이 커요 ({}). 이 앱 폴더에 그대로 복사돼 그만큼 디스크를 차지해요.", &[&size_text(bytes)])).size(12.0).color(theme::danger()));
+            }
             ui.horizontal(|ui| {
                 if theme::primary(ui, tr("가져오기")).clicked() {
                     match skillbox::import(&c.path) {
@@ -771,25 +780,37 @@ impl GhostApp {
         }
         if skills.len() > 1 {
             ui.add_space(8.0);
-            if self.toolbox.import_all {
+            if let Some(sizes) = self.toolbox.import_all.clone() {
                 theme::tinted(theme::warn()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new(trf("스킬 {}개를 모두 가져올까요?", &[&self.toolbox.candidates.len()])).strong());
                     ui.label(theme::hint(tr("각 스킬이 이 앱 안에 복사돼요. 스킬에 든 스크립트는 에이전트가 실행하려 할 때 내게 허락을 물어요.")));
+                    ui.label(theme::hint(trf("모두 합쳐 {}", &[&size_text(sizes.iter().map(|(_, b)| b).sum())])));
+                    egui::ScrollArea::vertical().max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for (n, b) in &sizes {
+                            let c = if *b > skillbox::LARGE { theme::danger() } else { theme::body() };
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(n).size(12.5).color(c));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(size_text(*b)).size(12.0).color(c));
+                                });
+                            });
+                        }
+                    });
                     ui.horizontal(|ui| {
                         if theme::primary(ui, tr("모두 가져오기")).clicked() {
-                            let bad = self.toolbox.candidates.clone().iter().filter(|c| skillbox::import(&c.path).is_err()).count();
-                            self.toolbox.skill_note = (bad > 0).then(|| trf("{}개는 가져오지 못했어요 (너무 크거나 형식이 달라요)", &[&bad]));
-                            self.toolbox.import_all = false;
+                            let bad: Vec<String> = self.toolbox.candidates.clone().iter().filter_map(|c| skillbox::import(&c.path).err().map(|e| format!("{} ({})", c.name, tr(&e)))).collect();
+                            self.toolbox.skill_note = (!bad.is_empty()).then(|| trf("가져오지 못한 스킬: {}", &[&bad.join(", ")]));
+                            self.toolbox.import_all = None;
                             self.reload_skills();
                         }
                         if theme::secondary(ui, tr("취소")).clicked() {
-                            self.toolbox.import_all = false;
+                            self.toolbox.import_all = None;
                         }
                     });
                 });
             } else if theme::secondary(ui, trf("스킬 {}개 모두 가져오기", &[&self.toolbox.candidates.len()])).clicked() {
-                self.toolbox.import_all = true;
+                self.toolbox.import_all = Some(self.toolbox.candidates.iter().filter_map(|c| skillbox::inspect(&c.path).ok().map(|(_, _, b)| (c.name.clone(), b))).collect());
             }
         }
         for i in skills {
